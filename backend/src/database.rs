@@ -75,6 +75,62 @@ pub struct UserView {
     pub persona: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CompanionAttitude {
+    pub id: Option<i32>,
+    pub companion_id: i32,
+    pub target_id: i32,
+    pub target_type: String,
+    pub attraction: f32,
+    pub trust: f32,
+    pub fear: f32,
+    pub anger: f32,
+    pub joy: f32,
+    pub sorrow: f32,
+    pub disgust: f32,
+    pub surprise: f32,
+    pub curiosity: f32,
+    pub respect: f32,
+    pub suspicion: f32,
+    pub gratitude: f32,
+    pub jealousy: f32,
+    pub empathy: f32,
+    pub relationship_score: Option<f32>,
+    pub last_updated: String,
+    pub created_at: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AttitudeMetadata {
+    pub id: Option<i32>,
+    pub attitude_id: i32,
+    pub interaction_count: i32,
+    pub positive_interactions: i32,
+    pub negative_interactions: i32,
+    pub neutral_interactions: i32,
+    pub last_significant_event: Option<String>,
+    pub relationship_status: String,
+    pub notes: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AttitudeUpdate {
+    pub attraction: Option<f32>,
+    pub trust: Option<f32>,
+    pub fear: Option<f32>,
+    pub anger: Option<f32>,
+    pub joy: Option<f32>,
+    pub sorrow: Option<f32>,
+    pub disgust: Option<f32>,
+    pub surprise: Option<f32>,
+    pub curiosity: Option<f32>,
+    pub respect: Option<f32>,
+    pub suspicion: Option<f32>,
+    pub gratitude: Option<f32>,
+    pub jealousy: Option<f32>,
+    pub empathy: Option<f32>,
+}
+
 #[derive(PartialEq, Serialize, Deserialize)]
 pub enum Device {
     CPU,
@@ -221,6 +277,59 @@ impl Database {
                 gpu_layers INTEGER,
                 prompt_template TEXT
             )", []
+        )?;
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS companion_attitudes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                companion_id INTEGER NOT NULL,
+                target_id INTEGER NOT NULL,
+                target_type TEXT NOT NULL CHECK(target_type IN ('user', 'third_party')),
+                attraction REAL DEFAULT 0 CHECK(attraction >= -100 AND attraction <= 100),
+                trust REAL DEFAULT 0 CHECK(trust >= -100 AND trust <= 100),
+                fear REAL DEFAULT 0 CHECK(fear >= -100 AND fear <= 100),
+                anger REAL DEFAULT 0 CHECK(anger >= -100 AND anger <= 100),
+                joy REAL DEFAULT 0 CHECK(joy >= -100 AND joy <= 100),
+                sorrow REAL DEFAULT 0 CHECK(sorrow >= -100 AND sorrow <= 100),
+                disgust REAL DEFAULT 0 CHECK(disgust >= -100 AND disgust <= 100),
+                surprise REAL DEFAULT 0 CHECK(surprise >= -100 AND surprise <= 100),
+                curiosity REAL DEFAULT 0 CHECK(curiosity >= -100 AND curiosity <= 100),
+                respect REAL DEFAULT 0 CHECK(respect >= -100 AND respect <= 100),
+                suspicion REAL DEFAULT 0 CHECK(suspicion >= -100 AND suspicion <= 100),
+                gratitude REAL DEFAULT 0 CHECK(gratitude >= -100 AND gratitude <= 100),
+                jealousy REAL DEFAULT 0 CHECK(jealousy >= -100 AND jealousy <= 100),
+                empathy REAL DEFAULT 0 CHECK(empathy >= -100 AND empathy <= 100),
+                relationship_score REAL GENERATED ALWAYS AS ((attraction + trust + joy + respect + gratitude + empathy - fear - anger - sorrow - disgust - suspicion - jealousy) / 12.0) STORED,
+                last_updated TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (companion_id) REFERENCES companion(id) ON DELETE CASCADE,
+                UNIQUE(companion_id, target_id, target_type)
+            )", []
+        )?;
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS attitude_metadata (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                attitude_id INTEGER NOT NULL,
+                interaction_count INTEGER DEFAULT 0,
+                positive_interactions INTEGER DEFAULT 0,
+                negative_interactions INTEGER DEFAULT 0,
+                neutral_interactions INTEGER DEFAULT 0,
+                last_significant_event TEXT,
+                relationship_status TEXT DEFAULT 'neutral' CHECK(relationship_status IN ('hostile', 'unfriendly', 'neutral', 'friendly', 'close', 'intimate')),
+                notes TEXT,
+                FOREIGN KEY (attitude_id) REFERENCES companion_attitudes(id) ON DELETE CASCADE
+            )", []
+        )?;
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_companion_attitudes_companion ON companion_attitudes(companion_id)", []
+        )?;
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_companion_attitudes_target ON companion_attitudes(target_id, target_type)", []
+        )?;
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_companion_attitudes_relationship ON companion_attitudes(relationship_score)", []
+        )?;
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_attitude_metadata_attitude ON attitude_metadata(attitude_id)", []
         )?;
         if Database::is_table_empty("companion", &con)? {
             con.execute(
@@ -586,6 +695,177 @@ impl Database {
                 &prompt_template as &dyn ToSql,
             ]
         )?;
+        Ok(())
+    }
+
+    pub fn create_or_update_attitude(companion_id: i32, target_id: i32, target_type: &str, attitude: &CompanionAttitude) -> Result<i32> {
+        let con = Connection::open("companion_database.db")?;
+        let current_time = get_current_date();
+        
+        let existing_id: Option<i32> = con.query_row(
+            "SELECT id FROM companion_attitudes WHERE companion_id = ? AND target_id = ? AND target_type = ?",
+            &[&companion_id, &target_id, target_type],
+            |row| row.get(0)
+        ).ok();
+        
+        if let Some(id) = existing_id {
+            con.execute(
+                "UPDATE companion_attitudes SET 
+                    attraction = ?, trust = ?, fear = ?, anger = ?, joy = ?, sorrow = ?,
+                    disgust = ?, surprise = ?, curiosity = ?, respect = ?, suspicion = ?,
+                    gratitude = ?, jealousy = ?, empathy = ?, last_updated = ?
+                WHERE id = ?",
+                &[
+                    &attitude.attraction, &attitude.trust, &attitude.fear, &attitude.anger,
+                    &attitude.joy, &attitude.sorrow, &attitude.disgust, &attitude.surprise,
+                    &attitude.curiosity, &attitude.respect, &attitude.suspicion,
+                    &attitude.gratitude, &attitude.jealousy, &attitude.empathy,
+                    &current_time, &id
+                ]
+            )?;
+            Ok(id)
+        } else {
+            con.execute(
+                "INSERT INTO companion_attitudes (
+                    companion_id, target_id, target_type, attraction, trust, fear, anger,
+                    joy, sorrow, disgust, surprise, curiosity, respect, suspicion,
+                    gratitude, jealousy, empathy, last_updated, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                &[
+                    &companion_id, &target_id, target_type,
+                    &attitude.attraction, &attitude.trust, &attitude.fear, &attitude.anger,
+                    &attitude.joy, &attitude.sorrow, &attitude.disgust, &attitude.surprise,
+                    &attitude.curiosity, &attitude.respect, &attitude.suspicion,
+                    &attitude.gratitude, &attitude.jealousy, &attitude.empathy,
+                    &current_time, &current_time
+                ]
+            )?;
+            Ok(con.last_insert_rowid() as i32)
+        }
+    }
+
+    pub fn get_attitude(companion_id: i32, target_id: i32, target_type: &str) -> Result<Option<CompanionAttitude>> {
+        let con = Connection::open("companion_database.db")?;
+        let mut stmt = con.prepare(
+            "SELECT id, companion_id, target_id, target_type, attraction, trust, fear, anger,
+                    joy, sorrow, disgust, surprise, curiosity, respect, suspicion,
+                    gratitude, jealousy, empathy, relationship_score, last_updated, created_at
+             FROM companion_attitudes
+             WHERE companion_id = ? AND target_id = ? AND target_type = ?"
+        )?;
+        
+        let attitude = stmt.query_row(&[&companion_id, &target_id, target_type], |row| {
+            Ok(CompanionAttitude {
+                id: Some(row.get(0)?),
+                companion_id: row.get(1)?,
+                target_id: row.get(2)?,
+                target_type: row.get(3)?,
+                attraction: row.get(4)?,
+                trust: row.get(5)?,
+                fear: row.get(6)?,
+                anger: row.get(7)?,
+                joy: row.get(8)?,
+                sorrow: row.get(9)?,
+                disgust: row.get(10)?,
+                surprise: row.get(11)?,
+                curiosity: row.get(12)?,
+                respect: row.get(13)?,
+                suspicion: row.get(14)?,
+                gratitude: row.get(15)?,
+                jealousy: row.get(16)?,
+                empathy: row.get(17)?,
+                relationship_score: row.get(18)?,
+                last_updated: row.get(19)?,
+                created_at: row.get(20)?,
+            })
+        }).ok();
+        
+        Ok(attitude)
+    }
+
+    pub fn update_attitude_dimension(companion_id: i32, target_id: i32, target_type: &str, dimension: &str, delta: f32) -> Result<()> {
+        let con = Connection::open("companion_database.db")?;
+        let current_time = get_current_date();
+        
+        let query = format!(
+            "UPDATE companion_attitudes 
+             SET {} = MAX(-100, MIN(100, {} + ?)), last_updated = ?
+             WHERE companion_id = ? AND target_id = ? AND target_type = ?",
+            dimension, dimension
+        );
+        
+        con.execute(
+            &query,
+            &[&delta, &current_time, &companion_id, &target_id, target_type]
+        )?;
+        
+        Ok(())
+    }
+
+    pub fn get_all_companion_attitudes(companion_id: i32) -> Result<Vec<CompanionAttitude>> {
+        let con = Connection::open("companion_database.db")?;
+        let mut stmt = con.prepare(
+            "SELECT id, companion_id, target_id, target_type, attraction, trust, fear, anger,
+                    joy, sorrow, disgust, surprise, curiosity, respect, suspicion,
+                    gratitude, jealousy, empathy, relationship_score, last_updated, created_at
+             FROM companion_attitudes
+             WHERE companion_id = ?
+             ORDER BY relationship_score DESC"
+        )?;
+        
+        let attitudes = stmt.query_map(&[&companion_id], |row| {
+            Ok(CompanionAttitude {
+                id: Some(row.get(0)?),
+                companion_id: row.get(1)?,
+                target_id: row.get(2)?,
+                target_type: row.get(3)?,
+                attraction: row.get(4)?,
+                trust: row.get(5)?,
+                fear: row.get(6)?,
+                anger: row.get(7)?,
+                joy: row.get(8)?,
+                sorrow: row.get(9)?,
+                disgust: row.get(10)?,
+                surprise: row.get(11)?,
+                curiosity: row.get(12)?,
+                respect: row.get(13)?,
+                suspicion: row.get(14)?,
+                gratitude: row.get(15)?,
+                jealousy: row.get(16)?,
+                empathy: row.get(17)?,
+                relationship_score: row.get(18)?,
+                last_updated: row.get(19)?,
+                created_at: row.get(20)?,
+            })
+        })?;
+        
+        let mut result = Vec::new();
+        for attitude in attitudes {
+            result.push(attitude?);
+        }
+        
+        Ok(result)
+    }
+
+    pub fn update_attitude_metadata(attitude_id: i32, interaction_type: &str, event: Option<&str>) -> Result<()> {
+        let con = Connection::open("companion_database.db")?;
+        
+        let field = match interaction_type {
+            "positive" => "positive_interactions",
+            "negative" => "negative_interactions",
+            "neutral" => "neutral_interactions",
+            _ => return Err(Error::InvalidParameterName("Invalid interaction type".to_string())),
+        };
+        
+        let query = format!(
+            "UPDATE attitude_metadata 
+             SET interaction_count = interaction_count + 1, {} = {} + 1, last_significant_event = COALESCE(?, last_significant_event)
+             WHERE attitude_id = ?",
+            field, field
+        );
+        
+        con.execute(&query, &[&event, &attitude_id])?;
+        
         Ok(())
     }
 }
