@@ -1,7 +1,7 @@
 use actix_web::{get, post, delete, put, App, web, HttpResponse, HttpServer};
 use futures_util::StreamExt as _;
 mod database;
-use database::{Database, Message, NewMessage, CompanionView, UserView, ConfigModify, CompanionAttitude};
+use database::{Database, Message, NewMessage, CompanionView, UserView, ConfigModify, CompanionAttitude, AttitudeMemory};
 mod long_term_mem;
 use long_term_mem::LongTermMem;
 mod dialogue_tuning;
@@ -536,6 +536,20 @@ async fn update_attitude_dimension(received: web::Json<AttitudeDimensionUpdate>)
     }
 }
 
+#[get("/api/attitude/memories/{companion_id}")]
+async fn get_attitude_memories(companion_id: web::Path<i32>) -> HttpResponse {
+    match Database::get_priority_attitude_memories(*companion_id, 20) {
+        Ok(memories) => {
+            let memories_json = serde_json::to_string(&memories).unwrap_or(String::from("Error serializing attitude memories as JSON"));
+            HttpResponse::Ok().body(memories_json)
+        },
+        Err(e) => {
+            println!("Failed to get attitude memories: {}", e);
+            HttpResponse::InternalServerError().body("Error while getting attitude memories, check logs for more information")
+        }
+    }
+}
+
 //
 
 #[actix_web::main]
@@ -599,6 +613,7 @@ async fn main() -> std::io::Result<()> {
             .service(create_or_update_attitude)
             .service(get_companion_attitudes)
             .service(update_attitude_dimension)
+            .service(get_attitude_memories)
     })
     .bind((hostname, port))?
     .run()

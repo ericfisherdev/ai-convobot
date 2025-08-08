@@ -291,6 +291,157 @@ pub struct ConfigModify {
     pub prompt_template: String
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AttitudeMemory {
+    pub id: Option<i32>,
+    pub companion_id: i32,
+    pub target_id: i32,
+    pub target_type: String,
+    pub memory_type: String,
+    pub description: String,
+    pub priority_score: f32,
+    pub attitude_delta_json: String,
+    pub impact_score: f32,
+    pub message_context: String,
+    pub created_at: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AttitudeDelta {
+    pub attraction: f32,
+    pub trust: f32,
+    pub fear: f32,
+    pub anger: f32,
+    pub joy: f32,
+    pub sorrow: f32,
+    pub disgust: f32,
+    pub surprise: f32,
+    pub curiosity: f32,
+    pub respect: f32,
+    pub suspicion: f32,
+    pub gratitude: f32,
+    pub jealousy: f32,
+    pub empathy: f32,
+}
+
+fn calculate_attitude_delta(previous: &CompanionAttitude, new: &CompanionAttitude) -> AttitudeDelta {
+    AttitudeDelta {
+        attraction: new.attraction - previous.attraction,
+        trust: new.trust - previous.trust,
+        fear: new.fear - previous.fear,
+        anger: new.anger - previous.anger,
+        joy: new.joy - previous.joy,
+        sorrow: new.sorrow - previous.sorrow,
+        disgust: new.disgust - previous.disgust,
+        surprise: new.surprise - previous.surprise,
+        curiosity: new.curiosity - previous.curiosity,
+        respect: new.respect - previous.respect,
+        suspicion: new.suspicion - previous.suspicion,
+        gratitude: new.gratitude - previous.gratitude,
+        jealousy: new.jealousy - previous.jealousy,
+        empathy: new.empathy - previous.empathy,
+    }
+}
+
+fn calculate_impact_score(delta: &AttitudeDelta) -> f32 {
+    // Calculate weighted Euclidean distance in attitude space
+    let dimensions = [
+        ("attraction", delta.attraction, 1.2),  // High weight for relationship-defining emotions
+        ("trust", delta.trust, 1.5),
+        ("fear", delta.fear, 1.1),
+        ("anger", delta.anger, 1.3),
+        ("joy", delta.joy, 1.0),
+        ("sorrow", delta.sorrow, 1.0),
+        ("disgust", delta.disgust, 1.1),
+        ("surprise", delta.surprise, 0.8),    // Lower weight for transient emotions
+        ("curiosity", delta.curiosity, 0.9),
+        ("respect", delta.respect, 1.4),
+        ("suspicion", delta.suspicion, 1.2),
+        ("gratitude", delta.gratitude, 1.1),
+        ("jealousy", delta.jealousy, 1.3),
+        ("empathy", delta.empathy, 1.2),
+    ];
+    
+    let mut weighted_sum = 0.0;
+    for (_, value, weight) in dimensions.iter() {
+        weighted_sum += (value * weight).powi(2);
+    }
+    
+    weighted_sum.sqrt()
+}
+
+fn classify_memory_type(delta: &AttitudeDelta, impact_score: f32) -> String {
+    // Classify based on dominant changes and impact
+    if delta.trust > 15.0 && delta.attraction > 10.0 {
+        "BondingMoment".to_string()
+    } else if delta.trust < -20.0 || delta.anger > 20.0 {
+        "Betrayal".to_string()
+    } else if delta.attraction > 20.0 {
+        "AttractionSpike".to_string()
+    } else if delta.fear > 15.0 && delta.suspicion > 10.0 {
+        "ThreatDetection".to_string()
+    } else if delta.respect > 15.0 {
+        "RespectGained".to_string()
+    } else if delta.respect < -15.0 {
+        "RespectLost".to_string()
+    } else if delta.anger > 15.0 {
+        "ConflictMoment".to_string()
+    } else if delta.joy > 15.0 && delta.gratitude > 10.0 {
+        "JoyfulMemory".to_string()
+    } else if delta.sorrow > 15.0 {
+        "SadMoment".to_string()
+    } else if impact_score > 25.0 {
+        "PowerShift".to_string()
+    } else {
+        "SignificantChange".to_string()
+    }
+}
+
+fn calculate_priority_score(delta: &AttitudeDelta, impact_score: f32, memory_type: &str) -> f32 {
+    let recency_weight = 0.25;
+    let impact_weight = 0.4;
+    let type_weight = 0.2;
+    let relevance_weight = 0.15;
+    
+    // Base scores
+    let recency_score = 100.0; // Recent changes get max recency
+    let impact_normalized = (impact_score / 50.0).min(100.0); // Normalize to 0-100
+    
+    let type_score = match memory_type {
+        "BondingMoment" | "Betrayal" => 95.0,
+        "PowerShift" | "AttractionSpike" => 90.0,
+        "ThreatDetection" | "ConflictMoment" => 85.0,
+        "RespectGained" | "RespectLost" => 80.0,
+        "JoyfulMemory" | "SadMoment" => 70.0,
+        _ => 60.0,
+    };
+    
+    // Relevance based on relationship-critical dimensions
+    let critical_changes = delta.trust.abs() + delta.attraction.abs() + delta.respect.abs();
+    let relevance_score = (critical_changes / 30.0 * 100.0).min(100.0);
+    
+    recency_score * recency_weight 
+        + impact_normalized * impact_weight 
+        + type_score * type_weight 
+        + relevance_score * relevance_weight
+}
+
+fn generate_memory_description(memory_type: &str, delta: &AttitudeDelta, impact_score: f32) -> String {
+    match memory_type {
+        "BondingMoment" => format!("A bonding moment occurred (trust +{:.1}, attraction +{:.1}) with significant relationship impact", delta.trust, delta.attraction),
+        "Betrayal" => format!("Trust was broken (trust {:.1}, anger +{:.1}) creating lasting negative impact", delta.trust, delta.anger),
+        "AttractionSpike" => format!("Strong attraction developed (+{:.1}) indicating romantic/personal interest", delta.attraction),
+        "ThreatDetection" => format!("Threat response triggered (fear +{:.1}, suspicion +{:.1}) affecting security perception", delta.fear, delta.suspicion),
+        "PowerShift" => format!("Significant power dynamic change detected (impact score: {:.1})", impact_score),
+        "ConflictMoment" => format!("Conflict arose (anger +{:.1}) potentially damaging relationship", delta.anger),
+        "RespectGained" => format!("Respect significantly increased (+{:.1}) enhancing relationship status", delta.respect),
+        "RespectLost" => format!("Respect was lost ({:.1}) diminishing relationship quality", delta.respect),
+        "JoyfulMemory" => format!("Joyful experience shared (joy +{:.1}, gratitude +{:.1})", delta.joy, delta.gratitude),
+        "SadMoment" => format!("Sadness experienced together (sorrow +{:.1}) creating emotional bond", delta.sorrow),
+        _ => format!("Significant attitude change detected (impact: {:.1})", impact_score),
+    }
+}
+
 pub struct Database {}
 
 impl Database {
@@ -527,7 +678,11 @@ impl Database {
                     &PromptTemplate::Default as &dyn ToSql
                 ]
             )?;
-        } 
+        }
+        
+        // Initialize attitude memories table
+        Database::create_attitude_memories_table()?;
+        
         Ok(0)
     }
 
@@ -921,6 +1076,9 @@ impl Database {
     }
 
     pub fn update_attitude_dimension(companion_id: i32, target_id: i32, target_type: &str, dimension: &str, delta: f32) -> Result<()> {
+        // Get the attitude before the change for comparison
+        let previous_attitude = Database::get_attitude(companion_id, target_id, target_type)?;
+        
         let con = Connection::open("companion_database.db")?;
         let current_time = get_current_date();
         
@@ -935,6 +1093,14 @@ impl Database {
             &query,
             params![delta, current_time, companion_id, target_id, target_type]
         )?;
+        
+        // Get the attitude after the change and check for significant changes
+        if let Some(previous) = previous_attitude {
+            if let Some(new_attitude) = Database::get_attitude(companion_id, target_id, target_type)? {
+                // Trigger change detection - pass None for message context since we don't have it here
+                Database::detect_attitude_change(companion_id, target_id, target_type, &previous, &new_attitude, None)?;
+            }
+        }
         
         Ok(())
     }
@@ -1201,5 +1367,104 @@ impl Database {
         )?;
         
         Ok(())
+    }
+
+    // Attitude Change Detection System
+    
+    pub fn create_attitude_memories_table() -> Result<()> {
+        let con = Connection::open("companion_database.db")?;
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS attitude_memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                companion_id INTEGER NOT NULL,
+                target_id INTEGER NOT NULL,
+                target_type TEXT NOT NULL,
+                memory_type TEXT NOT NULL,
+                description TEXT NOT NULL,
+                priority_score REAL NOT NULL,
+                attitude_delta_json TEXT NOT NULL,
+                impact_score REAL NOT NULL,
+                message_context TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(companion_id) REFERENCES companions(id)
+            )",
+            [],
+        )?;
+        
+        // Create index for priority queries
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_attitude_memories_priority 
+             ON attitude_memories(companion_id, priority_score DESC)",
+            [],
+        )?;
+        
+        Ok(())
+    }
+
+    pub fn detect_attitude_change(companion_id: i32, target_id: i32, target_type: &str, 
+                                 previous_attitude: &CompanionAttitude, new_attitude: &CompanionAttitude,
+                                 message_context: Option<&str>) -> Result<()> {
+        let delta = calculate_attitude_delta(previous_attitude, new_attitude);
+        let impact_score = calculate_impact_score(&delta);
+        
+        if impact_score > 10.0 { // Threshold for significant changes
+            let memory_type = classify_memory_type(&delta, impact_score);
+            let priority_score = calculate_priority_score(&delta, impact_score, &memory_type);
+            
+            let description = generate_memory_description(&memory_type, &delta, impact_score);
+            let attitude_delta_json = serde_json::to_string(&delta).unwrap_or_default();
+            
+            let con = Connection::open("companion_database.db")?;
+            let current_time = get_current_date();
+            
+            con.execute(
+                "INSERT INTO attitude_memories (
+                    companion_id, target_id, target_type, memory_type, description,
+                    priority_score, attitude_delta_json, impact_score, message_context, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    companion_id, target_id, target_type, memory_type, description,
+                    priority_score, attitude_delta_json, impact_score, 
+                    message_context.unwrap_or(""), current_time
+                ]
+            )?;
+        }
+        
+        Ok(())
+    }
+
+    pub fn get_priority_attitude_memories(companion_id: i32, limit: usize) -> Result<Vec<AttitudeMemory>> {
+        let con = Connection::open("companion_database.db")?;
+        let mut stmt = con.prepare(
+            "SELECT id, companion_id, target_id, target_type, memory_type, description,
+                    priority_score, attitude_delta_json, impact_score, message_context, created_at
+             FROM attitude_memories 
+             WHERE companion_id = ?
+             ORDER BY priority_score DESC
+             LIMIT ?"
+        )?;
+        
+        let memories = stmt.query_map(params![companion_id, limit], |row| {
+            Ok(AttitudeMemory {
+                id: row.get(0)?,
+                companion_id: row.get(1)?,
+                target_id: row.get(2)?,
+                target_type: row.get(3)?,
+                memory_type: row.get(4)?,
+                description: row.get(5)?,
+                priority_score: row.get(6)?,
+                attitude_delta_json: row.get(7)?,
+                impact_score: row.get(8)?,
+                message_context: row.get(9)?,
+                created_at: row.get(10)?,
+            })
+        })?;
+        
+        let mut result = Vec::new();
+        for memory in memories {
+            result.push(memory?);
+        }
+        
+        Ok(result)
     }
 }
