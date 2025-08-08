@@ -1,4 +1,4 @@
-use rusqlite::{Connection, Error, Result, ToSql};
+use rusqlite::{Connection, Error, Result, ToSql, params};
 use rusqlite::types::{FromSql, FromSqlError, ValueRef, ToSqlOutput};
 use serde::{Serialize, Deserialize};
 use chrono::{DateTime, Local};
@@ -841,7 +841,7 @@ impl Database {
         
         let existing_id: Option<i32> = con.query_row(
             "SELECT id FROM companion_attitudes WHERE companion_id = ? AND target_id = ? AND target_type = ?",
-            &[&companion_id, &target_id, target_type],
+            params![companion_id, target_id, target_type],
             |row| row.get(0)
         ).ok();
         
@@ -852,12 +852,12 @@ impl Database {
                     disgust = ?, surprise = ?, curiosity = ?, respect = ?, suspicion = ?,
                     gratitude = ?, jealousy = ?, empathy = ?, last_updated = ?
                 WHERE id = ?",
-                &[
-                    &attitude.attraction, &attitude.trust, &attitude.fear, &attitude.anger,
-                    &attitude.joy, &attitude.sorrow, &attitude.disgust, &attitude.surprise,
-                    &attitude.curiosity, &attitude.respect, &attitude.suspicion,
-                    &attitude.gratitude, &attitude.jealousy, &attitude.empathy,
-                    &current_time, &id
+                params![
+                    attitude.attraction, attitude.trust, attitude.fear, attitude.anger,
+                    attitude.joy, attitude.sorrow, attitude.disgust, attitude.surprise,
+                    attitude.curiosity, attitude.respect, attitude.suspicion,
+                    attitude.gratitude, attitude.jealousy, attitude.empathy,
+                    current_time, id
                 ]
             )?;
             Ok(id)
@@ -868,13 +868,13 @@ impl Database {
                     joy, sorrow, disgust, surprise, curiosity, respect, suspicion,
                     gratitude, jealousy, empathy, last_updated, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                &[
-                    &companion_id, &target_id, target_type,
-                    &attitude.attraction, &attitude.trust, &attitude.fear, &attitude.anger,
-                    &attitude.joy, &attitude.sorrow, &attitude.disgust, &attitude.surprise,
-                    &attitude.curiosity, &attitude.respect, &attitude.suspicion,
-                    &attitude.gratitude, &attitude.jealousy, &attitude.empathy,
-                    &current_time, &current_time
+                params![
+                    companion_id, target_id, target_type,
+                    attitude.attraction, attitude.trust, attitude.fear, attitude.anger,
+                    attitude.joy, attitude.sorrow, attitude.disgust, attitude.surprise,
+                    attitude.curiosity, attitude.respect, attitude.suspicion,
+                    attitude.gratitude, attitude.jealousy, attitude.empathy,
+                    current_time, current_time
                 ]
             )?;
             Ok(con.last_insert_rowid() as i32)
@@ -891,7 +891,7 @@ impl Database {
              WHERE companion_id = ? AND target_id = ? AND target_type = ?"
         )?;
         
-        let attitude = stmt.query_row(&[&companion_id, &target_id, target_type], |row| {
+        let attitude = stmt.query_row(params![companion_id, target_id, target_type], |row| {
             Ok(CompanionAttitude {
                 id: Some(row.get(0)?),
                 companion_id: row.get(1)?,
@@ -933,7 +933,7 @@ impl Database {
         
         con.execute(
             &query,
-            &[&delta, &current_time, &companion_id, &target_id, target_type]
+            params![delta, current_time, companion_id, target_id, target_type]
         )?;
         
         Ok(())
@@ -1001,7 +1001,7 @@ impl Database {
             field, field
         );
         
-        con.execute(&query, &[&event, &attitude_id])?;
+        con.execute(&query, params![event, attitude_id])?;
         
         Ok(())
     }
@@ -1032,7 +1032,7 @@ impl Database {
                     &[
                         &data.relationship_to_user, &data.relationship_to_companion,
                         &data.occupation, &data.personality_traits, &data.physical_description,
-                        &current_time, &current_time, &id
+                        &Some(current_time.clone()), &Some(current_time), &id
                     ]
                 )?;
             } else {
@@ -1040,7 +1040,7 @@ impl Database {
                     "UPDATE third_party_individuals SET 
                         last_mentioned = ?, mention_count = mention_count + 1, updated_at = ?
                     WHERE id = ?",
-                    &[&current_time, &current_time, &id]
+                    params![&current_time, &current_time, &id]
                 )?;
             }
             Ok(id)
@@ -1068,7 +1068,7 @@ impl Database {
                     mention_count, importance_score, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 &[
-                    &data.name, &data.relationship_to_user, &data.relationship_to_companion,
+                    &data.name, &data.relationship_to_user.as_ref().unwrap_or(&"".to_string()), &data.relationship_to_companion,
                     &data.occupation, &data.personality_traits, &data.physical_description,
                     &data.first_mentioned, &data.mention_count, &data.importance_score,
                     &data.created_at, &data.updated_at
@@ -1197,7 +1197,7 @@ impl Database {
             "UPDATE third_party_individuals 
              SET importance_score = ?, updated_at = ?
              WHERE id = ?",
-            &[&new_importance, &current_time, &third_party_id]
+            params![&new_importance, &current_time, &third_party_id]
         )?;
         
         Ok(())

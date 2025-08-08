@@ -20,6 +20,11 @@ png = "0.17.13"
 base64 = "0.22.0"
 rand = "0.8.5"
 llm = { git = "https://github.com/rustformers/llm" , branch = "gguf" }
+# Force console to include std feature to fix indicatif compatibility
+console = { version = "*", features = ["std"] }
+# Fix zstd version mismatches by pinning compatible versions  
+zstd-safe = "=5.0.2"
+zstd-sys = "=2.0.9"
 
 [features]
 cublas = ["llm/cublas"]
