@@ -1029,10 +1029,10 @@ impl Database {
                         mention_count = mention_count + 1,
                         updated_at = ?
                     WHERE id = ?",
-                    &[
-                        &data.relationship_to_user, &data.relationship_to_companion,
-                        &data.occupation, &data.personality_traits, &data.physical_description,
-                        &Some(current_time.clone()), &Some(current_time), &id
+                    params![
+                        data.relationship_to_user, data.relationship_to_companion,
+                        data.occupation, data.personality_traits, data.physical_description,
+                        Some(current_time.clone()), Some(current_time), id
                     ]
                 )?;
             } else {
@@ -1067,11 +1067,11 @@ impl Database {
                     personality_traits, physical_description, first_mentioned, 
                     mention_count, importance_score, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                &[
-                    &data.name, &data.relationship_to_user.as_ref().unwrap_or(&"".to_string()), &data.relationship_to_companion,
-                    &data.occupation, &data.personality_traits, &data.physical_description,
-                    &data.first_mentioned, &data.mention_count, &data.importance_score,
-                    &data.created_at, &data.updated_at
+                params![
+                    data.name, data.relationship_to_user.as_ref().unwrap_or(&"".to_string()), data.relationship_to_companion.as_ref().unwrap_or(&"".to_string()),
+                    data.occupation, data.personality_traits, data.physical_description,
+                    data.first_mentioned, data.mention_count, data.importance_score,
+                    data.created_at, data.updated_at
                 ]
             )?;
             Ok(con.last_insert_rowid() as i32)
@@ -1087,10 +1087,10 @@ impl Database {
                 third_party_id, companion_id, memory_type, content,
                 importance, emotional_valence, created_at, context_message_id
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            &[
-                &third_party_id, &companion_id, &memory.memory_type, &memory.content,
-                &memory.importance, &memory.emotional_valence, &current_time,
-                &memory.context_message_id
+            params![
+                third_party_id, companion_id, memory.memory_type, memory.content,
+                memory.importance, memory.emotional_valence, current_time,
+                memory.context_message_id
             ]
         )?;
         
@@ -1106,11 +1106,11 @@ impl Database {
                 third_party_id, companion_id, interaction_type, description,
                 planned_date, impact_on_relationship, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            &[
-                &interaction.third_party_id, &interaction.companion_id,
-                &interaction.interaction_type, &interaction.description,
-                &interaction.planned_date, &interaction.impact_on_relationship,
-                &current_time, &current_time
+            params![
+                interaction.third_party_id, interaction.companion_id,
+                interaction.interaction_type, interaction.description,
+                interaction.planned_date, interaction.impact_on_relationship,
+                current_time, current_time
             ]
         )?;
         
