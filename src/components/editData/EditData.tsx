@@ -42,6 +42,7 @@ import { toast } from "sonner"
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "../ui/dialog"
 import { useMessages } from "../context/messageContext"
 import { AttitudeManager } from "../attitude/AttitudeManager"
+import { ThemeSettings } from "./ThemeSettings"
 
 export function EditData() {
   const companionDataContext = useCompanionData();
@@ -277,10 +278,11 @@ export function EditData() {
 
   return (
     <Tabs defaultValue="companion" className="h-[65vh] overflow-y-auto">
-      <TabsList className="grid w-full grid-cols-4">
+      <TabsList className="grid w-full grid-cols-5">
         <TabsTrigger value="companion">Companion</TabsTrigger>
         <TabsTrigger value="user">User</TabsTrigger>
         <TabsTrigger value="attitudes">Attitudes</TabsTrigger>
+        <TabsTrigger value="theme">Theme</TabsTrigger>
         <TabsTrigger value="config">Config</TabsTrigger>
       </TabsList>
       <TabsContent value="companion">
@@ -561,6 +563,19 @@ export function EditData() {
           </CardHeader>
           <CardContent>
             <AttitudeManager companionId={1} />
+          </CardContent>
+        </Card>
+      </TabsContent>
+      <TabsContent value="theme">
+        <Card className="bg-background border-none shadow-none">
+          <CardHeader>
+            <CardTitle>Theme Customization</CardTitle>
+            <CardDescription>
+              Personalize your chat interface appearance
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <ThemeSettings />
           </CardContent>
         </Card>
       </TabsContent>

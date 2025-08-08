@@ -48,6 +48,18 @@
     --input: 240 3.7% 15.9%;
     --ring: 346.8 77.2% 49.8%;
   }
+  
+  /* High contrast mode */
+  .high-contrast {
+    --border: 0 0% 50%;
+    --input: 0 0% 50%;
+  }
+  
+  .high-contrast.dark {
+    --border: 0 0% 70%;
+    --input: 0 0% 70%;
+    --muted-foreground: 0 0% 80%;
+  }
 }
 
 @layer base {
@@ -67,6 +79,66 @@ body {
 @layer utilities {
   .max-container {
     @apply max-w-5xl mx-auto sm:px-16 pb-12 px-8 h-full flex flex-col gap-2 items-center;
+  }
+  
+  /* Font size classes */
+  .font-xs {
+    font-size: 0.75rem;
+  }
+  
+  .font-sm {
+    font-size: 0.875rem;
+  }
+  
+  .font-md {
+    font-size: 1rem;
+  }
+  
+  .font-lg {
+    font-size: 1.125rem;
+  }
+  
+  .font-xl {
+    font-size: 1.25rem;
+  }
+  
+  /* Font family classes */
+  .font-system {
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+  
+  .font-sans {
+    font-family: ui-sans-serif, system-ui, sans-serif;
+  }
+  
+  .font-serif {
+    font-family: ui-serif, Georgia, serif;
+  }
+  
+  .font-mono {
+    font-family: ui-monospace, SFMono-Regular, 'Cascadia Code', 'Roboto Mono', monospace;
+  }
+  
+  /* Compact mode */
+  .compact-mode .chat {
+    padding-top: 0.25rem;
+    padding-bottom: 0.25rem;
+  }
+  
+  .compact-mode .chat-bubble {
+    padding: 0.5rem 0.75rem;
+    min-height: 2rem;
+  }
+  
+  .compact-mode .max-container {
+    gap: 0.5rem;
+  }
+  
+  /* Animations disabled */
+  .animations-disabled * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
   
   /* Animation delays for typing indicator */
