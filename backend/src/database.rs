@@ -131,6 +131,63 @@ pub struct AttitudeUpdate {
     pub empathy: Option<f32>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ThirdPartyIndividual {
+    pub id: Option<i32>,
+    pub name: String,
+    pub relationship_to_user: Option<String>,
+    pub relationship_to_companion: Option<String>,
+    pub occupation: Option<String>,
+    pub personality_traits: Option<String>,
+    pub physical_description: Option<String>,
+    pub first_mentioned: String,
+    pub last_mentioned: Option<String>,
+    pub mention_count: i32,
+    pub importance_score: f32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ThirdPartyMemory {
+    pub id: Option<i32>,
+    pub third_party_id: i32,
+    pub companion_id: i32,
+    pub memory_type: String,
+    pub content: String,
+    pub importance: f32,
+    pub emotional_valence: f32,
+    pub created_at: String,
+    pub context_message_id: Option<i32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ThirdPartyInteraction {
+    pub id: Option<i32>,
+    pub third_party_id: i32,
+    pub companion_id: i32,
+    pub interaction_type: String,
+    pub description: String,
+    pub planned_date: Option<String>,
+    pub actual_date: Option<String>,
+    pub outcome: Option<String>,
+    pub impact_on_relationship: f32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ThirdPartyRelationship {
+    pub id: Option<i32>,
+    pub from_party_id: i32,
+    pub to_party_id: i32,
+    pub relationship_type: String,
+    pub strength: f32,
+    pub description: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(PartialEq, Serialize, Deserialize)]
 pub enum Device {
     CPU,
@@ -330,6 +387,86 @@ impl Database {
         )?;
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_attitude_metadata_attitude ON attitude_metadata(attitude_id)", []
+        )?;
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS third_party_individuals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                relationship_to_user TEXT,
+                relationship_to_companion TEXT,
+                occupation TEXT,
+                personality_traits TEXT,
+                physical_description TEXT,
+                first_mentioned TEXT NOT NULL,
+                last_mentioned TEXT,
+                mention_count INTEGER DEFAULT 1,
+                importance_score REAL DEFAULT 0.5 CHECK(importance_score >= 0 AND importance_score <= 1),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )", []
+        )?;
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS third_party_memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                third_party_id INTEGER NOT NULL,
+                companion_id INTEGER NOT NULL,
+                memory_type TEXT CHECK(memory_type IN ('fact', 'event', 'opinion', 'relationship_change')),
+                content TEXT NOT NULL,
+                importance REAL DEFAULT 0.5 CHECK(importance >= 0 AND importance <= 1),
+                emotional_valence REAL DEFAULT 0 CHECK(emotional_valence >= -1 AND emotional_valence <= 1),
+                created_at TEXT NOT NULL,
+                context_message_id INTEGER,
+                FOREIGN KEY (third_party_id) REFERENCES third_party_individuals(id) ON DELETE CASCADE,
+                FOREIGN KEY (companion_id) REFERENCES companion(id) ON DELETE CASCADE,
+                FOREIGN KEY (context_message_id) REFERENCES messages(id) ON DELETE SET NULL
+            )", []
+        )?;
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS third_party_interactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                third_party_id INTEGER NOT NULL,
+                companion_id INTEGER NOT NULL,
+                interaction_type TEXT CHECK(interaction_type IN ('planned', 'ongoing', 'completed', 'cancelled')),
+                description TEXT NOT NULL,
+                planned_date TEXT,
+                actual_date TEXT,
+                outcome TEXT,
+                impact_on_relationship REAL DEFAULT 0 CHECK(impact_on_relationship >= -100 AND impact_on_relationship <= 100),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (third_party_id) REFERENCES third_party_individuals(id) ON DELETE CASCADE,
+                FOREIGN KEY (companion_id) REFERENCES companion(id) ON DELETE CASCADE
+            )", []
+        )?;
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS third_party_relationships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_party_id INTEGER NOT NULL,
+                to_party_id INTEGER NOT NULL,
+                relationship_type TEXT NOT NULL,
+                strength REAL DEFAULT 0.5 CHECK(strength >= 0 AND strength <= 1),
+                description TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (from_party_id) REFERENCES third_party_individuals(id) ON DELETE CASCADE,
+                FOREIGN KEY (to_party_id) REFERENCES third_party_individuals(id) ON DELETE CASCADE,
+                UNIQUE(from_party_id, to_party_id)
+            )", []
+        )?;
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_third_party_name ON third_party_individuals(name)", []
+        )?;
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_third_party_memories_party ON third_party_memories(third_party_id)", []
+        )?;
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_third_party_memories_companion ON third_party_memories(companion_id)", []
+        )?;
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_third_party_interactions_party ON third_party_interactions(third_party_id)", []
+        )?;
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_third_party_relationships ON third_party_relationships(from_party_id, to_party_id)", []
         )?;
         if Database::is_table_empty("companion", &con)? {
             con.execute(
@@ -865,6 +1002,203 @@ impl Database {
         );
         
         con.execute(&query, &[&event, &attitude_id])?;
+        
+        Ok(())
+    }
+
+    pub fn create_or_update_third_party(name: &str, initial_data: Option<ThirdPartyIndividual>) -> Result<i32> {
+        let con = Connection::open("companion_database.db")?;
+        let current_time = get_current_date();
+        
+        let existing_id: Option<i32> = con.query_row(
+            "SELECT id FROM third_party_individuals WHERE name = ?",
+            &[name],
+            |row| row.get(0)
+        ).ok();
+        
+        if let Some(id) = existing_id {
+            if let Some(data) = initial_data {
+                con.execute(
+                    "UPDATE third_party_individuals SET 
+                        relationship_to_user = COALESCE(?, relationship_to_user),
+                        relationship_to_companion = COALESCE(?, relationship_to_companion),
+                        occupation = COALESCE(?, occupation),
+                        personality_traits = COALESCE(?, personality_traits),
+                        physical_description = COALESCE(?, physical_description),
+                        last_mentioned = ?,
+                        mention_count = mention_count + 1,
+                        updated_at = ?
+                    WHERE id = ?",
+                    &[
+                        &data.relationship_to_user, &data.relationship_to_companion,
+                        &data.occupation, &data.personality_traits, &data.physical_description,
+                        &current_time, &current_time, &id
+                    ]
+                )?;
+            } else {
+                con.execute(
+                    "UPDATE third_party_individuals SET 
+                        last_mentioned = ?, mention_count = mention_count + 1, updated_at = ?
+                    WHERE id = ?",
+                    &[&current_time, &current_time, &id]
+                )?;
+            }
+            Ok(id)
+        } else {
+            let data = initial_data.unwrap_or(ThirdPartyIndividual {
+                id: None,
+                name: name.to_string(),
+                relationship_to_user: None,
+                relationship_to_companion: None,
+                occupation: None,
+                personality_traits: None,
+                physical_description: None,
+                first_mentioned: current_time.clone(),
+                last_mentioned: None,
+                mention_count: 1,
+                importance_score: 0.5,
+                created_at: current_time.clone(),
+                updated_at: current_time.clone(),
+            });
+            
+            con.execute(
+                "INSERT INTO third_party_individuals (
+                    name, relationship_to_user, relationship_to_companion, occupation,
+                    personality_traits, physical_description, first_mentioned, 
+                    mention_count, importance_score, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                &[
+                    &data.name, &data.relationship_to_user, &data.relationship_to_companion,
+                    &data.occupation, &data.personality_traits, &data.physical_description,
+                    &data.first_mentioned, &data.mention_count, &data.importance_score,
+                    &data.created_at, &data.updated_at
+                ]
+            )?;
+            Ok(con.last_insert_rowid() as i32)
+        }
+    }
+
+    pub fn add_third_party_memory(third_party_id: i32, companion_id: i32, memory: &ThirdPartyMemory) -> Result<i32> {
+        let con = Connection::open("companion_database.db")?;
+        let current_time = get_current_date();
+        
+        con.execute(
+            "INSERT INTO third_party_memories (
+                third_party_id, companion_id, memory_type, content,
+                importance, emotional_valence, created_at, context_message_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                &third_party_id, &companion_id, &memory.memory_type, &memory.content,
+                &memory.importance, &memory.emotional_valence, &current_time,
+                &memory.context_message_id
+            ]
+        )?;
+        
+        Ok(con.last_insert_rowid() as i32)
+    }
+
+    pub fn plan_third_party_interaction(interaction: &ThirdPartyInteraction) -> Result<i32> {
+        let con = Connection::open("companion_database.db")?;
+        let current_time = get_current_date();
+        
+        con.execute(
+            "INSERT INTO third_party_interactions (
+                third_party_id, companion_id, interaction_type, description,
+                planned_date, impact_on_relationship, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                &interaction.third_party_id, &interaction.companion_id,
+                &interaction.interaction_type, &interaction.description,
+                &interaction.planned_date, &interaction.impact_on_relationship,
+                &current_time, &current_time
+            ]
+        )?;
+        
+        Ok(con.last_insert_rowid() as i32)
+    }
+
+    pub fn get_third_party_by_name(name: &str) -> Result<Option<ThirdPartyIndividual>> {
+        let con = Connection::open("companion_database.db")?;
+        let mut stmt = con.prepare(
+            "SELECT id, name, relationship_to_user, relationship_to_companion, occupation,
+                    personality_traits, physical_description, first_mentioned, last_mentioned,
+                    mention_count, importance_score, created_at, updated_at
+             FROM third_party_individuals WHERE name = ?"
+        )?;
+        
+        let individual = stmt.query_row(&[name], |row| {
+            Ok(ThirdPartyIndividual {
+                id: Some(row.get(0)?),
+                name: row.get(1)?,
+                relationship_to_user: row.get(2)?,
+                relationship_to_companion: row.get(3)?,
+                occupation: row.get(4)?,
+                personality_traits: row.get(5)?,
+                physical_description: row.get(6)?,
+                first_mentioned: row.get(7)?,
+                last_mentioned: row.get(8)?,
+                mention_count: row.get(9)?,
+                importance_score: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
+            })
+        }).ok();
+        
+        Ok(individual)
+    }
+
+    pub fn get_third_party_memories(third_party_id: i32, limit: Option<usize>) -> Result<Vec<ThirdPartyMemory>> {
+        let con = Connection::open("companion_database.db")?;
+        let query = if let Some(limit) = limit {
+            format!(
+                "SELECT id, third_party_id, companion_id, memory_type, content,
+                        importance, emotional_valence, created_at, context_message_id
+                 FROM third_party_memories
+                 WHERE third_party_id = ?
+                 ORDER BY importance DESC, created_at DESC
+                 LIMIT {}", limit
+            )
+        } else {
+            "SELECT id, third_party_id, companion_id, memory_type, content,
+                    importance, emotional_valence, created_at, context_message_id
+             FROM third_party_memories
+             WHERE third_party_id = ?
+             ORDER BY importance DESC, created_at DESC".to_string()
+        };
+        
+        let mut stmt = con.prepare(&query)?;
+        let memories = stmt.query_map(&[&third_party_id], |row| {
+            Ok(ThirdPartyMemory {
+                id: Some(row.get(0)?),
+                third_party_id: row.get(1)?,
+                companion_id: row.get(2)?,
+                memory_type: row.get(3)?,
+                content: row.get(4)?,
+                importance: row.get(5)?,
+                emotional_valence: row.get(6)?,
+                created_at: row.get(7)?,
+                context_message_id: row.get(8)?,
+            })
+        })?;
+        
+        let mut result = Vec::new();
+        for memory in memories {
+            result.push(memory?);
+        }
+        
+        Ok(result)
+    }
+
+    pub fn update_third_party_importance(third_party_id: i32, new_importance: f32) -> Result<()> {
+        let con = Connection::open("companion_database.db")?;
+        let current_time = get_current_date();
+        
+        con.execute(
+            "UPDATE third_party_individuals 
+             SET importance_score = ?, updated_at = ?
+             WHERE id = ?",
+            &[&new_importance, &current_time, &third_party_id]
+        )?;
         
         Ok(())
     }
