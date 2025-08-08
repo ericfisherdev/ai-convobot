@@ -4,6 +4,7 @@ use chrono::{DateTime, Local};
 use crate::database::{Database, NewMessage, Message, ConfigView, UserView, CompanionView, PromptTemplate, Device, get_current_date, contains_time_question};
 use crate::dialogue_tuning::DialogueTuning;
 use crate::long_term_mem::LongTermMem;
+use crate::context_manager::ContextManager;
 
 pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
     let long_term_memory = match LongTermMem::connect() {
@@ -112,19 +113,25 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
             }
         }
     }
+    // Initialize context manager for intelligent memory management
+    let context_manager = ContextManager::new(config.clone());
+    
     let short_term_memory_entries: Vec<Message> = match Database::get_x_messages(
-        if companion.short_term_mem > 0 { companion.short_term_mem } else { 1 }, 0) {
+        if companion.short_term_mem > 0 { companion.short_term_mem } else { 50 }, 0) {
         Ok(entries) => entries,
         Err(e) => {
             eprintln!("Error while getting short term memory entries: {}", e);
             return Err(std::io::Error::new(std::io::ErrorKind::Other, "Error while getting short term memory entries"));
         }
     };
+    
+    // Apply context management to optimize memory usage
+    let managed_messages = context_manager.manage_message_context(short_term_memory_entries);
     let mut message_counter = 1;
-    let short_term_mem_len = short_term_memory_entries.len();
-    for message in short_term_memory_entries {
+    let short_term_mem_len = managed_messages.len();
+    for message in &managed_messages {
         let prefix = if message.ai { &companion.name } else { &user.name };
-        let text = message.content;
+        let text = &message.content;
         let mut formatted_message = format!("{}: {}\n", prefix, text);
         if message_counter == short_term_mem_len && contains_time_question(&formatted_message) {
             formatted_message = format!("\n* it's currently {} *\n{}", get_current_date(), formatted_message);
@@ -150,6 +157,19 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
         }
         message_counter += 1;
     }
+    
+    // Calculate token usage for memory management
+    let system_tokens = ContextManager::estimate_tokens(&base_prompt);
+    let attitude_tokens = 0; // TODO: Calculate attitude data tokens when implemented
+    let message_tokens = managed_messages.iter()
+        .map(|msg| ContextManager::estimate_tokens(&msg.content))
+        .sum::<usize>();
+    
+    // Get response token limit and print memory stats
+    let response_token_limit = context_manager.get_response_token_limit(system_tokens + attitude_tokens + message_tokens);
+    let memory_stats = context_manager.get_memory_stats(system_tokens, attitude_tokens, message_tokens);
+    memory_stats.print_stats();
+    
     let mut end_of_generation = String::new();
     let eog = format!("\n{}:", user.name);
     let res = session.infer::<std::convert::Infallible>(
@@ -159,7 +179,7 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
             prompt: llm::Prompt::Text(&format!("{}{}: ", &base_prompt, companion.name)),
             parameters: &llm::InferenceParameters::default(),
             play_back_previous_tokens: false,
-            maximum_token_count: None,
+            maximum_token_count: Some(response_token_limit),
         },
         &mut Default::default(),
         |t| {

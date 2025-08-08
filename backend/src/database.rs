@@ -6,7 +6,7 @@ use chrono::{DateTime, Local};
 use crate::character_card::CharacterCard;
 
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Message {
     pub id: i32,
     pub ai: bool,
@@ -188,7 +188,7 @@ pub struct ThirdPartyRelationship {
     pub updated_at: String,
 }
 
-#[derive(PartialEq, Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize, Clone)]
 pub enum Device {
     CPU,
     GPU,
@@ -226,7 +226,7 @@ impl ToSql for Device {
     }
 }
 
-#[derive(PartialEq, Serialize, Deserialize)]
+#[derive(PartialEq, Serialize, Deserialize, Clone)]
 pub enum PromptTemplate {
     Default,
     Llama2,
@@ -275,12 +275,16 @@ struct Config {
 }
 */
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ConfigView {
     pub device: Device,
     pub llm_model_path: String,
     pub gpu_layers: usize,
-    pub prompt_template: PromptTemplate
+    pub prompt_template: PromptTemplate,
+    pub context_window_size: usize,
+    pub max_response_tokens: usize,
+    pub enable_dynamic_context: bool,
+    pub vram_limit_gb: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -288,7 +292,11 @@ pub struct ConfigModify {
     pub device: String,
     pub llm_model_path: String,
     pub gpu_layers: usize,
-    pub prompt_template: String
+    pub prompt_template: String,
+    pub context_window_size: usize,
+    pub max_response_tokens: usize,
+    pub enable_dynamic_context: bool,
+    pub vram_limit_gb: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -483,7 +491,11 @@ impl Database {
                 device TEXT,
                 llm_model_path TEXT,
                 gpu_layers INTEGER,
-                prompt_template TEXT
+                prompt_template TEXT,
+                context_window_size INTEGER DEFAULT 2048,
+                max_response_tokens INTEGER DEFAULT 512,
+                enable_dynamic_context BOOLEAN DEFAULT true,
+                vram_limit_gb INTEGER DEFAULT 4
             )", []
         )?;
         con.execute(
@@ -671,7 +683,7 @@ impl Database {
         }
         if Database::is_table_empty("config", &con)? {
             con.execute(
-                "INSERT INTO config (device, llm_model_path, gpu_layers, prompt_template) VALUES (?, ?, 20, ?)",
+                "INSERT INTO config (device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb) VALUES (?, ?, 20, ?, 2048, 512, true, 4)",
                 &[
                     &Device::CPU as &dyn ToSql,
                     &"path/to/your/gguf/model.gguf",
@@ -682,6 +694,9 @@ impl Database {
         
         // Initialize attitude memories table
         Database::create_attitude_memories_table()?;
+        
+        // Migrate config table to add new context window fields if they don't exist
+        Database::migrate_config_table(&con)?;
         
         Ok(0)
     }
@@ -950,13 +965,17 @@ impl Database {
 
     pub fn get_config() -> Result<ConfigView> {
         let con = Connection::open("companion_database.db")?;
-        let mut stmt = con.prepare("SELECT device, llm_model_path, gpu_layers, prompt_template FROM config LIMIT 1")?;
+        let mut stmt = con.prepare("SELECT device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb FROM config LIMIT 1")?;
         let row = stmt.query_row([], |row| {
             Ok(ConfigView {
                 device: row.get(0)?,
                 llm_model_path: row.get(1)?,
                 gpu_layers: row.get(2)?,
-                prompt_template: row.get(3)?
+                prompt_template: row.get(3)?,
+                context_window_size: row.get::<_, Option<usize>>(4)?.unwrap_or(2048),
+                max_response_tokens: row.get::<_, Option<usize>>(5)?.unwrap_or(512),
+                enable_dynamic_context: row.get::<_, Option<bool>>(6)?.unwrap_or(true),
+                vram_limit_gb: row.get::<_, Option<usize>>(7)?.unwrap_or(4),
             })
         })?;
         Ok(row)
@@ -979,12 +998,16 @@ impl Database {
     
         let con = Connection::open("companion_database.db")?;
         con.execute(
-            "UPDATE config SET device = ?, llm_model_path = ?, gpu_layers = ?, prompt_template = ?",
+            "UPDATE config SET device = ?, llm_model_path = ?, gpu_layers = ?, prompt_template = ?, context_window_size = ?, max_response_tokens = ?, enable_dynamic_context = ?, vram_limit_gb = ?",
             &[
                 &device as &dyn ToSql,
                 &config.llm_model_path,
                 &config.gpu_layers,
                 &prompt_template as &dyn ToSql,
+                &config.context_window_size,
+                &config.max_response_tokens,
+                &config.enable_dynamic_context,
+                &config.vram_limit_gb,
             ]
         )?;
         Ok(())
@@ -2376,5 +2399,47 @@ impl Database {
         }).ok();
         
         Ok(interaction)
+    }
+    
+    pub fn migrate_config_table(con: &Connection) -> Result<()> {
+        // Check if new columns exist and add them if they don't
+        let mut has_context_window = false;
+        let mut has_max_response = false;
+        let mut has_dynamic_context = false;
+        let mut has_vram_limit = false;
+        
+        // Check existing columns
+        let mut stmt = con.prepare("PRAGMA table_info(config)")?;
+        let rows = stmt.query_map([], |row| {
+            let column_name: String = row.get(1)?;
+            Ok(column_name)
+        })?;
+        
+        for row in rows {
+            let column_name = row?;
+            match column_name.as_str() {
+                "context_window_size" => has_context_window = true,
+                "max_response_tokens" => has_max_response = true,
+                "enable_dynamic_context" => has_dynamic_context = true,
+                "vram_limit_gb" => has_vram_limit = true,
+                _ => {}
+            }
+        }
+        
+        // Add missing columns with default values
+        if !has_context_window {
+            con.execute("ALTER TABLE config ADD COLUMN context_window_size INTEGER DEFAULT 2048", [])?;
+        }
+        if !has_max_response {
+            con.execute("ALTER TABLE config ADD COLUMN max_response_tokens INTEGER DEFAULT 512", [])?;
+        }
+        if !has_dynamic_context {
+            con.execute("ALTER TABLE config ADD COLUMN enable_dynamic_context BOOLEAN DEFAULT true", [])?;
+        }
+        if !has_vram_limit {
+            con.execute("ALTER TABLE config ADD COLUMN vram_limit_gb INTEGER DEFAULT 4", [])?;
+        }
+        
+        Ok(())
     }
 }

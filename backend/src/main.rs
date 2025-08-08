@@ -11,6 +11,8 @@ use character_card::CharacterCard;
 use serde::Deserialize;
 mod llm;
 use crate::llm::prompt;
+mod context_manager;
+use crate::context_manager::ContextManager;
 
 use std::fs;
 use std::fs::File;
