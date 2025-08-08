@@ -13,6 +13,8 @@ mod llm;
 use crate::llm::prompt;
 mod context_manager;
 use crate::context_manager::ContextManager;
+mod inference_optimizer;
+use crate::inference_optimizer::{INFERENCE_OPTIMIZER, StreamChunk};
 
 use std::fs;
 use std::fs::File;
@@ -421,6 +423,12 @@ struct Prompt {
     prompt: String
 }
 
+#[derive(Deserialize)]
+struct StreamingRequest {
+    prompt: String,
+    session_id: String,
+}
+
 #[post("/api/prompt")]
 async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
     let prompt_message = received.into_inner().prompt.clone();
@@ -753,6 +761,75 @@ async fn detect_interaction(received: web::Json<InteractionQuery>) -> HttpRespon
     }
 }
 
+#[post("/api/prompt/stream")]
+async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpResponse {
+    let request = received.into_inner();
+    let session_id = request.session_id.clone();
+    let session_id_clone = session_id.clone();
+    
+    // Start streaming session
+    let mut _rx = INFERENCE_OPTIMIZER.start_streaming_session(session_id.clone());
+    
+    // In a real implementation, this would start async LLM inference
+    // For now, we'll simulate streaming by sending chunks
+    tokio::spawn(async move {
+        // Simulate processing chunks
+        for i in 1..=5 {
+            let chunk = StreamChunk {
+                request_id: session_id_clone.clone(),
+                content: format!("Chunk {} of response... ", i),
+                is_complete: i == 5,
+                token_count: Some(i * 10),
+            };
+            
+            if INFERENCE_OPTIMIZER.stream_chunk(&session_id_clone, chunk).is_err() {
+                break;
+            }
+            
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+        
+        // End session
+        INFERENCE_OPTIMIZER.end_streaming_session(&session_id_clone);
+    });
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "session_id": session_id,
+        "status": "streaming_started"
+    }))
+}
+
+#[get("/api/inference/stats")]
+async fn get_inference_stats() -> HttpResponse {
+    let stats = INFERENCE_OPTIMIZER.get_stats();
+    let (cache_size, cache_hits, hit_rate) = INFERENCE_OPTIMIZER.get_cache_stats();
+    
+    let response = serde_json::json!({
+        "performance": {
+            "total_requests": stats.total_requests,
+            "avg_response_time_ms": stats.avg_response_time.as_millis(),
+            "batch_processed": stats.batch_processed,
+            "streaming_sessions": stats.streaming_sessions
+        },
+        "cache": {
+            "size": cache_size,
+            "hits": cache_hits,
+            "misses": stats.cache_misses,
+            "hit_rate": hit_rate
+        }
+    });
+    
+    HttpResponse::Ok().json(response)
+}
+
+#[post("/api/inference/cache/cleanup")]
+async fn cleanup_cache() -> HttpResponse {
+    INFERENCE_OPTIMIZER.cleanup_cache();
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "cache_cleaned"
+    }))
+}
+
 //
 
 #[actix_web::main]
@@ -825,6 +902,9 @@ async fn main() -> std::io::Result<()> {
             .service(complete_interaction)
             .service(get_interaction_history)
             .service(detect_interaction)
+            .service(start_streaming_session)
+            .service(get_inference_stats)
+            .service(cleanup_cache)
     })
     .bind((hostname, port))?
     .run()
