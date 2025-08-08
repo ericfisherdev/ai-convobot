@@ -15,4 +15,8 @@ export interface ConfigInterface {
     llm_model_path: string;
     gpu_layers: number;
     prompt_template: PromptTemplate;
+    context_window_size: number;
+    max_response_tokens: number;
+    enable_dynamic_context: boolean;
+    vram_limit_gb: number;
 }

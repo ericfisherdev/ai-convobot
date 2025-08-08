@@ -743,6 +743,12 @@ impl Database {
         }
         Ok(messages.into_iter().rev().collect())
     }
+    
+    pub fn get_total_message_count() -> Result<usize> {
+        let con = Connection::open("companion_database.db")?;
+        let count: i64 = con.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
+        Ok(count as usize)
+    }
 
     pub fn get_latest_message() -> Result<Message> {
         let con = Connection::open("companion_database.db")?;

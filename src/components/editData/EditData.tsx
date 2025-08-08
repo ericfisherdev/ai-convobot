@@ -632,6 +632,109 @@ export function EditData() {
                 </SelectContent>
               </Select>
             </div>
+            
+            <div className="border-t pt-4">
+              <h3 className="text-lg font-semibold mb-4">Context Window & Token Management</h3>
+              <div className="space-y-4">
+                <div className="space-y-1">
+                  <Label htmlFor="contextWindowSize" className="flex flex-row gap-2">
+                    <div className="flex items-center gap-2">
+                      Context Window Size (tokens)
+                      <TooltipProvider delayDuration={0}>
+                        <Tooltip>
+                          <TooltipTrigger className="cursor-default"> <Info /></TooltipTrigger>
+                          <TooltipContent>
+                            <p>Maximum number of tokens to use for context (system prompt, memory, and conversation history)</p>
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    </div>
+                  </Label>
+                  <Input 
+                    id="contextWindowSize" 
+                    type="number" 
+                    min="512" 
+                    max="8192" 
+                    value={configFormData.context_window_size} 
+                    onChange={(e) => setConfigFormData({ ...configFormData, context_window_size: parseInt(e.target.value) })} 
+                  />
+                </div>
+                
+                <div className="space-y-1">
+                  <Label htmlFor="maxResponseTokens" className="flex flex-row gap-2">
+                    <div className="flex items-center gap-2">
+                      Max Response Tokens
+                      <TooltipProvider delayDuration={0}>
+                        <Tooltip>
+                          <TooltipTrigger className="cursor-default"> <Info /></TooltipTrigger>
+                          <TooltipContent>
+                            <p>Maximum number of tokens the AI can generate in a single response</p>
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    </div>
+                  </Label>
+                  <Input 
+                    id="maxResponseTokens" 
+                    type="number" 
+                    min="128" 
+                    max="2048" 
+                    value={configFormData.max_response_tokens} 
+                    onChange={(e) => setConfigFormData({ ...configFormData, max_response_tokens: parseInt(e.target.value) })} 
+                  />
+                </div>
+                
+                <div className="space-y-1">
+                  <Label htmlFor="vramLimit" className="flex flex-row gap-2">
+                    <div className="flex items-center gap-2">
+                      VRAM Limit (GB)
+                      <TooltipProvider delayDuration={0}>
+                        <Tooltip>
+                          <TooltipTrigger className="cursor-default"> <Info /></TooltipTrigger>
+                          <TooltipContent>
+                            <p>Available GPU memory for context window sizing (2GB: 1024 tokens, 4GB: 2048 tokens, 6GB+: 4096 tokens)</p>
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    </div>
+                  </Label>
+                  <Input 
+                    id="vramLimit" 
+                    type="number" 
+                    min="1" 
+                    max="24" 
+                    value={configFormData.vram_limit_gb} 
+                    onChange={(e) => setConfigFormData({ ...configFormData, vram_limit_gb: parseInt(e.target.value) })} 
+                  />
+                </div>
+                
+                <div className="flex items-center space-x-2">
+                  <input
+                    type="checkbox"
+                    id="enableDynamicContext"
+                    className="peer h-4 w-4 shrink-0 rounded-sm border border-primary shadow focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 data-[state=checked]:bg-primary data-[state=checked]:text-primary-foreground"
+                    checked={configFormData.enable_dynamic_context}
+                    onChange={(e) => setConfigFormData({ ...configFormData, enable_dynamic_context: e.target.checked })}
+                  />
+                  <label
+                    htmlFor="enableDynamicContext"
+                    className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex flex-row gap-2"
+                  >
+                    <div className="flex items-center gap-2">
+                      Enable Dynamic Context Management
+                      <TooltipProvider delayDuration={0}>
+                        <Tooltip>
+                          <TooltipTrigger className="cursor-default"> <Info /></TooltipTrigger>
+                          <TooltipContent>
+                            <p>Automatically adjust context window size based on VRAM availability and conversation length</p>
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    </div>
+                  </label>
+                </div>
+              </div>
+            </div>
           </CardContent>
           <CardFooter className="flex justify-center">
             <Button onClick={() => {
