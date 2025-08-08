@@ -5,8 +5,10 @@ use crate::database::{Database, NewMessage, Message, ConfigView, UserView, Compa
 use crate::dialogue_tuning::DialogueTuning;
 use crate::long_term_mem::LongTermMem;
 use crate::context_manager::ContextManager;
+use crate::inference_optimizer::INFERENCE_OPTIMIZER;
 
 pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
+    let start_time = std::time::Instant::now();
     let long_term_memory = match LongTermMem::connect() {
         Ok(ltm) => ltm,
         Err(e) => {
@@ -78,20 +80,45 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
             Err(_) => {}
         };
     }
-    if config.prompt_template == PromptTemplate::Default {
-        base_prompt = 
-        format!("Text transcript of a conversation between {} and {}. {}\n{}'s Persona: {}\n{}'s Persona: {}\n<START>\n{}\n<START>\n{}\n<START>\n", 
-                                            user.name, companion.name, rp, user.name, user.persona.replace("{{char}}", &companion.name).replace("{{user}}", &user.name), companion.name, companion.persona.replace("{{char}}", &companion.name).replace("{{user}}", &user.name), companion.example_dialogue.replace("{{char}}", &companion.name).replace("{{user}}", &user.name), &tuned_dialogue);
-    }
-    else if config.prompt_template == PromptTemplate::Llama2 {
-        base_prompt = 
-        format!("<<SYS>>\nYou are {}, {}\nyou are talking with {}, {} is {}\n{}\n[INST]\n{}\n{}\n[/INST]",
-                companion.name, companion.persona.replace("{{char}}", &companion.name).replace("{{user}}", &user.name), user.name, user.name, user.persona.replace("{{char}}", &companion.name).replace("{{user}}", &user.name), rp, companion.example_dialogue.replace("{{char}}", &companion.name).replace("{{user}}", &user.name), &tuned_dialogue);
-    }
-    else {
-        base_prompt = 
-        format!("<s>[INST]Text transcript of a conversation between {} and {}. {}\n{}'s Persona: {}\n{}'s Persona: {}[/INST]\n<s>[INST]\n{}[/INST]\n<s>[INST]\n{}\n[/INST]\n",
-        user.name, companion.name, rp, user.name, user.persona.replace("{{char}}", &companion.name).replace("{{user}}", &user.name), companion.name, companion.persona.replace("{{char}}", &companion.name).replace("{{user}}", &user.name), companion.example_dialogue.replace("{{char}}", &companion.name).replace("{{user}}", &user.name), &tuned_dialogue);
+    // Build base prompt components for caching optimization
+    let base_components = if config.prompt_template == PromptTemplate::Default {
+        vec![
+            format!("Text transcript of a conversation between {} and {}. {}\n", user.name, companion.name, rp),
+            format!("{}'s Persona: {}\n", user.name, user.persona.replace("{{char}}", &companion.name).replace("{{user}}", &user.name)),
+            format!("{}'s Persona: {}\n<START>\n", companion.name, companion.persona.replace("{{char}}", &companion.name).replace("{{user}}", &user.name)),
+            format!("{}\n<START>\n", companion.example_dialogue.replace("{{char}}", &companion.name).replace("{{user}}", &user.name)),
+            format!("{}\n<START>\n", &tuned_dialogue)
+        ]
+    } else if config.prompt_template == PromptTemplate::Llama2 {
+        vec![
+            format!("<<SYS>>\nYou are {}, {}\n", companion.name, companion.persona.replace("{{char}}", &companion.name).replace("{{user}}", &user.name)),
+            format!("you are talking with {}, {} is {}\n{}\n[INST]\n", user.name, user.name, user.persona.replace("{{char}}", &companion.name).replace("{{user}}", &user.name), rp),
+            format!("{}\n", companion.example_dialogue.replace("{{char}}", &companion.name).replace("{{user}}", &user.name)),
+            format!("{}\n[/INST]\n", &tuned_dialogue)
+        ]
+    } else {
+        vec![
+            format!("<s>[INST]Text transcript of a conversation between {} and {}. {}\n", user.name, companion.name, rp),
+            format!("{}'s Persona: {}\n", user.name, user.persona.replace("{{char}}", &companion.name).replace("{{user}}", &user.name)),
+            format!("{}'s Persona: {}[/INST]\n<s>[INST]\n", companion.name, companion.persona.replace("{{char}}", &companion.name).replace("{{user}}", &user.name)),
+            format!("{}[/INST]\n<s>[INST]\n", companion.example_dialogue.replace("{{char}}", &companion.name).replace("{{user}}", &user.name)),
+            format!("{}[/INST]\n", &tuned_dialogue)
+        ]
+    };
+
+    // Use cache optimization for base prompt construction
+    let (optimized_base_prompt, cache_hit) = INFERENCE_OPTIMIZER.optimize_prompt_construction(
+        &base_components,
+        "",
+        &[]
+    );
+    
+    base_prompt = optimized_base_prompt;
+    
+    if cache_hit {
+        println!("✓ Cache hit for base prompt construction");
+    } else {
+        println!("✗ Cache miss - caching base prompt for future use");
     }
     if companion.long_term_mem > 0 {
         let long_term_memory_entries: Vec<String> = match long_term_memory.get_matches(prompt, companion.long_term_mem) {
@@ -220,5 +247,20 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
         Ok(_) => {},
         Err(e) => eprintln!("Error while adding message to long-term memory: {}", e),
     };
+
+    // Record performance statistics
+    let response_time = start_time.elapsed();
+    INFERENCE_OPTIMIZER.record_response_time(response_time);
+    
+    // Print cache statistics periodically
+    let stats = INFERENCE_OPTIMIZER.get_stats();
+    if stats.total_requests % 10 == 0 {
+        let (cache_size, cache_hits, hit_rate) = INFERENCE_OPTIMIZER.get_cache_stats();
+        println!("📊 Cache Stats: {} entries, {} hits, {:.2}% hit rate", 
+                 cache_size, cache_hits, hit_rate * 100.0);
+        println!("📈 Performance: {} requests, avg response time: {:?}", 
+                 stats.total_requests, stats.avg_response_time);
+    }
+    
     Ok(companion_text.trim_start().to_string())
 }

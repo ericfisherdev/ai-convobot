@@ -250,6 +250,7 @@ dependencies = [
  "chrono",
  "console",
  "futures-util",
+ "lazy_static",
  "llm",
  "png",
  "rand 0.8.5",
@@ -257,7 +258,9 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tantivy",
+ "tokio",
  "winres",
  "zstd-safe 5.0.2+zstd.1.5.2",
  "zstd-sys",
@@ -2931,7 +2934,19 @@ dependencies = [
  "signal-hook-registry",
  "slab",
  "socket2 0.6.0",
+ "tokio-macros",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "tokio-macros"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e06d43f1345a3bcd39f6a56dbb7dcab2ba47e68e8ac134855e7e2bdbaf8cab8"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.104",
 ]
 
 [[package]]
