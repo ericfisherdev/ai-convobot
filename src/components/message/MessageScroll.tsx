@@ -3,18 +3,36 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Message } from "./Message";
 import { TypingIndicator } from "./TypingIndicator";
 import { useMessages } from "../context/messageContext";
+import { useMobile } from "../../hooks/useMobile";
+import { cn } from "../../lib/utils";
 
 export function MessageScroll() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const { messages, loadMoreMessages } = useMessages();
   const [hasMoreMessages, setHasMoreMessages] = useState<boolean>(true);
   const [isTyping, setIsTyping] = useState<boolean>(false);
+  const { isMobile } = useMobile();
 
   useEffect(() => {
     if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight - scrollRef.current.clientHeight;
+      const scrollContainer = scrollRef.current.querySelector('[data-radix-scroll-area-viewport]');
+      if (scrollContainer) {
+        scrollContainer.scrollTop = scrollContainer.scrollHeight;
+      }
     }
   }, [messages]);
+  
+  // Handle mobile scroll behavior
+  useEffect(() => {
+    if (isMobile && scrollRef.current) {
+      const scrollContainer = scrollRef.current.querySelector('[data-radix-scroll-area-viewport]') as HTMLElement;
+      if (scrollContainer) {
+        // Better touch scrolling on mobile
+        (scrollContainer.style as any).webkitOverflowScrolling = 'touch';
+        scrollContainer.style.overscrollBehavior = 'contain';
+      }
+    }
+  }, [isMobile]);
 
   useEffect(() => {
     setHasMoreMessages(messages.length >= 50);
@@ -43,22 +61,38 @@ export function MessageScroll() {
   return (
     <ScrollArea
       ref={scrollRef}
-      className="h-[70vh] md:h-[82vh] w-full rounded-md border backdrop-blur-sm"
+      className={cn(
+        "w-full touch-scroll smooth-scroll",
+        isMobile ? "h-full" : "h-[70vh] md:h-[82vh] rounded-md border backdrop-blur-sm"
+      )}
     >
-      <div className="p-4 h-full">
+      <div className={cn(
+        "h-full",
+        isMobile ? "p-2 pb-4" : "p-4"
+      )}>
         {hasMoreMessages && (
           <div className="mb-4 text-center">
             <button
-              className="text-sm font-medium text-primary hover:text-primary/80 transition-colors duration-200 px-4 py-2 rounded-full hover:bg-primary/10"
+              className={cn(
+                "text-sm font-medium text-primary hover:text-primary/80 transition-colors duration-200 rounded-full hover:bg-primary/10",
+                isMobile ? "px-3 py-2 touch-target" : "px-4 py-2"
+              )}
               onClick={handleLoadMore}
             >
               Load previous messages
             </button>
           </div>
         )}
-        <div className="flex flex-col gap-4">
+        <div className={cn(
+          "flex flex-col",
+          isMobile ? "gap-3" : "gap-4"
+        )}>
           {messages.map((message, index) => (
-            <div key={index} className="animate-in fade-in-0 duration-300" style={{ animationDelay: `${index * 50}ms` }}>
+            <div 
+              key={index} 
+              className="animate-in fade-in-0 duration-300" 
+              style={{ animationDelay: `${Math.min(index * 50, 500)}ms` }}
+            >
               <Message 
                 received={message.ai} 
                 id={message.id} 
@@ -69,6 +103,8 @@ export function MessageScroll() {
             </div>
           ))}
           <TypingIndicator isVisible={isTyping} />
+          {/* Bottom padding for mobile to prevent input overlap */}
+          {isMobile && <div className="h-4" />}
         </div>
       </div>
     </ScrollArea>

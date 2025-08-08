@@ -16,21 +16,21 @@ import {
   } from "../../components/ui/drawer"
 import { Settings } from "lucide-react"
 import { EditData } from "./EditData"
+import { useMobile } from "../../hooks/useMobile"
 
 export function EditDataPopup() {
-    let isMobile = false;
-    const isMobileOrTablet = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-    if (window.matchMedia('(max-width: 810px)').matches || isMobileOrTablet) {
-        isMobile = true;
-    }
+    const { isMobile, isTablet } = useMobile();
+    const useMobileLayout = isMobile || isTablet;
   return (
     <>
-    {isMobile ? 
+    {useMobileLayout ? 
     <Drawer>
-    <DrawerTrigger>
-      <Button variant="outline" size={"sm"}><Settings /></Button>
+    <DrawerTrigger asChild>
+      <Button variant="outline" size={"sm"} className="touch-target">
+        <Settings className="h-4 w-4" />
+      </Button>
     </DrawerTrigger>
-    <DrawerContent>
+    <DrawerContent className="max-h-[85vh]">
       <DrawerHeader>
       </DrawerHeader>
       <DrawerDescription>
@@ -46,9 +46,11 @@ export function EditDataPopup() {
     :
     <Dialog>
     <DialogTrigger asChild>
-      <Button variant="outline" size={"sm"}><Settings /></Button>
+      <Button variant="outline" size={"sm"}>
+        <Settings className="h-4 w-4" />
+      </Button>
     </DialogTrigger>
-    <DialogContent className="sm:max-w-[425px]">
+    <DialogContent className="sm:max-w-[650px] max-h-[85vh] overflow-hidden">
       <EditData />
     </DialogContent>
   </Dialog>

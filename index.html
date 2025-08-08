@@ -2,9 +2,34 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/ai_companion_logo.jpg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AI Companion webui</title>
+    <link rel="icon" type="image/jpeg" href="/ai_companion_logo.jpg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <title>AI Companion</title>
+    
+    <!-- PWA Meta Tags -->
+    <meta name="description" content="Your personal AI companion with advanced conversation and personality tracking" />
+    <meta name="theme-color" content="#dc2626" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="AI Companion" />
+    <meta name="msapplication-TileColor" content="#dc2626" />
+    <meta name="msapplication-tap-highlight" content="no" />
+    
+    <!-- PWA Manifest -->
+    <link rel="manifest" href="/manifest.json" />
+    
+    <!-- Apple Touch Icons -->
+    <link rel="apple-touch-icon" href="/ai_companion_logo.jpg" />
+    <link rel="apple-touch-icon" sizes="152x152" href="/ai_companion_logo.jpg" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/ai_companion_logo.jpg" />
+    <link rel="apple-touch-icon" sizes="167x167" href="/ai_companion_logo.jpg" />
+    
+    <!-- Splash Screen Meta -->
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    
+    <!-- Preload Critical Resources -->
+    <link rel="preload" href="/assets/companion_avatar-4rust.jpg" as="image" />
   </head>
   <body>
     <div id="root"></div>

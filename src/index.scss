@@ -73,12 +73,41 @@
 
 body {
   height: 100vh;
+  height: calc(var(--vh, 1vh) * 100);
   padding: 0;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
 }
 
 @layer utilities {
   .max-container {
     @apply max-w-5xl mx-auto sm:px-16 pb-12 px-8 h-full flex flex-col gap-2 items-center;
+    height: calc(var(--vh, 1vh) * 100);
+    min-height: -webkit-fill-available;
+  }
+  
+  /* Mobile-specific utilities */
+  .mobile-safe-area {
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+  }
+  
+  /* Touch-optimized buttons */
+  .touch-target {
+    min-height: 44px;
+    min-width: 44px;
+    touch-action: manipulation;
+  }
+  
+  /* Improved scrolling */
+  .smooth-scroll {
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
   }
   
   /* Font size classes */
@@ -222,6 +251,107 @@ body {
       opacity: 1;
       transform: scale(1);
     }
+  }
+  
+  /* Mobile-responsive breakpoints */
+  @media (max-width: 640px) {
+    .max-container {
+      @apply px-4 pb-6 gap-1;
+    }
+    
+    .chat-bubble {
+      max-width: 95%;
+      font-size: 0.9rem;
+    }
+    
+    /* Larger touch targets on mobile */
+    button, .touch-target {
+      min-height: 48px;
+      min-width: 48px;
+      padding: 12px;
+    }
+    
+    /* Better text input on mobile */
+    textarea, input {
+      font-size: 16px; /* Prevents zoom on iOS */
+      -webkit-appearance: none;
+      border-radius: 8px;
+    }
+    
+    /* Improved drawer on mobile */
+    .drawer-content {
+      max-height: 85vh;
+      border-radius: 16px 16px 0 0;
+    }
+    
+    /* Hide scrollbars on mobile */
+    .scroll-area {
+      scrollbar-width: none;
+      -ms-overflow-style: none;
+    }
+    
+    .scroll-area::-webkit-scrollbar {
+      display: none;
+    }
+  }
+  
+  @media (max-width: 480px) {
+    .chat {
+      padding-top: 0.25rem;
+      padding-bottom: 0.25rem;
+      column-gap: 0.5rem;
+    }
+    
+    .chat-bubble {
+      padding: 0.625rem 0.875rem;
+      max-width: 92%;
+      font-size: 0.875rem;
+    }
+    
+    /* Even more compact on very small screens */
+    .max-container {
+      @apply px-2 gap-0.5;
+    }
+  }
+  
+  /* Touch and gesture improvements */
+  .touch-scroll {
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-y: contain;
+    scroll-behavior: smooth;
+  }
+  
+  /* Prevent text selection on UI elements */
+  button, .ui-element {
+    -webkit-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+    user-select: none;
+  }
+  
+  /* Allow text selection in content areas */
+  .chat-bubble, textarea, input {
+    -webkit-user-select: text;
+    -moz-user-select: text;
+    -ms-user-select: text;
+    user-select: text;
+  }
+  
+  /* Focus improvements for accessibility */
+  button:focus, input:focus, textarea:focus {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 2px;
+  }
+  
+  /* Remove tap highlights */
+  * {
+    -webkit-tap-highlight-color: transparent;
+  }
+  
+  /* Improved performance for animations */
+  .animate-in, .chat {
+    will-change: transform;
+    transform: translateZ(0);
   }
 }
 
