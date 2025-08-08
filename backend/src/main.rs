@@ -1,7 +1,7 @@
 use actix_web::{get, post, delete, put, App, web, HttpResponse, HttpServer};
 use futures_util::StreamExt as _;
 mod database;
-use database::{Database, Message, NewMessage, CompanionView, UserView, ConfigModify};
+use database::{Database, Message, NewMessage, CompanionView, UserView, ConfigModify, CompanionAttitude};
 mod long_term_mem;
 use long_term_mem::LongTermMem;
 mod dialogue_tuning;
@@ -465,6 +465,77 @@ async fn config_post(received: web::Json<ConfigModify>) -> HttpResponse {
     }
 }
 
+//              Attitude Tracking
+
+#[derive(Deserialize)]
+struct AttitudeParams {
+    companion_id: i32,
+    target_id: i32,
+    target_type: String,
+}
+
+#[get("/api/attitude")]
+async fn get_attitude(query: web::Query<AttitudeParams>) -> HttpResponse {
+    match Database::get_attitude(query.companion_id, query.target_id, &query.target_type) {
+        Ok(Some(attitude)) => {
+            let attitude_json = serde_json::to_string(&attitude).unwrap_or(String::from("Error serializing attitude as JSON"));
+            HttpResponse::Ok().body(attitude_json)
+        },
+        Ok(None) => HttpResponse::NotFound().body("Attitude not found"),
+        Err(e) => {
+            println!("Failed to get attitude: {}", e);
+            HttpResponse::InternalServerError().body("Error while getting attitude, check logs for more information")
+        }
+    }
+}
+
+#[post("/api/attitude")]
+async fn create_or_update_attitude(received: web::Json<CompanionAttitude>) -> HttpResponse {
+    let attitude = received.into_inner();
+    match Database::create_or_update_attitude(attitude.companion_id, attitude.target_id, &attitude.target_type, &attitude) {
+        Ok(id) => HttpResponse::Ok().body(format!("Attitude created/updated with id: {}", id)),
+        Err(e) => {
+            println!("Failed to create/update attitude: {}", e);
+            HttpResponse::InternalServerError().body("Error while creating/updating attitude, check logs for more information")
+        }
+    }
+}
+
+#[get("/api/attitude/companion/{companion_id}")]
+async fn get_companion_attitudes(companion_id: web::Path<i32>) -> HttpResponse {
+    match Database::get_all_companion_attitudes(*companion_id) {
+        Ok(attitudes) => {
+            let attitudes_json = serde_json::to_string(&attitudes).unwrap_or(String::from("Error serializing attitudes as JSON"));
+            HttpResponse::Ok().body(attitudes_json)
+        },
+        Err(e) => {
+            println!("Failed to get companion attitudes: {}", e);
+            HttpResponse::InternalServerError().body("Error while getting companion attitudes, check logs for more information")
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AttitudeDimensionUpdate {
+    companion_id: i32,
+    target_id: i32,
+    target_type: String,
+    dimension: String,
+    delta: f32,
+}
+
+#[put("/api/attitude/dimension")]
+async fn update_attitude_dimension(received: web::Json<AttitudeDimensionUpdate>) -> HttpResponse {
+    let update = received.into_inner();
+    match Database::update_attitude_dimension(update.companion_id, update.target_id, &update.target_type, &update.dimension, update.delta) {
+        Ok(_) => HttpResponse::Ok().body("Attitude dimension updated!"),
+        Err(e) => {
+            println!("Failed to update attitude dimension: {}", e);
+            HttpResponse::InternalServerError().body("Error while updating attitude dimension, check logs for more information")
+        }
+    }
+}
+
 //
 
 #[actix_web::main]
@@ -524,6 +595,10 @@ async fn main() -> std::io::Result<()> {
             .service(regenerate_prompt)
             .service(config)
             .service(config_post)
+            .service(get_attitude)
+            .service(create_or_update_attitude)
+            .service(get_companion_attitudes)
+            .service(update_attitude_dimension)
     })
     .bind((hostname, port))?
     .run()

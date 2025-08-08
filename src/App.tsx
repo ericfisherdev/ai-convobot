@@ -7,6 +7,7 @@ import { MessagesProvider } from './components/context/messageContext'
 import { UserDataProvider } from './components/context/userContext'
 import { CompanionDataProvider } from './components/context/companionContext'
 import { ConfigProvider } from './components/context/configContext'
+import { AttitudeProvider } from './components/context/attitudeContext'
 
 import { Toaster } from "@/components/ui/sonner"
 
@@ -16,12 +17,14 @@ function App() {
       <ConfigProvider>
         <UserDataProvider>
           <CompanionDataProvider>
-            <MessagesProvider>
-              <div className='max-container'>
-                <ChatWindow />
-              </div>
-              <Toaster />
-            </MessagesProvider>
+            <AttitudeProvider>
+              <MessagesProvider>
+                <div className='max-container'>
+                  <ChatWindow />
+                </div>
+                <Toaster />
+              </MessagesProvider>
+            </AttitudeProvider>
           </CompanionDataProvider>
         </UserDataProvider>
       </ConfigProvider>
