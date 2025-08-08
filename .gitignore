@@ -25,3 +25,9 @@ dist-ssr
 
 # Backend
 backend/target
+
+# Local documentation and Claude files
+docs/local/
+CLAUDE.md
+.claude/
+*.claude
