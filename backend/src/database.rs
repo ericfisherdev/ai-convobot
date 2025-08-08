@@ -1282,6 +1282,105 @@ impl Database {
         
         Ok(con.last_insert_rowid() as i32)
     }
+    
+    pub fn get_planned_interactions(companion_id: i32, limit: Option<usize>) -> Result<Vec<ThirdPartyInteraction>> {
+        let con = Connection::open("companion_database.db")?;
+        let query = if let Some(limit) = limit {
+            format!(
+                "SELECT id, third_party_id, companion_id, interaction_type, description,
+                        planned_date, actual_date, outcome, impact_on_relationship,
+                        created_at, updated_at
+                 FROM third_party_interactions
+                 WHERE companion_id = ? AND interaction_type = 'planned'
+                 ORDER BY planned_date ASC
+                 LIMIT {}", limit
+            )
+        } else {
+            "SELECT id, third_party_id, companion_id, interaction_type, description,
+                    planned_date, actual_date, outcome, impact_on_relationship,
+                    created_at, updated_at
+             FROM third_party_interactions
+             WHERE companion_id = ? AND interaction_type = 'planned'
+             ORDER BY planned_date ASC".to_string()
+        };
+        
+        let mut stmt = con.prepare(&query)?;
+        let interactions = stmt.query_map(&[&companion_id], |row| {
+            Ok(ThirdPartyInteraction {
+                id: Some(row.get(0)?),
+                third_party_id: row.get(1)?,
+                companion_id: row.get(2)?,
+                interaction_type: row.get(3)?,
+                description: row.get(4)?,
+                planned_date: row.get(5)?,
+                actual_date: row.get(6)?,
+                outcome: row.get(7)?,
+                impact_on_relationship: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        })?;
+        
+        let mut result = Vec::new();
+        for interaction in interactions {
+            result.push(interaction?);
+        }
+        
+        Ok(result)
+    }
+    
+    pub fn complete_interaction(interaction_id: i32, outcome: &str, impact: f32) -> Result<()> {
+        let con = Connection::open("companion_database.db")?;
+        let current_time = get_current_date();
+        
+        con.execute(
+            "UPDATE third_party_interactions 
+             SET interaction_type = 'completed', 
+                 actual_date = ?, 
+                 outcome = ?, 
+                 impact_on_relationship = ?,
+                 updated_at = ?
+             WHERE id = ?",
+            params![current_time, outcome, impact, current_time, interaction_id]
+        )?;
+        
+        Ok(())
+    }
+    
+    pub fn get_interaction_history(companion_id: i32, third_party_id: i32) -> Result<Vec<ThirdPartyInteraction>> {
+        let con = Connection::open("companion_database.db")?;
+        let mut stmt = con.prepare(
+            "SELECT id, third_party_id, companion_id, interaction_type, description,
+                    planned_date, actual_date, outcome, impact_on_relationship,
+                    created_at, updated_at
+             FROM third_party_interactions
+             WHERE companion_id = ? AND third_party_id = ?
+             ORDER BY COALESCE(actual_date, planned_date) DESC"
+        )?;
+        
+        let interactions = stmt.query_map(params![companion_id, third_party_id], |row| {
+            Ok(ThirdPartyInteraction {
+                id: Some(row.get(0)?),
+                third_party_id: row.get(1)?,
+                companion_id: row.get(2)?,
+                interaction_type: row.get(3)?,
+                description: row.get(4)?,
+                planned_date: row.get(5)?,
+                actual_date: row.get(6)?,
+                outcome: row.get(7)?,
+                impact_on_relationship: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        })?;
+        
+        let mut result = Vec::new();
+        for interaction in interactions {
+            result.push(interaction?);
+        }
+        
+        Ok(result)
+    }
 
     pub fn get_third_party_by_name(name: &str) -> Result<Option<ThirdPartyIndividual>> {
         let con = Connection::open("companion_database.db")?;
@@ -1876,5 +1975,406 @@ impl Database {
         attitude.gratitude = attitude.gratitude.max(-100.0).min(100.0);
         attitude.jealousy = attitude.jealousy.max(-100.0).min(100.0);
         attitude.empathy = attitude.empathy.max(-100.0).min(100.0);
+    }
+    
+    // Companion Interaction Tracking System
+    
+    pub fn generate_interaction_outcome(interaction_id: i32) -> Result<String> {
+        let con = Connection::open("companion_database.db")?;
+        
+        // Get the interaction details
+        let interaction: ThirdPartyInteraction = con.query_row(
+            "SELECT id, third_party_id, companion_id, interaction_type, description,
+                    planned_date, actual_date, outcome, impact_on_relationship,
+                    created_at, updated_at
+             FROM third_party_interactions WHERE id = ?",
+            &[&interaction_id],
+            |row| {
+                Ok(ThirdPartyInteraction {
+                    id: Some(row.get(0)?),
+                    third_party_id: row.get(1)?,
+                    companion_id: row.get(2)?,
+                    interaction_type: row.get(3)?,
+                    description: row.get(4)?,
+                    planned_date: row.get(5)?,
+                    actual_date: row.get(6)?,
+                    outcome: row.get(7)?,
+                    impact_on_relationship: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
+                })
+            }
+        )?;
+        
+        // Get the companion's attitude toward this third party
+        let attitude = Database::get_attitude(interaction.companion_id, interaction.third_party_id, "third_party")?
+            .ok_or_else(|| Error::QueryReturnedNoRows)?;
+        
+        // Get third party details
+        let third_party = Database::get_third_party_by_id(interaction.third_party_id)?
+            .ok_or_else(|| Error::QueryReturnedNoRows)?;
+        
+        // Generate outcome based on attitude and interaction type
+        let outcome = Database::create_realistic_outcome(&interaction, &attitude, &third_party);
+        
+        // Calculate impact on relationship
+        let impact = Database::calculate_interaction_impact(&interaction, &attitude);
+        
+        // Complete the interaction with the generated outcome
+        Database::complete_interaction(interaction_id, &outcome, impact)?;
+        
+        // Update attitudes based on the interaction
+        Database::update_attitude_from_interaction(
+            interaction.companion_id, 
+            interaction.third_party_id, 
+            &interaction.description, 
+            impact
+        )?;
+        
+        Ok(outcome)
+    }
+    
+    fn create_realistic_outcome(
+        interaction: &ThirdPartyInteraction, 
+        attitude: &CompanionAttitude,
+        third_party: &ThirdPartyIndividual
+    ) -> String {
+        let relationship_quality = attitude.relationship_score.unwrap_or(0.0);
+        let interaction_desc = &interaction.description;
+        let person_name = &third_party.name;
+        
+        // Generate outcome based on relationship quality and interaction type
+        if interaction_desc.contains("meet") || interaction_desc.contains("coffee") || interaction_desc.contains("lunch") {
+            if relationship_quality > 50.0 {
+                format!("Had a wonderful time with {}! We talked about various topics and really enjoyed each other's company. {} seemed happy and we made plans to meet again soon.", person_name, person_name)
+            } else if relationship_quality > 0.0 {
+                format!("Met with {} as planned. The conversation was pleasant enough, though there were a few awkward moments. {} was friendly but seemed a bit distracted.", person_name, person_name)
+            } else {
+                format!("The meeting with {} was tense. We struggled to find common ground and the conversation felt forced. {} left early citing other commitments.", person_name, person_name)
+            }
+        } else if interaction_desc.contains("call") || interaction_desc.contains("phone") {
+            if relationship_quality > 30.0 {
+                format!("Had a great phone conversation with {}. We caught up on recent events and shared some laughs. The call lasted longer than expected because we were enjoying the chat.", person_name)
+            } else if relationship_quality > -20.0 {
+                format!("Spoke with {} on the phone briefly. The conversation was polite but somewhat formal. We covered the necessary topics and ended the call.", person_name)
+            } else {
+                format!("The phone call with {} was brief and uncomfortable. We barely exchanged pleasantries before {} had to go.", person_name, person_name)
+            }
+        } else if interaction_desc.contains("help") || interaction_desc.contains("assist") {
+            if attitude.trust > 50.0 && attitude.gratitude > 30.0 {
+                format!("{} was incredibly grateful for my help! They thanked me multiple times and offered to return the favor anytime. This really strengthened our bond.", person_name)
+            } else if attitude.trust > 0.0 {
+                format!("{} appreciated the help, though they seemed a bit hesitant to accept it at first. In the end, everything worked out well.", person_name)
+            } else {
+                format!("{} reluctantly accepted my help but didn't seem very appreciative. There was an underlying tension throughout the interaction.", person_name)
+            }
+        } else if interaction_desc.contains("party") || interaction_desc.contains("event") || interaction_desc.contains("gathering") {
+            if attitude.joy > 40.0 && relationship_quality > 20.0 {
+                format!("The event with {} was fantastic! We had a great time, met interesting people, and {} introduced me to several of their friends. Definitely a night to remember!", person_name, person_name)
+            } else if relationship_quality > -10.0 {
+                format!("Attended the event with {}. It was decent - the venue was nice and there were some interesting moments, though {} and I didn't interact as much as expected.", person_name, person_name)
+            } else {
+                format!("The event with {} was awkward. We barely spoke and {} spent most of the time with other people. I left early.", person_name, person_name)
+            }
+        } else {
+            // Generic interaction outcome
+            if relationship_quality > 40.0 {
+                format!("The interaction with {} went very well! Everything proceeded smoothly and we both seemed to enjoy it. Our relationship feels stronger.", person_name)
+            } else if relationship_quality > -20.0 {
+                format!("Completed the planned activity with {}. It was fine, nothing particularly memorable but no issues either.", person_name)
+            } else {
+                format!("The interaction with {} was difficult. There were several uncomfortable moments and neither of us seemed happy with how things went.", person_name)
+            }
+        }
+    }
+    
+    fn calculate_interaction_impact(interaction: &ThirdPartyInteraction, attitude: &CompanionAttitude) -> f32 {
+        let base_relationship = attitude.relationship_score.unwrap_or(0.0);
+        let mut impact = 0.0;
+        
+        // Positive interactions have more impact when relationship is already good
+        if interaction.description.contains("fun") || interaction.description.contains("enjoy") || interaction.description.contains("great") {
+            impact = 5.0 + (base_relationship * 0.1);
+        }
+        // Helping interactions build trust and gratitude
+        else if interaction.description.contains("help") || interaction.description.contains("assist") || interaction.description.contains("support") {
+            impact = 8.0 + (attitude.trust * 0.05);
+        }
+        // Conflict reduces relationship quality
+        else if interaction.description.contains("argue") || interaction.description.contains("fight") || interaction.description.contains("disagree") {
+            impact = -10.0 - (attitude.anger * 0.1);
+        }
+        // Casual interactions have mild impact
+        else if interaction.description.contains("meet") || interaction.description.contains("talk") || interaction.description.contains("chat") {
+            impact = 2.0 * (1.0 + base_relationship / 100.0);
+        }
+        // Professional interactions are neutral to positive
+        else if interaction.description.contains("work") || interaction.description.contains("project") || interaction.description.contains("business") {
+            impact = 1.0 + (attitude.respect * 0.02);
+        }
+        else {
+            // Default small positive impact
+            impact = 1.0;
+        }
+        
+        // Clamp impact to reasonable range
+        impact.max(-25.0).min(25.0)
+    }
+    
+    fn update_attitude_from_interaction(companion_id: i32, third_party_id: i32, description: &str, impact: f32) -> Result<()> {
+        // Determine which dimensions to update based on interaction description
+        let mut updates: Vec<(&str, f32)> = Vec::new();
+        
+        if impact > 0.0 {
+            // Positive interaction
+            if description.contains("fun") || description.contains("laugh") || description.contains("enjoy") {
+                updates.push(("joy", impact * 0.8));
+                updates.push(("attraction", impact * 0.3));
+            }
+            if description.contains("help") || description.contains("support") || description.contains("assist") {
+                updates.push(("gratitude", impact * 1.2));
+                updates.push(("trust", impact * 0.6));
+            }
+            if description.contains("deep") || description.contains("meaningful") || description.contains("understand") {
+                updates.push(("empathy", impact * 0.7));
+                updates.push(("respect", impact * 0.5));
+            }
+            // Reduce negative emotions
+            updates.push(("suspicion", -impact * 0.3));
+            updates.push(("fear", -impact * 0.2));
+        } else {
+            // Negative interaction
+            if description.contains("argue") || description.contains("fight") || description.contains("conflict") {
+                updates.push(("anger", -impact * 0.8));
+                updates.push(("trust", impact * 0.5));
+            }
+            if description.contains("disappoint") || description.contains("letdown") || description.contains("fail") {
+                updates.push(("sorrow", -impact * 0.6));
+                updates.push(("respect", impact * 0.4));
+            }
+            if description.contains("lie") || description.contains("betray") || description.contains("deceive") {
+                updates.push(("suspicion", -impact * 1.5));
+                updates.push(("trust", impact * 2.0));
+                updates.push(("disgust", -impact * 0.7));
+            }
+            // Reduce positive emotions
+            updates.push(("joy", impact * 0.4));
+            updates.push(("attraction", impact * 0.3));
+        }
+        
+        // Apply all updates
+        for (dimension, delta) in updates {
+            Database::update_attitude_dimension(companion_id, third_party_id, "third_party", dimension, delta)?;
+        }
+        
+        Ok(())
+    }
+    
+    pub fn get_third_party_by_id(id: i32) -> Result<Option<ThirdPartyIndividual>> {
+        let con = Connection::open("companion_database.db")?;
+        let mut stmt = con.prepare(
+            "SELECT id, name, relationship_to_user, relationship_to_companion, occupation,
+                    personality_traits, physical_description, first_mentioned, last_mentioned,
+                    mention_count, importance_score, created_at, updated_at
+             FROM third_party_individuals WHERE id = ?"
+        )?;
+        
+        let individual = stmt.query_row(&[&id], |row| {
+            Ok(ThirdPartyIndividual {
+                id: Some(row.get(0)?),
+                name: row.get(1)?,
+                relationship_to_user: row.get(2)?,
+                relationship_to_companion: row.get(3)?,
+                occupation: row.get(4)?,
+                personality_traits: row.get(5)?,
+                physical_description: row.get(6)?,
+                first_mentioned: row.get(7)?,
+                last_mentioned: row.get(8)?,
+                mention_count: row.get(9)?,
+                importance_score: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
+            })
+        }).ok();
+        
+        Ok(individual)
+    }
+    
+    pub fn detect_interaction_request(message: &str, companion_id: i32) -> Result<Option<ThirdPartyInteraction>> {
+        let message_lower = message.to_lowercase();
+        
+        // Check if user is asking about past interactions
+        if message_lower.contains("did you") || message_lower.contains("have you") || 
+           message_lower.contains("what happened") || message_lower.contains("how did") ||
+           message_lower.contains("tell me about") {
+            
+            // Extract person name from the message
+            if let Some(person_name) = Database::extract_person_from_query(message) {
+                if let Some(third_party) = Database::get_third_party_by_name(&person_name)? {
+                    // Check for recent interactions
+                    let history = Database::get_interaction_history(companion_id, third_party.id.unwrap())?;
+                    if !history.is_empty() {
+                        return Ok(Some(history[0].clone()));
+                    }
+                    
+                    // Check for planned interactions that might have occurred
+                    let planned = Database::get_planned_interactions(companion_id, Some(5))?;
+                    for interaction in planned {
+                        if interaction.third_party_id == third_party.id.unwrap() {
+                            // Generate outcome for this interaction
+                            let _outcome = Database::generate_interaction_outcome(interaction.id.unwrap())?;
+                            return Database::get_interaction_by_id(interaction.id.unwrap());
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Check if user is planning future interaction
+        if message_lower.contains("plan to") || message_lower.contains("going to") ||
+           message_lower.contains("will meet") || message_lower.contains("scheduled") {
+            
+            if let Some(person_name) = Database::extract_person_from_query(message) {
+                if let Some(third_party) = Database::get_third_party_by_name(&person_name)? {
+                    let interaction = ThirdPartyInteraction {
+                        id: None,
+                        third_party_id: third_party.id.unwrap(),
+                        companion_id,
+                        interaction_type: "planned".to_string(),
+                        description: Database::extract_interaction_description(message, &person_name),
+                        planned_date: Some(Database::extract_planned_date(message)),
+                        actual_date: None,
+                        outcome: None,
+                        impact_on_relationship: 0.0,
+                        created_at: get_current_date(),
+                        updated_at: get_current_date(),
+                    };
+                    
+                    let interaction_id = Database::plan_third_party_interaction(&interaction)?;
+                    return Database::get_interaction_by_id(interaction_id);
+                }
+            }
+        }
+        
+        Ok(None)
+    }
+    
+    fn extract_person_from_query(message: &str) -> Option<String> {
+        // Try to find person names mentioned in the query
+        let message_lower = message.to_lowercase();
+        
+        // Look for patterns like "with [Name]", "to [Name]", "about [Name]"
+        let patterns = [
+            r"with\s+(\w+)",
+            r"to\s+(\w+)",
+            r"about\s+(\w+)",
+            r"see\s+(\w+)",
+            r"meet\s+(\w+)",
+            r"call\s+(\w+)",
+            r"visit\s+(\w+)",
+        ];
+        
+        for pattern in &patterns {
+            if let Ok(re) = regex::Regex::new(pattern) {
+                if let Some(cap) = re.captures(&message_lower) {
+                    if let Some(name_match) = cap.get(1) {
+                        let name = name_match.as_str();
+                        if name.len() > 2 && !Database::is_common_word(name) {
+                            return Some(Database::capitalize_name(name));
+                        }
+                    }
+                }
+            }
+        }
+        
+        None
+    }
+    
+    fn extract_interaction_description(message: &str, person_name: &str) -> String {
+        let message_lower = message.to_lowercase();
+        let _name_lower = person_name.to_lowercase();
+        
+        // Extract the core activity from the message
+        if message_lower.contains("coffee") {
+            format!("Have coffee with {}", person_name)
+        } else if message_lower.contains("lunch") {
+            format!("Have lunch with {}", person_name)
+        } else if message_lower.contains("dinner") {
+            format!("Have dinner with {}", person_name)
+        } else if message_lower.contains("meet") {
+            format!("Meet with {}", person_name)
+        } else if message_lower.contains("call") || message_lower.contains("phone") {
+            format!("Phone call with {}", person_name)
+        } else if message_lower.contains("help") {
+            format!("Help {} with something", person_name)
+        } else if message_lower.contains("party") || message_lower.contains("event") {
+            format!("Attend event with {}", person_name)
+        } else if message_lower.contains("work") || message_lower.contains("project") {
+            format!("Work on project with {}", person_name)
+        } else if message_lower.contains("visit") {
+            format!("Visit {}", person_name)
+        } else {
+            format!("Interact with {}", person_name)
+        }
+    }
+    
+    fn extract_planned_date(message: &str) -> String {
+        let message_lower = message.to_lowercase();
+        
+        if message_lower.contains("tomorrow") {
+            "tomorrow".to_string()
+        } else if message_lower.contains("today") {
+            "today".to_string()
+        } else if message_lower.contains("tonight") {
+            "tonight".to_string()
+        } else if message_lower.contains("this weekend") {
+            "this weekend".to_string()
+        } else if message_lower.contains("next week") {
+            "next week".to_string()
+        } else if message_lower.contains("monday") {
+            "Monday".to_string()
+        } else if message_lower.contains("tuesday") {
+            "Tuesday".to_string()
+        } else if message_lower.contains("wednesday") {
+            "Wednesday".to_string()
+        } else if message_lower.contains("thursday") {
+            "Thursday".to_string()
+        } else if message_lower.contains("friday") {
+            "Friday".to_string()
+        } else if message_lower.contains("saturday") {
+            "Saturday".to_string()
+        } else if message_lower.contains("sunday") {
+            "Sunday".to_string()
+        } else {
+            "soon".to_string()
+        }
+    }
+    
+    pub fn get_interaction_by_id(id: i32) -> Result<Option<ThirdPartyInteraction>> {
+        let con = Connection::open("companion_database.db")?;
+        let mut stmt = con.prepare(
+            "SELECT id, third_party_id, companion_id, interaction_type, description,
+                    planned_date, actual_date, outcome, impact_on_relationship,
+                    created_at, updated_at
+             FROM third_party_interactions WHERE id = ?"
+        )?;
+        
+        let interaction = stmt.query_row(&[&id], |row| {
+            Ok(ThirdPartyInteraction {
+                id: Some(row.get(0)?),
+                third_party_id: row.get(1)?,
+                companion_id: row.get(2)?,
+                interaction_type: row.get(3)?,
+                description: row.get(4)?,
+                planned_date: row.get(5)?,
+                actual_date: row.get(6)?,
+                outcome: row.get(7)?,
+                impact_on_relationship: row.get(8)?,
+                created_at: row.get(9)?,
+                updated_at: row.get(10)?,
+            })
+        }).ok();
+        
+        Ok(interaction)
     }
 }

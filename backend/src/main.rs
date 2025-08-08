@@ -1,7 +1,7 @@
 use actix_web::{get, post, delete, put, App, web, HttpResponse, HttpServer};
 use futures_util::StreamExt as _;
 mod database;
-use database::{Database, Message, NewMessage, CompanionView, UserView, ConfigModify, CompanionAttitude, ThirdPartyIndividual};
+use database::{Database, Message, NewMessage, CompanionView, UserView, ConfigModify, CompanionAttitude, ThirdPartyIndividual, ThirdPartyInteraction};
 mod long_term_mem;
 use long_term_mem::LongTermMem;
 mod dialogue_tuning;
@@ -406,6 +406,39 @@ async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
         // Continue processing even if person detection fails
     }
     
+    // Detect and handle interaction requests
+    if let Ok(Some(interaction)) = Database::detect_interaction_request(&prompt_message, companion_id) {
+        // Store interaction context for LLM to use
+        if interaction.outcome.is_some() {
+            // If interaction has outcome, include it in the context
+            let enhanced_prompt = format!("{}\n[Context: Interaction with {} - {}]", 
+                prompt_message, 
+                Database::get_third_party_by_id(interaction.third_party_id)
+                    .ok()
+                    .flatten()
+                    .map(|p| p.name)
+                    .unwrap_or_else(|| "unknown".to_string()),
+                interaction.outcome.as_ref().unwrap_or(&"".to_string())
+            );
+            
+            match Database::insert_message(NewMessage { ai: false, content: prompt_message.to_string() }) {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("Failed to add message to database: {}", e);
+                    return HttpResponse::InternalServerError().body("Error while adding message to database, check logs for more information");
+                }
+            };
+            
+            // Generate response with interaction context
+            match prompt(&enhanced_prompt) {
+                Ok(v) => return HttpResponse::Ok().body(v),
+                Err(e) => {
+                    println!("Failed to generate prompt with interaction context: {}", e);
+                }
+            }
+        }
+    }
+    
     match Database::insert_message(NewMessage { ai: false, content: prompt_message.to_string() }) {
         Ok(_) => {}
         Err(e) => {
@@ -606,6 +639,94 @@ async fn get_person_by_name(name: web::Path<String>) -> HttpResponse {
     }
 }
 
+#[post("/api/interactions/plan")]
+async fn plan_interaction(received: web::Json<ThirdPartyInteraction>) -> HttpResponse {
+    match Database::plan_third_party_interaction(&received.into_inner()) {
+        Ok(interaction_id) => {
+            let response = serde_json::json!({
+                "success": true,
+                "interaction_id": interaction_id,
+                "message": "Interaction planned successfully"
+            });
+            HttpResponse::Ok().body(response.to_string())
+        },
+        Err(e) => {
+            println!("Failed to plan interaction: {}", e);
+            HttpResponse::InternalServerError().body("Error while planning interaction, check logs for more information")
+        }
+    }
+}
+
+#[get("/api/interactions/planned/{companion_id}")]
+async fn get_planned_interactions(companion_id: web::Path<i32>) -> HttpResponse {
+    match Database::get_planned_interactions(*companion_id, Some(10)) {
+        Ok(interactions) => {
+            let interactions_json = serde_json::to_string(&interactions).unwrap_or(String::from("Error serializing interactions as JSON"));
+            HttpResponse::Ok().body(interactions_json)
+        },
+        Err(e) => {
+            println!("Failed to get planned interactions: {}", e);
+            HttpResponse::InternalServerError().body("Error while getting planned interactions, check logs for more information")
+        }
+    }
+}
+
+#[post("/api/interactions/{interaction_id}/complete")]
+async fn complete_interaction(interaction_id: web::Path<i32>) -> HttpResponse {
+    match Database::generate_interaction_outcome(*interaction_id) {
+        Ok(outcome) => {
+            let response = serde_json::json!({
+                "success": true,
+                "outcome": outcome,
+                "message": "Interaction completed successfully"
+            });
+            HttpResponse::Ok().body(response.to_string())
+        },
+        Err(e) => {
+            println!("Failed to complete interaction: {}", e);
+            HttpResponse::InternalServerError().body("Error while completing interaction, check logs for more information")
+        }
+    }
+}
+
+#[get("/api/interactions/history/{companion_id}/{third_party_id}")]
+async fn get_interaction_history(params: web::Path<(i32, i32)>) -> HttpResponse {
+    let (companion_id, third_party_id) = params.into_inner();
+    match Database::get_interaction_history(companion_id, third_party_id) {
+        Ok(history) => {
+            let history_json = serde_json::to_string(&history).unwrap_or(String::from("Error serializing history as JSON"));
+            HttpResponse::Ok().body(history_json)
+        },
+        Err(e) => {
+            println!("Failed to get interaction history: {}", e);
+            HttpResponse::InternalServerError().body("Error while getting interaction history, check logs for more information")
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct InteractionQuery {
+    message: String,
+    companion_id: i32,
+}
+
+#[post("/api/interactions/detect")]
+async fn detect_interaction(received: web::Json<InteractionQuery>) -> HttpResponse {
+    match Database::detect_interaction_request(&received.message, received.companion_id) {
+        Ok(Some(interaction)) => {
+            let interaction_json = serde_json::to_string(&interaction).unwrap_or(String::from("Error serializing interaction as JSON"));
+            HttpResponse::Ok().body(interaction_json)
+        },
+        Ok(None) => {
+            HttpResponse::Ok().body("{\"message\": \"No interaction detected\"}")
+        },
+        Err(e) => {
+            println!("Failed to detect interaction: {}", e);
+            HttpResponse::InternalServerError().body("Error while detecting interaction, check logs for more information")
+        }
+    }
+}
+
 //
 
 #[actix_web::main]
@@ -673,6 +794,11 @@ async fn main() -> std::io::Result<()> {
             .service(detect_persons)
             .service(get_all_persons)
             .service(get_person_by_name)
+            .service(plan_interaction)
+            .service(get_planned_interactions)
+            .service(complete_interaction)
+            .service(get_interaction_history)
+            .service(detect_interaction)
     })
     .bind((hostname, port))?
     .run()
