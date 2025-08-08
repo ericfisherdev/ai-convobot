@@ -1,5 +1,5 @@
 import { Avatar, AvatarFallback, AvatarImage } from "../ui/avatar";
-import { Pencil, RotateCw, ThumbsUp, Trash2 } from "lucide-react";
+import { Pencil, RotateCw, ThumbsUp, Trash2, Smile, Check, CheckCheck } from "lucide-react";
 import { useUserData } from "../context/userContext";
 import { useCompanionData } from "../context/companionContext";
 
@@ -7,6 +7,7 @@ import companionAvatar from "../../assets/companion_avatar.jpg";
 import { CompanionData } from "../interfaces/CompanionData";
 import { UserData } from "../interfaces/UserData";
 import { useEffect, useState, lazy } from "react";
+import { cn } from "../../lib/utils";
 import { useMessages } from "../context/messageContext";
 import { Textarea } from "../ui/textarea";
 import { TooltipProvider, Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
@@ -41,6 +42,10 @@ const UserMessage = ({ id, content, created_at }: MessageProps) => {
   const [editing, setEditing] = useState(false);
   const [editedContent, setEditedContent] = useState(content);
   const [originalContent, setOriginalContent] = useState(content);
+  const [isLiked, setIsLiked] = useState(false);
+  const [showReactions, setShowReactions] = useState(false);
+  const [isDelivered] = useState(true);
+  const [isRead] = useState(Math.random() > 0.3); // Simulate read status
 
   const handleEdit = () => {
     setOriginalContent(content);
@@ -96,19 +101,80 @@ const UserMessage = ({ id, content, created_at }: MessageProps) => {
   };
 
   return (
-    <div className='chat chat-end'>
+    <div className='chat chat-end group animate-in slide-in-from-right-5 duration-300'>
       <div className="chat-header">
         <time className="text-xs mr-3 opacity-50">{created_at}</time>
         {userData.name || "User"}
       </div>
-      <div className="chat-bubble">
+      <div className="relative">
+        <div className={cn(
+          "chat-bubble bg-primary text-primary-foreground transition-all duration-200 hover:shadow-md",
+          "relative overflow-visible"
+        )}>
           {editing ? (
             <Textarea value={editedContent} onChange={(e) => setEditedContent(e.target.value)} />
           ) : (
             <Markdown>{content}</Markdown>
           )}
-          </div> 
-      <div className="chat-footer opacity-50 flex flex-row gap-2 mt-1">
+        </div>
+        
+        {/* Message status indicators */}
+        <div className="flex items-center justify-end mt-1 gap-1 opacity-70">
+          {isDelivered && (
+            <div className="flex items-center">
+              {isRead ? (
+                <CheckCheck className="w-3 h-3 text-blue-500" />
+              ) : (
+                <Check className="w-3 h-3" />
+              )}
+            </div>
+          )}
+        </div>
+        
+        {/* Reaction emoji display */}
+        {(isLiked || showReactions) && (
+          <div className="absolute -bottom-2 -right-2 flex gap-1 animate-in zoom-in-50 duration-200">
+            {isLiked && (
+              <div className="bg-red-500 text-white rounded-full p-1 text-xs shadow-lg">
+                ❤️
+              </div>
+            )}
+          </div>
+        )}
+        
+        {/* Quick reaction hover menu */}
+        <div className={cn(
+          "absolute -top-12 right-0 bg-background border rounded-lg shadow-lg p-2 gap-1 transition-all duration-200",
+          showReactions ? "flex animate-in fade-in-0 scale-in-95" : "hidden"
+        )}>
+          <button 
+            onClick={() => { setIsLiked(!isLiked); setShowReactions(false); }}
+            className="hover:bg-secondary rounded p-1 text-lg transition-colors"
+          >
+            ❤️
+          </button>
+          <button 
+            onClick={() => setShowReactions(false)}
+            className="hover:bg-secondary rounded p-1 text-lg transition-colors"
+          >
+            👍
+          </button>
+          <button 
+            onClick={() => setShowReactions(false)}
+            className="hover:bg-secondary rounded p-1 text-lg transition-colors"
+          >
+            😂
+          </button>
+          <button 
+            onClick={() => setShowReactions(false)}
+            className="hover:bg-secondary rounded p-1 text-lg transition-colors"
+          >
+            😮
+          </button>
+        </div>
+      </div>
+      
+      <div className="chat-footer opacity-50 flex flex-row gap-2 mt-1 group-hover:opacity-100 transition-opacity duration-200">
         {editing ? (
           <>
             <button onClick={handleSave}>Save</button>
@@ -119,7 +185,27 @@ const UserMessage = ({ id, content, created_at }: MessageProps) => {
             <TooltipProvider delayDuration={250}>
                 <Tooltip>
                     <TooltipTrigger asChild>
-                    <button onClick={handleEdit}><Pencil /></button>
+                    <button 
+                      onClick={() => setShowReactions(!showReactions)}
+                      className="hover:bg-secondary rounded p-1 transition-colors"
+                    >
+                      <Smile className="w-4 h-4" />
+                    </button>
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom">
+                      <p>Add reaction</p>
+                    </TooltipContent>
+                  </Tooltip>
+              </TooltipProvider>
+            <TooltipProvider delayDuration={250}>
+                <Tooltip>
+                    <TooltipTrigger asChild>
+                    <button 
+                      onClick={handleEdit}
+                      className="hover:bg-secondary rounded p-1 transition-colors"
+                    >
+                      <Pencil className="w-4 h-4" />
+                    </button>
                     </TooltipTrigger>
                     <TooltipContent side="bottom">
                       <p>Edit message</p>
@@ -129,7 +215,12 @@ const UserMessage = ({ id, content, created_at }: MessageProps) => {
             <TooltipProvider delayDuration={250}>
                 <Tooltip>
                     <TooltipTrigger asChild>
-                    <button onClick={handleDelete}><Trash2 /></button>
+                    <button 
+                      onClick={handleDelete}
+                      className="hover:bg-secondary rounded p-1 transition-colors"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
                     </TooltipTrigger>
                     <TooltipContent side="bottom">
                       <p>Delete message</p>
@@ -151,14 +242,24 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
   const { refreshMessages } = useMessages();
 
   const [displayedContent, setDisplayedContent] = useState(content);
-
   const [editing, setEditing] = useState(false);
   const [editedContent, setEditedContent] = useState(content);
   const [originalContent, setOriginalContent] = useState(content);
+  const [isTyping, setIsTyping] = useState(false);
+  const [reactions, setReactions] = useState<string[]>([]);
+  const [showReactions, setShowReactions] = useState(false);
 
   useEffect(() => {
-    setDisplayedContent(content);
-  }, [content]);
+    if (content !== displayedContent && content) {
+      setIsTyping(true);
+      // Simulate typing effect
+      const timer = setTimeout(() => {
+        setDisplayedContent(content);
+        setIsTyping(false);
+      }, 800);
+      return () => clearTimeout(timer);
+    }
+  }, [content, displayedContent]);
 
   const handleEdit = () => {
     setOriginalContent(content);
@@ -260,51 +361,128 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
 
 
   return (
-    <div className='chat chat-start'>
+    <div className='chat chat-start group animate-in slide-in-from-left-5 duration-300'>
       <div className="chat-image avatar">
-        <div className="w-10 rounded-full">
+        <div className="w-10 rounded-full relative">
           <Avatar>
             <AvatarImage src={companionData.avatar_path || companionAvatar} alt="Companion Avatar" />
             <AvatarFallback>AI</AvatarFallback>
           </Avatar>
+          {/* Online indicator */}
+          <div className="absolute -bottom-0 -right-0 w-3 h-3 bg-green-500 border-2 border-background rounded-full animate-pulse" />
         </div>
       </div>
       <div className="chat-header">
         {companionData.name || "Assistant"}
         <time className="text-xs ml-3 opacity-50">{created_at}</time>
+        {isTyping && (
+          <span className="text-xs ml-2 text-muted-foreground italic animate-pulse">
+            is typing...
+          </span>
+        )}
       </div>
-      {regenerate ? 
-        <div className="flex flex-row gap-2 items-center">
-          <div className="chat-bubble">
+      
+      <div className="relative">
+        {regenerate ? 
+          <div className="flex flex-row gap-2 items-center">
+            <div className={cn(
+              "chat-bubble bg-secondary text-secondary-foreground transition-all duration-200 hover:shadow-md",
+              "relative overflow-visible",
+              isTyping && "animate-pulse"
+            )}>
+              {editing ? (
+                <Textarea value={editedContent} onChange={(e) => setEditedContent(e.target.value)} />
+              ) : isTyping ? (
+                <div className="flex gap-1">
+                  <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" />
+                  <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce animation-delay-100" />
+                  <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce animation-delay-200" />
+                </div>
+              ) : (
+                <Markdown>{displayedContent}</Markdown>
+              )}
+              </div> 
+              {!editing && !isTyping && 
+                <TooltipProvider delayDuration={350}>
+                  <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button 
+                          onClick={handleRegenerate}
+                          className="hover:bg-primary/10 rounded p-1 transition-colors"
+                        >
+                          <RotateCw className="w-4 h-4" />
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent side="right">
+                        <p>Regenerate message</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                }
+          </div>
+          :
+          <div className={cn(
+            "chat-bubble bg-secondary text-secondary-foreground transition-all duration-200 hover:shadow-md",
+            "relative overflow-visible",
+            isTyping && "animate-pulse"
+          )}>
             {editing ? (
               <Textarea value={editedContent} onChange={(e) => setEditedContent(e.target.value)} />
+            ) : isTyping ? (
+              <div className="flex gap-1">
+                <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" />
+                <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{animationDelay: '0.1s'}} />
+                <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{animationDelay: '0.2s'}} />
+              </div>
             ) : (
               <Markdown>{displayedContent}</Markdown>
             )}
-            </div> 
-            {!editing && 
-              <TooltipProvider delayDuration={350}>
-                <Tooltip>
-                    <TooltipTrigger asChild>
-                      <button onClick={handleRegenerate}><RotateCw /></button>
-                    </TooltipTrigger>
-                    <TooltipContent side="right">
-                      <p>Regenerate message</p>
-                    </TooltipContent>
-                  </Tooltip>
-                </TooltipProvider>
-              }
+          </div> 
+        }
+        
+        {/* Reaction display */}
+        {reactions.length > 0 && (
+          <div className="absolute -bottom-2 -left-2 flex gap-1 animate-in zoom-in-50 duration-200">
+            {reactions.map((reaction, index) => (
+              <div key={index} className="bg-primary text-primary-foreground rounded-full p-1 text-xs shadow-lg">
+                {reaction}
+              </div>
+            ))}
+          </div>
+        )}
+        
+        {/* Quick reaction hover menu */}
+        <div className={cn(
+          "absolute -top-12 left-0 bg-background border rounded-lg shadow-lg p-2 gap-1 transition-all duration-200",
+          showReactions ? "flex animate-in fade-in-0 scale-in-95" : "hidden"
+        )}>
+          <button 
+            onClick={() => { setReactions([...reactions, '❤️']); setShowReactions(false); }}
+            className="hover:bg-secondary rounded p-1 text-lg transition-colors"
+          >
+            ❤️
+          </button>
+          <button 
+            onClick={() => { setReactions([...reactions, '👍']); setShowReactions(false); }}
+            className="hover:bg-secondary rounded p-1 text-lg transition-colors"
+          >
+            👍
+          </button>
+          <button 
+            onClick={() => { setReactions([...reactions, '😂']); setShowReactions(false); }}
+            className="hover:bg-secondary rounded p-1 text-lg transition-colors"
+          >
+            😂
+          </button>
+          <button 
+            onClick={() => { setReactions([...reactions, '😮']); setShowReactions(false); }}
+            className="hover:bg-secondary rounded p-1 text-lg transition-colors"
+          >
+            😮
+          </button>
         </div>
-        :
-        <div className="chat-bubble">
-          {editing ? (
-            <Textarea value={editedContent} onChange={(e) => setEditedContent(e.target.value)} />
-          ) : (
-            <Markdown>{displayedContent}</Markdown>
-          )}
-        </div> 
-      }
-      <div className="chat-footer opacity-50 flex flex-row gap-2 mt-1">
+      </div>
+      <div className="chat-footer opacity-50 flex flex-row gap-2 mt-1 group-hover:opacity-100 transition-opacity duration-200">
         {editing ? (
           <>
             <button onClick={handleSave}>Save</button>
@@ -315,7 +493,27 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
             <TooltipProvider delayDuration={250}>
                 <Tooltip>
                     <TooltipTrigger asChild>
-                    <button onClick={handleEdit}><Pencil /></button>
+                    <button 
+                      onClick={() => setShowReactions(!showReactions)}
+                      className="hover:bg-secondary rounded p-1 transition-colors"
+                    >
+                      <Smile className="w-4 h-4" />
+                    </button>
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom">
+                      <p>Add reaction</p>
+                    </TooltipContent>
+                  </Tooltip>
+              </TooltipProvider>
+            <TooltipProvider delayDuration={250}>
+                <Tooltip>
+                    <TooltipTrigger asChild>
+                    <button 
+                      onClick={handleEdit}
+                      className="hover:bg-secondary rounded p-1 transition-colors"
+                    >
+                      <Pencil className="w-4 h-4" />
+                    </button>
                     </TooltipTrigger>
                     <TooltipContent side="bottom">
                       <p>Edit message</p>
@@ -326,7 +524,12 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
               <TooltipProvider delayDuration={250}>
               <Tooltip>
                   <TooltipTrigger asChild>
-                  <button onClick={handleTuning}><ThumbsUp /></button>
+                  <button 
+                    onClick={handleTuning}
+                    className="hover:bg-secondary rounded p-1 transition-colors"
+                  >
+                    <ThumbsUp className="w-4 h-4" />
+                  </button>
                   </TooltipTrigger>
                   <TooltipContent side="bottom">
                     <p>Good response</p>
@@ -337,7 +540,12 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
             <TooltipProvider delayDuration={250}>
                 <Tooltip>
                     <TooltipTrigger asChild>
-                    <button onClick={handleDelete}><Trash2 /></button>
+                    <button 
+                      onClick={handleDelete}
+                      className="hover:bg-secondary rounded p-1 transition-colors"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
                     </TooltipTrigger>
                     <TooltipContent side="bottom">
                       <p>Delete message</p>
