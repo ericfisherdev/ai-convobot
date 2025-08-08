@@ -1313,6 +1313,42 @@ impl Database {
         Ok(individual)
     }
 
+    pub fn get_all_third_party_individuals() -> Result<Vec<ThirdPartyIndividual>> {
+        let con = Connection::open("companion_database.db")?;
+        let mut stmt = con.prepare(
+            "SELECT id, name, relationship_to_user, relationship_to_companion, occupation,
+                    personality_traits, physical_description, first_mentioned, last_mentioned,
+                    mention_count, importance_score, created_at, updated_at
+             FROM third_party_individuals 
+             ORDER BY importance_score DESC, mention_count DESC"
+        )?;
+        
+        let individuals = stmt.query_map([], |row| {
+            Ok(ThirdPartyIndividual {
+                id: Some(row.get(0)?),
+                name: row.get(1)?,
+                relationship_to_user: row.get(2)?,
+                relationship_to_companion: row.get(3)?,
+                occupation: row.get(4)?,
+                personality_traits: row.get(5)?,
+                physical_description: row.get(6)?,
+                first_mentioned: row.get(7)?,
+                last_mentioned: row.get(8)?,
+                mention_count: row.get(9)?,
+                importance_score: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
+            })
+        })?;
+        
+        let mut result = Vec::new();
+        for individual in individuals {
+            result.push(individual?);
+        }
+        
+        Ok(result)
+    }
+
     pub fn get_third_party_memories(third_party_id: i32, limit: Option<usize>) -> Result<Vec<ThirdPartyMemory>> {
         let con = Connection::open("companion_database.db")?;
         let query = if let Some(limit) = limit {
@@ -1466,5 +1502,379 @@ impl Database {
         }
         
         Ok(result)
+    }
+
+    // Automatic Person Detection System
+    
+    pub fn detect_new_persons_in_message(message: &str, companion_id: i32) -> Result<Vec<i32>> {
+        let detected_names = Database::extract_person_names(message);
+        let mut new_person_ids = Vec::new();
+        
+        for name in detected_names {
+            // Check if person already exists
+            if Database::get_third_party_by_name(&name)?.is_none() {
+                // Create new third-party individual with context-based initial data
+                let initial_data = Database::analyze_context_for_person(&name, message);
+                let person_id = Database::create_or_update_third_party(&name, Some(initial_data))?;
+                
+                // Initialize attitude tracking with context-based values
+                let mut initial_attitude = Database::generate_initial_attitudes(&name, message, companion_id);
+                initial_attitude.target_id = person_id;
+                Database::create_or_update_attitude(companion_id, person_id, "third_party", &initial_attitude)?;
+                
+                new_person_ids.push(person_id);
+                
+                // Add initial memory about this person
+                let memory = ThirdPartyMemory {
+                    id: None,
+                    third_party_id: person_id,
+                    companion_id,
+                    memory_type: "fact".to_string(),
+                    content: format!("First mentioned: {}", message.trim()),
+                    importance: 0.6,
+                    emotional_valence: 0.0,
+                    created_at: get_current_date(),
+                    context_message_id: None,
+                };
+                Database::add_third_party_memory(person_id, companion_id, &memory)?;
+            } else {
+                // Update mention count for existing person
+                if let Some(_existing) = Database::get_third_party_by_name(&name)? {
+                    Database::create_or_update_third_party(&name, None)?;
+                }
+            }
+        }
+        
+        Ok(new_person_ids)
+    }
+    
+    fn extract_person_names(text: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let text = text.to_lowercase();
+        
+        // Common patterns for person references
+        let patterns = [
+            // Direct name mentions
+            r"(my|the|a) (friend|colleague|boss|manager|teacher|doctor|neighbor|brother|sister|mother|father|parent|cousin|uncle|aunt) (\w+)",
+            r"(\w+) (said|told|asked|mentioned|thinks|believes|wants|needs|likes|dislikes)",
+            r"(with|from|to|about|for) (\w+) (yesterday|today|tomorrow|last|next)",
+            r"(\w+) (is|was|will be|has|had|does|did|can|could|should|would)",
+            // Relationship indicators
+            r"(my|his|her) (\w+)",
+            // Conversation indicators  
+            r"(\w+) (and I|and me)",
+            r"(I and|me and) (\w+)",
+            // Common name patterns (capitalize first letter)
+            r"\b([A-Z][a-z]{2,})\b",
+        ];
+        
+        for pattern in &patterns {
+            if let Ok(re) = regex::Regex::new(pattern) {
+                for cap in re.captures_iter(&text) {
+                    if let Some(name_match) = cap.get(cap.len() - 1) {
+                        let name = name_match.as_str().trim();
+                        if Database::is_likely_person_name(name) {
+                            names.push(Database::capitalize_name(name));
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Remove duplicates and common words
+        names.sort();
+        names.dedup();
+        names.into_iter()
+            .filter(|name| !Database::is_common_word(name))
+            .collect()
+    }
+    
+    fn is_likely_person_name(name: &str) -> bool {
+        // Filter out common non-name words
+        let non_names = ["the", "and", "or", "but", "if", "when", "where", "what", "who", "how", "why",
+                        "this", "that", "these", "those", "here", "there", "now", "then", "today",
+                        "tomorrow", "yesterday", "said", "told", "asked", "mentioned", "think", "know"];
+        
+        !non_names.contains(&name.to_lowercase().as_str()) && 
+        name.len() > 2 && 
+        name.chars().all(|c| c.is_alphabetic() || c == '\'' || c == '-')
+    }
+    
+    fn is_common_word(name: &str) -> bool {
+        let common_words = ["User", "Assistant", "System", "Admin", "Anonymous", "Guest", "Bot", 
+                           "AI", "Computer", "Machine", "Program", "Software", "App", "Website"];
+        common_words.contains(&name)
+    }
+    
+    fn capitalize_name(name: &str) -> String {
+        let mut result = String::new();
+        let mut capitalize_next = true;
+        
+        for c in name.chars() {
+            if c.is_alphabetic() {
+                if capitalize_next {
+                    result.push(c.to_uppercase().next().unwrap_or(c));
+                    capitalize_next = false;
+                } else {
+                    result.push(c.to_lowercase().next().unwrap_or(c));
+                }
+            } else {
+                result.push(c);
+                if c == ' ' || c == '-' || c == '\'' {
+                    capitalize_next = true;
+                }
+            }
+        }
+        
+        result
+    }
+    
+    fn analyze_context_for_person(name: &str, message: &str) -> ThirdPartyIndividual {
+        let current_time = get_current_date();
+        let relationship_to_user = Database::extract_relationship_to_user(name, message);
+        let occupation = Database::extract_occupation(name, message);
+        let personality_traits = Database::extract_personality_traits(name, message);
+        
+        let importance_score = Database::calculate_person_importance(name, message);
+        
+        ThirdPartyIndividual {
+            id: None,
+            name: name.to_string(),
+            relationship_to_user: relationship_to_user,
+            relationship_to_companion: Some("newly_mentioned".to_string()),
+            occupation: occupation,
+            personality_traits: personality_traits,
+            physical_description: None,
+            first_mentioned: current_time.clone(),
+            last_mentioned: None,
+            mention_count: 1,
+            importance_score,
+            created_at: current_time.clone(),
+            updated_at: current_time,
+        }
+    }
+    
+    fn extract_relationship_to_user(name: &str, message: &str) -> Option<String> {
+        let text = message.to_lowercase();
+        let name_lower = name.to_lowercase();
+        
+        // Look for relationship keywords near the name
+        let relationships = [
+            ("friend", "friend"),
+            ("best friend", "best friend"),
+            ("colleague", "colleague"),
+            ("coworker", "colleague"),
+            ("boss", "boss"),
+            ("manager", "manager"),
+            ("teacher", "teacher"),
+            ("professor", "teacher"),
+            ("doctor", "doctor"),
+            ("neighbor", "neighbor"),
+            ("brother", "brother"),
+            ("sister", "sister"),
+            ("mother", "mother"),
+            ("father", "father"),
+            ("mom", "mother"),
+            ("dad", "father"),
+            ("parent", "parent"),
+            ("cousin", "cousin"),
+            ("uncle", "uncle"),
+            ("aunt", "aunt"),
+            ("boyfriend", "boyfriend"),
+            ("girlfriend", "girlfriend"),
+            ("partner", "partner"),
+            ("spouse", "spouse"),
+            ("husband", "husband"),
+            ("wife", "wife"),
+        ];
+        
+        for (keyword, relationship) in &relationships {
+            if text.contains(&format!("my {} {}", keyword, name_lower)) ||
+               text.contains(&format!("{} is my {}", name_lower, keyword)) ||
+               text.contains(&format!("my {}", keyword)) {
+                return Some(relationship.to_string());
+            }
+        }
+        
+        None
+    }
+    
+    fn extract_occupation(name: &str, message: &str) -> Option<String> {
+        let text = message.to_lowercase();
+        let name_lower = name.to_lowercase();
+        
+        let occupations = [
+            "doctor", "teacher", "engineer", "lawyer", "nurse", "manager", "developer",
+            "programmer", "designer", "artist", "writer", "accountant", "consultant",
+            "analyst", "researcher", "scientist", "professor", "student", "chef",
+            "mechanic", "electrician", "plumber", "carpenter", "architect", "pharmacist",
+        ];
+        
+        for occupation in &occupations {
+            if text.contains(&format!("{} is a {}", name_lower, occupation)) ||
+               text.contains(&format!("{} works as", name_lower)) ||
+               text.contains(&format!("dr. {}", name_lower)) ||
+               text.contains(&format!("professor {}", name_lower)) {
+                return Some(occupation.to_string());
+            }
+        }
+        
+        None
+    }
+    
+    fn extract_personality_traits(name: &str, message: &str) -> Option<String> {
+        let text = message.to_lowercase();
+        let name_lower = name.to_lowercase();
+        
+        let traits = [
+            "kind", "nice", "friendly", "helpful", "smart", "intelligent", "funny",
+            "serious", "quiet", "loud", "outgoing", "shy", "confident", "nervous",
+            "patient", "impatient", "generous", "selfish", "honest", "dishonest",
+            "reliable", "unreliable", "creative", "logical", "emotional", "calm",
+        ];
+        
+        let mut found_traits = Vec::new();
+        for trait_word in &traits {
+            if text.contains(&format!("{} is {}", name_lower, trait_word)) ||
+               text.contains(&format!("{} seems {}", name_lower, trait_word)) ||
+               text.contains(&format!("very {} {}", trait_word, name_lower)) {
+                found_traits.push(trait_word.to_string());
+            }
+        }
+        
+        if found_traits.is_empty() {
+            None
+        } else {
+            Some(found_traits.join(", "))
+        }
+    }
+    
+    fn calculate_person_importance(name: &str, message: &str) -> f32 {
+        let mut importance = 0.5; // Base importance
+        let text = message.to_lowercase();
+        let name_lower = name.to_lowercase();
+        
+        // Increase importance based on relationship closeness
+        if text.contains("best friend") || text.contains("family") {
+            importance += 0.3;
+        } else if text.contains("friend") || text.contains("colleague") {
+            importance += 0.2;
+        } else if text.contains("boss") || text.contains("manager") {
+            importance += 0.2;
+        }
+        
+        // Increase importance based on emotional context
+        let emotional_words = ["love", "hate", "angry", "happy", "sad", "excited", "worried"];
+        for word in &emotional_words {
+            if text.contains(word) {
+                importance += 0.1;
+                break;
+            }
+        }
+        
+        // Increase importance if mentioned multiple times in the same message
+        let mention_count = text.matches(&name_lower).count();
+        if mention_count > 1 {
+            importance += 0.1 * (mention_count - 1) as f32;
+        }
+        
+        // Cap at 1.0
+        importance.min(1.0)
+    }
+    
+    fn generate_initial_attitudes(name: &str, message: &str, companion_id: i32) -> CompanionAttitude {
+        let current_time = get_current_date();
+        let text = message.to_lowercase();
+        
+        // Base neutral attitudes
+        let mut attitude = CompanionAttitude {
+            id: None,
+            companion_id,
+            target_id: 0, // Will be set by caller
+            target_type: "third_party".to_string(),
+            attraction: 0.0,
+            trust: 5.0,
+            fear: 0.0,
+            anger: 0.0,
+            joy: 0.0,
+            sorrow: 0.0,
+            disgust: 0.0,
+            surprise: 15.0, // New person = some surprise
+            curiosity: 20.0, // New person = high curiosity
+            respect: 10.0,
+            suspicion: 5.0, // Slight initial caution
+            gratitude: 0.0,
+            jealousy: 0.0,
+            empathy: 10.0,
+            relationship_score: None,
+            last_updated: current_time.clone(),
+            created_at: current_time,
+        };
+        
+        // Adjust based on relationship context
+        if let Some(relationship) = Database::extract_relationship_to_user(name, message) {
+            match relationship.as_str() {
+                "friend" | "best friend" => {
+                    attitude.trust += 15.0;
+                    attitude.joy += 10.0;
+                    attitude.respect += 10.0;
+                    attitude.suspicion -= 5.0;
+                }
+                "family" | "brother" | "sister" | "mother" | "father" => {
+                    attitude.trust += 20.0;
+                    attitude.joy += 15.0;
+                    attitude.respect += 15.0;
+                    attitude.empathy += 10.0;
+                    attitude.suspicion = 0.0;
+                }
+                "boss" | "manager" => {
+                    attitude.respect += 20.0;
+                    attitude.fear += 10.0;
+                    attitude.curiosity += 10.0;
+                }
+                "colleague" | "coworker" => {
+                    attitude.trust += 10.0;
+                    attitude.respect += 10.0;
+                }
+                _ => {}
+            }
+        }
+        
+        // Adjust based on emotional context in the message
+        if text.contains("love") || text.contains("adore") {
+            attitude.attraction += 15.0;
+            attitude.joy += 20.0;
+        } else if text.contains("hate") || text.contains("dislike") {
+            attitude.anger += 15.0;
+            attitude.disgust += 10.0;
+            attitude.trust -= 10.0;
+        } else if text.contains("worried") || text.contains("concerned") {
+            attitude.fear += 10.0;
+            attitude.empathy += 10.0;
+        } else if text.contains("excited") || text.contains("happy") {
+            attitude.joy += 15.0;
+            attitude.curiosity += 10.0;
+        }
+        
+        // Clamp all values to valid range
+        Database::clamp_attitude_values(&mut attitude);
+        attitude
+    }
+    
+    fn clamp_attitude_values(attitude: &mut CompanionAttitude) {
+        attitude.attraction = attitude.attraction.max(-100.0).min(100.0);
+        attitude.trust = attitude.trust.max(-100.0).min(100.0);
+        attitude.fear = attitude.fear.max(-100.0).min(100.0);
+        attitude.anger = attitude.anger.max(-100.0).min(100.0);
+        attitude.joy = attitude.joy.max(-100.0).min(100.0);
+        attitude.sorrow = attitude.sorrow.max(-100.0).min(100.0);
+        attitude.disgust = attitude.disgust.max(-100.0).min(100.0);
+        attitude.surprise = attitude.surprise.max(-100.0).min(100.0);
+        attitude.curiosity = attitude.curiosity.max(-100.0).min(100.0);
+        attitude.respect = attitude.respect.max(-100.0).min(100.0);
+        attitude.suspicion = attitude.suspicion.max(-100.0).min(100.0);
+        attitude.gratitude = attitude.gratitude.max(-100.0).min(100.0);
+        attitude.jealousy = attitude.jealousy.max(-100.0).min(100.0);
+        attitude.empathy = attitude.empathy.max(-100.0).min(100.0);
     }
 }

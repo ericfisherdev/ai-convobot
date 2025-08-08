@@ -253,6 +253,7 @@ dependencies = [
  "llm",
  "png",
  "rand 0.8.5",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
