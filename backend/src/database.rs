@@ -2,6 +2,9 @@ use rusqlite::{Connection, Error, Result, ToSql, params};
 use rusqlite::types::{FromSql, FromSqlError, ValueRef, ToSqlOutput};
 use serde::{Serialize, Deserialize};
 use chrono::{DateTime, Local};
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crate::character_card::CharacterCard;
 
@@ -450,7 +453,27 @@ fn generate_memory_description(memory_type: &str, delta: &AttitudeDelta, impact_
     }
 }
 
+// Database query cache for performance optimization
+lazy_static::lazy_static! {
+    static ref DB_CACHE: Arc<Mutex<HashMap<String, (String, Instant)>>> = Arc::new(Mutex::new(HashMap::new()));
+    static ref MESSAGE_CACHE: Arc<Mutex<HashMap<String, (Vec<Message>, Instant)>>> = Arc::new(Mutex::new(HashMap::new()));
+}
+
 pub struct Database {}
+
+impl Database {
+    pub fn clear_message_cache() {
+        if let Ok(mut cache) = MESSAGE_CACHE.lock() {
+            cache.clear();
+        }
+    }
+    
+    pub fn clear_db_cache() {
+        if let Ok(mut cache) = DB_CACHE.lock() {
+            cache.clear();
+        }
+    }
+}
 
 impl Database {
     pub fn new() -> Result<usize> {
@@ -546,6 +569,15 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_companion_attitudes_target ON companion_attitudes(target_id, target_type)", []
         )?;
         con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_companion_attitudes_compound ON companion_attitudes(companion_id, target_id, target_type)", []
+        )?;
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_order ON messages(id DESC)", []
+        )?;
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at)", []
+        )?;
+        con.execute(
             "CREATE INDEX IF NOT EXISTS idx_companion_attitudes_relationship ON companion_attitudes(relationship_score)", []
         )?;
         con.execute(
@@ -620,13 +652,28 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_third_party_name ON third_party_individuals(name)", []
         )?;
         con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_third_party_importance ON third_party_individuals(importance_score DESC, mention_count DESC)", []
+        )?;
+        con.execute(
             "CREATE INDEX IF NOT EXISTS idx_third_party_memories_party ON third_party_memories(third_party_id)", []
         )?;
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_third_party_memories_companion ON third_party_memories(companion_id)", []
         )?;
         con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_third_party_memories_importance ON third_party_memories(importance DESC, created_at DESC)", []
+        )?;
+        con.execute(
             "CREATE INDEX IF NOT EXISTS idx_third_party_interactions_party ON third_party_interactions(third_party_id)", []
+        )?;
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_third_party_interactions_companion ON third_party_interactions(companion_id)", []
+        )?;
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_third_party_interactions_date ON third_party_interactions(companion_id, COALESCE(actual_date, planned_date) DESC)", []
+        )?;
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_third_party_interactions_type ON third_party_interactions(companion_id, interaction_type, planned_date ASC)", []
         )?;
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_third_party_relationships ON third_party_relationships(from_party_id, to_party_id)", []
@@ -727,6 +774,18 @@ impl Database {
     } */
 
     pub fn get_x_messages(x: usize, index: usize) -> Result<Vec<Message>> {
+        let cache_key = format!("messages:{}:{}", x, index);
+        
+        // Check cache first
+        if let Ok(cache) = MESSAGE_CACHE.lock() {
+            if let Some((messages, timestamp)) = cache.get(&cache_key) {
+                // Cache for 2 minutes for message queries
+                if timestamp.elapsed() < Duration::from_secs(120) {
+                    return Ok(messages.clone());
+                }
+            }
+        }
+        
         let con = Connection::open("companion_database.db")?;
         let mut stmt = con.prepare("SELECT id, ai, content, created_at FROM messages ORDER BY id DESC LIMIT ? OFFSET ?")?;
         let rows = stmt.query_map([x, index], |row| {
@@ -741,7 +800,18 @@ impl Database {
         for row in rows {
             messages.push(row?);
         }
-        Ok(messages.into_iter().rev().collect())
+        let result: Vec<Message> = messages.into_iter().rev().collect();
+        
+        // Cache the results
+        if let Ok(mut cache) = MESSAGE_CACHE.lock() {
+            // Limit cache size
+            if cache.len() > 50 {
+                cache.clear();
+            }
+            cache.insert(cache_key, (result.clone(), Instant::now()));
+        }
+        
+        Ok(result)
     }
     
     pub fn get_total_message_count() -> Result<usize> {
@@ -832,6 +902,10 @@ impl Database {
                 &get_current_date()
             ]
         )?;
+        
+        // Clear message cache when new message is inserted
+        Database::clear_message_cache();
+        
         Ok(())
     }
 
@@ -844,6 +918,10 @@ impl Database {
                 &id.to_string()
             ]
         )?;
+        
+        // Clear message cache when message is edited
+        Database::clear_message_cache();
+        
         Ok(())
     }
 
@@ -853,6 +931,10 @@ impl Database {
             "DELETE FROM messages WHERE id = ?",
             [id],
         )?;
+        
+        // Clear message cache when message is deleted
+        Database::clear_message_cache();
+        
         Ok(())
     }
 
@@ -876,6 +958,9 @@ impl Database {
             "DELETE FROM messages",
             []
         )?;
+        
+        // Clear message cache when all messages are erased
+        Database::clear_message_cache();
         struct CompanionReturn {
             name: String,
             first_message: String

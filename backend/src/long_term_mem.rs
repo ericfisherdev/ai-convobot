@@ -1,14 +1,19 @@
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
-use tantivy::Index;
+use tantivy::{Index, IndexReader};
 use tantivy::error::TantivyError;
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 pub struct LongTermMem {
     index: Index,
     chat_field: Field,
+    reader: Arc<IndexReader>,
+    query_cache: Arc<Mutex<HashMap<String, (Vec<String>, Instant)>>>,
 }
 
 impl LongTermMem {
@@ -23,9 +28,16 @@ impl LongTermMem {
             Ok(index) => index,
             Err(_) => Index::create_in_dir("longterm_memory", schema)?,
         };
+        
+        // Create shared reader for better performance
+        let reader = Arc::new(companion_vector.reader()?);
+        let query_cache = Arc::new(Mutex::new(HashMap::new()));
+        
         Ok(LongTermMem {
             index: companion_vector,
             chat_field,
+            reader,
+            query_cache,
         })
     }
 
@@ -35,10 +47,20 @@ impl LongTermMem {
             self.chat_field => text
         ))?;
         writer.commit()?;
+        
+        // Clear cache when new entries are added to ensure fresh results
+        if let Ok(mut cache) = self.query_cache.lock() {
+            cache.clear();
+        }
+        
         Ok(())
     }
 
     pub fn get_matches(&self, query_string: &str, limit: usize) -> Result<Vec<String>, TantivyError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        
         let mut sanitized_query = query_string.replace("\n", " ");
         sanitized_query = sanitized_query
             .chars()
@@ -46,17 +68,26 @@ impl LongTermMem {
             .collect::<String>()
             .to_lowercase();
     
-        let reader = self.index.reader()?;
-        let searcher = reader.searcher();
+        // Create cache key including limit for proper caching
+        let cache_key = format!("{}:{}", sanitized_query, limit);
+        
+        // Check cache first
+        if let Ok(cache) = self.query_cache.lock() {
+            if let Some((results, timestamp)) = cache.get(&cache_key) {
+                // Cache for 5 minutes
+                if timestamp.elapsed() < Duration::from_secs(300) {
+                    return Ok(results.clone());
+                }
+            }
+        }
+        
+        // Use the shared reader instead of creating a new one
+        let searcher = self.reader.searcher();
         let qp = QueryParser::for_index(&self.index, vec![self.chat_field]);
         let query = match qp.parse_query(&sanitized_query) {
             Ok(q) => q,
             Err(e) => return Err(TantivyError::from(e)),
         };
-    
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
     
         let matches: Vec<(f32, tantivy::DocAddress)> = searcher.search(&query, &TopDocs::with_limit(limit))?;
         let mut result: Vec<String> = Vec::new();
@@ -67,6 +98,15 @@ impl LongTermMem {
             result.push(r.to_string());
         }
     
+        // Cache the results
+        if let Ok(mut cache) = self.query_cache.lock() {
+            // Limit cache size to prevent memory issues
+            if cache.len() > 100 {
+                cache.clear();
+            }
+            cache.insert(cache_key, (result.clone(), Instant::now()));
+        }
+    
         Ok(result)
     }
 
@@ -74,6 +114,30 @@ impl LongTermMem {
         let mut writer = self.index.writer(50_000_000)?;
         writer.delete_all_documents()?;
         writer.commit()?;
+        
+        // Clear cache when memory is erased
+        if let Ok(mut cache) = self.query_cache.lock() {
+            cache.clear();
+        }
+        
         Ok(())
+    }
+    
+    pub fn refresh_reader(&self) -> Result<(), TantivyError> {
+        // Force refresh the reader to see latest changes
+        self.reader.reload()?;
+        Ok(())
+    }
+    
+    pub fn get_cache_stats(&self) -> (usize, usize) {
+        if let Ok(cache) = self.query_cache.lock() {
+            let total_entries = cache.len();
+            let expired_entries = cache.iter()
+                .filter(|(_, (_, timestamp))| timestamp.elapsed() >= Duration::from_secs(300))
+                .count();
+            (total_entries, expired_entries)
+        } else {
+            (0, 0)
+        }
     }
 }
