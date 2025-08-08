@@ -75,6 +75,13 @@ struct MessageQuery {
     limit: Option<usize>,
 }
 
+#[derive(serde::Serialize)]
+struct MessagePage {
+    messages: Vec<Message>,
+    total_count: usize,
+    has_more: bool,
+}
+
 #[get("/api/message")]
 async fn message(query_params: web::Query<MessageQuery>) -> HttpResponse {
     let start_index: usize = query_params.start_index.unwrap_or(0);
@@ -82,7 +89,16 @@ async fn message(query_params: web::Query<MessageQuery>) -> HttpResponse {
     // 50 Messages is the max
     let limit: usize = query_params.limit.unwrap_or(15).min(50);
 
-    // query to database, and return messages
+    // Get total message count for pagination metadata
+    let total_count = match Database::get_total_message_count() {
+        Ok(count) => count,
+        Err(e) => {
+            println!("Failed to get total message count: {}", e);
+            return HttpResponse::InternalServerError().body("Error while getting message count, check logs for more information");
+        }
+    };
+
+    // Query to database, and return messages
     let messages: Vec<Message> = match Database::get_x_messages(limit, start_index) {
         Ok(v) => v,
         Err(e) => {
@@ -90,8 +106,16 @@ async fn message(query_params: web::Query<MessageQuery>) -> HttpResponse {
             return HttpResponse::InternalServerError().body("Error while getting messages from database, check logs for more information");
         },
     };
-    let messages_json = serde_json::to_string(&messages).unwrap_or(String::from("Error serializing messages as JSON"));
-    HttpResponse::Ok().body(messages_json)
+    
+    let has_more = start_index + messages.len() < total_count;
+    let message_page = MessagePage {
+        messages,
+        total_count,
+        has_more,
+    };
+    
+    let page_json = serde_json::to_string(&message_page).unwrap_or(String::from("Error serializing message page as JSON"));
+    HttpResponse::Ok().body(page_json)
 }
 
 #[post("/api/message")]
