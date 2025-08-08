@@ -1,0 +1,66 @@
+{
+  "name": "AI Companion",
+  "short_name": "AI Companion",
+  "description": "Your personal AI companion with advanced conversation and personality tracking",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f0f23",
+  "theme_color": "#dc2626",
+  "orientation": "portrait",
+  "scope": "/",
+  "lang": "en",
+  "categories": ["productivity", "entertainment", "social"],
+  "icons": [
+    {
+      "src": "/ai_companion_logo.jpg",
+      "sizes": "512x512",
+      "type": "image/jpeg",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/ai_companion_logo.jpg", 
+      "sizes": "192x192",
+      "type": "image/jpeg",
+      "purpose": "any"
+    },
+    {
+      "src": "/ai_companion_logo.jpg",
+      "sizes": "144x144", 
+      "type": "image/jpeg",
+      "purpose": "any"
+    },
+    {
+      "src": "/ai_companion_logo.jpg",
+      "sizes": "96x96",
+      "type": "image/jpeg",
+      "purpose": "any"
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "/webui_screenshot.png",
+      "sizes": "1920x1080",
+      "type": "image/png"
+    },
+    {
+      "src": "/webui_screenshot2.png", 
+      "sizes": "1920x1080",
+      "type": "image/png"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "New Chat",
+      "short_name": "New Chat",
+      "url": "/?action=new-chat",
+      "icons": [
+        {
+          "src": "/ai_companion_logo.jpg",
+          "sizes": "96x96",
+          "type": "image/jpeg"
+        }
+      ]
+    }
+  ],
+  "prefer_related_applications": false
+}
