@@ -277,7 +277,7 @@ export function EditData() {
   };
 
   return (
-    <Tabs defaultValue="companion" className="h-[65vh] overflow-y-auto">
+    <Tabs defaultValue="companion" className="w-full max-h-[65vh] overflow-y-auto">
       <TabsList className="grid w-full grid-cols-5">
         <TabsTrigger value="companion">Companion</TabsTrigger>
         <TabsTrigger value="user">User</TabsTrigger>

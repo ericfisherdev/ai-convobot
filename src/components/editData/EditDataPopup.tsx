@@ -50,7 +50,7 @@ export function EditDataPopup() {
         <Settings className="h-4 w-4" />
       </Button>
     </DialogTrigger>
-    <DialogContent className="sm:max-w-[650px] max-h-[85vh] overflow-hidden">
+    <DialogContent className="sm:max-w-[650px] max-h-[85vh] overflow-hidden flex flex-col !translate-x-[-50%] !translate-y-[-50%] !left-[50%] !top-[50%]">
       <EditData />
     </DialogContent>
   </Dialog>
