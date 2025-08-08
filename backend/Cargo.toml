@@ -19,6 +19,7 @@ chrono = "0.4.37"
 png = "0.17.13"
 base64 = "0.22.0"
 rand = "0.8.5"
+regex = "1.10.0"
 llm = { git = "https://github.com/rustformers/llm" , branch = "gguf" }
 # Force console to include std feature to fix indicatif compatibility
 console = { version = "*", features = ["std"] }

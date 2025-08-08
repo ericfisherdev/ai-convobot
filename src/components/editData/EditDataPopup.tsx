@@ -19,7 +19,7 @@ import { EditData } from "./EditData"
 
 export function EditDataPopup() {
     let isMobile = false;
-    let isMobileOrTablet = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    const isMobileOrTablet = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
     if (window.matchMedia('(max-width: 810px)').matches || isMobileOrTablet) {
         isMobile = true;
     }

@@ -1,7 +1,7 @@
 use actix_web::{get, post, delete, put, App, web, HttpResponse, HttpServer};
 use futures_util::StreamExt as _;
 mod database;
-use database::{Database, Message, NewMessage, CompanionView, UserView, ConfigModify, CompanionAttitude, AttitudeMemory};
+use database::{Database, Message, NewMessage, CompanionView, UserView, ConfigModify, CompanionAttitude, ThirdPartyIndividual};
 mod long_term_mem;
 use long_term_mem::LongTermMem;
 mod dialogue_tuning;
@@ -398,6 +398,14 @@ struct Prompt {
 #[post("/api/prompt")]
 async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
     let prompt_message = received.into_inner().prompt.clone();
+    
+    // Automatically detect new persons in the message
+    let companion_id = 1; // Default companion ID
+    if let Err(e) = Database::detect_new_persons_in_message(&prompt_message, companion_id) {
+        eprintln!("Failed to detect persons in message: {}", e);
+        // Continue processing even if person detection fails
+    }
+    
     match Database::insert_message(NewMessage { ai: false, content: prompt_message.to_string() }) {
         Ok(_) => {}
         Err(e) => {
@@ -550,6 +558,54 @@ async fn get_attitude_memories(companion_id: web::Path<i32>) -> HttpResponse {
     }
 }
 
+#[post("/api/persons/detect")]
+async fn detect_persons(received: web::Json<Prompt>) -> HttpResponse {
+    let companion_id = 1; // Default companion ID - in a real system this would come from context
+    
+    match Database::detect_new_persons_in_message(&received.prompt, companion_id) {
+        Ok(new_person_ids) => {
+            let response = serde_json::json!({
+                "detected_persons": new_person_ids,
+                "message": format!("Detected {} new persons", new_person_ids.len())
+            });
+            HttpResponse::Ok().body(response.to_string())
+        },
+        Err(e) => {
+            println!("Failed to detect persons: {}", e);
+            HttpResponse::InternalServerError().body("Error while detecting persons, check logs for more information")
+        }
+    }
+}
+
+#[get("/api/persons")]
+async fn get_all_persons() -> HttpResponse {
+    match Database::get_all_third_party_individuals() {
+        Ok(persons) => {
+            let persons_json = serde_json::to_string(&persons).unwrap_or(String::from("Error serializing persons as JSON"));
+            HttpResponse::Ok().body(persons_json)
+        },
+        Err(e) => {
+            println!("Failed to get all persons: {}", e);
+            HttpResponse::InternalServerError().body("Error while getting persons, check logs for more information")
+        }
+    }
+}
+
+#[get("/api/persons/{name}")]
+async fn get_person_by_name(name: web::Path<String>) -> HttpResponse {
+    match Database::get_third_party_by_name(&name) {
+        Ok(Some(person)) => {
+            let person_json = serde_json::to_string(&person).unwrap_or(String::from("Error serializing person as JSON"));
+            HttpResponse::Ok().body(person_json)
+        },
+        Ok(None) => HttpResponse::NotFound().body("Person not found"),
+        Err(e) => {
+            println!("Failed to get person by name: {}", e);
+            HttpResponse::InternalServerError().body("Error while getting person, check logs for more information")
+        }
+    }
+}
+
 //
 
 #[actix_web::main]
@@ -614,6 +670,9 @@ async fn main() -> std::io::Result<()> {
             .service(get_companion_attitudes)
             .service(update_attitude_dimension)
             .service(get_attitude_memories)
+            .service(detect_persons)
+            .service(get_all_persons)
+            .service(get_person_by_name)
     })
     .bind((hostname, port))?
     .run()
