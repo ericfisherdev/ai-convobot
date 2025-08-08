@@ -1,6 +1,7 @@
 import './App.scss'
 
 import { ThemeProvider } from "@/components/theme-provider"
+import { ThemeCustomizationProvider } from './components/context/themeContext'
 import Footer from './components/Footer'
 import ChatWindow from './components/ChatWindow'
 import { MessagesProvider } from './components/context/messageContext'
@@ -14,21 +15,23 @@ import { Toaster } from "@/components/ui/sonner"
 function App() {
   return (
     <ThemeProvider defaultTheme="dark" storageKey="vite-ui-theme">
-      <ConfigProvider>
-        <UserDataProvider>
-          <CompanionDataProvider>
-            <AttitudeProvider>
-              <MessagesProvider>
-                <div className='max-container'>
-                  <ChatWindow />
-                </div>
-                <Toaster />
-              </MessagesProvider>
-            </AttitudeProvider>
-          </CompanionDataProvider>
-        </UserDataProvider>
-      </ConfigProvider>
-      <Footer />
+      <ThemeCustomizationProvider>
+        <ConfigProvider>
+          <UserDataProvider>
+            <CompanionDataProvider>
+              <AttitudeProvider>
+                <MessagesProvider>
+                  <div className='max-container'>
+                    <ChatWindow />
+                  </div>
+                  <Toaster />
+                </MessagesProvider>
+              </AttitudeProvider>
+            </CompanionDataProvider>
+          </UserDataProvider>
+        </ConfigProvider>
+        <Footer />
+      </ThemeCustomizationProvider>
     </ThemeProvider>
   )
 }
