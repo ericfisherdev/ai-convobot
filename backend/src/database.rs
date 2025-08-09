@@ -216,6 +216,16 @@ pub enum Device {
     Metal,
 }
 
+impl std::fmt::Display for Device {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Device::CPU => write!(f, "CPU"),
+            Device::GPU => write!(f, "GPU"),
+            Device::Metal => write!(f, "Metal"),
+        }
+    }
+}
+
 impl FromSql for Device {
     fn column_result(value: ValueRef<'_>) -> Result<Self, FromSqlError> {
         match value {
@@ -801,6 +811,30 @@ impl Database {
 
         // Migrate companion_attitudes table to add new attitude dimensions if they don't exist
         Database::migrate_companion_attitudes_table(&con)?;
+
+        // Create inference performance metrics table
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS inference_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                model_path TEXT NOT NULL,
+                gpu_layers INTEGER NOT NULL,
+                device_type TEXT DEFAULT 'CPU',
+                tokens_per_second REAL NOT NULL,
+                time_to_first_token REAL NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                total_time REAL GENERATED ALWAYS AS (output_tokens / tokens_per_second + time_to_first_token) STORED,
+                created_at TEXT NOT NULL
+            )", []
+        )?;
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inference_metrics_config ON inference_metrics(model_path, gpu_layers, created_at DESC)",
+            [],
+        )?;
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_inference_metrics_performance ON inference_metrics(tokens_per_second DESC, created_at DESC)",
+            [],
+        )?;
 
         Ok(0)
     }
