@@ -23,6 +23,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./ui/tooltip";
 import { cn } from "../lib/utils";
+import { AttitudeSummaryBar } from "./attitude/AttitudeSummaryBar";
 
 const ChatWindow = () => {
   const companionDataContext = useCompanionData();
@@ -84,6 +85,9 @@ const ChatWindow = () => {
   
       await Promise.all([sendPromise, clearPromise, pushSentMessagePromise]);
       refreshMessages();
+      
+      // Trigger attitude update
+      window.dispatchEvent(new CustomEvent('attitude-update'));
   
     } catch (error) {
       console.error('Error sending message:', error);
@@ -106,6 +110,9 @@ const ChatWindow = () => {
         setUserMessage('');
         setCompanionMessage('');
         setIsImpersonating(false);
+        
+        // Trigger attitude update
+        window.dispatchEvent(new CustomEvent('attitude-update'));
       }
 
     } catch (error) {
@@ -160,6 +167,9 @@ const ChatWindow = () => {
           <div className="flex-1 overflow-hidden">
             <MessageScroll />
           </div>
+          
+          {/* Attitude Summary Bar */}
+          <AttitudeSummaryBar companionId={1} userId={1} />
           
           {/* Input - mobile optimized */}
           {isMobile ? (
