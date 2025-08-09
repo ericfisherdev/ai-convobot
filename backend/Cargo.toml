@@ -24,6 +24,7 @@ tokio = { version = "1.0", features = ["full"] }
 sha2 = "0.10.8"
 lazy_static = "1.4.0"
 uuid = { version = "1.6", features = ["v4", "serde"] }
+walkdir = "2.4"
 llm = { git = "https://github.com/rustformers/llm" , branch = "gguf" }
 # Force console to include std feature to fix indicatif compatibility
 console = { version = "*", features = ["std"] }

@@ -34,3 +34,6 @@ CLAUDE.md
 SPRINTS.md
 release-package/
 backend/release-package/
+
+# Zip files
+*.zip

@@ -836,6 +836,19 @@ impl Database {
             [],
         )?;
 
+        // Create llm_directories table for managing model scan directories
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS llm_directories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT UNIQUE NOT NULL,
+                created_at TEXT NOT NULL
+            )", []
+        )?;
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_llm_directories_path ON llm_directories(path)",
+            [],
+        )?;
+
         Ok(0)
     }
 

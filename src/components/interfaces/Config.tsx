@@ -13,6 +13,7 @@ export enum PromptTemplate {
 export interface ConfigInterface {
     device: Device;
     llm_model_path: string;
+    selected_model_path?: string;
     gpu_layers: number;
     prompt_template: PromptTemplate;
     context_window_size: number;
@@ -22,6 +23,20 @@ export interface ConfigInterface {
     dynamic_gpu_allocation: boolean;
     gpu_safety_margin: number;
     min_free_vram_mb: number;
+}
+
+export interface ModelInfo {
+    path: string;
+    filename: string;
+    size_bytes: number;
+    directory: string;
+    last_modified: string;
+}
+
+export interface DirectoryInfo {
+    id: number;
+    path: string;
+    created_at: string;
 }
 
 export interface GpuMemoryInfo {

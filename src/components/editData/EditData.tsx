@@ -44,6 +44,9 @@ import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, Di
 import { useMessages } from "../context/messageContext"
 import { AttitudeManager } from "../attitude/AttitudeManager"
 import { ThemeSettings } from "./ThemeSettings"
+import { DirectoryManager } from "../llm/DirectoryManager"
+import { LlmModelSelector } from "../llm/LlmModelSelector"
+import { ModelList } from "../llm/ModelList"
 
 export function EditData() {
   const companionDataContext = useCompanionData();
@@ -63,6 +66,7 @@ export function EditData() {
   const [gpuMemoryInfo, setGpuMemoryInfo] = useState<GpuMemoryInfo | null>(null);
   const [layerAllocation, setLayerAllocation] = useState<LayerAllocation | null>(null);
   const [isLoadingGpuInfo, setIsLoadingGpuInfo] = useState(false);
+  const [modelRefreshTrigger, setModelRefreshTrigger] = useState(0);
 
   const { refreshMessages, resetStart } = useMessages();
 
@@ -845,21 +849,31 @@ export function EditData() {
                 )}
               </div>
             </div>
-            <div className="space-y-1">
-              <Label htmlFor="userPersona" className="flex flex-row gap-2">
-              <div className="flex items-center gap-2">
-                Path to your Large Language Model (LLM)
-                <TooltipProvider delayDuration={0}>
-                      <Tooltip>
-                        <TooltipTrigger className="cursor-default"> <Info /></TooltipTrigger>
-                        <TooltipContent>
-                          <p>path on the server to the llm model file with the .gguf extension</p>
-                        </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
+            <div className="space-y-4">
+              <div className="border-b pb-4">
+                <Label className="text-base font-semibold mb-2">LLM Model Management</Label>
+                <div className="mt-4">
+                  <DirectoryManager 
+                    onDirectoriesChange={() => setModelRefreshTrigger(prev => prev + 1)}
+                  />
                 </div>
-                </Label>
-              <Input id="llmModelPath" value={configFormData.llm_model_path} onChange={(e) => setConfigFormData({ ...configData, llm_model_path: e.target.value })} />
+              </div>
+              
+              <div className="space-y-4">
+                <LlmModelSelector
+                  selectedModel={configFormData.llm_model_path}
+                  onModelSelect={(modelPath) => setConfigFormData({ ...configFormData, llm_model_path: modelPath })}
+                  refreshTrigger={modelRefreshTrigger}
+                />
+                
+                <div className="max-h-96 overflow-y-auto">
+                  <ModelList
+                    selectedModel={configFormData.llm_model_path}
+                    onModelSelect={(modelPath) => setConfigFormData({ ...configFormData, llm_model_path: modelPath })}
+                    refreshTrigger={modelRefreshTrigger}
+                  />
+                </div>
+              </div>
             </div>
             <div className="space-y-1">
               <Label htmlFor="promptTemplate">Prompt template</Label>
