@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useMemo } from 'react';
+import React, { useEffect, useState, useMemo, useCallback } from 'react';
 import { Progress } from "../ui/progress";
 import { AttitudeData, ATTITUDE_DIMENSIONS } from '../interfaces/AttitudeData';
 import { useAttitude } from '../context/attitudeContext';
@@ -26,7 +26,7 @@ export const AttitudeSummaryBar: React.FC<AttitudeSummaryBarProps> = ({ companio
     const [loading, setLoading] = useState(true);
 
     // Fetch attitude summary from backend
-    const fetchAttitudeSummary = async () => {
+    const fetchAttitudeSummary = useCallback(async () => {
         try {
             const response = await fetch(`/api/attitude/summary/${companionId}/${userId}`);
             if (response.ok) {
@@ -34,7 +34,7 @@ export const AttitudeSummaryBar: React.FC<AttitudeSummaryBarProps> = ({ companio
                 setAttitude(data.attitude);
                 
                 // Replace placeholders with actual names
-                let formattedSummary = data.summary
+                const formattedSummary = data.summary
                     .replace(/\{\{companion\}\}/g, companionData?.name || 'Companion')
                     .replace(/\{\{user\}\}/g, userData?.name || 'User');
                 setSummary(formattedSummary);
@@ -57,10 +57,11 @@ export const AttitudeSummaryBar: React.FC<AttitudeSummaryBarProps> = ({ companio
         } finally {
             setLoading(false);
         }
-    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [companionId, userId, companionData?.name, userData?.name, getAttitude]); // generateLocalSummary is stable
 
     // Generate summary locally if backend endpoint not available
-    const generateLocalSummary = (attitudeData: AttitudeData) => {
+    const generateLocalSummary = useCallback((attitudeData: AttitudeData) => {
         const companionName = companionData?.name || 'Companion';
         const userName = userData?.name || 'User';
         
@@ -117,7 +118,7 @@ export const AttitudeSummaryBar: React.FC<AttitudeSummaryBarProps> = ({ companio
         }
 
         setSummary(summaryText);
-    };
+    }, [companionData?.name, userData?.name]);
 
     // Filter for significant attitudes (> 30 or < -30)
     const significantAttitudes = useMemo(() => {
@@ -153,7 +154,7 @@ export const AttitudeSummaryBar: React.FC<AttitudeSummaryBarProps> = ({ companio
         if (companionId && userId) {
             fetchAttitudeSummary();
         }
-    }, [companionId, userId]);
+    }, [companionId, userId, fetchAttitudeSummary]);
 
     // Update on message send/receive
     useEffect(() => {
@@ -165,7 +166,7 @@ export const AttitudeSummaryBar: React.FC<AttitudeSummaryBarProps> = ({ companio
         return () => {
             window.removeEventListener('attitude-update', handleAttitudeUpdate);
         };
-    }, [companionId, userId]);
+    }, [fetchAttitudeSummary]);
 
     if (loading || !attitude || significantAttitudes.length === 0) {
         return null;

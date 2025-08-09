@@ -28,15 +28,21 @@ export function VirtualMessageList({
   const [scrollTop, setScrollTop] = useState(0);
   const [isScrolledToBottom, setIsScrolledToBottom] = useState(true);
 
-  // Calculate visible range
+  // Bottom padding constants for proper spacing
+  const BOTTOM_PADDING_MOBILE = 80; // 80px for mobile (input area + buffer)
+  const BOTTOM_PADDING_DESKTOP = 96; // 96px for desktop (input area + buffer)
+  const bottomPadding = isMobile ? BOTTOM_PADDING_MOBILE : BOTTOM_PADDING_DESKTOP;
+  
+  // Calculate visible range accounting for bottom padding
+  const adjustedContainerHeight = containerHeight - bottomPadding;
   const startIndex = Math.max(0, Math.floor(scrollTop / ITEM_HEIGHT) - OVERSCAN);
   const endIndex = Math.min(
     messages.length - 1,
-    Math.floor((scrollTop + containerHeight) / ITEM_HEIGHT) + OVERSCAN
+    Math.floor((scrollTop + adjustedContainerHeight) / ITEM_HEIGHT) + OVERSCAN
   );
 
   const visibleMessages = messages.slice(startIndex, endIndex + 1);
-  const totalHeight = messages.length * ITEM_HEIGHT;
+  const totalHeight = messages.length * ITEM_HEIGHT + bottomPadding;
   const offsetY = startIndex * ITEM_HEIGHT;
 
   // Update container height when component mounts/resizes
@@ -52,11 +58,17 @@ export function VirtualMessageList({
     return () => window.removeEventListener('resize', updateHeight);
   }, []);
 
-  // Auto-scroll to bottom for new messages
+  // Auto-scroll to bottom for new messages with smooth behavior
   useEffect(() => {
     if (isScrolledToBottom && containerRef.current) {
       const container = containerRef.current;
-      container.scrollTop = container.scrollHeight - container.clientHeight;
+      const targetScrollTop = container.scrollHeight - container.clientHeight;
+      
+      // Smooth scroll to bottom
+      container.scrollTo({
+        top: targetScrollTop,
+        behavior: 'smooth'
+      });
     }
   }, [messages.length, isScrolledToBottom]);
 
@@ -64,7 +76,9 @@ export function VirtualMessageList({
   const handleScroll = useCallback((event: React.UIEvent<HTMLDivElement>) => {
     const container = event.currentTarget;
     const newScrollTop = container.scrollTop;
-    const isNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 100;
+    // Account for bottom padding when detecting if near bottom
+    const scrollBuffer = bottomPadding + 50; // Add 50px extra buffer
+    const isNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < scrollBuffer;
     
     setScrollTop(newScrollTop);
     setIsScrolledToBottom(isNearBottom);
@@ -83,7 +97,7 @@ export function VirtualMessageList({
         }
       });
     }
-  }, [hasMoreMessages, isLoadingMore, onLoadMore]);
+  }, [hasMoreMessages, isLoadingMore, onLoadMore, bottomPadding]);
 
   return (
     <div
@@ -154,15 +168,24 @@ export function VirtualMessageList({
         </div>
       </div>
 
-      {/* Bottom padding for mobile */}
-      {isMobile && <div className="h-4" />}
+      {/* Bottom padding for proper message visibility */}
+      <div 
+        className="flex-shrink-0" 
+        style={{ height: `${bottomPadding}px` }}
+      />
       
       {/* Scroll to bottom button */}
       {!isScrolledToBottom && (
         <button
           onClick={() => {
             if (containerRef.current) {
-              containerRef.current.scrollTop = containerRef.current.scrollHeight;
+              const container = containerRef.current;
+              const targetScrollTop = container.scrollHeight - container.clientHeight;
+              
+              container.scrollTo({
+                top: targetScrollTop,
+                behavior: 'smooth'
+              });
               setIsScrolledToBottom(true);
             }
           }}
