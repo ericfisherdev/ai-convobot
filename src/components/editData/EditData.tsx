@@ -303,6 +303,24 @@ export function EditData() {
     }
   };
 
+  const handleClearAttitudes = async () => {
+    try {
+      const response = await fetch("/api/attitude/clear", {
+        method: "DELETE",
+      });
+
+      if (response.ok) {
+        toast.success("Attitudes cleared and reset based on companion persona!");
+      } else {
+        toast.error("Failed to clear attitudes");
+        console.error("Failed to clear attitudes");
+      }
+    } catch (error) {
+      toast.error(`Error while clearing attitudes: ${error}`);
+      console.error("Error while clearing attitudes:", error);
+    }
+  };
+
   const handleExportCharacterJson = async () => {
     try {
       const response = await fetch("/api/companion/characterJson");
@@ -551,6 +569,22 @@ export function EditData() {
                 <DialogFooter>
                   <DialogClose>
                     <Button onClick={handleClearMessages}>Clear chat log</Button>
+                  </DialogClose>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+            <Dialog>
+              <DialogTrigger><Button variant={"outline"} className="grow">Clear attitude</Button></DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Are you absolutely sure?</DialogTitle>
+                  <DialogDescription>
+                  All companion attitudes will be erased and reset to initial values based on the companion's persona. This will reset the relationship progress (this action cannot be undone).
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogFooter>
+                  <DialogClose>
+                    <Button onClick={handleClearAttitudes}>Clear attitude</Button>
                   </DialogClose>
                 </DialogFooter>
               </DialogContent>

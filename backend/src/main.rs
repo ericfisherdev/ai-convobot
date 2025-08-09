@@ -778,6 +778,39 @@ async fn get_attitude_memories(companion_id: web::Path<i32>) -> HttpResponse {
     }
 }
 
+#[delete("/api/attitude/clear")]
+async fn clear_attitudes() -> HttpResponse {
+    let companion_id = 1;
+    let user_id = 1;
+
+    let companion_persona = match Database::get_companion_data() {
+        Ok(companion_data) => companion_data.persona,
+        Err(e) => {
+            println!("Failed to get companion persona: {}", e);
+            return HttpResponse::InternalServerError()
+                .body("Error while getting companion data, check logs for more information");
+        }
+    };
+
+    match Database::clear_companion_attitudes(companion_id) {
+        Ok(_) => {
+            match Database::create_initial_user_attitude(companion_id, user_id, &companion_persona) {
+                Ok(_) => HttpResponse::Ok().body("Attitudes cleared and reset based on companion persona!"),
+                Err(e) => {
+                    println!("Failed to create initial attitude: {}", e);
+                    HttpResponse::InternalServerError()
+                        .body("Attitudes cleared but failed to create initial attitude, check logs for more information")
+                }
+            }
+        }
+        Err(e) => {
+            println!("Failed to clear attitudes: {}", e);
+            HttpResponse::InternalServerError()
+                .body("Error while clearing attitudes, check logs for more information")
+        }
+    }
+}
+
 #[post("/api/persons/detect")]
 async fn detect_persons(received: web::Json<Prompt>) -> HttpResponse {
     let companion_id = 1; // Default companion ID - in a real system this would come from context
@@ -1269,6 +1302,7 @@ async fn main() -> std::io::Result<()> {
             .service(get_attitude_summary)
             .service(update_attitude_dimension)
             .service(get_attitude_memories)
+            .service(clear_attitudes)
             .service(detect_persons)
             .service(get_all_persons)
             .service(get_person_by_name)
