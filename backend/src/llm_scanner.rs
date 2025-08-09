@@ -8,6 +8,12 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
+/// LLM Scanner module for discovering GGUF model files across different platforms.
+/// 
+/// This module handles path normalization and ensures cross-platform compatibility
+/// for Windows, Linux, and macOS filesystems. It uses `Path::display()` for string
+/// conversion to properly handle different path separators and encodings.
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub path: String,
@@ -90,13 +96,13 @@ impl LlmScanner {
                                 .unwrap_or_else(|| "Unknown".to_string());
                             
                             models.push(ModelInfo {
-                                path: path.to_string_lossy().to_string(),
+                                path: path.display().to_string(),
                                 filename: path.file_name()
                                     .unwrap_or_default()
                                     .to_string_lossy()
                                     .to_string(),
                                 size_bytes,
-                                directory: dir_path.to_string_lossy().to_string(),
+                                directory: dir_path.display().to_string(),
                                 last_modified: last_modified_str,
                             });
                         }
@@ -131,18 +137,30 @@ impl LlmScanner {
 
     /// Add a new directory to scan for models
     pub fn add_directory(&self, path: &str) -> Result<()> {
-        let normalized_path = Path::new(path)
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(path))
-            .to_string_lossy()
-            .to_string();
+        // Normalize the path for cross-platform compatibility
+        let path_buf = PathBuf::from(path);
+        
+        // Try to canonicalize, but if it fails (e.g., directory doesn't exist yet),
+        // just clean up the path as much as possible
+        let normalized_path = if let Ok(canonical) = path_buf.canonicalize() {
+            canonical
+        } else {
+            // Clean up the path manually for cross-platform compatibility
+            let cleaned = path_buf
+                .components()
+                .collect::<PathBuf>();
+            cleaned
+        };
+        
+        // Convert to string using display() for better cross-platform compatibility
+        let path_string = normalized_path.display().to_string();
         
         let conn = Connection::open(&self.database_path)?;
         let created_at = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
         
         conn.execute(
             "INSERT OR IGNORE INTO llm_directories (path, created_at) VALUES (?1, ?2)",
-            params![normalized_path, created_at],
+            params![path_string, created_at],
         )?;
         
         Ok(())
@@ -210,7 +228,7 @@ impl LlmScanner {
             // If it's a file path and the file exists, add its parent directory
             if path_buf.is_file() {
                 if let Some(parent) = path_buf.parent() {
-                    let parent_str = parent.to_string_lossy().to_string();
+                    let parent_str = parent.display().to_string();
                     // Add the parent directory to the scan list
                     self.add_directory(&parent_str)?;
                 }
