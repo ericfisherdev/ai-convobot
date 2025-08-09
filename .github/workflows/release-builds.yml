@@ -106,12 +106,45 @@ jobs:
           # Install Visual Studio Build Tools if needed
           choco install visualstudio2022buildtools --package-parameters "--add Microsoft.VisualStudio.Workload.VCTools"
           
-          # Set up CUDA availability flags for Windows
+          # Set up CUDA for Windows builds
           if ("${{ matrix.build_type }}" -eq "cuda") {
-            # For Windows, we assume CUDA is available if requested (GitHub runners may have it)
-            # If not available, the build process will handle fallback
-            echo "CUDA_AVAILABLE=true" | Out-File -FilePath $env:GITHUB_ENV -Append
-            Write-Host "Windows CUDA build requested - assuming CUDA toolkit availability"
+            Write-Host "Setting up CUDA for Windows build..."
+            
+            # Try to install CUDA toolkit on Windows
+            try {
+              # Download and install CUDA toolkit 12.2
+              Write-Host "Downloading CUDA toolkit installer..."
+              $cudaUrl = "https://developer.download.nvidia.com/compute/cuda/12.2.2/network_installers/cuda_12.2.2_windows_network.exe"
+              $cudaInstaller = "$env:TEMP\cuda_installer.exe"
+              Invoke-WebRequest -Uri $cudaUrl -OutFile $cudaInstaller -UseBasicParsing
+              
+              Write-Host "Installing CUDA toolkit (silent install with timeout)..."
+              $process = Start-Process -FilePath $cudaInstaller -ArgumentList "/S" -PassThru -NoNewWindow
+              if (-not $process.WaitForExit(600000)) { # 10 minute timeout
+                $process.Kill()
+                throw "CUDA installation timed out after 10 minutes"
+              }
+              if ($process.ExitCode -ne 0) {
+                throw "CUDA installer exited with code $($process.ExitCode)"
+              }
+              
+              # Set CUDA environment variables
+              $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.2"
+              if (Test-Path $cudaPath) {
+                echo "CUDA_PATH=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+                echo "CUDA_HOME=$cudaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+                echo "PATH=$cudaPath\bin;$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Append
+                echo "CUDA_AVAILABLE=true" | Out-File -FilePath $env:GITHUB_ENV -Append
+                Write-Host "CUDA toolkit installed and configured successfully"
+              } else {
+                throw "CUDA installation directory not found"
+              }
+              
+            } catch {
+              Write-Host "CUDA installation failed: $_"
+              Write-Host "Falling back to CPU-only build"
+              echo "CUDA_AVAILABLE=false" | Out-File -FilePath $env:GITHUB_ENV -Append
+            }
           } else {
             echo "CUDA_AVAILABLE=false" | Out-File -FilePath $env:GITHUB_ENV -Append
           }
@@ -131,19 +164,63 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libssl-dev
           
-          # Install CUDA toolkit for CUDA builds (with better error handling)
+          # Install CUDA toolkit for CUDA builds (with proper error handling)
           if [ "${{ matrix.build_type }}" = "cuda" ]; then
             echo "Setting up CUDA environment..."
-            # Try to install CUDA, but don't fail if it doesn't work
+            
+            # Set up proper environment first
+            export DEBIAN_FRONTEND=noninteractive
+            
+            # Install CUDA toolkit with more robust error handling
             {
+              echo "Downloading CUDA keyring..."
               wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb
+              
+              echo "Installing CUDA keyring..."
               sudo dpkg -i cuda-keyring_1.0-1_all.deb
-              sudo apt-get update
-              sudo apt-get install -y --no-install-recommends cuda-toolkit-12-2
-              echo "CUDA toolkit installed successfully"
-              echo "CUDA_AVAILABLE=true" >> $GITHUB_ENV
+              
+              echo "Updating package lists..."
+              sudo apt-get update -qq
+              
+              echo "Installing CUDA toolkit (this may take several minutes)..."
+              sudo apt-get install -y --no-install-recommends \
+                cuda-toolkit-12-2 \
+                cuda-compiler-12-2 \
+                cuda-libraries-dev-12-2 \
+                cuda-driver-dev-12-2
+              
+              # Verify CUDA installation
+              export PATH="/usr/local/cuda-12.2/bin:$PATH"
+              export LD_LIBRARY_PATH="/usr/local/cuda-12.2/lib64:$LD_LIBRARY_PATH"
+              export CUDA_PATH="/usr/local/cuda-12.2"
+              export CUDA_ROOT="/usr/local/cuda-12.2"
+              export CUDA_HOME="/usr/local/cuda-12.2"
+              export CUDA_INCLUDE_PATH="/usr/local/cuda-12.2/include"
+              export CUDA_LIB_PATH="/usr/local/cuda-12.2/lib64"
+              
+              # Add to GitHub environment for subsequent steps
+              echo "PATH=/usr/local/cuda-12.2/bin:$PATH" >> $GITHUB_ENV
+              echo "LD_LIBRARY_PATH=/usr/local/cuda-12.2/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+              echo "CUDA_PATH=/usr/local/cuda-12.2" >> $GITHUB_ENV
+              echo "CUDA_ROOT=/usr/local/cuda-12.2" >> $GITHUB_ENV
+              echo "CUDA_HOME=/usr/local/cuda-12.2" >> $GITHUB_ENV
+              echo "CUDA_INCLUDE_PATH=/usr/local/cuda-12.2/include" >> $GITHUB_ENV
+              echo "CUDA_LIB_PATH=/usr/local/cuda-12.2/lib64" >> $GITHUB_ENV
+              
+              # Verify nvcc is available
+              if command -v nvcc >/dev/null 2>&1; then
+                nvcc --version
+                echo "CUDA toolkit installed and verified successfully"
+                echo "CUDA_AVAILABLE=true" >> $GITHUB_ENV
+              else
+                echo "NVCC not found in PATH, CUDA installation may have failed"
+                echo "CUDA_AVAILABLE=false" >> $GITHUB_ENV
+                exit 1
+              fi
+              
             } || {
               echo "CUDA installation failed, will build CPU-only version instead"
+              echo "Warning: CUDA build requested but CUDA installation failed"
               echo "CUDA_AVAILABLE=false" >> $GITHUB_ENV
             }
           else
