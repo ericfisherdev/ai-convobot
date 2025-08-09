@@ -14,6 +14,7 @@ import { Label } from "@/components/ui/label"
 import { Textarea } from "../ui/textarea"
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
 import { Info } from "lucide-react"
+import { Switch } from "@/components/ui/switch"
 
 import companionAvatar from "../../assets/companion_avatar.jpg";
 
@@ -34,7 +35,7 @@ import {
 } from "@/components/ui/tooltip"
 import { updateUserData, useUserData } from "../context/userContext"
 import { updateConfigData, useConfigData } from "../context/configContext"
-import { ConfigInterface, Device, PromptTemplate } from "../interfaces/Config"
+import { ConfigInterface, Device, PromptTemplate, GpuMemoryInfo, LayerAllocation } from "../interfaces/Config"
 import { useEffect, useState } from "react"
 import { CompanionData } from "../interfaces/CompanionData"
 import { UserData } from "../interfaces/UserData"
@@ -59,6 +60,10 @@ export function EditData() {
   const configData: ConfigInterface = configContext?.config ?? {} as ConfigInterface;
   const [configFormData, setConfigFormData] = useState<ConfigInterface>(configData);
 
+  const [gpuMemoryInfo, setGpuMemoryInfo] = useState<GpuMemoryInfo | null>(null);
+  const [layerAllocation, setLayerAllocation] = useState<LayerAllocation | null>(null);
+  const [isLoadingGpuInfo, setIsLoadingGpuInfo] = useState(false);
+
   const { refreshMessages, resetStart } = useMessages();
 
   const handleCompanionSave = async () => {
@@ -76,6 +81,41 @@ export function EditData() {
   const handleConfigSave = async () => {
     if (configFormData) {
       await updateConfigData(configFormData);
+      // Refresh GPU info after config save if dynamic allocation is enabled
+      if (configFormData.dynamic_gpu_allocation) {
+        fetchGpuInfo();
+      }
+    }
+  };
+
+  const fetchGpuInfo = async () => {
+    if (configFormData.device === Device.CPU) {
+      setGpuMemoryInfo(null);
+      setLayerAllocation(null);
+      return;
+    }
+
+    setIsLoadingGpuInfo(true);
+    try {
+      const [memoryResponse, allocationResponse] = await Promise.all([
+        fetch('/api/gpu/memory'),
+        fetch('/api/gpu/allocation')
+      ]);
+
+      if (memoryResponse.ok) {
+        const memoryData = await memoryResponse.json();
+        setGpuMemoryInfo(memoryData);
+      }
+
+      if (allocationResponse.ok) {
+        const allocationData = await allocationResponse.json();
+        setLayerAllocation(allocationData);
+      }
+    } catch (error) {
+      console.error('Failed to fetch GPU info:', error);
+      toast.error('Failed to fetch GPU information');
+    } finally {
+      setIsLoadingGpuInfo(false);
     }
   };
 
@@ -93,6 +133,16 @@ export function EditData() {
       setCompanionFormData(companionDataContext.companionData as CompanionData);
     }
   }, [companionDataContext?.companionData]);
+
+  useEffect(() => {
+    if (configContext && configContext.config) {
+      setConfigFormData(configContext.config as ConfigInterface);
+      // Fetch GPU info when device changes or component mounts
+      if (configContext.config.device !== Device.CPU && configContext.config.dynamic_gpu_allocation) {
+        fetchGpuInfo();
+      }
+    }
+  }, [configContext?.config?.device, configContext?.config?.dynamic_gpu_allocation]);
 
   const handleAvatarUpload = async () => {
     if (avatarFile) {
@@ -602,6 +652,164 @@ export function EditData() {
               <Label htmlFor="gpuLayers" className="flex flex-row gap-2">GPU Layers
               </Label>
               <Input id="gpuLayers" type="number" value={configFormData.gpu_layers} onChange={(e) => setConfigFormData({ ...configFormData, gpu_layers: parseInt(e.target.value) })} />
+            </div>
+
+            <div className="space-y-3 p-4 border rounded-lg">
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="dynamicGpuAllocation" className="flex flex-row gap-2">
+                    <div className="flex items-center gap-2">
+                      Dynamic GPU Layer Allocation
+                      <TooltipProvider delayDuration={0}>
+                        <Tooltip>
+                          <TooltipTrigger className="cursor-default"> <Info /></TooltipTrigger>
+                          <TooltipContent>
+                            <p>Automatically optimize GPU layer allocation based on available VRAM</p>
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    </div>
+                  </Label>
+                  <Switch
+                    id="dynamicGpuAllocation"
+                    checked={configFormData.dynamic_gpu_allocation}
+                    onCheckedChange={(checked) => {
+                      setConfigFormData({ ...configFormData, dynamic_gpu_allocation: checked });
+                      if (checked && configFormData.device !== Device.CPU) {
+                        fetchGpuInfo();
+                      }
+                    }}
+                  />
+                </div>
+
+                {configFormData.dynamic_gpu_allocation && (
+                  <>
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="space-y-1">
+                        <Label htmlFor="gpuSafetyMargin" className="flex flex-row gap-2">
+                          Safety Margin
+                          <TooltipProvider delayDuration={0}>
+                            <Tooltip>
+                              <TooltipTrigger className="cursor-default"> <Info /></TooltipTrigger>
+                              <TooltipContent>
+                                <p>Percentage of VRAM to use (0.1-1.0). Lower values are more conservative.</p>
+                              </TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
+                        </Label>
+                        <Input 
+                          id="gpuSafetyMargin" 
+                          type="number" 
+                          step="0.1" 
+                          min="0.1" 
+                          max="1.0"
+                          value={configFormData.gpu_safety_margin} 
+                          onChange={(e) => setConfigFormData({ ...configFormData, gpu_safety_margin: parseFloat(e.target.value) })} 
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <Label htmlFor="minFreeVramMb" className="flex flex-row gap-2">
+                          Min Free VRAM (MB)
+                          <TooltipProvider delayDuration={0}>
+                            <Tooltip>
+                              <TooltipTrigger className="cursor-default"> <Info /></TooltipTrigger>
+                              <TooltipContent>
+                                <p>Minimum VRAM to keep free for system operations</p>
+                              </TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
+                        </Label>
+                        <Input 
+                          id="minFreeVramMb" 
+                          type="number" 
+                          value={configFormData.min_free_vram_mb} 
+                          onChange={(e) => setConfigFormData({ ...configFormData, min_free_vram_mb: parseInt(e.target.value) })} 
+                        />
+                      </div>
+                    </div>
+
+                    {gpuMemoryInfo && (
+                      <div className="space-y-2 p-3 bg-muted rounded-md">
+                        <div className="flex items-center justify-between">
+                          <span className="text-sm font-medium">GPU Memory Status</span>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={fetchGpuInfo}
+                            disabled={isLoadingGpuInfo}
+                          >
+                            {isLoadingGpuInfo ? "Refreshing..." : "Refresh"}
+                          </Button>
+                        </div>
+                        <div className="grid grid-cols-2 gap-2 text-sm">
+                          <div>
+                            <span className="text-muted-foreground">Device:</span> {gpuMemoryInfo.device_name}
+                          </div>
+                          <div>
+                            <span className="text-muted-foreground">Driver:</span> {gpuMemoryInfo.driver_version}
+                          </div>
+                          <div>
+                            <span className="text-muted-foreground">Total VRAM:</span> {(gpuMemoryInfo.total_vram_mb / 1024).toFixed(1)} GB
+                          </div>
+                          <div>
+                            <span className="text-muted-foreground">Available:</span> {(gpuMemoryInfo.available_vram_mb / 1024).toFixed(1)} GB
+                          </div>
+                          <div>
+                            <span className="text-muted-foreground">Utilization:</span> {gpuMemoryInfo.utilization_percent.toFixed(1)}%
+                          </div>
+                        </div>
+
+                        {layerAllocation && (
+                          <div className="mt-2 p-2 bg-background rounded border">
+                            <div className="text-sm font-medium mb-1">Recommended Allocation</div>
+                            <div className="grid grid-cols-2 gap-2 text-sm">
+                              <div>
+                                <span className="text-muted-foreground">GPU Layers:</span> {layerAllocation.gpu_layers}
+                              </div>
+                              <div>
+                                <span className="text-muted-foreground">CPU Layers:</span> {layerAllocation.cpu_layers}
+                              </div>
+                              <div>
+                                <span className="text-muted-foreground">Strategy:</span> {layerAllocation.allocation_strategy}
+                              </div>
+                              <div>
+                                <span className="text-muted-foreground">Est. VRAM:</span> {(layerAllocation.estimated_vram_usage_mb / 1024).toFixed(1)} GB
+                              </div>
+                            </div>
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="mt-2"
+                              onClick={() => {
+                                setConfigFormData({ 
+                                  ...configFormData, 
+                                  gpu_layers: layerAllocation.gpu_layers 
+                                });
+                                toast.success('Applied recommended GPU layer allocation');
+                              }}
+                            >
+                              Apply Recommendation
+                            </Button>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {configFormData.device !== Device.CPU && !gpuMemoryInfo && !isLoadingGpuInfo && (
+                      <div className="p-3 bg-muted rounded-md">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={fetchGpuInfo}
+                          className="w-full"
+                        >
+                          Detect GPU Memory
+                        </Button>
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
             </div>
             <div className="space-y-1">
               <Label htmlFor="userPersona" className="flex flex-row gap-2">

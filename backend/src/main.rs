@@ -21,6 +21,8 @@ mod session_manager;
 use crate::session_manager::{SessionManager, Session};
 mod attitude_formatter;
 use crate::attitude_formatter::AttitudeFormatter;
+mod gpu_allocator;
+use crate::gpu_allocator::{GpuAllocator, GpuMemoryInfo, LayerAllocation};
 #[cfg(test)]
 mod simple_tests;
 
@@ -928,6 +930,102 @@ async fn get_session_stats(
     }
 }
 
+#[get("/api/gpu/memory")]
+async fn get_gpu_memory() -> HttpResponse {
+    let config_data = match Database::get_config() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            println!("Failed to get config: {}", e);
+            return HttpResponse::InternalServerError().body("Failed to get configuration");
+        }
+    };
+
+    let allocator = GpuAllocator::new()
+        .with_safety_margin(config_data.gpu_safety_margin)
+        .with_min_free_vram(config_data.min_free_vram_mb);
+    
+    match allocator.detect_gpu_memory(&config_data.device) {
+        Ok(gpu_info) => {
+            match serde_json::to_string(&gpu_info) {
+                Ok(json) => HttpResponse::Ok().body(json),
+                Err(e) => {
+                    println!("Failed to serialize GPU memory info: {}", e);
+                    HttpResponse::InternalServerError().body("Failed to serialize GPU info")
+                }
+            }
+        }
+        Err(e) => {
+            println!("Failed to detect GPU memory: {}", e);
+            HttpResponse::InternalServerError().body(format!("Failed to detect GPU memory: {}", e))
+        }
+    }
+}
+
+#[get("/api/gpu/allocation")]
+async fn get_gpu_allocation() -> HttpResponse {
+    let config_data = match Database::get_config() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            println!("Failed to get config: {}", e);
+            return HttpResponse::InternalServerError().body("Failed to get configuration");
+        }
+    };
+
+    if !config_data.dynamic_gpu_allocation {
+        let static_allocation = LayerAllocation {
+            gpu_layers: config_data.gpu_layers,
+            cpu_layers: 0, // We don't know total layers without loading the model
+            total_layers: config_data.gpu_layers,
+            estimated_vram_usage_mb: 0,
+            allocation_strategy: crate::gpu_allocator::AllocationStrategy::MaxGpu,
+        };
+        match serde_json::to_string(&static_allocation) {
+            Ok(json) => return HttpResponse::Ok().body(json),
+            Err(e) => {
+                println!("Failed to serialize allocation: {}", e);
+                return HttpResponse::InternalServerError().body("Failed to serialize allocation");
+            }
+        }
+    }
+
+    let allocator = GpuAllocator::new()
+        .with_safety_margin(config_data.gpu_safety_margin)
+        .with_min_free_vram(config_data.min_free_vram_mb);
+    
+    match allocator.detect_gpu_memory(&config_data.device) {
+        Ok(gpu_info) => {
+            let vram_limit = if config_data.vram_limit_gb > 0 { 
+                Some(config_data.vram_limit_gb as f32) 
+            } else { 
+                None 
+            };
+            
+            // Estimate model size (this would ideally come from model metadata)
+            let estimated_model_size_mb = 4096; // 4GB default estimate
+            let estimated_total_layers = 32; // Default layer count
+            
+            let allocation = allocator.calculate_optimal_layers(
+                &gpu_info,
+                estimated_model_size_mb,
+                estimated_total_layers,
+                vram_limit
+            );
+            
+            match serde_json::to_string(&allocation) {
+                Ok(json) => HttpResponse::Ok().body(json),
+                Err(e) => {
+                    println!("Failed to serialize allocation: {}", e);
+                    HttpResponse::InternalServerError().body("Failed to serialize allocation")
+                }
+            }
+        }
+        Err(e) => {
+            println!("Failed to detect GPU memory: {}", e);
+            HttpResponse::InternalServerError().body(format!("Failed to detect GPU memory: {}", e))
+        }
+    }
+}
+
 //
 
 #[actix_web::main]
@@ -1013,6 +1111,8 @@ async fn main() -> std::io::Result<()> {
             .service(update_session_attitude)
             .service(end_session)
             .service(get_session_stats)
+            .service(get_gpu_memory)
+            .service(get_gpu_allocation)
     })
     .bind((hostname, port))?
     .run()

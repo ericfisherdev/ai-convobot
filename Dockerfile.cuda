@@ -1,0 +1,88 @@
+# Multi-stage build for AI Companion (CUDA)
+FROM node:18-alpine AS frontend-builder
+
+WORKDIR /app/frontend
+
+# Copy frontend package files
+COPY package*.json ./
+RUN npm ci --only=production
+
+# Copy frontend source and build
+COPY src/ ./src/
+COPY public/ ./public/
+COPY index.html ./
+COPY vite.config.ts ./
+COPY tsconfig.json ./
+COPY tsconfig.node.json ./
+COPY tailwind.config.js ./
+COPY postcss.config.js ./
+
+# Build frontend
+RUN npm run build
+
+# Rust build stage with CUDA
+FROM nvidia/cuda:12.2-devel-ubuntu22.04 AS backend-builder
+
+# Install Rust
+RUN apt-get update && apt-get install -y \
+    curl \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /app
+
+# Copy backend source
+COPY backend/ ./backend/
+
+# Copy built frontend from previous stage
+COPY --from=frontend-builder /app/frontend/dist ./dist
+
+# Build backend with CUDA support
+WORKDIR /app/backend
+RUN cargo build --release --features cublas
+
+# Runtime stage with CUDA runtime
+FROM nvidia/cuda:12.2-runtime-ubuntu22.04
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app user
+RUN useradd -r -s /bin/false -m -d /app appuser
+
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=backend-builder /app/backend/target/release/ai-companion ./ai-companion
+RUN chmod +x ./ai-companion
+
+# Create directory for models and data
+RUN mkdir -p /app/models /app/data && chown -R appuser:appuser /app
+
+USER appuser
+
+# Expose port
+EXPOSE 3000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:3000/ || exit 1
+
+# Set environment variables
+ENV RUST_LOG=info
+ENV COMPANION_HOST=0.0.0.0
+ENV COMPANION_PORT=3000
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+# Run the application
+CMD ["./ai-companion"]

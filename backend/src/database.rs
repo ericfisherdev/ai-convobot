@@ -288,6 +288,9 @@ pub struct ConfigView {
     pub max_response_tokens: usize,
     pub enable_dynamic_context: bool,
     pub vram_limit_gb: usize,
+    pub dynamic_gpu_allocation: bool,
+    pub gpu_safety_margin: f32,
+    pub min_free_vram_mb: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -300,6 +303,9 @@ pub struct ConfigModify {
     pub max_response_tokens: usize,
     pub enable_dynamic_context: bool,
     pub vram_limit_gb: usize,
+    pub dynamic_gpu_allocation: bool,
+    pub gpu_safety_margin: f32,
+    pub min_free_vram_mb: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -518,7 +524,10 @@ impl Database {
                 context_window_size INTEGER DEFAULT 2048,
                 max_response_tokens INTEGER DEFAULT 512,
                 enable_dynamic_context BOOLEAN DEFAULT true,
-                vram_limit_gb INTEGER DEFAULT 4
+                vram_limit_gb INTEGER DEFAULT 4,
+                dynamic_gpu_allocation BOOLEAN DEFAULT true,
+                gpu_safety_margin REAL DEFAULT 0.8,
+                min_free_vram_mb INTEGER DEFAULT 512
             )", []
         )?;
         con.execute(
@@ -730,7 +739,7 @@ impl Database {
         }
         if Database::is_table_empty("config", &con)? {
             con.execute(
-                "INSERT INTO config (device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb) VALUES (?, ?, 20, ?, 2048, 512, true, 4)",
+                "INSERT INTO config (device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb, dynamic_gpu_allocation, gpu_safety_margin, min_free_vram_mb) VALUES (?, ?, 20, ?, 2048, 512, true, 4, true, 0.8, 512)",
                 &[
                     &Device::CPU as &dyn ToSql,
                     &"path/to/your/gguf/model.gguf",
@@ -1056,7 +1065,7 @@ impl Database {
 
     pub fn get_config() -> Result<ConfigView> {
         let con = Connection::open("companion_database.db")?;
-        let mut stmt = con.prepare("SELECT device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb FROM config LIMIT 1")?;
+        let mut stmt = con.prepare("SELECT device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb, dynamic_gpu_allocation, gpu_safety_margin, min_free_vram_mb FROM config LIMIT 1")?;
         let row = stmt.query_row([], |row| {
             Ok(ConfigView {
                 device: row.get(0)?,
@@ -1067,6 +1076,9 @@ impl Database {
                 max_response_tokens: row.get::<_, Option<usize>>(5)?.unwrap_or(512),
                 enable_dynamic_context: row.get::<_, Option<bool>>(6)?.unwrap_or(true),
                 vram_limit_gb: row.get::<_, Option<usize>>(7)?.unwrap_or(4),
+                dynamic_gpu_allocation: row.get::<_, Option<bool>>(8)?.unwrap_or(true),
+                gpu_safety_margin: row.get::<_, Option<f32>>(9)?.unwrap_or(0.8),
+                min_free_vram_mb: row.get::<_, Option<u64>>(10)?.unwrap_or(512),
             })
         })?;
         Ok(row)
@@ -1089,7 +1101,7 @@ impl Database {
     
         let con = Connection::open("companion_database.db")?;
         con.execute(
-            "UPDATE config SET device = ?, llm_model_path = ?, gpu_layers = ?, prompt_template = ?, context_window_size = ?, max_response_tokens = ?, enable_dynamic_context = ?, vram_limit_gb = ?",
+            "UPDATE config SET device = ?, llm_model_path = ?, gpu_layers = ?, prompt_template = ?, context_window_size = ?, max_response_tokens = ?, enable_dynamic_context = ?, vram_limit_gb = ?, dynamic_gpu_allocation = ?, gpu_safety_margin = ?, min_free_vram_mb = ?",
             &[
                 &device as &dyn ToSql,
                 &config.llm_model_path,
@@ -1099,6 +1111,9 @@ impl Database {
                 &config.max_response_tokens,
                 &config.enable_dynamic_context,
                 &config.vram_limit_gb,
+                &config.dynamic_gpu_allocation,
+                &config.gpu_safety_margin,
+                &config.min_free_vram_mb,
             ]
         )?;
         Ok(())

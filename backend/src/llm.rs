@@ -7,6 +7,7 @@ use crate::long_term_mem::LongTermMem;
 use crate::context_manager::ContextManager;
 use crate::inference_optimizer::INFERENCE_OPTIMIZER;
 use crate::attitude_formatter::AttitudeFormatter;
+use crate::gpu_allocator::GpuAllocator;
 
 pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
     let start_time = std::time::Instant::now();
@@ -45,10 +46,50 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
         let mut params = llm::ModelParameters::default();
         if config.device == Device::GPU || config.device == Device::Metal {
             params.use_gpu = true;
-            params.gpu_layers = Some(config.gpu_layers);
+            
+            // Use dynamic GPU allocation if enabled
+            if config.dynamic_gpu_allocation {
+                let allocator = GpuAllocator::new()
+                    .with_safety_margin(config.gpu_safety_margin)
+                    .with_min_free_vram(config.min_free_vram_mb);
+                
+                match allocator.detect_gpu_memory(&config.device) {
+                    Ok(gpu_info) => {
+                        println!("🔍 GPU Detection: {}", gpu_info);
+                        
+                        let vram_limit = if config.vram_limit_gb > 0 { 
+                            Some(config.vram_limit_gb as f32) 
+                        } else { 
+                            None 
+                        };
+                        
+                        // Estimate model size (this would ideally come from model metadata)
+                        let estimated_model_size_mb = 4096;
+                        let estimated_total_layers = 32;
+                        
+                        let allocation = allocator.calculate_optimal_layers(
+                            &gpu_info,
+                            estimated_model_size_mb,
+                            estimated_total_layers,
+                            vram_limit
+                        );
+                        
+                        println!("🎯 Dynamic Allocation: {}", allocation);
+                        params.gpu_layers = Some(allocation.gpu_layers);
+                    }
+                    Err(e) => {
+                        eprintln!("⚠️ GPU detection failed, using configured layers: {}", e);
+                        params.gpu_layers = Some(config.gpu_layers);
+                    }
+                }
+            } else {
+                println!("📌 Static Allocation: {} GPU layers", config.gpu_layers);
+                params.gpu_layers = Some(config.gpu_layers);
+            }
         } else {
             params.use_gpu = false;
             params.gpu_layers = None;
+            println!("💻 CPU-only inference mode");
         }
         params
     };
