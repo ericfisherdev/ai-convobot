@@ -168,10 +168,7 @@ const ChatWindow = () => {
             <MessageScroll />
           </div>
           
-          {/* Attitude Summary Bar */}
-          <AttitudeSummaryBar companionId={1} userId={1} />
-          
-          {/* Input - mobile optimized */}
+          {/* Input - mobile optimized (moved above attitude summary) */}
           {isMobile ? (
             <MobileChatInput
               value={isImpersonating ? companionMessage : userMessage}
@@ -227,6 +224,9 @@ const ChatWindow = () => {
               </div>
             </div>
           )}
+          
+          {/* Attitude Summary Bar (moved to bottom as status indicator) */}
+          <AttitudeSummaryBar companionId={1} userId={1} />
         </div>
     )
 }
