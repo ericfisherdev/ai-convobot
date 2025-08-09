@@ -191,6 +191,12 @@ impl TokenUsageMonitor {
             attitude.gratitude,
             attitude.jealousy,
             attitude.empathy,
+            attitude.lust,
+            attitude.love,
+            attitude.anxiety,
+            attitude.butterflies,
+            attitude.submissiveness,
+            attitude.dominance,
         ];
 
         // Calculate weighted significance based on intensity and emotional impact
