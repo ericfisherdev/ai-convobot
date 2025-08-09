@@ -19,6 +19,8 @@ mod token_budget;
 use crate::token_budget::{TokenBudget, TokenUsageMonitor};
 mod session_manager;
 use crate::session_manager::{SessionManager, Session};
+mod attitude_formatter;
+use crate::attitude_formatter::AttitudeFormatter;
 #[cfg(test)]
 mod simple_tests;
 
