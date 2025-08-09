@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Card } from "../ui/card";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
@@ -25,7 +25,7 @@ export const AttitudeManager: React.FC<AttitudeManagerProps> = ({ companionId })
         targetName: ''
     });
 
-    const fetchAttitudes = async () => {
+    const fetchAttitudes = useCallback(async () => {
         try {
             const response = await fetch(`/api/attitude/companion/${companionId}`);
             if (response.ok) {
@@ -35,11 +35,11 @@ export const AttitudeManager: React.FC<AttitudeManagerProps> = ({ companionId })
         } catch (error) {
             console.error('Error fetching attitudes:', error);
         }
-    };
+    }, [companionId]);
 
     useEffect(() => {
         fetchAttitudes();
-    }, [companionId]);
+    }, [fetchAttitudes]);
 
     const createNewAttitude = async () => {
         if (!newAttitude.target_id || !newAttitude.targetName) return;

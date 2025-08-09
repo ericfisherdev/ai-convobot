@@ -132,7 +132,7 @@ export function EditData() {
     if (companionDataContext) {
       setCompanionFormData(companionDataContext.companionData as CompanionData);
     }
-  }, [companionDataContext?.companionData]);
+  }, [companionDataContext?.companionData]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (configContext && configContext.config) {
@@ -142,7 +142,7 @@ export function EditData() {
         fetchGpuInfo();
       }
     }
-  }, [configContext?.config?.device, configContext?.config?.dynamic_gpu_allocation]);
+  }, [configContext?.config?.device, configContext?.config?.dynamic_gpu_allocation]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleAvatarUpload = async () => {
     if (avatarFile) {
