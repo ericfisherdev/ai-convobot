@@ -2062,10 +2062,10 @@ impl Database {
         ThirdPartyIndividual {
             id: None,
             name: name.to_string(),
-            relationship_to_user: relationship_to_user,
+            relationship_to_user,
             relationship_to_companion: Some("newly_mentioned".to_string()),
-            occupation: occupation,
-            personality_traits: personality_traits,
+            occupation,
+            personality_traits,
             physical_description: None,
             first_mentioned: current_time.clone(),
             last_mentioned: None,

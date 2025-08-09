@@ -68,18 +68,19 @@ export function MobileChatInput({
       setKeyboardHeight(0);
     };
 
-    if (textareaRef.current) {
-      textareaRef.current.addEventListener('focus', handleFocus);
-      textareaRef.current.addEventListener('blur', handleBlur);
+    const textarea = textareaRef.current;
+    if (textarea) {
+      textarea.addEventListener('focus', handleFocus);
+      textarea.addEventListener('blur', handleBlur);
     }
 
     window.addEventListener('resize', handleResize);
     
     return () => {
       window.removeEventListener('resize', handleResize);
-      if (textareaRef.current) {
-        textareaRef.current.removeEventListener('focus', handleFocus);
-        textareaRef.current.removeEventListener('blur', handleBlur);
+      if (textarea) {
+        textarea.removeEventListener('focus', handleFocus);
+        textarea.removeEventListener('blur', handleBlur);
       }
     };
   }, []);

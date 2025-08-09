@@ -50,7 +50,7 @@ export const SessionProvider: React.FC<SessionProviderProps> = ({ children }) =>
         } else if (companionData) {
             initializeSession();
         }
-    }, [companionData]);
+    }, [companionData]); // eslint-disable-line react-hooks/exhaustive-deps
     
     // Auto-save session activity every 5 minutes
     useEffect(() => {
@@ -61,7 +61,7 @@ export const SessionProvider: React.FC<SessionProviderProps> = ({ children }) =>
         }, 5 * 60 * 1000); // 5 minutes
         
         return () => clearInterval(interval);
-    }, [sessionId]);
+    }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
     
     // Clean up on unmount
     useEffect(() => {
