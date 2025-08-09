@@ -12,9 +12,26 @@ interface AttitudeManagerProps {
     companionId: number;
 }
 
+interface ThirdPartyPerson {
+    id: number;
+    name: string;
+    relationship_to_user?: string;
+    relationship_to_companion?: string;
+    occupation?: string;
+    personality_traits?: string;
+    physical_description?: string;
+    first_mentioned: string;
+    last_mentioned?: string;
+    mention_count: number;
+    importance_score: number;
+    created_at: string;
+    updated_at: string;
+}
+
 export const AttitudeManager: React.FC<AttitudeManagerProps> = ({ companionId }) => {
     const [attitudes, setAttitudes] = useState<AttitudeData[]>([]);
     const [selectedAttitude, setSelectedAttitude] = useState<AttitudeData | null>(null);
+    const [thirdPartyPersons, setThirdPartyPersons] = useState<ThirdPartyPerson[]>([]);
     const [newAttitude, setNewAttitude] = useState<{
         target_id: string;
         target_type: 'user' | 'third_party';
@@ -37,9 +54,31 @@ export const AttitudeManager: React.FC<AttitudeManagerProps> = ({ companionId })
         }
     }, [companionId]);
 
+    const fetchThirdPartyPersons = useCallback(async () => {
+        try {
+            const response = await fetch('/api/persons');
+            if (response.ok) {
+                const data = await response.json();
+                setThirdPartyPersons(data);
+            }
+        } catch (error) {
+            console.error('Error fetching third party persons:', error);
+        }
+    }, []);
+
+    const getTargetName = (attitude: AttitudeData): string => {
+        if (attitude.target_type === 'user') {
+            return 'User';
+        } else {
+            const person = thirdPartyPersons.find(p => p.id === attitude.target_id);
+            return person ? person.name : `Third Party ${attitude.target_id}`;
+        }
+    };
+
     useEffect(() => {
         fetchAttitudes();
-    }, [fetchAttitudes]);
+        fetchThirdPartyPersons();
+    }, [fetchAttitudes, fetchThirdPartyPersons]);
 
     const createNewAttitude = async () => {
         if (!newAttitude.target_id || !newAttitude.targetName) return;
@@ -77,6 +116,7 @@ export const AttitudeManager: React.FC<AttitudeManagerProps> = ({ companionId })
 
             if (response.ok) {
                 fetchAttitudes();
+                fetchThirdPartyPersons(); // Refresh third party list in case a new person was added
                 setNewAttitude({ target_id: '', target_type: 'user', targetName: '' });
             }
         } catch (error) {
@@ -140,7 +180,7 @@ export const AttitudeManager: React.FC<AttitudeManagerProps> = ({ companionId })
                                     <AttitudeDisplay
                                         key={`${attitude.target_id}-${attitude.target_type}`}
                                         attitude={attitude}
-                                        targetName={`${attitude.target_type === 'user' ? 'User' : 'Third Party'} ${attitude.target_id}`}
+                                        targetName={getTargetName(attitude)}
                                         showDetails={false}
                                     />
                                 ))
@@ -171,7 +211,7 @@ export const AttitudeManager: React.FC<AttitudeManagerProps> = ({ companionId })
                                                 key={`${attitude.target_id}-${attitude.target_type}`}
                                                 value={`${attitude.target_id}-${attitude.target_type}`}
                                             >
-                                                {attitude.target_type === 'user' ? 'User' : 'Third Party'} {attitude.target_id}
+                                                {getTargetName(attitude)}
                                             </SelectItem>
                                         ))}
                                     </SelectContent>
@@ -183,7 +223,7 @@ export const AttitudeManager: React.FC<AttitudeManagerProps> = ({ companionId })
                             <div className="space-y-4">
                                 <AttitudeDisplay
                                     attitude={selectedAttitude}
-                                    targetName={`${selectedAttitude.target_type === 'user' ? 'User' : 'Third Party'} ${selectedAttitude.target_id}`}
+                                    targetName={getTargetName(selectedAttitude)}
                                     showDetails={true}
                                 />
                                 

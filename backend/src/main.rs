@@ -925,6 +925,24 @@ async fn detect_interaction(received: web::Json<InteractionQuery>) -> HttpRespon
     }
 }
 
+#[post("/api/persons/cleanup-duplicates")]
+async fn cleanup_duplicate_third_parties() -> HttpResponse {
+    match Database::cleanup_duplicate_third_parties() {
+        Ok(count) => {
+            let response = serde_json::json!({
+                "message": format!("Cleaned up {} duplicate third party entries", count),
+                "cleaned_count": count
+            });
+            HttpResponse::Ok().body(response.to_string())
+        }
+        Err(e) => {
+            println!("Failed to cleanup duplicate third parties: {}", e);
+            HttpResponse::InternalServerError()
+                .body("Error while cleaning up duplicates, check logs for more information")
+        }
+    }
+}
+
 #[post("/api/prompt/stream")]
 async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpResponse {
     let request = received.into_inner();
@@ -1254,6 +1272,7 @@ async fn main() -> std::io::Result<()> {
             .service(detect_persons)
             .service(get_all_persons)
             .service(get_person_by_name)
+            .service(cleanup_duplicate_third_parties)
             .service(plan_interaction)
             .service(get_planned_interactions)
             .service(complete_interaction)

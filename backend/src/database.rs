@@ -1925,7 +1925,20 @@ impl Database {
         let detected_names = Database::extract_person_names(message);
         let mut new_person_ids = Vec::new();
 
+        // Get user name to filter it out from third party detection
+        let user_name = match Database::get_user_data() {
+            Ok(user) => Some(user.name.to_lowercase()),
+            Err(_) => None,
+        };
+
         for name in detected_names {
+            // Skip if this is the user's own name
+            if let Some(ref user_name) = user_name {
+                if name.to_lowercase() == *user_name {
+                    continue;
+                }
+            }
+
             // Check if person already exists
             if Database::get_third_party_by_name(&name)?.is_none() {
                 // Create new third-party individual with context-based initial data
@@ -1960,13 +1973,123 @@ impl Database {
                 Database::add_third_party_memory(person_id, companion_id, &memory)?;
             } else {
                 // Update mention count for existing person
-                if let Some(_existing) = Database::get_third_party_by_name(&name)? {
-                    Database::create_or_update_third_party(&name, None)?;
-                }
+                Database::create_or_update_third_party(&name, None)?;
             }
         }
 
         Ok(new_person_ids)
+    }
+
+    pub fn cleanup_duplicate_third_parties() -> Result<i32> {
+        let con = Connection::open("companion_database.db")?;
+        let mut cleaned_count = 0;
+
+        // Find all duplicate names (case-insensitive)
+        let mut stmt = con.prepare("
+            SELECT LOWER(name) as lower_name, COUNT(*) as count 
+            FROM third_party_individuals 
+            GROUP BY LOWER(name) 
+            HAVING COUNT(*) > 1
+        ")?;
+
+        let duplicate_names: Vec<String> = stmt.query_map([], |row| {
+            Ok(row.get::<_, String>(0)?)
+        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+
+        for lower_name in duplicate_names {
+            // Get all instances of this name
+            let mut instances_stmt = con.prepare("
+                SELECT id, name, relationship_to_user, relationship_to_companion, occupation,
+                       personality_traits, physical_description, first_mentioned, last_mentioned,
+                       mention_count, importance_score, created_at, updated_at
+                FROM third_party_individuals 
+                WHERE LOWER(name) = ? 
+                ORDER BY created_at ASC
+            ")?;
+
+            let instances: Vec<ThirdPartyIndividual> = instances_stmt.query_map([&lower_name], |row| {
+                Ok(ThirdPartyIndividual {
+                    id: Some(row.get(0)?),
+                    name: row.get(1)?,
+                    relationship_to_user: row.get(2)?,
+                    relationship_to_companion: row.get(3)?,
+                    occupation: row.get(4)?,
+                    personality_traits: row.get(5)?,
+                    physical_description: row.get(6)?,
+                    first_mentioned: row.get(7)?,
+                    last_mentioned: row.get(8)?,
+                    mention_count: row.get(9)?,
+                    importance_score: row.get(10)?,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
+                })
+            })?.collect::<std::result::Result<Vec<_>, _>>()?;
+
+            if instances.len() > 1 {
+                // Keep the first instance, merge data from others
+                let keep_id = instances[0].id.unwrap();
+                let mut total_mentions = 0;
+                let mut max_importance = 0.0;
+                let mut earliest_first_mentioned = instances[0].first_mentioned.clone();
+                let mut latest_last_mentioned = instances[0].last_mentioned.clone();
+
+                // Collect data from all instances
+                for instance in &instances {
+                    total_mentions += instance.mention_count;
+                    if instance.importance_score > max_importance {
+                        max_importance = instance.importance_score;
+                    }
+                    if instance.first_mentioned < earliest_first_mentioned {
+                        earliest_first_mentioned = instance.first_mentioned.clone();
+                    }
+                    if let Some(ref last) = instance.last_mentioned {
+                        if latest_last_mentioned.is_none() || last > latest_last_mentioned.as_ref().unwrap() {
+                            latest_last_mentioned = Some(last.clone());
+                        }
+                    }
+                }
+
+                // Update the kept instance with merged data
+                con.execute("
+                    UPDATE third_party_individuals SET 
+                        mention_count = ?,
+                        importance_score = ?,
+                        first_mentioned = ?,
+                        last_mentioned = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                ", params![
+                    total_mentions,
+                    max_importance,
+                    earliest_first_mentioned,
+                    latest_last_mentioned,
+                    get_current_date(),
+                    keep_id
+                ])?;
+
+                // Update attitudes to point to the kept instance
+                for instance in &instances[1..] {
+                    if let Some(delete_id) = instance.id {
+                        con.execute("
+                            UPDATE companion_attitudes SET target_id = ? 
+                            WHERE target_id = ? AND target_type = 'third_party'
+                        ", params![keep_id, delete_id])?;
+
+                        // Update memories to point to the kept instance  
+                        con.execute("
+                            UPDATE third_party_memories SET third_party_id = ?
+                            WHERE third_party_id = ?
+                        ", params![keep_id, delete_id])?;
+
+                        // Delete the duplicate instance
+                        con.execute("DELETE FROM third_party_individuals WHERE id = ?", [delete_id])?;
+                        cleaned_count += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(cleaned_count)
     }
 
     fn extract_person_names(text: &str) -> Vec<String> {
