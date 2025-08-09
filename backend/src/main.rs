@@ -1022,6 +1022,24 @@ async fn cleanup_duplicate_third_parties() -> HttpResponse {
     }
 }
 
+#[post("/api/persons/cleanup-invalid")]
+async fn cleanup_invalid_third_parties() -> HttpResponse {
+    match Database::cleanup_invalid_third_parties() {
+        Ok(count) => {
+            let response = serde_json::json!({
+                "message": format!("Cleaned up {} invalid third party entries", count),
+                "cleaned_count": count
+            });
+            HttpResponse::Ok().body(response.to_string())
+        }
+        Err(e) => {
+            println!("Failed to cleanup invalid third parties: {}", e);
+            HttpResponse::InternalServerError()
+                .body("Error while cleaning up invalid entries, check logs for more information")
+        }
+    }
+}
+
 #[post("/api/prompt/stream")]
 async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpResponse {
     let request = received.into_inner();
@@ -1376,6 +1394,7 @@ async fn main() -> std::io::Result<()> {
             .service(get_all_persons)
             .service(get_person_by_name)
             .service(cleanup_duplicate_third_parties)
+            .service(cleanup_invalid_third_parties)
             .service(plan_interaction)
             .service(get_planned_interactions)
             .service(complete_interaction)
