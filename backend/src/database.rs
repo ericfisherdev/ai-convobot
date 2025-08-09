@@ -1423,6 +1423,129 @@ impl Database {
         Ok(())
     }
 
+    pub fn clear_companion_attitudes(companion_id: i32) -> Result<()> {
+        let con = Connection::open("companion_database.db")?;
+        con.execute(
+            "DELETE FROM companion_attitudes WHERE companion_id = ?",
+            params![companion_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn create_initial_user_attitude(companion_id: i32, user_id: i32, companion_persona: &str) -> Result<i32> {
+        let base_attitude = CompanionAttitude {
+            id: None,
+            companion_id,
+            target_id: user_id,
+            target_type: "user".to_string(),
+            attraction: 50.0,
+            trust: 45.0,
+            fear: 5.0,
+            anger: 5.0,
+            joy: 40.0,
+            sorrow: 10.0,
+            disgust: 5.0,
+            surprise: 30.0,
+            curiosity: 60.0,
+            respect: 40.0,
+            suspicion: 15.0,
+            gratitude: 20.0,
+            jealousy: 10.0,
+            empathy: 50.0,
+            lust: 25.0,
+            love: 30.0,
+            anxiety: 20.0,
+            butterflies: 15.0,
+            submissiveness: 30.0,
+            dominance: 35.0,
+            relationship_score: Some(0.0),
+            last_updated: get_current_date(),
+            created_at: get_current_date(),
+        };
+
+        let adjusted_attitude = Database::adjust_attitude_for_persona(&base_attitude, companion_persona);
+        Database::create_or_update_attitude(companion_id, user_id, "user", &adjusted_attitude)
+    }
+
+    pub fn adjust_attitude_for_persona(base_attitude: &CompanionAttitude, persona: &str) -> CompanionAttitude {
+        let mut attitude = base_attitude.clone();
+        let persona_lower = persona.to_lowercase();
+
+        if persona_lower.contains("shy") || persona_lower.contains("introverted") {
+            attitude.curiosity -= 10.0;
+            attitude.anxiety += 15.0;
+            attitude.trust -= 10.0;
+            attitude.submissiveness += 10.0;
+        }
+
+        if persona_lower.contains("confident") || persona_lower.contains("outgoing") {
+            attitude.curiosity += 15.0;
+            attitude.anxiety -= 10.0;
+            attitude.dominance += 10.0;
+            attitude.attraction += 5.0;
+        }
+
+        if persona_lower.contains("friendly") || persona_lower.contains("warm") {
+            attitude.joy += 15.0;
+            attitude.empathy += 10.0;
+            attitude.trust += 10.0;
+            attitude.gratitude += 10.0;
+        }
+
+        if persona_lower.contains("cold") || persona_lower.contains("distant") {
+            attitude.joy -= 10.0;
+            attitude.empathy -= 15.0;
+            attitude.trust -= 15.0;
+            attitude.suspicion += 10.0;
+        }
+
+        if persona_lower.contains("flirty") || persona_lower.contains("seductive") {
+            attitude.attraction += 15.0;
+            attitude.lust += 20.0;
+            attitude.butterflies += 10.0;
+        }
+
+        if persona_lower.contains("aggressive") || persona_lower.contains("dominant") {
+            attitude.dominance += 15.0;
+            attitude.anger += 10.0;
+            attitude.submissiveness -= 10.0;
+        }
+
+        if persona_lower.contains("submissive") || persona_lower.contains("obedient") {
+            attitude.submissiveness += 15.0;
+            attitude.dominance -= 10.0;
+            attitude.respect += 10.0;
+        }
+
+        if persona_lower.contains("curious") || persona_lower.contains("inquisitive") {
+            attitude.curiosity += 20.0;
+            attitude.surprise += 10.0;
+        }
+
+        attitude.attraction = attitude.attraction.clamp(0.0, 100.0);
+        attitude.trust = attitude.trust.clamp(0.0, 100.0);
+        attitude.fear = attitude.fear.clamp(0.0, 100.0);
+        attitude.anger = attitude.anger.clamp(0.0, 100.0);
+        attitude.joy = attitude.joy.clamp(0.0, 100.0);
+        attitude.sorrow = attitude.sorrow.clamp(0.0, 100.0);
+        attitude.disgust = attitude.disgust.clamp(0.0, 100.0);
+        attitude.surprise = attitude.surprise.clamp(0.0, 100.0);
+        attitude.curiosity = attitude.curiosity.clamp(0.0, 100.0);
+        attitude.respect = attitude.respect.clamp(0.0, 100.0);
+        attitude.suspicion = attitude.suspicion.clamp(0.0, 100.0);
+        attitude.gratitude = attitude.gratitude.clamp(0.0, 100.0);
+        attitude.jealousy = attitude.jealousy.clamp(0.0, 100.0);
+        attitude.empathy = attitude.empathy.clamp(0.0, 100.0);
+        attitude.lust = attitude.lust.clamp(0.0, 100.0);
+        attitude.love = attitude.love.clamp(0.0, 100.0);
+        attitude.anxiety = attitude.anxiety.clamp(0.0, 100.0);
+        attitude.butterflies = attitude.butterflies.clamp(0.0, 100.0);
+        attitude.submissiveness = attitude.submissiveness.clamp(0.0, 100.0);
+        attitude.dominance = attitude.dominance.clamp(0.0, 100.0);
+
+        attitude
+    }
+
     pub fn create_or_update_third_party(
         name: &str,
         initial_data: Option<ThirdPartyIndividual>,
