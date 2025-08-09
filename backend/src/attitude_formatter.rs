@@ -428,6 +428,163 @@ impl AttitudeFormatter {
 
         relationship_weight * 0.7 + emotion_intensity * 0.3
     }
+
+    /// Generate a natural language summary of companion's attitude towards user
+    pub fn generate_natural_language_summary(&self, attitude: &CompanionAttitude) -> String {
+        // Find dominant emotions and their values
+        let mut emotions = vec![
+            ("love", attitude.love),
+            ("attraction", attitude.attraction),
+            ("lust", attitude.lust),
+            ("trust", attitude.trust),
+            ("anger", attitude.anger),
+            ("suspicion", attitude.suspicion),
+            ("curiosity", attitude.curiosity),
+            ("butterflies", attitude.butterflies),
+            ("joy", attitude.joy),
+            ("sorrow", attitude.sorrow),
+            ("fear", attitude.fear),
+            ("anxiety", attitude.anxiety),
+            ("empathy", attitude.empathy),
+            ("respect", attitude.respect),
+        ];
+        
+        // Sort by absolute value (intensity)
+        emotions.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+        
+        let dominant = emotions[0];
+        let secondary = emotions[1];
+        let tertiary = emotions[2];
+        
+        // Generate contextual summary based on emotional combinations
+        match dominant {
+            ("love", val) if val > 80.0 => {
+                if secondary.0 == "trust" && secondary.1 > 70.0 {
+                    "{{companion}} is deeply in love with {{user}}"
+                } else if secondary.0 == "lust" && secondary.1 > 60.0 {
+                    "{{companion}} is passionately in love with {{user}}"
+                } else if secondary.0 == "butterflies" && secondary.1 > 50.0 {
+                    "{{companion}} is madly and nervously in love with {{user}}"
+                } else {
+                    "{{companion}} is deeply in love with {{user}}"
+                }
+            },
+            ("love", val) if val > 60.0 => {
+                if secondary.0 == "attraction" && secondary.1 > 50.0 {
+                    "{{companion}} has strong romantic feelings for {{user}}"
+                } else {
+                    "{{companion}} is falling in love with {{user}}"
+                }
+            },
+            ("attraction", val) if val > 70.0 => {
+                if attitude.lust > 60.0 {
+                    "{{companion}} really wants to be intimate with {{user}}"
+                } else if attitude.butterflies > 50.0 {
+                    "{{companion}} has a huge crush on {{user}}"
+                } else {
+                    "{{companion}} is very attracted to {{user}}"
+                }
+            },
+            ("lust", val) if val > 70.0 => {
+                if attitude.love > 50.0 {
+                    "{{companion}} deeply desires {{user}} romantically"
+                } else {
+                    "{{companion}} is physically drawn to {{user}}"
+                }
+            },
+            ("trust", val) if val > 80.0 => {
+                if attitude.love > 60.0 {
+                    "{{companion}} trusts and loves {{user}} deeply"
+                } else if attitude.respect > 70.0 {
+                    "{{companion}} has complete faith in {{user}}"
+                } else {
+                    "{{companion}} deeply trusts {{user}}"
+                }
+            },
+            ("curiosity", val) if val > 70.0 => {
+                if attitude.butterflies > 60.0 {
+                    "{{companion}} is nervously excited about {{user}}"
+                } else if attitude.attraction > 50.0 {
+                    "{{companion}} is intrigued and attracted to {{user}}"
+                } else {
+                    "{{companion}} is fascinated by {{user}}"
+                }
+            },
+            ("butterflies", val) if val > 70.0 => {
+                if attitude.love > 50.0 {
+                    "{{companion}} gets adorably flustered around {{user}}"
+                } else if attitude.attraction > 50.0 {
+                    "{{companion}} has an intense crush on {{user}}"
+                } else {
+                    "{{companion}} is nervously excited around {{user}}"
+                }
+            },
+            ("joy", val) if val > 70.0 => {
+                if attitude.love > 50.0 {
+                    "{{companion}} is blissfully happy with {{user}}"
+                } else {
+                    "{{companion}} feels very happy around {{user}}"
+                }
+            },
+            ("anger", val) if val > 60.0 => {
+                if attitude.suspicion > 50.0 {
+                    "{{companion}} is upset and distrustful of {{user}}"
+                } else if attitude.sorrow > 40.0 {
+                    "{{companion}} is hurt and angry with {{user}}"
+                } else {
+                    "{{companion}} is upset with {{user}}"
+                }
+            },
+            ("suspicion", val) if val > 60.0 => {
+                if attitude.fear > 40.0 {
+                    "{{companion}} is wary and fearful of {{user}}"
+                } else {
+                    "{{companion}} doesn't trust {{user}}"
+                }
+            },
+            ("sorrow", val) if val > 60.0 => {
+                if attitude.love > 40.0 {
+                    "{{companion}} is heartbroken about {{user}}"
+                } else {
+                    "{{companion}} feels sad about {{user}}"
+                }
+            },
+            ("anxiety", val) if val > 60.0 => {
+                if attitude.attraction > 40.0 {
+                    "{{companion}} is nervously attracted to {{user}}"
+                } else {
+                    "{{companion}} feels anxious around {{user}}"
+                }
+            },
+            ("empathy", val) if val > 70.0 => {
+                if attitude.love > 50.0 {
+                    "{{companion}} deeply cares about {{user}}'s feelings"
+                } else {
+                    "{{companion}} is very understanding of {{user}}"
+                }
+            },
+            _ => {
+                // Check for moderate feelings
+                if dominant.1.abs() > 40.0 {
+                    match dominant.0 {
+                        "love" => "{{companion}} cares about {{user}}",
+                        "attraction" => "{{companion}} is attracted to {{user}}",
+                        "trust" => "{{companion}} trusts {{user}}",
+                        "curiosity" => "{{companion}} is curious about {{user}}",
+                        "joy" => "{{companion}} enjoys being with {{user}}",
+                        _ if dominant.1 < 0.0 => "{{companion}} has negative feelings toward {{user}}",
+                        _ => "{{companion}} has mixed feelings about {{user}}"
+                    }
+                } else if attitude.relationship_score.unwrap_or(0.0) > 30.0 {
+                    "{{companion}} likes {{user}}"
+                } else if attitude.relationship_score.unwrap_or(0.0) < -30.0 {
+                    "{{companion}} dislikes {{user}}"
+                } else {
+                    "{{companion}} feels neutral toward {{user}}"
+                }
+            }
+        }.to_string()
+    }
 }
 
 #[derive(Debug, Clone)]

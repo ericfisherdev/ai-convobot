@@ -696,6 +696,44 @@ async fn get_companion_attitudes(companion_id: web::Path<i32>) -> HttpResponse {
     }
 }
 
+#[derive(serde::Serialize)]
+struct AttitudeSummaryResponse {
+    attitude: CompanionAttitude,
+    summary: String,
+}
+
+#[get("/api/attitude/summary/{companion_id}/{user_id}")]
+async fn get_attitude_summary(path: web::Path<(i32, i32)>) -> HttpResponse {
+    let (companion_id, user_id) = path.into_inner();
+    
+    match Database::get_attitude(companion_id, user_id, "user") {
+        Ok(Some(attitude)) => {
+            let formatter = attitude_formatter::AttitudeFormatter::new();
+            let summary = formatter.generate_natural_language_summary(&attitude);
+            
+            let response = AttitudeSummaryResponse {
+                attitude,
+                summary,
+            };
+            
+            match serde_json::to_string(&response) {
+                Ok(json) => HttpResponse::Ok().body(json),
+                Err(e) => {
+                    println!("Failed to serialize attitude summary: {}", e);
+                    HttpResponse::InternalServerError()
+                        .body("Error while serializing attitude summary")
+                }
+            }
+        }
+        Ok(None) => HttpResponse::NotFound().body("Attitude not found"),
+        Err(e) => {
+            println!("Failed to get attitude for summary: {}", e);
+            HttpResponse::InternalServerError()
+                .body("Error while getting attitude for summary, check logs for more information")
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct AttitudeDimensionUpdate {
     companion_id: i32,
@@ -1210,6 +1248,7 @@ async fn main() -> std::io::Result<()> {
             .service(get_attitude)
             .service(create_or_update_attitude)
             .service(get_companion_attitudes)
+            .service(get_attitude_summary)
             .service(update_attitude_dimension)
             .service(get_attitude_memories)
             .service(detect_persons)
