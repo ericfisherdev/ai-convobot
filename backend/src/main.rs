@@ -27,6 +27,8 @@ mod system_memory;
 // Removed unused system_memory imports
 mod inference_performance;
 use crate::inference_performance::{ModelConfig, ResponseEstimate, INFERENCE_TRACKER};
+mod llm_scanner;
+use crate::llm_scanner::{DirectoryInfo, LlmScanner, ModelInfo};
 #[cfg(test)]
 mod simple_tests;
 
@@ -689,6 +691,79 @@ async fn config_post(received: web::Json<ConfigModify>) -> HttpResponse {
             println!("Failed to update config: {}", e);
             HttpResponse::InternalServerError()
                 .body("Error while updating config, check logs for more information")
+        }
+    }
+}
+
+//              LLM Model Management
+
+#[get("/api/llm/models")]
+async fn get_llm_models() -> HttpResponse {
+    let scanner = LlmScanner::new();
+    
+    // Perform migration of existing config if needed
+    if let Err(e) = scanner.migrate_existing_config() {
+        println!("Warning: Failed to migrate existing config: {}", e);
+    }
+    
+    match scanner.scan_for_models() {
+        Ok(models) => {
+            let models_json = serde_json::to_string(&models)
+                .unwrap_or(String::from("Error serializing models as JSON"));
+            HttpResponse::Ok().body(models_json)
+        }
+        Err(e) => {
+            println!("Failed to scan for models: {}", e);
+            HttpResponse::InternalServerError()
+                .body("Error while scanning for models, check logs for more information")
+        }
+    }
+}
+
+#[get("/api/llm/directories")]
+async fn get_llm_directories() -> HttpResponse {
+    let scanner = LlmScanner::new();
+    match scanner.get_directories() {
+        Ok(directories) => {
+            let directories_json = serde_json::to_string(&directories)
+                .unwrap_or(String::from("Error serializing directories as JSON"));
+            HttpResponse::Ok().body(directories_json)
+        }
+        Err(e) => {
+            println!("Failed to get directories: {}", e);
+            HttpResponse::InternalServerError()
+                .body("Error while getting directories, check logs for more information")
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AddDirectoryRequest {
+    path: String,
+}
+
+#[post("/api/llm/directories")]
+async fn add_llm_directory(received: web::Json<AddDirectoryRequest>) -> HttpResponse {
+    let scanner = LlmScanner::new();
+    match scanner.add_directory(&received.path) {
+        Ok(_) => HttpResponse::Ok().body("Directory added successfully"),
+        Err(e) => {
+            println!("Failed to add directory: {}", e);
+            HttpResponse::InternalServerError()
+                .body("Error while adding directory, check logs for more information")
+        }
+    }
+}
+
+#[delete("/api/llm/directories/{id}")]
+async fn remove_llm_directory(id: web::Path<i32>) -> HttpResponse {
+    let scanner = LlmScanner::new();
+    match scanner.remove_directory(*id) {
+        Ok(_) => HttpResponse::Ok().body("Directory removed successfully"),
+        Err(e) => {
+            println!("Failed to remove directory: {}", e);
+            HttpResponse::InternalServerError()
+                .body("Error while removing directory, check logs for more information")
         }
     }
 }
@@ -1436,6 +1511,10 @@ async fn main() -> std::io::Result<()> {
             .service(regenerate_prompt)
             .service(config)
             .service(config_post)
+            .service(get_llm_models)
+            .service(get_llm_directories)
+            .service(add_llm_directory)
+            .service(remove_llm_directory)
             .service(get_attitude)
             .service(create_or_update_attitude)
             .service(get_companion_attitudes)
