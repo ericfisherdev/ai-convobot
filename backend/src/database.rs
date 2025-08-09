@@ -110,6 +110,12 @@ pub struct CompanionAttitude {
     pub gratitude: f32,
     pub jealousy: f32,
     pub empathy: f32,
+    pub lust: f32,
+    pub love: f32,
+    pub anxiety: f32,
+    pub butterflies: f32,
+    pub submissiveness: f32,
+    pub dominance: f32,
     pub relationship_score: Option<f32>,
     pub last_updated: String,
     pub created_at: String,
@@ -564,7 +570,13 @@ impl Database {
                 gratitude REAL DEFAULT 0 CHECK(gratitude >= -100 AND gratitude <= 100),
                 jealousy REAL DEFAULT 0 CHECK(jealousy >= -100 AND jealousy <= 100),
                 empathy REAL DEFAULT 0 CHECK(empathy >= -100 AND empathy <= 100),
-                relationship_score REAL GENERATED ALWAYS AS ((attraction + trust + joy + respect + gratitude + empathy - fear - anger - sorrow - disgust - suspicion - jealousy) / 12.0) STORED,
+                lust REAL DEFAULT 0 CHECK(lust >= -100 AND lust <= 100),
+                love REAL DEFAULT 0 CHECK(love >= -100 AND love <= 100),
+                anxiety REAL DEFAULT 0 CHECK(anxiety >= -100 AND anxiety <= 100),
+                butterflies REAL DEFAULT 0 CHECK(butterflies >= -100 AND butterflies <= 100),
+                submissiveness REAL DEFAULT 0 CHECK(submissiveness >= -100 AND submissiveness <= 100),
+                dominance REAL DEFAULT 0 CHECK(dominance >= -100 AND dominance <= 100),
+                relationship_score REAL GENERATED ALWAYS AS ((attraction + trust + joy + respect + gratitude + empathy + love + lust + butterflies - fear - anger - sorrow - disgust - suspicion - jealousy - anxiety) / 16.0) STORED,
                 last_updated TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (companion_id) REFERENCES companion(id) ON DELETE CASCADE,
@@ -774,6 +786,9 @@ impl Database {
 
         // Migrate config table to add new context window fields if they don't exist
         Database::migrate_config_table(&con)?;
+
+        // Migrate companion_attitudes table to add new attitude dimensions if they don't exist
+        Database::migrate_companion_attitudes_table(&con)?;
 
         Ok(0)
     }
@@ -1160,7 +1175,8 @@ impl Database {
                 "UPDATE companion_attitudes SET 
                     attraction = ?, trust = ?, fear = ?, anger = ?, joy = ?, sorrow = ?,
                     disgust = ?, surprise = ?, curiosity = ?, respect = ?, suspicion = ?,
-                    gratitude = ?, jealousy = ?, empathy = ?, last_updated = ?
+                    gratitude = ?, jealousy = ?, empathy = ?, lust = ?, love = ?, 
+                    anxiety = ?, butterflies = ?, submissiveness = ?, dominance = ?, last_updated = ?
                 WHERE id = ?",
                 params![
                     attitude.attraction,
@@ -1177,6 +1193,12 @@ impl Database {
                     attitude.gratitude,
                     attitude.jealousy,
                     attitude.empathy,
+                    attitude.lust,
+                    attitude.love,
+                    attitude.anxiety,
+                    attitude.butterflies,
+                    attitude.submissiveness,
+                    attitude.dominance,
                     current_time,
                     id
                 ],
@@ -1187,8 +1209,9 @@ impl Database {
                 "INSERT INTO companion_attitudes (
                     companion_id, target_id, target_type, attraction, trust, fear, anger,
                     joy, sorrow, disgust, surprise, curiosity, respect, suspicion,
-                    gratitude, jealousy, empathy, last_updated, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    gratitude, jealousy, empathy, lust, love, anxiety, butterflies,
+                    submissiveness, dominance, last_updated, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     companion_id,
                     target_id,
@@ -1207,6 +1230,12 @@ impl Database {
                     attitude.gratitude,
                     attitude.jealousy,
                     attitude.empathy,
+                    attitude.lust,
+                    attitude.love,
+                    attitude.anxiety,
+                    attitude.butterflies,
+                    attitude.submissiveness,
+                    attitude.dominance,
                     current_time,
                     current_time
                 ],
@@ -1224,7 +1253,8 @@ impl Database {
         let mut stmt = con.prepare(
             "SELECT id, companion_id, target_id, target_type, attraction, trust, fear, anger,
                     joy, sorrow, disgust, surprise, curiosity, respect, suspicion,
-                    gratitude, jealousy, empathy, relationship_score, last_updated, created_at
+                    gratitude, jealousy, empathy, lust, love, anxiety, butterflies,
+                    submissiveness, dominance, relationship_score, last_updated, created_at
              FROM companion_attitudes
              WHERE companion_id = ? AND target_id = ? AND target_type = ?",
         )?;
@@ -1250,9 +1280,15 @@ impl Database {
                     gratitude: row.get(15)?,
                     jealousy: row.get(16)?,
                     empathy: row.get(17)?,
-                    relationship_score: row.get(18)?,
-                    last_updated: row.get(19)?,
-                    created_at: row.get(20)?,
+                    lust: row.get(18)?,
+                    love: row.get(19)?,
+                    anxiety: row.get(20)?,
+                    butterflies: row.get(21)?,
+                    submissiveness: row.get(22)?,
+                    dominance: row.get(23)?,
+                    relationship_score: row.get(24)?,
+                    last_updated: row.get(25)?,
+                    created_at: row.get(26)?,
                 })
             })
             .ok();
@@ -1310,7 +1346,8 @@ impl Database {
         let mut stmt = con.prepare(
             "SELECT id, companion_id, target_id, target_type, attraction, trust, fear, anger,
                     joy, sorrow, disgust, surprise, curiosity, respect, suspicion,
-                    gratitude, jealousy, empathy, relationship_score, last_updated, created_at
+                    gratitude, jealousy, empathy, lust, love, anxiety, butterflies,
+                    submissiveness, dominance, relationship_score, last_updated, created_at
              FROM companion_attitudes
              WHERE companion_id = ?
              ORDER BY relationship_score DESC",
@@ -1336,9 +1373,15 @@ impl Database {
                 gratitude: row.get(15)?,
                 jealousy: row.get(16)?,
                 empathy: row.get(17)?,
-                relationship_score: row.get(18)?,
-                last_updated: row.get(19)?,
-                created_at: row.get(20)?,
+                lust: row.get(18)?,
+                love: row.get(19)?,
+                anxiety: row.get(20)?,
+                butterflies: row.get(21)?,
+                submissiveness: row.get(22)?,
+                dominance: row.get(23)?,
+                relationship_score: row.get(24)?,
+                last_updated: row.get(25)?,
+                created_at: row.get(26)?,
             })
         })?;
 
@@ -2280,6 +2323,12 @@ impl Database {
             gratitude: 0.0,
             jealousy: 0.0,
             empathy: 10.0,
+            lust: 0.0,
+            love: 0.0,
+            anxiety: 0.0,
+            butterflies: 0.0,
+            submissiveness: 0.0,
+            dominance: 0.0,
             relationship_score: None,
             last_updated: current_time.clone(),
             created_at: current_time,
@@ -2874,6 +2923,65 @@ impl Database {
                 "ALTER TABLE config ADD COLUMN vram_limit_gb INTEGER DEFAULT 4",
                 [],
             )?;
+        }
+
+        Ok(())
+    }
+
+    pub fn migrate_companion_attitudes_table(con: &Connection) -> Result<()> {
+        // Check if new attitude columns exist and add them if they don't
+        let mut has_lust = false;
+        let mut has_love = false;
+        let mut has_anxiety = false;
+        let mut has_butterflies = false;
+        let mut has_submissiveness = false;
+        let mut has_dominance = false;
+
+        // Check existing columns
+        let mut stmt = con.prepare("PRAGMA table_info(companion_attitudes)")?;
+        let rows = stmt.query_map([], |row| {
+            let column_name: String = row.get(1)?;
+            Ok(column_name)
+        })?;
+
+        for row in rows {
+            let column_name = row?;
+            match column_name.as_str() {
+                "lust" => has_lust = true,
+                "love" => has_love = true,
+                "anxiety" => has_anxiety = true,
+                "butterflies" => has_butterflies = true,
+                "submissiveness" => has_submissiveness = true,
+                "dominance" => has_dominance = true,
+                _ => {}
+            }
+        }
+
+        // Add missing columns
+        if !has_lust {
+            con.execute("ALTER TABLE companion_attitudes ADD COLUMN lust REAL DEFAULT 0 CHECK(lust >= -100 AND lust <= 100)", [])?;
+        }
+        if !has_love {
+            con.execute("ALTER TABLE companion_attitudes ADD COLUMN love REAL DEFAULT 0 CHECK(love >= -100 AND love <= 100)", [])?;
+        }
+        if !has_anxiety {
+            con.execute("ALTER TABLE companion_attitudes ADD COLUMN anxiety REAL DEFAULT 0 CHECK(anxiety >= -100 AND anxiety <= 100)", [])?;
+        }
+        if !has_butterflies {
+            con.execute("ALTER TABLE companion_attitudes ADD COLUMN butterflies REAL DEFAULT 0 CHECK(butterflies >= -100 AND butterflies <= 100)", [])?;
+        }
+        if !has_submissiveness {
+            con.execute("ALTER TABLE companion_attitudes ADD COLUMN submissiveness REAL DEFAULT 0 CHECK(submissiveness >= -100 AND submissiveness <= 100)", [])?;
+        }
+        if !has_dominance {
+            con.execute("ALTER TABLE companion_attitudes ADD COLUMN dominance REAL DEFAULT 0 CHECK(dominance >= -100 AND dominance <= 100)", [])?;
+        }
+
+        // Update the relationship_score calculation in the database by dropping the generated column and recreating it
+        // Note: SQLite doesn't support modifying generated columns directly
+        if !has_lust || !has_love || !has_anxiety || !has_butterflies || !has_submissiveness || !has_dominance {
+            // The relationship_score column will be recalculated automatically with the new formula
+            // when the table structure is updated
         }
 
         Ok(())

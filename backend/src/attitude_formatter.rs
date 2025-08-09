@@ -165,6 +165,31 @@ impl AttitudeFormatter {
             emotions.push("sad");
         }
 
+        // New attitude dimensions
+        if attitude.lust > 70.0 {
+            emotions.push("very lustful");
+        } else if attitude.lust > self.medium_threshold {
+            emotions.push("physically attracted");
+        }
+
+        if attitude.love > 80.0 {
+            emotions.push("deeply in love");
+        } else if attitude.love > self.medium_threshold {
+            emotions.push("in love");
+        }
+
+        if attitude.anxiety > 70.0 {
+            emotions.push("very anxious");
+        } else if attitude.anxiety > self.medium_threshold {
+            emotions.push("nervous");
+        }
+
+        if attitude.butterflies > 80.0 {
+            emotions.push("completely flustered");
+        } else if attitude.butterflies > self.medium_threshold {
+            emotions.push("giddy");
+        }
+
         if emotions.is_empty() {
             "emotionally balanced".to_string()
         } else {
@@ -230,6 +255,31 @@ impl AttitudeFormatter {
                 instructions.push("be more casual or dismissive, less concerned with politeness")
             }
             _ => {}
+        }
+
+        // New attitude dimensions behavioral instructions
+        if attitude.lust > self.medium_threshold {
+            instructions.push("show physical attraction subtly, use more sensual language");
+        }
+
+        if attitude.love > 70.0 {
+            instructions.push("express romantic feelings, be affectionate and caring");
+        }
+
+        if attitude.anxiety > self.medium_threshold {
+            instructions.push("be hesitant and uncertain, show nervous energy");
+        }
+
+        if attitude.butterflies > self.medium_threshold {
+            instructions.push("be adorably clumsy with words, show excited nervousness, giggle or stutter occasionally");
+        }
+
+        if attitude.submissiveness > 60.0 {
+            instructions.push("be eager to please, ask for approval, defer decisions to user");
+        }
+
+        if attitude.dominance > 60.0 {
+            instructions.push("take charge, give gentle commands, show protective authority");
         }
 
         instructions.join("; ")
@@ -367,8 +417,14 @@ impl AttitudeFormatter {
             + attitude.joy.abs()
             + attitude.trust.abs()
             + attitude.fear.abs()
-            + attitude.curiosity.abs())
-            / 500.0; // Normalize across 5 key emotions
+            + attitude.curiosity.abs()
+            + attitude.lust.abs()
+            + attitude.love.abs()
+            + attitude.anxiety.abs()
+            + attitude.butterflies.abs()
+            + attitude.submissiveness.abs()
+            + attitude.dominance.abs())
+            / 1100.0; // Normalize across 11 key emotions
 
         relationship_weight * 0.7 + emotion_intensity * 0.3
     }
@@ -410,6 +466,12 @@ mod tests {
             gratitude: 70.0,
             jealousy: 5.0,
             suspicion: 0.0,
+            lust: 0.0,
+            love: 0.0,
+            anxiety: 0.0,
+            butterflies: 0.0,
+            submissiveness: 0.0,
+            dominance: 0.0,
             relationship_score: Some(85.0),
             last_updated: Utc::now().to_string(),
             created_at: Utc::now().to_string(),
@@ -442,6 +504,12 @@ mod tests {
             gratitude: 50.0,
             jealousy: 0.0,
             suspicion: 0.0,
+            lust: 0.0,
+            love: 0.0,
+            anxiety: 0.0,
+            butterflies: 0.0,
+            submissiveness: 0.0,
+            dominance: 0.0,
             relationship_score: Some(60.0),
             last_updated: Utc::now().to_string(),
             created_at: Utc::now().to_string(),
@@ -474,6 +542,12 @@ mod tests {
             gratitude: 50.0,
             jealousy: 0.0,
             suspicion: 0.0,
+            lust: 0.0,
+            love: 0.0,
+            anxiety: 0.0,
+            butterflies: 0.0,
+            submissiveness: 0.0,
+            dominance: 0.0,
             relationship_score: Some(65.0),
             last_updated: Utc::now().to_string(),
             created_at: Utc::now().to_string(),
