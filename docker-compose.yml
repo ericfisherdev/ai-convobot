@@ -1,0 +1,94 @@
+version: '3.8'
+
+services:
+  # CPU-only version
+  ai-companion-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./models:/app/models:ro
+      - ./data:/app/data
+    environment:
+      - RUST_LOG=info
+      - COMPANION_HOST=0.0.0.0
+      - COMPANION_PORT=3000
+    restart: unless-stopped
+    profiles:
+      - cpu
+
+  # CUDA version (requires NVIDIA Docker)
+  ai-companion-cuda:
+    build:
+      context: .
+      dockerfile: Dockerfile.cuda
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./models:/app/models:ro
+      - ./data:/app/data
+    environment:
+      - RUST_LOG=info
+      - COMPANION_HOST=0.0.0.0
+      - COMPANION_PORT=3000
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    restart: unless-stopped
+    profiles:
+      - cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Alternative CUDA service using pre-built image (if available)
+  ai-companion-cuda-prebuilt:
+    image: ${DOCKER_USERNAME:-ericfisherdev}/ai-companion:latest-cuda
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./models:/app/models:ro
+      - ./data:/app/data
+    environment:
+      - RUST_LOG=info
+      - COMPANION_HOST=0.0.0.0
+      - COMPANION_PORT=3000
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    restart: unless-stopped
+    profiles:
+      - prebuilt-cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # CPU pre-built image
+  ai-companion-cpu-prebuilt:
+    image: ${DOCKER_USERNAME:-ericfisherdev}/ai-companion:latest-cpu
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./models:/app/models:ro
+      - ./data:/app/data
+    environment:
+      - RUST_LOG=info
+      - COMPANION_HOST=0.0.0.0
+      - COMPANION_PORT=3000
+    restart: unless-stopped
+    profiles:
+      - prebuilt-cpu
+
+volumes:
+  models:
+    driver: local
+  data:
+    driver: local
