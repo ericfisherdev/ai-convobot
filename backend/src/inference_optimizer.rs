@@ -5,7 +5,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use sha2::{Sha256, Digest};
 
-use crate::database::{ConfigView, Message};
+use crate::database::Message;
 
 /// Cache entry for frequently used prompts
 #[derive(Debug, Clone)]

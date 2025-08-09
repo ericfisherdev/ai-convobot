@@ -1,7 +1,7 @@
 use actix_web::{get, post, delete, put, App, web, HttpResponse, HttpServer};
 use futures_util::StreamExt as _;
 mod database;
-use database::{Database, Message, NewMessage, CompanionView, UserView, ConfigModify, CompanionAttitude, ThirdPartyIndividual, ThirdPartyInteraction};
+use database::{Database, Message, NewMessage, CompanionView, UserView, ConfigModify, CompanionAttitude, ThirdPartyInteraction};
 mod long_term_mem;
 use long_term_mem::LongTermMem;
 mod dialogue_tuning;
@@ -12,17 +12,14 @@ use serde::Deserialize;
 mod llm;
 use crate::llm::prompt;
 mod context_manager;
-use crate::context_manager::{ContextManager, OptimizedContext};
 mod inference_optimizer;
 use crate::inference_optimizer::{INFERENCE_OPTIMIZER, StreamChunk};
 mod token_budget;
-use crate::token_budget::{TokenBudget, TokenUsageMonitor};
 mod session_manager;
-use crate::session_manager::{SessionManager, Session};
+use crate::session_manager::SessionManager;
 mod attitude_formatter;
-use crate::attitude_formatter::AttitudeFormatter;
 mod gpu_allocator;
-use crate::gpu_allocator::{GpuAllocator, GpuMemoryInfo, LayerAllocation};
+use crate::gpu_allocator::{GpuAllocator, LayerAllocation};
 #[cfg(test)]
 mod simple_tests;
 

@@ -1,5 +1,4 @@
-use crate::database::{ConfigView, Message, CompanionAttitude, ThirdPartyIndividual};
-use std::collections::HashMap;
+use crate::database::{Message, CompanionAttitude, ThirdPartyIndividual};
 
 #[derive(Debug, Clone)]
 pub struct TokenBudget {
