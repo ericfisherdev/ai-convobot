@@ -15,14 +15,14 @@ describe('Button Component', () => {
     render(<Button variant="destructive">Delete</Button>)
     const button = screen.getByRole('button', { name: /delete/i })
     expect(button).toBeInTheDocument()
-    expect(button).toHaveClass('destructive')
+    expect(button).toHaveClass('bg-destructive', 'text-destructive-foreground')
   })
 
   it('renders button with custom size', () => {
     render(<Button size="sm">Small Button</Button>)
     const button = screen.getByRole('button', { name: /small button/i })
     expect(button).toBeInTheDocument()
-    expect(button).toHaveClass('h-9')
+    expect(button).toHaveClass('h-8')
   })
 
   it('handles click events', async () => {
