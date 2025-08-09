@@ -12,9 +12,11 @@ use serde::Deserialize;
 mod llm;
 use crate::llm::prompt;
 mod context_manager;
-use crate::context_manager::ContextManager;
+use crate::context_manager::{ContextManager, OptimizedContext};
 mod inference_optimizer;
 use crate::inference_optimizer::{INFERENCE_OPTIMIZER, StreamChunk};
+mod token_budget;
+use crate::token_budget::{TokenBudget, TokenUsageMonitor};
 #[cfg(test)]
 mod simple_tests;
 

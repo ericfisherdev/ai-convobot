@@ -1,7 +1,11 @@
-use crate::database::{ConfigView, Message};
+use crate::database::{ConfigView, Message, CompanionAttitude, ThirdPartyIndividual};
+use crate::token_budget::{TokenBudget, TokenUsageMonitor, TokenUsageStatistics};
 
 pub struct ContextManager {
     pub config: ConfigView,
+    pub token_budget: TokenBudget,
+    pub usage_monitor: TokenUsageMonitor,
+    // Legacy fields for backward compatibility
     pub system_token_budget: usize,
     pub attitude_token_budget: usize,
     pub message_token_budget: usize,
@@ -16,14 +20,20 @@ impl ContextManager {
             config.context_window_size
         };
         
-        // Allocate token budget based on the specification
-        let system_token_budget = (context_size as f32 * 0.20) as usize;     // 20% for system prompt
-        let attitude_token_budget = (context_size as f32 * 0.10) as usize;   // 10% for attitude data
-        let message_token_budget = (context_size as f32 * 0.50) as usize;    // 50% for messages
-        let response_token_budget = (context_size as f32 * 0.20) as usize;   // 20% for response buffer
+        // Create comprehensive token budget system
+        let token_budget = TokenBudget::from_vram_limit(config.vram_limit_gb, context_size);
+        let usage_monitor = TokenUsageMonitor::new(token_budget.clone());
+        
+        // Legacy allocations for backward compatibility
+        let system_token_budget = token_budget.system_prompt;
+        let attitude_token_budget = token_budget.attitude_data;
+        let message_token_budget = token_budget.recent_messages;
+        let response_token_budget = token_budget.response_buffer;
         
         Self {
             config,
+            token_budget,
+            usage_monitor,
             system_token_budget,
             attitude_token_budget,
             message_token_budget,
@@ -127,7 +137,7 @@ impl ContextManager {
         total_tokens <= self.config.context_window_size
     }
     
-    /// Get memory usage statistics
+    /// Get memory usage statistics (legacy method)
     pub fn get_memory_stats(&self, system_tokens: usize, attitude_tokens: usize, message_tokens: usize) -> MemoryStats {
         let used_tokens = system_tokens + attitude_tokens + message_tokens;
         let available_response_tokens = self.get_response_token_limit(used_tokens);
@@ -142,6 +152,201 @@ impl ContextManager {
             total_available_tokens: self.config.context_window_size,
             utilization_percentage: (total_used as f32 / self.config.context_window_size as f32 * 100.0) as u8,
         }
+    }
+    
+    /// Comprehensive context optimization using the new token budget system
+    pub fn optimize_full_context(&mut self, 
+        system_prompt: &str,
+        messages: Vec<Message>,
+        attitudes: Vec<CompanionAttitude>,
+        third_parties: Vec<ThirdPartyIndividual>
+    ) -> OptimizedContext {
+        // Estimate system prompt tokens
+        let system_tokens = TokenUsageMonitor::estimate_tokens(system_prompt);
+        self.usage_monitor.current_usage.system_tokens = system_tokens;
+        
+        // Optimize each component using the advanced token budget system
+        let optimized_attitudes = self.usage_monitor.optimize_attitude_context(attitudes);
+        let optimized_third_parties = self.usage_monitor.optimize_third_party_context(third_parties);
+        let optimized_messages = self.usage_monitor.optimize_message_context(messages);
+        
+        // Get comprehensive usage statistics
+        let usage_stats = self.usage_monitor.get_usage_statistics();
+        let optimization_suggestions = self.usage_monitor.get_optimization_suggestions();
+        
+        OptimizedContext {
+            system_prompt: system_prompt.to_string(),
+            messages: optimized_messages,
+            attitudes: optimized_attitudes,
+            third_parties: optimized_third_parties,
+            usage_statistics: usage_stats,
+            optimization_suggestions,
+            overflow_detected: self.check_overflow_risk(),
+        }
+    }
+    
+    /// Check if we're at risk of context overflow
+    fn check_overflow_risk(&self) -> bool {
+        let total_context = self.usage_monitor.current_usage.total_context_tokens;
+        let safety_threshold = (self.token_budget.total as f32 * 0.85) as usize;
+        total_context > safety_threshold
+    }
+    
+    /// Get token budget allocation summary
+    pub fn get_budget_summary(&self) -> String {
+        self.token_budget.get_allocation_summary()
+    }
+    
+    /// Reset usage monitor for new conversation
+    pub fn reset_usage_monitor(&mut self) {
+        self.usage_monitor = TokenUsageMonitor::new(self.token_budget.clone());
+    }
+    
+    /// Get optimization suggestions based on usage patterns
+    pub fn get_context_optimization_suggestions(&self) -> Vec<String> {
+        self.usage_monitor.get_optimization_suggestions()
+    }
+    
+    /// Format context for LLM prompt with priority-based inclusion
+    pub fn format_optimized_prompt(&self, context: &OptimizedContext) -> String {
+        let mut prompt_parts = Vec::new();
+        
+        // System prompt (always included)
+        prompt_parts.push(context.system_prompt.clone());
+        
+        // Third-party information (if any)
+        if !context.third_parties.is_empty() {
+            let third_party_info = context.third_parties.iter()
+                .map(|tp| format!("- {} (mentioned {} times)", tp.name, tp.mention_count))
+                .collect::<Vec<_>>()
+                .join("\n");
+            prompt_parts.push(format!("Known individuals:\n{}", third_party_info));
+        }
+        
+        // Attitude context (if any significant attitudes)
+        if !context.attitudes.is_empty() {
+            let attitude_info = context.attitudes.iter()
+                .map(|att| format!("Attitude towards {}: trust:{:.0}, joy:{:.0}, curiosity:{:.0}", 
+                    att.target_type, att.trust, att.joy, att.curiosity))
+                .collect::<Vec<_>>()
+                .join("\n- ");
+            if !attitude_info.is_empty() {
+                prompt_parts.push(format!("Current attitudes:\n- {}", attitude_info));
+            }
+        }
+        
+        // Recent conversation history
+        if !context.messages.is_empty() {
+            let conversation = context.messages.iter()
+                .map(|msg| {
+                    let speaker = if msg.ai { "Assistant" } else { "Human" };
+                    format!("{}: {}", speaker, msg.content)
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            prompt_parts.push(format!("Recent conversation:\n{}", conversation));
+        }
+        
+        prompt_parts.join("\n\n")
+    }
+    
+    /// Handle context overflow by intelligently trimming content
+    pub fn handle_context_overflow(&mut self, context: &mut OptimizedContext) -> bool {
+        if !context.overflow_detected {
+            return false;
+        }
+        
+        let mut overflow_handled = false;
+        
+        // Strategy 1: Further compress messages
+        if context.messages.len() > 3 {
+            let compressed_messages = self.compress_message_history(&context.messages, 3);
+            if compressed_messages.len() < context.messages.len() {
+                context.messages = compressed_messages;
+                overflow_handled = true;
+            }
+        }
+        
+        // Strategy 2: Reduce attitude details
+        if context.attitudes.len() > 5 {
+            context.attitudes.truncate(5);
+            overflow_handled = true;
+        }
+        
+        // Strategy 3: Limit third-party information
+        if context.third_parties.len() > 3 {
+            context.third_parties.truncate(3);
+            overflow_handled = true;
+        }
+        
+        // Recalculate usage after modifications
+        if overflow_handled {
+            context.usage_statistics = self.usage_monitor.get_usage_statistics();
+            context.overflow_detected = self.check_overflow_risk();
+        }
+        
+        overflow_handled
+    }
+    
+    /// Compress message history to essential messages
+    fn compress_message_history(&self, messages: &[Message], target_count: usize) -> Vec<Message> {
+        if messages.len() <= target_count {
+            return messages.to_vec();
+        }
+        
+        let mut compressed = Vec::new();
+        
+        // Always keep the most recent message
+        if let Some(last) = messages.last() {
+            compressed.push(last.clone());
+        }
+        
+        // Try to keep a balanced selection of AI and human messages
+        let remaining_slots = target_count - 1;
+        let mut selected_indices = Vec::new();
+        let step = messages.len() / remaining_slots.max(1);
+        
+        for i in (0..messages.len()).step_by(step).take(remaining_slots) {
+            if i != messages.len() - 1 { // Don't duplicate the last message
+                selected_indices.push(i);
+            }
+        }
+        
+        for &index in selected_indices.iter().rev() {
+            compressed.insert(0, messages[index].clone());
+        }
+        
+        compressed
+    }
+}
+
+#[derive(Debug)]
+pub struct OptimizedContext {
+    pub system_prompt: String,
+    pub messages: Vec<Message>,
+    pub attitudes: Vec<CompanionAttitude>,
+    pub third_parties: Vec<ThirdPartyIndividual>,
+    pub usage_statistics: TokenUsageStatistics,
+    pub optimization_suggestions: Vec<String>,
+    pub overflow_detected: bool,
+}
+
+impl OptimizedContext {
+    pub fn print_optimization_summary(&self) {
+        println!("🔧 Context Optimization Summary:");
+        println!("   Messages included: {}", self.messages.len());
+        println!("   Attitudes included: {}", self.attitudes.len());
+        println!("   Third-parties included: {}", self.third_parties.len());
+        println!("   Overflow detected: {}", self.overflow_detected);
+        
+        if !self.optimization_suggestions.is_empty() {
+            println!("💡 Optimization suggestions:");
+            for suggestion in &self.optimization_suggestions {
+                println!("   - {}", suggestion);
+            }
+        }
+        
+        self.usage_statistics.print_detailed_stats();
     }
 }
 

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crate::character_card::CharacterCard;
 
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Message {
     pub id: i32,
     pub ai: bool,
