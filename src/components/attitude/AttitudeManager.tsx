@@ -120,7 +120,7 @@ export const AttitudeManager: React.FC<AttitudeManagerProps> = ({ companionId })
     };
 
     return (
-        <div className="space-y-6">
+        <div className="space-y-6" data-testid="attitude-manager">
             <Card className="p-6">
                 <h2 className="text-xl font-semibold mb-4">Attitude Tracking System</h2>
                 
