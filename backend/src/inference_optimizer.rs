@@ -322,8 +322,8 @@ impl Default for InferenceOptimizer {
     }
 }
 
-/// Global inference optimizer instance
 lazy_static::lazy_static! {
+    /// Global inference optimizer instance
     pub static ref INFERENCE_OPTIMIZER: InferenceOptimizer = InferenceOptimizer::new();
 }
 

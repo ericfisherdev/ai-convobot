@@ -410,9 +410,9 @@ mod tests {
             gratitude: 70.0,
             jealousy: 5.0,
             suspicion: 0.0,
-            relationship_score: 85.0,
-            last_updated: Utc::now(),
-            created_at: Utc::now(),
+            relationship_score: Some(85.0),
+            last_updated: Utc::now().to_string(),
+            created_at: Utc::now().to_string(),
         };
 
         let level = formatter.calculate_relationship_level(&intimate_attitude);
@@ -442,9 +442,9 @@ mod tests {
             gratitude: 50.0,
             jealousy: 0.0,
             suspicion: 0.0,
-            relationship_score: 60.0,
-            last_updated: Utc::now(),
-            created_at: Utc::now(),
+            relationship_score: Some(60.0),
+            last_updated: Utc::now().to_string(),
+            created_at: Utc::now().to_string(),
         };
 
         let emotional_state = formatter.analyze_emotional_state(&happy_attitude);
@@ -474,9 +474,9 @@ mod tests {
             gratitude: 50.0,
             jealousy: 0.0,
             suspicion: 0.0,
-            relationship_score: 65.0,
-            last_updated: Utc::now(),
-            created_at: Utc::now(),
+            relationship_score: Some(65.0),
+            last_updated: Utc::now().to_string(),
+            created_at: Utc::now().to_string(),
         };
 
         let context = formatter.format_attitude_context(&[attitude], &[], "TestUser");

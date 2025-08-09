@@ -322,9 +322,9 @@ mod tests {
             gratitude: 15.0,
             jealousy: 0.0,
             suspicion: 0.0,
-            relationship_score: 50.0,
-            last_updated: Utc::now(),
-            created_at: Utc::now(),
+            relationship_score: Some(50.0),
+            last_updated: Utc::now().to_string(),
+            created_at: Utc::now().to_string(),
         };
 
         // Note: This test would need a mock database to fully work
