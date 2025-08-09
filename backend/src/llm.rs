@@ -6,6 +6,7 @@ use crate::dialogue_tuning::DialogueTuning;
 use crate::long_term_mem::LongTermMem;
 use crate::context_manager::ContextManager;
 use crate::inference_optimizer::INFERENCE_OPTIMIZER;
+use crate::attitude_formatter::AttitudeFormatter;
 
 pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
     let start_time = std::time::Instant::now();
@@ -185,9 +186,45 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
         message_counter += 1;
     }
     
+    // Load and integrate attitude context
+    let attitude_formatter = AttitudeFormatter::new();
+    let attitudes = match Database::get_all_companion_attitudes(1) {
+        Ok(attitudes) => attitudes,
+        Err(e) => {
+            eprintln!("Warning: Could not load attitudes: {}", e);
+            Vec::new()
+        }
+    };
+    
+    let third_parties = match Database::get_all_third_party_individuals() {
+        Ok(parties) => parties,
+        Err(e) => {
+            eprintln!("Warning: Could not load third parties: {}", e);
+            Vec::new()
+        }
+    };
+    
+    // Add attitude context to prompt if attitudes exist
+    let attitude_context = if !attitudes.is_empty() {
+        let context = attitude_formatter.format_attitude_context(&attitudes, &third_parties, &user.name);
+        if !context.is_empty() {
+            format!("\n{}\n", context)
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+    
+    // Insert attitude context before conversation history
+    if !attitude_context.is_empty() {
+        base_prompt += &attitude_context;
+        println!("✓ Attitude context integrated: {} characters", attitude_context.len());
+    }
+
     // Calculate token usage for memory management
     let system_tokens = ContextManager::estimate_tokens(&base_prompt);
-    let attitude_tokens = 0; // TODO: Calculate attitude data tokens when implemented
+    let attitude_tokens = ContextManager::estimate_tokens(&attitude_context);
     let message_tokens = managed_messages.iter()
         .map(|msg| ContextManager::estimate_tokens(&msg.content))
         .sum::<usize>();
