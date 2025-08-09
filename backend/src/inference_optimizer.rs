@@ -1,9 +1,9 @@
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
-use serde::Serialize;
 use tokio::sync::mpsc;
-use sha2::{Sha256, Digest};
 
 use crate::database::Message;
 
@@ -96,26 +96,26 @@ impl InferenceOptimizer {
     pub fn get_cached_prompt(&self, prompt: &str) -> Option<CachedPrompt> {
         let hash = self.hash_prompt(prompt);
         let cache = self.prompt_cache.read().unwrap();
-        
+
         if let Some(cached) = cache.get(&hash) {
             // Check if cache entry is still valid
             if cached.timestamp.elapsed() < self.cache_ttl {
                 let mut stats = self.stats.write().unwrap();
                 stats.cache_hits += 1;
-                
+
                 // Clone and update hit count
                 let mut updated_cache = cached.clone();
                 updated_cache.hit_count += 1;
                 drop(cache);
-                
+
                 // Update cache with new hit count
                 let mut cache_write = self.prompt_cache.write().unwrap();
                 cache_write.insert(hash, updated_cache.clone());
-                
+
                 return Some(updated_cache);
             }
         }
-        
+
         let mut stats = self.stats.write().unwrap();
         stats.cache_misses += 1;
         None
@@ -133,12 +133,12 @@ impl InferenceOptimizer {
         };
 
         let mut cache = self.prompt_cache.write().unwrap();
-        
+
         // Implement LRU eviction if cache is full
         if cache.len() >= self.cache_max_size {
             self.evict_lru_entries();
         }
-        
+
         cache.insert(hash, cached);
     }
 
@@ -146,9 +146,12 @@ impl InferenceOptimizer {
     fn evict_lru_entries(&self) {
         let mut cache = self.prompt_cache.write().unwrap();
         // Find oldest entries and remove 25% of cache
-        let mut entries: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), v.timestamp)).collect();
+        let mut entries: Vec<_> = cache
+            .iter()
+            .map(|(k, v)| (k.clone(), v.timestamp))
+            .collect();
         entries.sort_by_key(|(_, timestamp)| *timestamp);
-        
+
         let to_remove = cache.len() / 4;
         for (hash, _) in entries.into_iter().take(to_remove) {
             cache.remove(&hash);
@@ -164,7 +167,7 @@ impl InferenceOptimizer {
     ) -> (String, bool) {
         let base_prompt = base_components.join("");
         let _base_hash = self.hash_prompt(&base_prompt);
-        
+
         // Check if base prompt is cached
         if let Some(cached) = self.get_cached_prompt(&base_prompt) {
             // Construct full prompt with dynamic content
@@ -175,7 +178,7 @@ impl InferenceOptimizer {
         // Not cached, construct normally and cache for future use
         let estimated_tokens = self.estimate_tokens(&base_prompt);
         self.cache_prompt(&base_prompt, &base_prompt, estimated_tokens);
-        
+
         let full_prompt = format!("{}{}", base_prompt, dynamic_content);
         (full_prompt, false)
     }
@@ -185,13 +188,13 @@ impl InferenceOptimizer {
         let mut queue = self.batch_queue.lock().unwrap();
         let request_id = request.id.clone();
         queue.push(request);
-        
+
         // Process batch if it reaches target size
         if queue.len() >= self.batch_size {
             drop(queue);
             self.process_batch().await?;
         }
-        
+
         Ok(request_id)
     }
 
@@ -201,44 +204,48 @@ impl InferenceOptimizer {
         if queue.is_empty() {
             return Ok(());
         }
-        
+
         let batch: Vec<_> = queue.drain(..).collect();
         drop(queue);
-        
+
         println!("Processing batch of {} requests", batch.len());
-        
+
         // In a real implementation, this would use the LLM's batch inference capabilities
         // For now, we'll process them sequentially but track batch statistics
         for _request in batch {
             // Simulate batch processing - in reality this would be optimized
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        
+
         let mut stats = self.stats.write().unwrap();
         stats.batch_processed += 1;
-        
+
         Ok(())
     }
 
     /// Start response streaming session
-    pub fn start_streaming_session(&self, session_id: String) -> mpsc::UnboundedReceiver<StreamChunk> {
+    pub fn start_streaming_session(
+        &self,
+        session_id: String,
+    ) -> mpsc::UnboundedReceiver<StreamChunk> {
         let (tx, rx) = mpsc::unbounded_channel();
-        
+
         let mut sessions = self.streaming_sessions.write().unwrap();
         sessions.insert(session_id.clone(), tx);
-        
+
         let mut stats = self.stats.write().unwrap();
         stats.streaming_sessions += 1;
-        
+
         rx
     }
 
     /// Stream response chunk to client
     pub fn stream_chunk(&self, session_id: &str, chunk: StreamChunk) -> Result<(), String> {
         let sessions = self.streaming_sessions.read().unwrap();
-        
+
         if let Some(tx) = sessions.get(session_id) {
-            tx.send(chunk).map_err(|e| format!("Failed to stream chunk: {}", e))?;
+            tx.send(chunk)
+                .map_err(|e| format!("Failed to stream chunk: {}", e))?;
             Ok(())
         } else {
             Err("Session not found".to_string())
@@ -267,13 +274,14 @@ impl InferenceOptimizer {
     pub fn record_response_time(&self, duration: Duration) {
         let mut stats = self.stats.write().unwrap();
         stats.total_requests += 1;
-        
+
         // Calculate running average
         let total_requests = stats.total_requests as u64;
         let current_avg_nanos = stats.avg_response_time.as_nanos() as u64;
         let new_duration_nanos = duration.as_nanos() as u64;
-        
-        let new_avg_nanos = ((current_avg_nanos * (total_requests - 1)) + new_duration_nanos) / total_requests;
+
+        let new_avg_nanos =
+            ((current_avg_nanos * (total_requests - 1)) + new_duration_nanos) / total_requests;
         stats.avg_response_time = Duration::from_nanos(new_avg_nanos);
     }
 
@@ -281,17 +289,20 @@ impl InferenceOptimizer {
     pub fn cleanup_cache(&self) {
         let mut cache = self.prompt_cache.write().unwrap();
         let now = Instant::now();
-        
+
         cache.retain(|_, cached| now.duration_since(cached.timestamp) < self.cache_ttl);
-        
-        println!("Cache cleanup completed. Entries remaining: {}", cache.len());
+
+        println!(
+            "Cache cleanup completed. Entries remaining: {}",
+            cache.len()
+        );
     }
 
     /// Get cache statistics
     pub fn get_cache_stats(&self) -> (usize, usize, f64) {
         let cache = self.prompt_cache.read().unwrap();
         let stats = self.stats.read().unwrap();
-        
+
         let cache_size = cache.len();
         let total_hits = stats.cache_hits;
         let total_requests = stats.cache_hits + stats.cache_misses;
@@ -300,7 +311,7 @@ impl InferenceOptimizer {
         } else {
             0.0
         };
-        
+
         (cache_size, total_hits, hit_rate)
     }
 }
@@ -334,13 +345,13 @@ mod tests {
         let optimizer = InferenceOptimizer::new();
         let prompt = "Test prompt";
         let base_prompt = "Base: Test prompt";
-        
+
         // Should be cache miss initially
         assert!(optimizer.get_cached_prompt(prompt).is_none());
-        
+
         // Cache the prompt
         optimizer.cache_prompt(prompt, base_prompt, 10);
-        
+
         // Should be cache hit now
         assert!(optimizer.get_cached_prompt(prompt).is_some());
     }

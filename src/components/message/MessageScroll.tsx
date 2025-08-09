@@ -29,7 +29,7 @@ export function MessageScroll() {
       const scrollContainer = scrollRef.current.querySelector('[data-radix-scroll-area-viewport]') as HTMLElement;
       if (scrollContainer) {
         // Better touch scrolling on mobile
-        (scrollContainer.style as any).webkitOverflowScrolling = 'touch';
+        (scrollContainer.style as CSSStyleDeclaration & { webkitOverflowScrolling?: string }).webkitOverflowScrolling = 'touch';
         scrollContainer.style.overscrollBehavior = 'contain';
       }
     }
@@ -57,9 +57,9 @@ export function MessageScroll() {
   
   // Expose typing state for parent components
   useEffect(() => {
-    (window as any).setMessageTyping = setIsTyping;
+    (window as Window & { setMessageTyping?: (typing: boolean) => void }).setMessageTyping = setIsTyping;
     return () => {
-      delete (window as any).setMessageTyping;
+      delete (window as Window & { setMessageTyping?: (typing: boolean) => void }).setMessageTyping;
     };
   }, []);
 

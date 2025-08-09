@@ -29,19 +29,21 @@ impl AttitudeFormatter {
         }
 
         let mut context = String::new();
-        
+
         // Primary user attitude (most important)
         if let Some(user_attitude) = attitudes.iter().find(|a| a.target_type == "user") {
             context.push_str(&self.format_primary_attitude(user_attitude, target_user));
         }
 
         // Third-party attitudes (if significant)
-        let significant_third_parties = self.get_significant_third_party_attitudes(attitudes, third_parties);
+        let significant_third_parties =
+            self.get_significant_third_party_attitudes(attitudes, third_parties);
         if !significant_third_parties.is_empty() {
             context.push_str("\n\nRelationship awareness:\n");
             for (party, attitude) in significant_third_parties {
-                context.push_str(&format!("- Attitude toward {}: {}\n", 
-                    party.name, 
+                context.push_str(&format!(
+                    "- Attitude toward {}: {}\n",
+                    party.name,
                     self.format_attitude_summary(attitude)
                 ));
             }
@@ -74,40 +76,95 @@ impl AttitudeFormatter {
     /// Calculate relationship level based on overall attitude
     fn calculate_relationship_level(&self, attitude: &CompanionAttitude) -> RelationshipLevel {
         let score = attitude.relationship_score.unwrap_or(0.0);
-        
+
         match score {
-            s if s >= 80.0 => RelationshipLevel { name: "Intimate", score: s, description: "deeply connected, comfortable with vulnerability" },
-            s if s >= 60.0 => RelationshipLevel { name: "Close", score: s, description: "warm and trusting, shares personal thoughts" },
-            s if s >= 40.0 => RelationshipLevel { name: "Friendly", score: s, description: "positive and helpful, maintains boundaries" },
-            s if s >= 20.0 => RelationshipLevel { name: "Acquaintance", score: s, description: "polite but reserved, professional" },
-            s if s >= 0.0 => RelationshipLevel { name: "Neutral", score: s, description: "factual and cautious, minimal emotion" },
-            s if s >= -20.0 => RelationshipLevel { name: "Distant", score: s, description: "formal and detached, reluctant engagement" },
-            s if s >= -40.0 => RelationshipLevel { name: "Unfriendly", score: s, description: "curt and dismissive, shows irritation" },
-            s if s >= -60.0 => RelationshipLevel { name: "Hostile", score: s, description: "argumentative and defensive, openly annoyed" },
-            _ => RelationshipLevel { name: "Antagonistic", score, description: "aggressive and confrontational, barely cooperative" },
+            s if s >= 80.0 => RelationshipLevel {
+                name: "Intimate",
+                score: s,
+                description: "deeply connected, comfortable with vulnerability",
+            },
+            s if s >= 60.0 => RelationshipLevel {
+                name: "Close",
+                score: s,
+                description: "warm and trusting, shares personal thoughts",
+            },
+            s if s >= 40.0 => RelationshipLevel {
+                name: "Friendly",
+                score: s,
+                description: "positive and helpful, maintains boundaries",
+            },
+            s if s >= 20.0 => RelationshipLevel {
+                name: "Acquaintance",
+                score: s,
+                description: "polite but reserved, professional",
+            },
+            s if s >= 0.0 => RelationshipLevel {
+                name: "Neutral",
+                score: s,
+                description: "factual and cautious, minimal emotion",
+            },
+            s if s >= -20.0 => RelationshipLevel {
+                name: "Distant",
+                score: s,
+                description: "formal and detached, reluctant engagement",
+            },
+            s if s >= -40.0 => RelationshipLevel {
+                name: "Unfriendly",
+                score: s,
+                description: "curt and dismissive, shows irritation",
+            },
+            s if s >= -60.0 => RelationshipLevel {
+                name: "Hostile",
+                score: s,
+                description: "argumentative and defensive, openly annoyed",
+            },
+            _ => RelationshipLevel {
+                name: "Antagonistic",
+                score,
+                description: "aggressive and confrontational, barely cooperative",
+            },
         }
     }
 
     /// Analyze dominant emotional states from attitude dimensions
     fn analyze_emotional_state(&self, attitude: &CompanionAttitude) -> String {
         let mut emotions = Vec::new();
-        
+
         // High-intensity emotions (>70)
-        if attitude.joy > 70.0 { emotions.push("very happy"); }
-        else if attitude.joy > self.medium_threshold { emotions.push("pleased"); }
-        
-        if attitude.anger > 70.0 { emotions.push("quite angry"); }
-        else if attitude.anger > self.medium_threshold { emotions.push("irritated"); }
-        
-        if attitude.fear > self.high_threshold { emotions.push("anxious"); }
-        if attitude.trust > self.high_threshold { emotions.push("deeply trusting"); }
-        else if attitude.trust > self.medium_threshold { emotions.push("trusting"); }
-        
-        if attitude.curiosity > self.high_threshold { emotions.push("very curious"); }
-        if attitude.empathy > self.high_threshold { emotions.push("deeply empathetic"); }
-        if attitude.suspicion > self.medium_threshold { emotions.push("suspicious"); }
-        if attitude.sorrow > self.medium_threshold { emotions.push("sad"); }
-        
+        if attitude.joy > 70.0 {
+            emotions.push("very happy");
+        } else if attitude.joy > self.medium_threshold {
+            emotions.push("pleased");
+        }
+
+        if attitude.anger > 70.0 {
+            emotions.push("quite angry");
+        } else if attitude.anger > self.medium_threshold {
+            emotions.push("irritated");
+        }
+
+        if attitude.fear > self.high_threshold {
+            emotions.push("anxious");
+        }
+        if attitude.trust > self.high_threshold {
+            emotions.push("deeply trusting");
+        } else if attitude.trust > self.medium_threshold {
+            emotions.push("trusting");
+        }
+
+        if attitude.curiosity > self.high_threshold {
+            emotions.push("very curious");
+        }
+        if attitude.empathy > self.high_threshold {
+            emotions.push("deeply empathetic");
+        }
+        if attitude.suspicion > self.medium_threshold {
+            emotions.push("suspicious");
+        }
+        if attitude.sorrow > self.medium_threshold {
+            emotions.push("sad");
+        }
+
         if emotions.is_empty() {
             "emotionally balanced".to_string()
         } else {
@@ -118,29 +175,40 @@ impl AttitudeFormatter {
     /// Generate specific behavioral instructions based on attitudes
     fn generate_behavioral_instructions(&self, attitude: &CompanionAttitude) -> String {
         let mut instructions = Vec::new();
-        
+
         // Trust-based behaviors
         match attitude.trust {
-            t if t > self.high_threshold => instructions.push("be open and vulnerable, share personal insights"),
-            t if t > self.medium_threshold => instructions.push("be warm and sharing, show genuine interest"),
-            t if t > self.low_threshold => instructions.push("be friendly but maintain some privacy"),
+            t if t > self.high_threshold => {
+                instructions.push("be open and vulnerable, share personal insights")
+            }
+            t if t > self.medium_threshold => {
+                instructions.push("be warm and sharing, show genuine interest")
+            }
+            t if t > self.low_threshold => {
+                instructions.push("be friendly but maintain some privacy")
+            }
             t if t > 0.0 => instructions.push("be polite and helpful, keep responses professional"),
-            t if t > -self.medium_threshold => instructions.push("be cautious and formal, avoid personal topics"),
+            t if t > -self.medium_threshold => {
+                instructions.push("be cautious and formal, avoid personal topics")
+            }
             _ => instructions.push("be guarded and brief, show reluctance to engage deeply"),
         }
 
         // Joy/Sorrow influence on tone
         match (attitude.joy, attitude.sorrow) {
-            (j, s) if j > self.medium_threshold && s < self.low_threshold => 
-                instructions.push("use enthusiastic and positive language, include light humor"),
-            (j, s) if s > self.medium_threshold && j < self.low_threshold => 
-                instructions.push("be more subdued and supportive, avoid overly cheerful responses"),
+            (j, s) if j > self.medium_threshold && s < self.low_threshold => {
+                instructions.push("use enthusiastic and positive language, include light humor")
+            }
+            (j, s) if s > self.medium_threshold && j < self.low_threshold => {
+                instructions.push("be more subdued and supportive, avoid overly cheerful responses")
+            }
             _ => {}
         }
 
         // Anger influence
         if attitude.anger > self.medium_threshold {
-            instructions.push("be more direct and blunt, show impatience with lengthy explanations");
+            instructions
+                .push("be more direct and blunt, show impatience with lengthy explanations");
         }
 
         // Curiosity influence
@@ -155,8 +223,12 @@ impl AttitudeFormatter {
 
         // Respect influence on formality
         match attitude.respect {
-            r if r > self.high_threshold => instructions.push("show deference and use more formal language when appropriate"),
-            r if r < -self.medium_threshold => instructions.push("be more casual or dismissive, less concerned with politeness"),
+            r if r > self.high_threshold => {
+                instructions.push("show deference and use more formal language when appropriate")
+            }
+            r if r < -self.medium_threshold => {
+                instructions.push("be more casual or dismissive, less concerned with politeness")
+            }
             _ => {}
         }
 
@@ -164,17 +236,21 @@ impl AttitudeFormatter {
     }
 
     /// Generate response calibration instructions for the LLM
-    fn generate_response_calibration_instructions(&self, attitudes: &[CompanionAttitude]) -> String {
+    fn generate_response_calibration_instructions(
+        &self,
+        attitudes: &[CompanionAttitude],
+    ) -> String {
         if attitudes.is_empty() {
             return String::new();
         }
 
-        let primary_attitude = attitudes.iter()
+        let primary_attitude = attitudes
+            .iter()
             .find(|a| a.target_type == "user")
             .unwrap_or(&attitudes[0]);
 
         let relationship = self.calculate_relationship_level(primary_attitude);
-        
+
         format!(
             "\n\nIMPORTANT: Respond according to your {} relationship level. {}. \
             Express emotions naturally through your word choice, response length, and level of detail. \
@@ -191,9 +267,12 @@ impl AttitudeFormatter {
         third_parties: &'a [ThirdPartyIndividual],
     ) -> Vec<(&'a ThirdPartyIndividual, &'a CompanionAttitude)> {
         let mut significant = Vec::new();
-        
+
         for attitude in attitudes.iter().filter(|a| a.target_type == "third_party") {
-            if let Some(party) = third_parties.iter().find(|p| p.id == Some(attitude.target_id)) {
+            if let Some(party) = third_parties
+                .iter()
+                .find(|p| p.id == Some(attitude.target_id))
+            {
                 // Include if relationship is strong (positive or negative) or recently changed
                 if attitude.relationship_score.unwrap_or(0.0).abs() > self.medium_threshold {
                     significant.push((party, attitude));
@@ -203,7 +282,9 @@ impl AttitudeFormatter {
 
         // Sort by significance (absolute relationship score)
         significant.sort_by(|a, b| {
-            b.1.relationship_score.unwrap_or(0.0).abs()
+            b.1.relationship_score
+                .unwrap_or(0.0)
+                .abs()
                 .partial_cmp(&a.1.relationship_score.unwrap_or(0.0).abs())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
@@ -216,12 +297,16 @@ impl AttitudeFormatter {
     fn format_attitude_summary(&self, attitude: &CompanionAttitude) -> String {
         let level = self.calculate_relationship_level(attitude);
         let emotions = self.analyze_emotional_state(attitude);
-        
+
         format!("{} ({})", level.name.to_lowercase(), emotions)
     }
 
     /// Estimate token count for attitude context
-    pub fn estimate_attitude_tokens(&self, attitudes: &[CompanionAttitude], third_parties: &[ThirdPartyIndividual]) -> usize {
+    pub fn estimate_attitude_tokens(
+        &self,
+        attitudes: &[CompanionAttitude],
+        third_parties: &[ThirdPartyIndividual],
+    ) -> usize {
         let context = self.format_attitude_context(attitudes, third_parties, "User");
         (context.len() as f32 / 4.0).ceil() as usize
     }
@@ -258,12 +343,12 @@ impl AttitudeFormatter {
 
         // Add as many as fit in token budget
         let mut _current_tokens = self.estimate_attitude_tokens(&prioritized, third_parties);
-        
+
         for attitude in remaining_attitudes {
             let mut test_set = prioritized.clone();
             test_set.push(attitude.clone());
             let tokens = self.estimate_attitude_tokens(&test_set, third_parties);
-            
+
             if tokens <= max_tokens {
                 prioritized.push(attitude);
                 _current_tokens = tokens;
@@ -278,10 +363,12 @@ impl AttitudeFormatter {
     /// Calculate how significant an attitude is for context inclusion
     fn calculate_attitude_significance(&self, attitude: &CompanionAttitude) -> f32 {
         let relationship_weight = attitude.relationship_score.unwrap_or(0.0).abs() / 100.0;
-        let emotion_intensity = (
-            attitude.anger.abs() + attitude.joy.abs() + attitude.trust.abs() + 
-            attitude.fear.abs() + attitude.curiosity.abs()
-        ) / 500.0; // Normalize across 5 key emotions
+        let emotion_intensity = (attitude.anger.abs()
+            + attitude.joy.abs()
+            + attitude.trust.abs()
+            + attitude.fear.abs()
+            + attitude.curiosity.abs())
+            / 500.0; // Normalize across 5 key emotions
 
         relationship_weight * 0.7 + emotion_intensity * 0.3
     }
@@ -302,7 +389,7 @@ mod tests {
     #[test]
     fn test_relationship_levels() {
         let formatter = AttitudeFormatter::new();
-        
+
         // Test intimate relationship
         let intimate_attitude = CompanionAttitude {
             id: None,
@@ -335,7 +422,7 @@ mod tests {
     #[test]
     fn test_emotional_state_analysis() {
         let formatter = AttitudeFormatter::new();
-        
+
         let happy_attitude = CompanionAttitude {
             id: None,
             companion_id: 1,
@@ -348,7 +435,7 @@ mod tests {
             fear: 0.0,
             surprise: 10.0,
             anger: 0.0,
-            joy: 80.0,  // High joy
+            joy: 80.0, // High joy
             sorrow: 0.0,
             disgust: 0.0,
             empathy: 70.0,
@@ -367,7 +454,7 @@ mod tests {
     #[test]
     fn test_attitude_context_formatting() {
         let formatter = AttitudeFormatter::new();
-        
+
         let attitude = CompanionAttitude {
             id: None,
             companion_id: 1,
@@ -393,7 +480,7 @@ mod tests {
         };
 
         let context = formatter.format_attitude_context(&[attitude], &[], "TestUser");
-        
+
         assert!(context.contains("Current relationship with TestUser"));
         assert!(context.contains("Close"));
         assert!(context.contains("Response guidance"));

@@ -8,7 +8,7 @@ interface Session {
     user_id: number | null;
     created_at: string;
     last_activity: string;
-    attitude_state: any[];
+    attitude_state: unknown[];
     is_active: boolean;
 }
 

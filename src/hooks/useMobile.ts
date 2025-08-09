@@ -81,7 +81,7 @@ function getMobileInfo(): MobileInfo {
   
   // PWA detection
   const isStandalone = window.matchMedia('(display-mode: standalone)').matches || 
-                      (window.navigator as any).standalone === true;
+                      (window.navigator as Navigator & { standalone?: boolean }).standalone === true;
   
   // Orientation
   const orientation = height > width ? 'portrait' : 'landscape';

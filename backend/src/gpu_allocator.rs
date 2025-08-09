@@ -1,6 +1,6 @@
-use std::process::Command;
-use serde::{Serialize, Deserialize};
 use crate::database::Device;
+use serde::{Deserialize, Serialize};
+use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuMemoryInfo {
@@ -38,7 +38,7 @@ impl Default for GpuAllocator {
     fn default() -> Self {
         Self {
             safety_margin_percent: 0.8, // Use only 80% of available VRAM
-            min_free_vram_mb: 512,       // Keep at least 512MB free
+            min_free_vram_mb: 512,      // Keep at least 512MB free
         }
     }
 }
@@ -59,7 +59,10 @@ impl GpuAllocator {
     }
 
     /// Detect GPU memory information based on device type
-    pub fn detect_gpu_memory(&self, device: &Device) -> Result<GpuMemoryInfo, Box<dyn std::error::Error>> {
+    pub fn detect_gpu_memory(
+        &self,
+        device: &Device,
+    ) -> Result<GpuMemoryInfo, Box<dyn std::error::Error>> {
         match device {
             Device::GPU => self.detect_cuda_memory(),
             Device::Metal => self.detect_metal_memory(),
@@ -125,7 +128,7 @@ impl GpuAllocator {
         match output {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                
+
                 // Parse system_profiler output for GPU memory
                 // This is a simplified version - real implementation would parse JSON
                 if stdout.contains("VRAM") {
@@ -193,10 +196,7 @@ impl GpuAllocator {
 
         // Calculate maximum layers that fit in VRAM
         let max_gpu_layers = if vram_per_layer_mb > 0 && usable_vram_mb > 0 {
-            std::cmp::min(
-                (usable_vram_mb / vram_per_layer_mb) as usize,
-                total_layers
-            )
+            std::cmp::min((usable_vram_mb / vram_per_layer_mb) as usize, total_layers)
         } else {
             0
         };
@@ -231,21 +231,25 @@ impl GpuAllocator {
         current_gpu_info: &GpuMemoryInfo,
     ) -> Option<LayerAllocation> {
         let memory_pressure = current_gpu_info.utilization_percent;
-        let available_ratio = current_gpu_info.available_vram_mb as f32 / current_gpu_info.total_vram_mb as f32;
+        let available_ratio =
+            current_gpu_info.available_vram_mb as f32 / current_gpu_info.total_vram_mb as f32;
 
         // If memory pressure is high (>90%) or available memory is low (<10%), suggest reallocation
         if memory_pressure > 90.0 || available_ratio < 0.1 {
             if current_allocation.gpu_layers > 0 {
                 // Reduce GPU layers by 20%
                 let new_gpu_layers = (current_allocation.gpu_layers as f32 * 0.8) as usize;
-                let new_cpu_layers = current_allocation.total_layers.saturating_sub(new_gpu_layers);
-                
+                let new_cpu_layers = current_allocation
+                    .total_layers
+                    .saturating_sub(new_gpu_layers);
+
                 return Some(LayerAllocation {
                     gpu_layers: new_gpu_layers,
                     cpu_layers: new_cpu_layers,
                     total_layers: current_allocation.total_layers,
-                    estimated_vram_usage_mb: new_gpu_layers as u64 * 
-                        (current_allocation.estimated_vram_usage_mb / current_allocation.gpu_layers.max(1) as u64),
+                    estimated_vram_usage_mb: new_gpu_layers as u64
+                        * (current_allocation.estimated_vram_usage_mb
+                            / current_allocation.gpu_layers.max(1) as u64),
                     allocation_strategy: AllocationStrategy::Conservative,
                 });
             }
@@ -257,16 +261,19 @@ impl GpuAllocator {
                 let additional_layers = (current_allocation.total_layers as f32 * 0.1) as usize;
                 let new_gpu_layers = std::cmp::min(
                     current_allocation.gpu_layers + additional_layers,
-                    current_allocation.total_layers
+                    current_allocation.total_layers,
                 );
-                let new_cpu_layers = current_allocation.total_layers.saturating_sub(new_gpu_layers);
+                let new_cpu_layers = current_allocation
+                    .total_layers
+                    .saturating_sub(new_gpu_layers);
 
                 return Some(LayerAllocation {
                     gpu_layers: new_gpu_layers,
                     cpu_layers: new_cpu_layers,
                     total_layers: current_allocation.total_layers,
-                    estimated_vram_usage_mb: new_gpu_layers as u64 * 
-                        (current_allocation.estimated_vram_usage_mb / current_allocation.gpu_layers.max(1) as u64),
+                    estimated_vram_usage_mb: new_gpu_layers as u64
+                        * (current_allocation.estimated_vram_usage_mb
+                            / current_allocation.gpu_layers.max(1) as u64),
                     allocation_strategy: if new_gpu_layers == current_allocation.total_layers {
                         AllocationStrategy::MaxGpu
                     } else {
@@ -292,9 +299,9 @@ impl GpuAllocator {
         let min_free_vram = if gpu_info.total_vram_mb > 16000 {
             1024 // Keep 1GB free for high-end
         } else if gpu_info.total_vram_mb > 8000 {
-            512  // Keep 512MB free for mid-range
+            512 // Keep 512MB free for mid-range
         } else {
-            256  // Keep 256MB free for low-end
+            256 // Keep 256MB free for low-end
         };
 
         (safety_margin, min_free_vram)
@@ -306,9 +313,9 @@ impl std::fmt::Display for LayerAllocation {
         write!(
             f,
             "GPU Layers: {}/{} | Strategy: {:?} | Est. VRAM: {}MB",
-            self.gpu_layers, 
-            self.total_layers, 
-            self.allocation_strategy, 
+            self.gpu_layers,
+            self.total_layers,
+            self.allocation_strategy,
             self.estimated_vram_usage_mb
         )
     }
@@ -344,7 +351,7 @@ mod tests {
         };
 
         let allocation = allocator.calculate_optimal_layers(&gpu_info, 4096, 32, None);
-        
+
         assert!(allocation.gpu_layers > 0);
         assert!(allocation.gpu_layers <= 32);
         assert_eq!(allocation.gpu_layers + allocation.cpu_layers, 32);
@@ -370,9 +377,10 @@ mod tests {
             driver_version: "1.0".to_string(),
         };
 
-        let suggestion = allocator.monitor_and_suggest_reallocation(&current_allocation, &high_pressure_info);
+        let suggestion =
+            allocator.monitor_and_suggest_reallocation(&current_allocation, &high_pressure_info);
         assert!(suggestion.is_some());
-        
+
         if let Some(new_allocation) = suggestion {
             assert!(new_allocation.gpu_layers < current_allocation.gpu_layers);
         }
