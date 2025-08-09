@@ -32,3 +32,5 @@ CLAUDE.md
 .claude/
 *.claude
 SPRINTS.md
+release-package/
+backend/release-package/
