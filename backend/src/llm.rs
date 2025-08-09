@@ -10,6 +10,7 @@ use crate::database::{
 use crate::dialogue_tuning::DialogueTuning;
 use crate::gpu_allocator::GpuAllocator;
 use crate::inference_optimizer::INFERENCE_OPTIMIZER;
+use crate::inference_performance::{ModelConfig, INFERENCE_TRACKER};
 use crate::long_term_mem::LongTermMem;
 
 pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
@@ -401,8 +402,30 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
         context_manager.get_memory_stats(system_tokens, attitude_tokens, message_tokens);
     memory_stats.print_stats();
 
+    // Initialize performance tracking
+    let session_id = format!("llm_{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis());
+    
+    let model_config = ModelConfig {
+        model_path: config.llm_model_path.clone(),
+        gpu_layers: config.gpu_layers as i32,
+        device_type: config.device.to_string(),
+    };
+    
+    let input_tokens = (system_tokens + attitude_tokens + message_tokens) as u32;
+    
+    // Start performance tracking
+    if let Ok(mut tracker) = INFERENCE_TRACKER.lock() {
+        tracker.start_session(session_id.clone(), model_config.clone(), input_tokens);
+    }
+
     let mut end_of_generation = String::new();
+    let mut tokens_generated = 0u32;
+    let mut first_token_recorded = false;
     let eog = format!("\n{}:", user.name);
+    
     let res = session.infer::<std::convert::Infallible>(
         llama.as_ref(),
         &mut rand::thread_rng(),
@@ -418,9 +441,23 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
                 llm::InferenceResponse::SnapshotToken(_) => { /*print!("{token}");*/ }
                 llm::InferenceResponse::PromptToken(_) => { /*print!("{token}");*/ }
                 llm::InferenceResponse::InferredToken(token) => {
-                    //  x = x.clone()+&token;
+                    // Track first token for time-to-first-token metric
+                    if !first_token_recorded {
+                        if let Ok(mut tracker) = INFERENCE_TRACKER.lock() {
+                            tracker.record_first_token(&session_id);
+                        }
+                        first_token_recorded = true;
+                    }
+                    
+                    tokens_generated += 1;
                     end_of_generation.push_str(&token);
                     print!("{token}");
+                    
+                    // Update token count for progress tracking
+                    if let Ok(mut tracker) = INFERENCE_TRACKER.lock() {
+                        tracker.update_token_count(&session_id, tokens_generated);
+                    }
+                    
                     if end_of_generation.contains(&eog)
                         || end_of_generation.contains("[/INST]")
                         || end_of_generation.contains("<</SYS>>")
@@ -471,6 +508,13 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
         Ok(_) => {}
         Err(e) => eprintln!("Error while adding message to long-term memory: {}", e),
     };
+
+    // Complete the performance tracking session
+    if let Ok(mut tracker) = INFERENCE_TRACKER.lock() {
+        if let Err(e) = tracker.complete_session(&session_id) {
+            eprintln!("Failed to complete performance tracking session: {}", e);
+        }
+    }
 
     // Record performance statistics
     let response_time = start_time.elapsed();

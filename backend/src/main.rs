@@ -24,7 +24,9 @@ mod attitude_formatter;
 mod gpu_allocator;
 use crate::gpu_allocator::{GpuAllocator, LayerAllocation};
 mod system_memory;
-use crate::system_memory::{SystemMemoryDetector, SystemMemoryInfo};
+// Removed unused system_memory imports
+mod inference_performance;
+use crate::inference_performance::{ModelConfig, ResponseEstimate, INFERENCE_TRACKER};
 #[cfg(test)]
 mod simple_tests;
 
@@ -541,8 +543,17 @@ async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
     };
 
     // Estimate response time based on message complexity
-    let estimated_seconds = estimate_response_time(&prompt_message);
-    println!("⏱️ Estimated response time: {}s", estimated_seconds);
+    let estimate = estimate_response_time_enhanced(&prompt_message);
+    println!(
+        "⏱️ Response ETA: {}s (range: {}-{}s, confidence: {:.1}%)",
+        estimate.expected_seconds,
+        estimate.min_seconds,
+        estimate.max_seconds,
+        estimate.confidence * 100.0
+    );
+    if !estimate.factors.is_empty() {
+        println!("   Factors: {}", estimate.factors.join(", "));
+    }
 
     // Detect and handle interaction requests
     if let Ok(Some(interaction)) =
@@ -1040,6 +1051,24 @@ async fn cleanup_invalid_third_parties() -> HttpResponse {
     }
 }
 
+#[derive(Deserialize)]
+struct EstimateRequest {
+    message: String,
+}
+
+#[post("/api/estimate-response-time")]
+async fn estimate_response_time_endpoint(req: web::Json<EstimateRequest>) -> HttpResponse {
+    let estimate = estimate_response_time_enhanced(&req.message);
+    let response = serde_json::json!({
+        "min_seconds": estimate.min_seconds,
+        "expected_seconds": estimate.expected_seconds,
+        "max_seconds": estimate.max_seconds,
+        "confidence": estimate.confidence,
+        "factors": estimate.factors
+    });
+    HttpResponse::Ok().json(response)
+}
+
 #[post("/api/prompt/stream")]
 async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpResponse {
     let request = received.into_inner();
@@ -1297,26 +1326,50 @@ async fn get_gpu_allocation() -> HttpResponse {
 //
 
 /// Estimate response time based on message complexity
+fn estimate_response_time_enhanced(msg: &str) -> ResponseEstimate {
+    // Get current model configuration
+    let db_config = match Database::get_config() {
+        Ok(cfg) => cfg,
+        Err(_) => {
+            // Fallback to conservative estimate if config not available
+            return ResponseEstimate {
+                min_seconds: 15,
+                expected_seconds: 30,
+                max_seconds: 120,
+                confidence: 0.3,
+                factors: vec!["Configuration unavailable - using conservative estimate".to_string()],
+            };
+        }
+    };
+
+    let model_config = ModelConfig {
+        model_path: db_config.llm_model_path,
+        gpu_layers: db_config.gpu_layers as i32,
+        device_type: db_config.device.to_string(),
+    };
+
+    // Use the performance tracker for accurate estimation
+    let mut tracker = match INFERENCE_TRACKER.lock() {
+        Ok(tracker) => tracker,
+        Err(_) => {
+            // Fallback if tracker is not available
+            return ResponseEstimate {
+                min_seconds: 10,
+                expected_seconds: 25,
+                max_seconds: 90,
+                confidence: 0.4,
+                factors: vec!["Performance tracker unavailable - using fallback estimate".to_string()],
+            };
+        }
+    };
+
+    tracker.estimate_response_time(msg, &model_config)
+}
+
+// Keep old function for backward compatibility during transition
 fn estimate_response_time(msg: &str) -> u32 {
-    let word_count = msg.split_whitespace().count();
-    let base_time = 3; // Base time in seconds
-    
-    // Add time based on message length
-    let length_factor = (word_count as f32 / 10.0).ceil() as u32;
-    
-    // Add time for complexity factors
-    let mut complexity_bonus = 0;
-    if msg.to_lowercase().contains("write") || msg.to_lowercase().contains("create") {
-        complexity_bonus += 5;
-    }
-    if msg.to_lowercase().contains("explain") || msg.to_lowercase().contains("how") {
-        complexity_bonus += 3;
-    }
-    if msg.to_lowercase().contains("?") {
-        complexity_bonus += 2;
-    }
-    
-    std::cmp::min(base_time + length_factor + complexity_bonus, 60) // Cap at 60 seconds
+    let enhanced = estimate_response_time_enhanced(msg);
+    enhanced.expected_seconds
 }
 
 #[actix_web::main]
@@ -1395,6 +1448,7 @@ async fn main() -> std::io::Result<()> {
             .service(get_person_by_name)
             .service(cleanup_duplicate_third_parties)
             .service(cleanup_invalid_third_parties)
+            .service(estimate_response_time_endpoint)
             .service(plan_interaction)
             .service(get_planned_interactions)
             .service(complete_interaction)
