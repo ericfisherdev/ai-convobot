@@ -60,6 +60,10 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
 
     let llama_model_params = {
         let mut params = llm::ModelParameters::default();
+        
+        // Enable performance optimizations for all devices
+        params.prefer_mmap = true;     // Memory-mapped model loading reduces RAM usage
+        
         if config.device == Device::GPU || config.device == Device::Metal {
             params.use_gpu = true;
 
@@ -83,8 +87,10 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
                         let estimated_model_size_mb = 4096;
                         let estimated_total_layers = 32;
 
-                        let allocation = allocator.calculate_optimal_layers(
+                        // Use the new optimized allocation method
+                        let allocation = allocator.calculate_optimal_layers_v2(
                             &gpu_info,
+                            &config.llm_model_path,
                             estimated_model_size_mb,
                             estimated_total_layers,
                             vram_limit,
@@ -140,8 +146,21 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
         }
     };
 
-    let mut session = llama.start_session(Default::default());
-    println!("Generating ai response...");
+    // Calculate CPU cores for optimizations
+    let cpu_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4); // Fallback to 4 cores if detection fails
+
+    // Create optimized session configuration for better caching
+    let session_config = llm::InferenceSessionConfig {
+        n_threads: cpu_cores,                         // Use all CPU cores for session
+        n_batch: 512,                                // Larger batch size
+        memory_k_type: llm::ModelKVMemoryType::Float16, // Use F16 for KV cache
+        memory_v_type: llm::ModelKVMemoryType::Float16,
+    };
+    
+    let mut session = llama.start_session(session_config);
+    println!("🚀 Generating AI response with optimized session...");
     let mut base_prompt: String;
     let mut rp: &str = "";
     let mut tuned_dialogue: String = String::from("");
@@ -421,6 +440,9 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
         tracker.start_session(session_id.clone(), model_config.clone(), input_tokens);
     }
 
+    // Create optimized inference parameters for better performance        
+    let optimized_inference_params = llm::InferenceParameters::default();
+
     let mut end_of_generation = String::new();
     let mut tokens_generated = 0u32;
     let mut first_token_recorded = false;
@@ -431,7 +453,7 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
         &mut rand::thread_rng(),
         &llm::InferenceRequest {
             prompt: llm::Prompt::Text(&format!("{}{}: ", &base_prompt, companion.name)),
-            parameters: &llm::InferenceParameters::default(),
+            parameters: &optimized_inference_params,
             play_back_previous_tokens: false,
             maximum_token_count: Some(response_token_limit),
         },
@@ -519,6 +541,20 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
     // Record performance statistics
     let response_time = start_time.elapsed();
     INFERENCE_OPTIMIZER.record_response_time(response_time);
+
+    // Enhanced performance telemetry
+    let tokens_per_second = if tokens_generated > 0 {
+        tokens_generated as f64 / response_time.as_secs_f64()
+    } else {
+        0.0
+    };
+    
+    println!("⚡ Performance Metrics:");
+    println!("  • Total time: {:.2}s", response_time.as_secs_f64());
+    println!("  • Tokens generated: {}", tokens_generated);
+    println!("  • Tokens per second: {:.1}", tokens_per_second);
+    println!("  • CPU cores used: {}", cpu_cores);
+    println!("  • Context size: {} tokens", input_tokens);
 
     // Print cache statistics periodically
     let stats = INFERENCE_OPTIMIZER.get_stats();
