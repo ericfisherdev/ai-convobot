@@ -15,6 +15,8 @@ mod context_manager;
 use crate::context_manager::ContextManager;
 mod inference_optimizer;
 use crate::inference_optimizer::{INFERENCE_OPTIMIZER, StreamChunk};
+#[cfg(test)]
+mod simple_tests;
 
 use std::fs;
 use std::fs::File;

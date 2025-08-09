@@ -260,6 +260,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tantivy",
+ "tempfile",
  "tokio",
  "winres",
  "zstd-safe 5.0.2+zstd.1.5.2",
