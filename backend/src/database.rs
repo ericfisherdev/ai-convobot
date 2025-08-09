@@ -300,6 +300,10 @@ pub struct ConfigView {
     pub dynamic_gpu_allocation: bool,
     pub gpu_safety_margin: f32,
     pub min_free_vram_mb: u64,
+    pub enable_hybrid_context: bool,
+    pub max_system_ram_usage_gb: usize,
+    pub context_expansion_strategy: String,
+    pub ram_safety_margin_gb: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -315,6 +319,10 @@ pub struct ConfigModify {
     pub dynamic_gpu_allocation: bool,
     pub gpu_safety_margin: f32,
     pub min_free_vram_mb: u64,
+    pub enable_hybrid_context: bool,
+    pub max_system_ram_usage_gb: usize,
+    pub context_expansion_strategy: String,
+    pub ram_safety_margin_gb: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -546,7 +554,11 @@ impl Database {
                 vram_limit_gb INTEGER DEFAULT 4,
                 dynamic_gpu_allocation BOOLEAN DEFAULT true,
                 gpu_safety_margin REAL DEFAULT 0.8,
-                min_free_vram_mb INTEGER DEFAULT 512
+                min_free_vram_mb INTEGER DEFAULT 512,
+                enable_hybrid_context BOOLEAN DEFAULT true,
+                max_system_ram_usage_gb INTEGER DEFAULT 8,
+                context_expansion_strategy TEXT DEFAULT 'balanced',
+                ram_safety_margin_gb INTEGER DEFAULT 2
             )",
             [],
         )?;
@@ -772,7 +784,7 @@ impl Database {
         }
         if Database::is_table_empty("config", &con)? {
             con.execute(
-                "INSERT INTO config (device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb, dynamic_gpu_allocation, gpu_safety_margin, min_free_vram_mb) VALUES (?, ?, 20, ?, 2048, 512, true, 4, true, 0.8, 512)",
+                "INSERT INTO config (device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb, dynamic_gpu_allocation, gpu_safety_margin, min_free_vram_mb, enable_hybrid_context, max_system_ram_usage_gb, context_expansion_strategy, ram_safety_margin_gb) VALUES (?, ?, 20, ?, 2048, 512, true, 4, true, 0.8, 512, true, 8, 'balanced', 2)",
                 &[
                     &Device::CPU as &dyn ToSql,
                     &"path/to/your/gguf/model.gguf",
@@ -1093,7 +1105,7 @@ impl Database {
 
     pub fn get_config() -> Result<ConfigView> {
         let con = Connection::open("companion_database.db")?;
-        let mut stmt = con.prepare("SELECT device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb, dynamic_gpu_allocation, gpu_safety_margin, min_free_vram_mb FROM config LIMIT 1")?;
+        let mut stmt = con.prepare("SELECT device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb, dynamic_gpu_allocation, gpu_safety_margin, min_free_vram_mb, enable_hybrid_context, max_system_ram_usage_gb, context_expansion_strategy, ram_safety_margin_gb FROM config LIMIT 1")?;
         let row = stmt.query_row([], |row| {
             Ok(ConfigView {
                 device: row.get(0)?,
@@ -1107,6 +1119,10 @@ impl Database {
                 dynamic_gpu_allocation: row.get::<_, Option<bool>>(8)?.unwrap_or(true),
                 gpu_safety_margin: row.get::<_, Option<f32>>(9)?.unwrap_or(0.8),
                 min_free_vram_mb: row.get::<_, Option<u64>>(10)?.unwrap_or(512),
+                enable_hybrid_context: row.get::<_, Option<bool>>(11)?.unwrap_or(true),
+                max_system_ram_usage_gb: row.get::<_, Option<usize>>(12)?.unwrap_or(8),
+                context_expansion_strategy: row.get::<_, Option<String>>(13)?.unwrap_or("balanced".to_string()),
+                ram_safety_margin_gb: row.get::<_, Option<usize>>(14)?.unwrap_or(2),
             })
         })?;
         Ok(row)
@@ -1137,7 +1153,7 @@ impl Database {
 
         let con = Connection::open("companion_database.db")?;
         con.execute(
-            "UPDATE config SET device = ?, llm_model_path = ?, gpu_layers = ?, prompt_template = ?, context_window_size = ?, max_response_tokens = ?, enable_dynamic_context = ?, vram_limit_gb = ?, dynamic_gpu_allocation = ?, gpu_safety_margin = ?, min_free_vram_mb = ?",
+            "UPDATE config SET device = ?, llm_model_path = ?, gpu_layers = ?, prompt_template = ?, context_window_size = ?, max_response_tokens = ?, enable_dynamic_context = ?, vram_limit_gb = ?, dynamic_gpu_allocation = ?, gpu_safety_margin = ?, min_free_vram_mb = ?, enable_hybrid_context = ?, max_system_ram_usage_gb = ?, context_expansion_strategy = ?, ram_safety_margin_gb = ?",
             &[
                 &device as &dyn ToSql,
                 &config.llm_model_path,
@@ -1150,6 +1166,10 @@ impl Database {
                 &config.dynamic_gpu_allocation,
                 &config.gpu_safety_margin,
                 &config.min_free_vram_mb,
+                &config.enable_hybrid_context,
+                &config.max_system_ram_usage_gb,
+                &config.context_expansion_strategy,
+                &config.ram_safety_margin_gb,
             ]
         )?;
         Ok(())
@@ -3126,6 +3146,10 @@ impl Database {
         let mut has_max_response = false;
         let mut has_dynamic_context = false;
         let mut has_vram_limit = false;
+        let mut has_hybrid_context = false;
+        let mut has_max_system_ram = false;
+        let mut has_context_strategy = false;
+        let mut has_ram_safety_margin = false;
 
         // Check existing columns
         let mut stmt = con.prepare("PRAGMA table_info(config)")?;
@@ -3141,6 +3165,10 @@ impl Database {
                 "max_response_tokens" => has_max_response = true,
                 "enable_dynamic_context" => has_dynamic_context = true,
                 "vram_limit_gb" => has_vram_limit = true,
+                "enable_hybrid_context" => has_hybrid_context = true,
+                "max_system_ram_usage_gb" => has_max_system_ram = true,
+                "context_expansion_strategy" => has_context_strategy = true,
+                "ram_safety_margin_gb" => has_ram_safety_margin = true,
                 _ => {}
             }
         }
@@ -3167,6 +3195,30 @@ impl Database {
         if !has_vram_limit {
             con.execute(
                 "ALTER TABLE config ADD COLUMN vram_limit_gb INTEGER DEFAULT 4",
+                [],
+            )?;
+        }
+        if !has_hybrid_context {
+            con.execute(
+                "ALTER TABLE config ADD COLUMN enable_hybrid_context BOOLEAN DEFAULT true",
+                [],
+            )?;
+        }
+        if !has_max_system_ram {
+            con.execute(
+                "ALTER TABLE config ADD COLUMN max_system_ram_usage_gb INTEGER DEFAULT 8",
+                [],
+            )?;
+        }
+        if !has_context_strategy {
+            con.execute(
+                "ALTER TABLE config ADD COLUMN context_expansion_strategy TEXT DEFAULT 'balanced'",
+                [],
+            )?;
+        }
+        if !has_ram_safety_margin {
+            con.execute(
+                "ALTER TABLE config ADD COLUMN ram_safety_margin_gb INTEGER DEFAULT 2",
                 [],
             )?;
         }
