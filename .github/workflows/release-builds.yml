@@ -141,9 +141,10 @@ jobs:
               }
               
             } catch {
-              Write-Host "CUDA installation failed: $_"
-              Write-Host "Falling back to CPU-only build"
-              echo "CUDA_AVAILABLE=false" | Out-File -FilePath $env:GITHUB_ENV -Append
+              Write-Host "ERROR: CUDA installation failed: $_"
+              Write-Host "CUDA build was requested but CUDA toolkit could not be installed."
+              Write-Host "This build will fail as CPU fallback is not allowed for CUDA builds."
+              exit 1
             }
           } else {
             echo "CUDA_AVAILABLE=false" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -219,9 +220,10 @@ jobs:
               fi
               
             } || {
-              echo "CUDA installation failed, will build CPU-only version instead"
-              echo "Warning: CUDA build requested but CUDA installation failed"
-              echo "CUDA_AVAILABLE=false" >> $GITHUB_ENV
+              echo "ERROR: CUDA installation failed!"
+              echo "CUDA build was requested but CUDA toolkit could not be installed."
+              echo "This build will fail as CPU fallback is not allowed for CUDA builds."
+              exit 1
             }
           else
             echo "CUDA_AVAILABLE=false" >> $GITHUB_ENV
@@ -235,8 +237,10 @@ jobs:
               echo "OpenCL headers installed successfully"
               echo "OPENCL_AVAILABLE=true" >> $GITHUB_ENV
             } || {
-              echo "OpenCL installation failed, will build CPU-only version instead"
-              echo "OPENCL_AVAILABLE=false" >> $GITHUB_ENV
+              echo "ERROR: OpenCL installation failed!"
+              echo "OpenCL build was requested but OpenCL libraries could not be installed."
+              echo "This build will fail as CPU fallback is not allowed for OpenCL builds."
+              exit 1
             }
           else
             echo "OPENCL_AVAILABLE=false" >> $GITHUB_ENV
@@ -279,30 +283,36 @@ jobs:
         run: |
           case "${{ matrix.build_type }}" in
             "cuda")
+              # CUDA builds must have CUDA available - no fallback
               if [ "${CUDA_AVAILABLE:-false}" = "true" ]; then
                 echo "features=cublas" >> $GITHUB_OUTPUT
                 echo "build_name=CUDA" >> $GITHUB_OUTPUT
               else
-                echo "features=" >> $GITHUB_OUTPUT
-                echo "build_name=CPU (CUDA unavailable)" >> $GITHUB_OUTPUT
+                echo "ERROR: CUDA build requested but CUDA is not available!"
+                echo "This should not happen - CUDA installation should have failed earlier."
+                exit 1
               fi
               ;;
             "opencl")
+              # OpenCL builds must have OpenCL available - no fallback
               if [ "${OPENCL_AVAILABLE:-false}" = "true" ]; then
                 echo "features=clblast" >> $GITHUB_OUTPUT
                 echo "build_name=OpenCL" >> $GITHUB_OUTPUT
               else
-                echo "features=" >> $GITHUB_OUTPUT
-                echo "build_name=CPU (OpenCL unavailable)" >> $GITHUB_OUTPUT
+                echo "ERROR: OpenCL build requested but OpenCL is not available!"
+                echo "This should not happen - OpenCL installation should have failed earlier."
+                exit 1
               fi
               ;;
             "metal")
+              # Metal builds must have Metal available - no fallback  
               if [ "${METAL_AVAILABLE:-true}" = "true" ]; then
                 echo "features=metal" >> $GITHUB_OUTPUT
                 echo "build_name=Metal" >> $GITHUB_OUTPUT
               else
-                echo "features=" >> $GITHUB_OUTPUT
-                echo "build_name=CPU (Metal unavailable)" >> $GITHUB_OUTPUT
+                echo "ERROR: Metal build requested but Metal is not available!"
+                echo "This should not happen - Metal should be available on macOS."
+                exit 1
               fi
               ;;
             *)
@@ -325,7 +335,7 @@ jobs:
           # Allow warnings in release builds
           export RUSTFLAGS=""
           
-          # Build with appropriate features (already determined by feature availability check)
+          # Build with appropriate features
           if [ -n "${{ steps.features.outputs.features }}" ]; then
             echo "Building ${{ steps.features.outputs.build_name }} version with features: ${{ steps.features.outputs.features }}"
             cargo build --release --target ${{ matrix.target }} --features ${{ steps.features.outputs.features }}
