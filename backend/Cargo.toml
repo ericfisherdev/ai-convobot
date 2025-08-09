@@ -34,3 +34,6 @@ zstd-sys = "=2.0.9"
 cublas = ["llm/cublas"]
 clblast = ["llm/clblast"]
 metal = ["llm/metal"]
+
+[dev-dependencies]
+tempfile = "3.8"
