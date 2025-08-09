@@ -3284,6 +3284,103 @@ impl Database {
 
         Ok(())
     }
+
+    /// Check for third-party mentions in message and track them, returning console output
+    pub fn track_third_party_mentions(message: &str) -> Result<String> {
+        let mut console_output = Vec::new();
+        
+        // Get all existing third parties to check for mentions
+        let third_parties = Database::get_all_third_party_individuals()?;
+        
+        let message_lower = message.to_lowercase();
+        
+        for party in &third_parties {
+            let name_lower = party.name.to_lowercase();
+            
+            // Check if this person is mentioned in the message
+            if message_lower.contains(&name_lower) {
+                // Update mention count and last_mentioned
+                let con = Connection::open("companion_database.db")?;
+                let current_time = get_current_date();
+                
+                con.execute(
+                    "UPDATE third_party_individuals 
+                     SET mention_count = mention_count + 1, 
+                         last_mentioned = ?,
+                         updated_at = ?
+                     WHERE id = ?",
+                    params![current_time, current_time, party.id.unwrap()],
+                )?;
+                
+                let new_count = party.mention_count + 1;
+                let suffix = match new_count {
+                    1 => "st",
+                    2 => "nd", 
+                    3 => "rd",
+                    _ => "th",
+                };
+                
+                console_output.push(format!(
+                    "👥 {} mentioned for the {}{} time",
+                    party.name, new_count, suffix
+                ));
+            }
+        }
+        
+        // Also check for new person names that might not be in the database yet
+        // This is a simplified detection - in practice you might want more sophisticated NER
+        let potential_names = Database::extract_potential_names(&message_lower);
+        for potential_name in potential_names {
+            // Check if this is a new person (not in database)
+            if Database::get_third_party_by_name(&potential_name)?.is_none() {
+                // This could be a new person mention - for now just report it
+                // The actual person creation is handled by detect_new_persons_in_message
+                console_output.push(format!(
+                    "👥 {} mentioned for the 1st time (new person detected)",
+                    potential_name
+                ));
+            }
+        }
+        
+        Ok(console_output.join("\n"))
+    }
+    
+    /// Extract potential person names from message (simplified approach)
+    fn extract_potential_names(message: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let words: Vec<&str> = message.split_whitespace().collect();
+        
+        for (i, word) in words.iter().enumerate() {
+            // Look for capitalized words that might be names
+            if word.chars().next().unwrap_or('a').is_uppercase() 
+                && word.len() > 2 
+                && word.chars().all(|c| c.is_alphabetic()) {
+                
+                // Skip common non-name words
+                let skip_words = [
+                    "the", "and", "but", "for", "nor", "yet", "so", "at", "by", "in", "of", "on", "to", "up", "as", "is", "it", "or", "be", "do", "go", "he", "if", "me", "my", "no", "we", "I"
+                ];
+                
+                if !skip_words.contains(&word.to_lowercase().as_str()) {
+                    // Check if the next word might be a last name
+                    if i + 1 < words.len() {
+                        let next_word = words[i + 1];
+                        if next_word.chars().next().unwrap_or('a').is_uppercase() 
+                            && next_word.len() > 2 
+                            && next_word.chars().all(|c| c.is_alphabetic()) {
+                            names.push(format!("{} {}", word, next_word));
+                        } else {
+                            names.push(word.to_string());
+                        }
+                    } else {
+                        names.push(word.to_string());
+                    }
+                }
+            }
+        }
+        
+        names
+    }
 }
 
 #[cfg(test)]

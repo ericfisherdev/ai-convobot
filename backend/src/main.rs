@@ -511,6 +511,17 @@ struct StreamingRequest {
 #[post("/api/prompt")]
 async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
     let prompt_message = received.into_inner().prompt.clone();
+    let start_time = std::time::Instant::now();
+
+    // Track third-party mentions and display console output
+    match Database::track_third_party_mentions(&prompt_message) {
+        Ok(mention_output) => {
+            if !mention_output.is_empty() {
+                println!("{}", mention_output);
+            }
+        },
+        Err(e) => eprintln!("Failed to track third-party mentions: {}", e),
+    }
 
     // Automatically detect new persons in the message
     let companion_id = 1; // Default companion ID
@@ -518,6 +529,20 @@ async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
         eprintln!("Failed to detect persons in message: {}", e);
         // Continue processing even if person detection fails
     }
+
+    // Get current attitude for comparison (before processing)
+    let user_id = 1; // Default user ID
+    let previous_attitude = match Database::get_all_companion_attitudes(companion_id) {
+        Ok(attitudes) => {
+            // Find the user attitude
+            attitudes.into_iter().find(|a| a.target_id == user_id && a.target_type == "user")
+        },
+        _ => None,
+    };
+
+    // Estimate response time based on message complexity
+    let estimated_seconds = estimate_response_time(&prompt_message);
+    println!("⏱️ Estimated response time: {}s", estimated_seconds);
 
     // Detect and handle interaction requests
     if let Ok(Some(interaction)) =
@@ -572,7 +597,26 @@ async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
         }
     };
     match prompt(&prompt_message) {
-        Ok(v) => HttpResponse::Ok().body(v),
+        Ok(v) => {
+            // Check for attitude changes after processing
+            if let Some(prev_attitude) = previous_attitude {
+                if let Ok(attitudes) = Database::get_all_companion_attitudes(companion_id) {
+                    if let Some(current_attitude) = attitudes.into_iter().find(|a| a.target_id == user_id && a.target_type == "user") {
+                        let formatter = crate::attitude_formatter::AttitudeFormatter::new();
+                        let attitude_changes = formatter.format_attitude_changes_for_console(&prev_attitude, &current_attitude);
+                        if !attitude_changes.is_empty() {
+                            println!("{}", attitude_changes);
+                        }
+                    }
+                }
+            }
+
+            // Display actual response time
+            let elapsed = start_time.elapsed();
+            println!("✓ Response completed in {:.1}s", elapsed.as_secs_f32());
+
+            HttpResponse::Ok().body(v)
+        },
         Err(e) => {
             println!("Failed to generate prompt: {}", e);
             HttpResponse::InternalServerError()
@@ -1233,6 +1277,29 @@ async fn get_gpu_allocation() -> HttpResponse {
 }
 
 //
+
+/// Estimate response time based on message complexity
+fn estimate_response_time(msg: &str) -> u32 {
+    let word_count = msg.split_whitespace().count();
+    let base_time = 3; // Base time in seconds
+    
+    // Add time based on message length
+    let length_factor = (word_count as f32 / 10.0).ceil() as u32;
+    
+    // Add time for complexity factors
+    let mut complexity_bonus = 0;
+    if msg.to_lowercase().contains("write") || msg.to_lowercase().contains("create") {
+        complexity_bonus += 5;
+    }
+    if msg.to_lowercase().contains("explain") || msg.to_lowercase().contains("how") {
+        complexity_bonus += 3;
+    }
+    if msg.to_lowercase().contains("?") {
+        complexity_bonus += 2;
+    }
+    
+    std::cmp::min(base_time + length_factor + complexity_bonus, 60) // Cap at 60 seconds
+}
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {

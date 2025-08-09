@@ -113,7 +113,20 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
         std::path::Path::new(&config.llm_model_path),
         llm::TokenizerSource::Embedded,
         llama_model_params,
-        llm::load_progress_callback_stdout,
+        // Use a quiet callback that only shows essential information
+        |progress| {
+            match progress {
+                llm::LoadProgress::HyperparametersLoaded => {
+                    print!("📚 Loading model... ");
+                    std::io::stdout().flush().unwrap();
+                }
+                llm::LoadProgress::Loaded { file_size, tensor_count } => {
+                    println!("✓ Model loaded ({} tensors, {:.2} MB)", tensor_count, file_size as f32 / 1024.0 / 1024.0);
+                }
+                // Suppress tensor loading messages
+                _ => {}
+            }
+        },
     );
 
     let llama = match llama {
