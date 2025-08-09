@@ -262,6 +262,7 @@ dependencies = [
  "tantivy",
  "tempfile",
  "tokio",
+ "uuid",
  "winres",
  "zstd-safe 5.0.2+zstd.1.5.2",
  "zstd-sys",
@@ -530,6 +531,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]

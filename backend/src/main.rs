@@ -17,6 +17,8 @@ mod inference_optimizer;
 use crate::inference_optimizer::{INFERENCE_OPTIMIZER, StreamChunk};
 mod token_budget;
 use crate::token_budget::{TokenBudget, TokenUsageMonitor};
+mod session_manager;
+use crate::session_manager::{SessionManager, Session};
 #[cfg(test)]
 mod simple_tests;
 
@@ -834,6 +836,96 @@ async fn cleanup_cache() -> HttpResponse {
     }))
 }
 
+// Session Management Endpoints
+#[derive(Deserialize)]
+struct CreateSessionRequest {
+    companion_id: i32,
+    user_id: Option<i32>,
+}
+
+#[post("/api/session")]
+async fn create_session(
+    session_manager: web::Data<SessionManager>,
+    req: web::Json<CreateSessionRequest>,
+) -> HttpResponse {
+    match session_manager.create_session(req.companion_id, req.user_id) {
+        Ok(session) => {
+            let response_json = serde_json::to_string(&session).unwrap_or_else(|_| "{}".to_string());
+            HttpResponse::Ok().body(response_json)
+        }
+        Err(e) => {
+            println!("Failed to create session: {}", e);
+            HttpResponse::InternalServerError().body(format!("Error creating session: {}", e))
+        }
+    }
+}
+
+#[get("/api/session/{session_id}")]
+async fn get_session(
+    session_manager: web::Data<SessionManager>,
+    session_id: web::Path<String>,
+) -> HttpResponse {
+    match session_manager.get_session(&session_id) {
+        Ok(session) => {
+            let response_json = serde_json::to_string(&session).unwrap_or_else(|_| "{}".to_string());
+            HttpResponse::Ok().body(response_json)
+        }
+        Err(e) => {
+            HttpResponse::NotFound().body(format!("Session not found: {}", e))
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateAttitudeRequest {
+    session_id: String,
+    attitude: CompanionAttitude,
+}
+
+#[put("/api/session/attitude")]
+async fn update_session_attitude(
+    session_manager: web::Data<SessionManager>,
+    req: web::Json<UpdateAttitudeRequest>,
+) -> HttpResponse {
+    match session_manager.update_attitude(&req.session_id, req.attitude.clone()) {
+        Ok(()) => HttpResponse::Ok().body("Attitude updated successfully"),
+        Err(e) => {
+            println!("Failed to update session attitude: {}", e);
+            HttpResponse::InternalServerError().body(format!("Error updating attitude: {}", e))
+        }
+    }
+}
+
+#[post("/api/session/{session_id}/end")]
+async fn end_session(
+    session_manager: web::Data<SessionManager>,
+    session_id: web::Path<String>,
+) -> HttpResponse {
+    match session_manager.end_session(&session_id) {
+        Ok(()) => HttpResponse::Ok().body("Session ended successfully"),
+        Err(e) => {
+            println!("Failed to end session: {}", e);
+            HttpResponse::InternalServerError().body(format!("Error ending session: {}", e))
+        }
+    }
+}
+
+#[get("/api/session/stats/summary")]
+async fn get_session_stats(
+    session_manager: web::Data<SessionManager>,
+) -> HttpResponse {
+    match session_manager.get_session_stats() {
+        Ok(stats) => {
+            let stats_json = serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string());
+            HttpResponse::Ok().body(stats_json)
+        }
+        Err(e) => {
+            println!("Failed to get session stats: {}", e);
+            HttpResponse::InternalServerError().body(format!("Error getting stats: {}", e))
+        }
+    }
+}
+
 //
 
 #[actix_web::main]
@@ -862,8 +954,13 @@ async fn main() -> std::io::Result<()> {
     println!("Listening on:\n  -> http://{}:{}/", hostname, port);
     println!("  -> http://localhost:{}/\n", port);
     println!("https://github.com/Hukasx0/ai-companion\n   By Hubert \"Hukasx0\" Kasperek\n");
-    HttpServer::new(|| {
+    
+    // Initialize session manager with 30 minute timeout
+    let session_manager = web::Data::new(SessionManager::new(30));
+    
+    HttpServer::new(move || {
         App::new()
+            .app_data(session_manager.clone())
             .service(index)
             .service(js)
             .service(js2)
@@ -909,6 +1006,11 @@ async fn main() -> std::io::Result<()> {
             .service(start_streaming_session)
             .service(get_inference_stats)
             .service(cleanup_cache)
+            .service(create_session)
+            .service(get_session)
+            .service(update_session_attitude)
+            .service(end_session)
+            .service(get_session_stats)
     })
     .bind((hostname, port))?
     .run()

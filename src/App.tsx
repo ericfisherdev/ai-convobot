@@ -10,6 +10,7 @@ import { UserDataProvider } from './components/context/userContext'
 import { CompanionDataProvider } from './components/context/companionContext'
 import { ConfigProvider } from './components/context/configContext'
 import { AttitudeProvider } from './components/context/attitudeContext'
+import { SessionProvider } from './components/context/sessionContext'
 import { useMobile } from './hooks/useMobile'
 
 import { Toaster } from "@/components/ui/sonner"
@@ -24,13 +25,15 @@ function App() {
           <UserDataProvider>
             <CompanionDataProvider>
               <AttitudeProvider>
-                <MessagesProvider>
-                  <div className='max-container'>
-                    <ChatWindow />
-                  </div>
-                  <Toaster />
-                  <PWAInstallPrompt />
-                </MessagesProvider>
+                <SessionProvider>
+                  <MessagesProvider>
+                    <div className='max-container'>
+                      <ChatWindow />
+                    </div>
+                    <Toaster />
+                    <PWAInstallPrompt />
+                  </MessagesProvider>
+                </SessionProvider>
               </AttitudeProvider>
             </CompanionDataProvider>
           </UserDataProvider>
