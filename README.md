@@ -1,95 +1,160 @@
-# AI companion v1
+# AI Companion - Enhanced Fork
 
-## A single little binary that has all the features you need!
+A fork of [https://github.com/Hukasx0/ai-companion](https://github.com/Hukasx0/ai-companion) with significant enhancements and improvements.
 
-AI Companion is a project that aims to provide a quick, simple, light and convenient way to create AI chatbots on your local computer, it does not require any external API, installation of any libraries, you simply install the binary file corresponding to your operating system and device, download the selected model and you can start using the tool as: WebUI for chatting with LLM, WebUI for roleplaying with an AI character, or use as an API for your other projects that require an AI chatbot.
+**Release builds coming soon!**
 
-The project includes many unique features, such as short-term memory, CUDA, OpenCL and Metal support, long-term memory, dialogue tuning, time recognition, learning by chatting, ability to work as a REST API, reading character cards, easy-to-use WebUI allowing you to edit data, edit configuration, send, edit and delete messages.
+## About This Fork
 
-## Installation
-Download the binary appropriate for your operating system and device from [here](https://github.com/Hukasx0/ai-companion/releases/tag/1.0.0) (for example **ai-companion-windows-cuda.exe**), and then install llm model with **.gguf** extension (for example [this one](https://huggingface.co/TheBloke/zephyr-7B-beta-GGUF/resolve/main/zephyr-7b-beta.Q4_K_M.gguf?download=true)), next launch ai-companion binary file, open your web browser at **http://localhost:3000** and you will see AI Companion WebUI, next click the **gear icon** on the website, go to **config**, and replace **Path to your Large Language Model (LLM)** with path to your **.gguf** model on your drive, after doing it, you can start chatting with your companion!
+This enhanced version of AI Companion includes numerous improvements, bug fixes, and new features designed to provide a better user experience and more robust functionality. All core features from the original project are preserved while adding significant quality-of-life improvements.
 
-![webui screenshot](https://raw.githubusercontent.com/Hukasx0/ai-companion/main/public/webui_screenshot.png)
+## What's AI Companion?
 
-![webui screenshot](https://raw.githubusercontent.com/Hukasx0/ai-companion/main/public/webui_screenshot2.png)
+AI Companion is a full-stack local chatbot application that runs entirely on your computer without requiring internet connectivity for conversations. Built with Rust (backend) and React/TypeScript (frontend), it provides a single binary with embedded web interface for easy deployment.
 
-![License](https://img.shields.io/github/license/Hukasx0/ai-companion)
-![Downloads](https://img.shields.io/github/downloads/Hukasx0/ai-companion/total)
+## ✨ New Features & Improvements
 
-## Features
-- works locally - does not require API keys for other services, which makes it completely free to use (well, apart from electricity costs - your computer must work somehow), also does not require the Internet to work
-- privacy - all conversations are kept locally in the SQLite database, which means that your conversations or the characteristics of your AI stay only on your computer
-- [API](/docs/api_docs.md) - you can use it as a backend for your other projects that requires LLMs, custom ai chatbots or custom ai characters
-- speed - wrote in Rust shows good efficiency when it comes to CPU, GPU (nothing slows your generation) and RAM (you don't need to use weaker ai models)
-- ease of use - everything can be changed in web user interface, and everything is compiled into a single binary file that can be launched on your machine (no need for playing with hundreds of confusing
-files, and no need to fight with wrong library/interpreter/framework versions)
-- customization - you can change the AI's name, personality, appearance and the first message sent. Also short term and long term memory of ai can be modified
-- short-term memory - artificial intelligence remembers recently received/sent messages
-- long-term memory - AI can remember conversations even thousands of prompts later using long-term memory - associating things with different words, phrases, sentences or even dates
-- real-time learning - when chatting with the AI, it is able to create "memories" as well as learn about the people it chats with (what their profession is, what they like to eat, drink and so on)
-- feeding ai with custom data - using the API, it is possible to save to the AI's long-term memory, e.g. fragments of documents, articles, song lyrics, poems
-- roleplay - ai chatbot can (if enabled) perform actions between asterisks (*) e.g. *moves closer*, *waves hello*
-- you can load character files in .json or .png (character cards) format. For example, you can create your own using [this tool](https://github.com/Hukasx0/character-factory)
-- you can use {{char}} and {{user}} in companion's persona, example dialogue, first message and user persona (if you change username or companion name, you don't need to change these, it will automatically change)
-- time - AI Chatbot can obtain information about the current time from the computer, and its long-term memory can remember what days certain conversations took place
+### 🎯 Easy LLM Model Selection (ACB-70)
+- **Automatic Model Discovery**: Automatically scans `./llms` and `../llms` directories for GGUF files
+- **Visual Model Browser**: Browse all available models with file size and metadata
+- **Directory Management**: Add unlimited custom directories to scan for models
+- **Smart Model Selector**: Dropdown selection with real-time updates
+- **Cross-Platform Compatible**: Works seamlessly on Windows, Linux, and macOS
 
-## Supported AI models
-small list of tested and working AI models:
-- [Mistral 7B](https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.1-GGUF)
-- [Zephyr 7B Beta](https://huggingface.co/TheBloke/zephyr-7B-beta-GGUF)
-- [Llama 3 8B Instruct](https://huggingface.co/MaziyarPanahi/Meta-Llama-3-8B-Instruct-GGUF) 
+### 🚀 Performance Optimizations (ACB-68, ACB-67)
+- **Response Time Improvements**: Optimized inference pipeline reducing 300+ second response times
+- **Intelligent ETA Estimation**: Accurate response time predictions in console output
+- **Memory Management**: Better resource allocation and cleanup
+- **GPU Acceleration**: Enhanced CUDA, OpenCL, and Metal support
 
-And many many other LLM models in .gguf format
+### 🖥️ Enhanced User Interface (ACB-64, ACB-65)
+- **Improved Message Layout**: Messages no longer cut off at bottom
+- **Persistent Scrollbar**: Always-visible scrollbar for better navigation
+- **Repositioned Controls**: Chat input moved above attitude summary for better UX
+- **Responsive Design**: Better handling of different screen sizes
 
-## API documentation
-API documentation can be found [here](/docs/api_docs.md)
+### 🔧 Console & Debugging (ACB-63)
+- **Clean Console Output**: Removed verbose tensor loading messages
+- **Attitude Change Display**: Real-time attitude changes shown in console (e.g., "Love +2 | Trust +5 | Fear -10")
+- **Third-Party Mentions**: Tracking and display of mentioned individuals (e.g., "Alicia mentioned for the 3rd time")
+- **Response ETA**: Estimated response times displayed during generation
 
-## Projects based on ai-companion Backend/API/Library
-- [local assistant](https://github.com/Hukasx0/local-assistant) - llm powered ai virtual assistant
-- [matrix companion bot](https://github.com/Hukasx0/matrix-companion-bot) - AI-based chat bot running on the Matrix protocol 
+### 🎭 Better Third-Party Detection (ACB-66)
+- **Improved Person Recognition**: Objects and activities no longer incorrectly recognized as people
+- **Smarter Filtering**: Enhanced algorithms to distinguish between people and other entities
+- **Cleaner Memory**: Reduced false positives in relationship tracking
 
-## ~~Use as python library~~ (Deprecated)
-~~If you are looking for a Python library that allows you to use the ai-companion backend in your projects, it is available here [ai-companion-py](https://github.com/Hukasx0/ai-companion-py)~~
+### 🐛 Bug Fixes & Stability (ACB-69)
+- **Date Display Fixed**: Resolved "Invalid Date, NaN @ invalid date" errors
+- **Memory Leak Prevention**: Better resource cleanup and management
+- **Cross-Platform Path Handling**: Improved file path resolution for all operating systems
 
-## Compilation from source code:
-To build an executable file you need: [Node.js and npm](https://nodejs.org/), [Rust and cargo](https://www.rust-lang.org/)
+## Core Features (Preserved from Original)
 
-To make the software work with CUDA, OpenCL and Metal you must also follow similar steps to those [in this documentation](https://github.com/rustformers/llm/blob/main/doc/acceleration-support.md)
+- **Complete Privacy**: All data stored locally in SQLite database
+- **No Internet Required**: Fully offline operation after initial setup  
+- **GPU Acceleration**: CUDA, OpenCL, and Metal support
+- **Advanced Memory System**: Both short-term and long-term memory with associative recall
+- **Character Cards**: Import .json and .png character card formats
+- **REST API**: Use as backend for other projects
+- **Roleplay Support**: Actions between asterisks (*waves hello*)
+- **Real-time Learning**: AI learns about users through conversation
+- **Time Awareness**: AI can access current date/time and remember when conversations occurred
 
-make a git clone of the repository:
-```
-git clone https://github.com/Hukasx0/ai-companion
-```
-go to the folder
-```
-cd ai-companion/
-```
-install node modules
-```
-npm i
-```
-compile everything into one binary
-```
+## Quick Start
+
+1. **Download**: Get the appropriate binary for your OS (coming soon)
+2. **Setup Models**: Place GGUF model files in a `llms` folder next to the executable
+3. **Launch**: Double-click the binary or run from command line
+4. **Configure**: Open http://localhost:3000 and select your model from the dropdown
+5. **Chat**: Start conversing with your AI companion!
+
+## Model Management Made Easy
+
+The new model selection system makes managing multiple LLM models effortless:
+
+- **Automatic Discovery**: Just drop GGUF files in the `llms` folder
+- **Multiple Directories**: Add as many model directories as needed
+- **Visual Selection**: See all models with sizes and metadata
+- **Hot Swapping**: Change models without restarting the application
+
+## System Requirements
+
+- **Windows**: Windows 10+ (x64)
+- **Linux**: Any modern distribution
+- **macOS**: macOS 10.14+
+- **RAM**: 4GB minimum, 8GB+ recommended
+- **Storage**: 500MB+ free space (plus space for models)
+- **GPU**: Optional but recommended for better performance
+
+## Supported Models
+
+Works with any GGUF format models including:
+- Llama 2/3/3.1/3.2 series
+- Mistral 7B/8x7B series  
+- Code Llama variants
+- Zephyr models
+- Phi-3 models
+- And many more!
+
+## Development & Building
+
+### Prerequisites
+- [Node.js and npm](https://nodejs.org/)
+- [Rust and cargo](https://www.rust-lang.org/)
+- For GPU support: Follow [CUDA/OpenCL/Metal setup guide](https://github.com/rustformers/llm/blob/main/doc/acceleration-support.md)
+
+### Build Commands
+```bash
+# Clone this repository
+git clone https://github.com/ericfisherdev/ai-convobot
+cd ai-convobot
+
+# Install dependencies
+npm install
+
+# Build frontend and backend (CPU only)
 npm run build-full
-```
-or
 
-compile everything into one binary with CUDA support
+# GPU-accelerated builds
+npm run build-full-cuda    # NVIDIA CUDA
+npm run build-full-opencl  # OpenCL (AMD/Intel)
+npm run build-full-metal   # Apple Metal (macOS)
 ```
-npm run build-full-cuda
-```
-or
 
-compile everything into one binary with OpenCL support
-```
-npm run build-full-opencl
-```
-or
+Binary will be available in `backend/target/release/`
 
-compile everything into one binary with Metal support
-```
-npm run build-full-metal
-```
-(after compilation the binary should be in ai-companion/backend/target/release)
+## API Documentation
 
-and then proceed the same as for [installation](#installation)
+Complete REST API documentation available at [/docs/api_docs.md](/docs/api_docs.md)
+
+## Contributing
+
+This fork welcomes contributions! Please:
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes with tests
+4. Submit a pull request with detailed description
+
+## Roadmap
+
+- [ ] Streaming responses for real-time generation
+- [ ] Plugin system for extensibility
+- [ ] Multi-language UI support
+- [ ] Enhanced voice synthesis integration
+- [ ] Docker containerization
+- [ ] Model quantization tools
+
+## Acknowledgments
+
+- Original project by [Hukasx0](https://github.com/Hukasx0/ai-companion)
+- Built on [rustformers/llm](https://github.com/rustformers/llm)
+- UI components from [shadcn/ui](https://ui.shadcn.com/)
+
+## License
+
+This project maintains the same license as the original AI Companion project.
+
+---
+
+**Note**: This is an independent fork focused on improvements and bug fixes. For the original project, visit [Hukasx0/ai-companion](https://github.com/Hukasx0/ai-companion).
