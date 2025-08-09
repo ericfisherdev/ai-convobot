@@ -23,6 +23,8 @@ use crate::session_manager::SessionManager;
 mod attitude_formatter;
 mod gpu_allocator;
 use crate::gpu_allocator::{GpuAllocator, LayerAllocation};
+mod system_memory;
+use crate::system_memory::{SystemMemoryDetector, SystemMemoryInfo};
 #[cfg(test)]
 mod simple_tests;
 
