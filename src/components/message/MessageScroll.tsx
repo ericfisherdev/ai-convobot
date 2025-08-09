@@ -67,8 +67,8 @@ export function MessageScroll() {
   if (useVirtualScrolling) {
     return (
       <div className={cn(
-        "w-full relative",
-        isMobile ? "h-full" : "h-[70vh] md:h-[82vh] rounded-md border backdrop-blur-sm"
+        "w-full relative h-full",
+        !isMobile && "rounded-md border backdrop-blur-sm"
       )}>
         <VirtualMessageList
           messages={messages}
@@ -90,8 +90,8 @@ export function MessageScroll() {
     <ScrollArea
       ref={scrollRef}
       className={cn(
-        "w-full touch-scroll smooth-scroll",
-        isMobile ? "h-full" : "h-[70vh] md:h-[82vh] rounded-md border backdrop-blur-sm"
+        "w-full h-full touch-scroll smooth-scroll scroll-area",
+        !isMobile && "rounded-md border backdrop-blur-sm"
       )}
     >
       <div className={cn(
@@ -135,8 +135,11 @@ export function MessageScroll() {
             </div>
           ))}
           <TypingIndicator isVisible={isTyping} />
-          {/* Bottom padding for mobile to prevent input overlap */}
-          {isMobile && <div className="h-4" />}
+          {/* Extra bottom padding to prevent message clipping */}
+          <div className={cn(
+            "flex-shrink-0",
+            isMobile ? "h-8" : "h-6"
+          )} />
         </div>
       </div>
     </ScrollArea>

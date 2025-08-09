@@ -163,8 +163,8 @@ const ChatWindow = () => {
             </div>
           </div>
           
-          {/* Messages - takes remaining space */}
-          <div className="flex-1 overflow-hidden">
+          {/* Messages - takes remaining space and allows scrolling */}
+          <div className="flex-1 min-h-0">
             <MessageScroll />
           </div>
           

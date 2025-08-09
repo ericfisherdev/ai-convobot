@@ -320,6 +320,47 @@ body {
     overscroll-behavior-y: contain;
     scroll-behavior: smooth;
   }
+
+  /* Persistent scrollbar styles */
+  .scroll-area[data-radix-scroll-area-root] {
+    scrollbar-gutter: stable;
+  }
+
+  .scroll-area [data-radix-scroll-area-viewport] {
+    scrollbar-width: auto;
+    scrollbar-color: hsl(var(--muted-foreground)) transparent;
+  }
+
+  .scroll-area [data-radix-scroll-area-viewport]::-webkit-scrollbar {
+    width: 8px;
+    background: transparent;
+  }
+
+  .scroll-area [data-radix-scroll-area-viewport]::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .scroll-area [data-radix-scroll-area-viewport]::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--muted-foreground) / 0.3);
+    border-radius: 4px;
+    border: 1px solid transparent;
+  }
+
+  .scroll-area [data-radix-scroll-area-viewport]::-webkit-scrollbar-thumb:hover {
+    background-color: hsl(var(--muted-foreground) / 0.5);
+  }
+
+  /* Always show scrollbar on desktop (override mobile hide) */
+  @media (min-width: 641px) {
+    .scroll-area [data-radix-scroll-area-viewport] {
+      scrollbar-width: auto !important;
+      -ms-overflow-style: auto !important;
+    }
+    
+    .scroll-area [data-radix-scroll-area-viewport]::-webkit-scrollbar {
+      display: block !important;
+    }
+  }
   
   /* Prevent text selection on UI elements */
   button, .ui-element {
