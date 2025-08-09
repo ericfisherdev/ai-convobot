@@ -72,13 +72,13 @@ const ChatWindow = () => {
           id: -1,
           ai: false,
           content: userMessage,
-          created_at: "now",
+          created_at: new Date().toISOString(),
         });
         pushMessage({
           id: -2,
           ai: true,
           content: `${companionData.name} is typing...`,
-          created_at: "",
+          created_at: new Date().toISOString(),
         })
         resolve();
       });
