@@ -7,6 +7,12 @@ export function cn(...inputs: ClassValue[]) {
 
 export function formatMessageDate(dateString: string): string {
   const date = new Date(dateString);
+  
+  // Validate date and provide fallback for invalid dates
+  if (isNaN(date.getTime())) {
+    return "Just now";
+  }
+  
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const messageDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
