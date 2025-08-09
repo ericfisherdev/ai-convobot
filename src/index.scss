@@ -353,6 +353,78 @@ body {
     will-change: transform;
     transform: translateZ(0);
   }
+  
+  /* Message container layout styles */
+  .message-container {
+    padding: 0.5rem 0;
+    margin: 0.25rem 0;
+    transition: all 0.2s ease-in-out;
+  }
+  
+  .message-header {
+    min-height: 1.5rem;
+  }
+  
+  .message-info {
+    flex: 1;
+  }
+  
+  .message-actions {
+    flex-shrink: 0;
+  }
+  
+  .message-content {
+    width: 100%;
+  }
+  
+  /* Compact mode for message containers */
+  .compact-mode .message-container {
+    padding: 0.25rem 0;
+    margin: 0.125rem 0;
+  }
+  
+  .compact-mode .message-header {
+    min-height: 1.25rem;
+  }
+  
+  /* Mobile responsive adjustments */
+  @media (max-width: 640px) {
+    .message-header {
+      flex-wrap: wrap;
+      gap: 0.25rem;
+    }
+    
+    .message-actions {
+      opacity: 1 !important; /* Always show on mobile */
+    }
+    
+    .message-info {
+      flex: 1 1 100%;
+      order: 1;
+    }
+    
+    .message-actions {
+      flex: 0 0 auto;
+      order: 2;
+      align-self: flex-start;
+    }
+  }
+  
+  @media (max-width: 480px) {
+    .message-container {
+      padding: 0.25rem 0;
+    }
+    
+    .message-header {
+      margin-bottom: 0.5rem;
+    }
+    
+    .message-actions button {
+      min-width: 36px;
+      min-height: 36px;
+      padding: 6px;
+    }
+  }
 }
 
 .chat {
