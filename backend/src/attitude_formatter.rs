@@ -429,6 +429,53 @@ impl AttitudeFormatter {
         relationship_weight * 0.7 + emotion_intensity * 0.3
     }
 
+    /// Format attitude changes for console output
+    pub fn format_attitude_changes_for_console(
+        &self,
+        previous: &CompanionAttitude,
+        current: &CompanionAttitude,
+    ) -> String {
+        let mut changes = Vec::new();
+        
+        // Define threshold for significant changes
+        let threshold = 1.0;
+        
+        // Check each attitude dimension for significant changes
+        let attitude_pairs = [
+            ("Love", previous.love, current.love),
+            ("Attraction", previous.attraction, current.attraction),
+            ("Lust", previous.lust, current.lust),
+            ("Trust", previous.trust, current.trust),
+            ("Anger", previous.anger, current.anger),
+            ("Suspicion", previous.suspicion, current.suspicion),
+            ("Curiosity", previous.curiosity, current.curiosity),
+            ("Butterflies", previous.butterflies, current.butterflies),
+            ("Joy", previous.joy, current.joy),
+            ("Sorrow", previous.sorrow, current.sorrow),
+            ("Fear", previous.fear, current.fear),
+            ("Anxiety", previous.anxiety, current.anxiety),
+            ("Empathy", previous.empathy, current.empathy),
+            ("Respect", previous.respect, current.respect),
+        ];
+        
+        for (name, prev, curr) in attitude_pairs {
+            let change = curr - prev;
+            if change.abs() >= threshold {
+                if change > 0.0 {
+                    changes.push(format!("{} +{:.0}", name, change));
+                } else {
+                    changes.push(format!("{} {:.0}", name, change));
+                }
+            }
+        }
+        
+        if changes.is_empty() {
+            String::new()
+        } else {
+            format!("💝 Attitude changes: {}", changes.join(" | "))
+        }
+    }
+
     /// Generate a natural language summary of companion's attitude towards user
     pub fn generate_natural_language_summary(&self, attitude: &CompanionAttitude) -> String {
         // Find dominant emotions and their values
