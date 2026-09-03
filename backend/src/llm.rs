@@ -538,8 +538,9 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
     let mut n_cur = prompt_tokens.len() as i32;
 
     while (tokens_generated as usize) < response_token_limit && (n_cur as u32) < context_size {
+        // `sample` already accepts the token into the chain, so calling
+        // `accept` here too would push it into the penalties ring buffer twice.
         let token = sampler.sample(&llama_context, -1);
-        sampler.accept(token);
 
         // Honour the model's own end-of-generation tokens, which the previous
         // string-only halting could not see.
