@@ -37,3 +37,14 @@ backend/release-package/
 
 # Zip files
 *.zip
+
+# Runtime databases and search index (contain user chat history)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+longterm_memory/*.lock
+longterm_memory/.tantivy-*
+backend/longterm_memory/*.lock
+backend/longterm_memory/.tantivy-*
