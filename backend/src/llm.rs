@@ -13,6 +13,48 @@ use crate::inference_optimizer::INFERENCE_OPTIMIZER;
 use crate::inference_performance::{ModelConfig, INFERENCE_TRACKER};
 use crate::long_term_mem::LongTermMem;
 
+use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::sampling::LlamaSampler;
+use std::num::NonZeroU32;
+use std::sync::{Mutex, OnceLock};
+
+/// Maximum tokens submitted to llama.cpp in a single decode call.
+const N_BATCH: u32 = 512;
+
+/// llama.cpp keeps process-global state, so its backend must be initialised
+/// exactly once. Later calls reuse the handle stored here.
+static LLAMA_BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
+static LLAMA_BACKEND_INIT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Returns the process-wide llama.cpp backend, initialising it on first use.
+///
+/// # Errors
+/// Returns `std::io::ErrorKind::Other` if llama.cpp fails to initialise.
+fn llama_backend() -> Result<&'static LlamaBackend, std::io::Error> {
+    if let Some(backend) = LLAMA_BACKEND.get() {
+        return Ok(backend);
+    }
+    // Serialise initialisation so two concurrent requests cannot both call
+    // llama_backend_init and have one fail with BackendAlreadyInitialized.
+    let _guard = LLAMA_BACKEND_INIT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(backend) = LLAMA_BACKEND.get() {
+        return Ok(backend);
+    }
+    let backend = LlamaBackend::init().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to initialize llama.cpp backend: {}", e),
+        )
+    })?;
+    Ok(LLAMA_BACKEND.get_or_init(|| backend))
+}
+
 pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
     let start_time = std::time::Instant::now();
     let long_term_memory = match LongTermMem::connect() {
@@ -58,108 +100,82 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
         }
     };
 
-    let llama_model_params = {
-        let mut params = llm::ModelParameters::default();
-        
-        // Enable performance optimizations for all devices
-        params.prefer_mmap = true;     // Memory-mapped model loading reduces RAM usage
-        
-        if config.device == Device::GPU || config.device == Device::Metal {
-            params.use_gpu = true;
+    // llama.cpp expresses GPU offloading as a single layer count, so resolve
+    // that number before building the model parameters.
+    let gpu_layers: u32 = if config.device == Device::GPU || config.device == Device::Metal {
+        if config.dynamic_gpu_allocation {
+            let allocator = GpuAllocator::new()
+                .with_safety_margin(config.gpu_safety_margin)
+                .with_min_free_vram(config.min_free_vram_mb);
 
-            // Use dynamic GPU allocation if enabled
-            if config.dynamic_gpu_allocation {
-                let allocator = GpuAllocator::new()
-                    .with_safety_margin(config.gpu_safety_margin)
-                    .with_min_free_vram(config.min_free_vram_mb);
+            match allocator.detect_gpu_memory(&config.device) {
+                Ok(gpu_info) => {
+                    println!("🔍 GPU Detection: {}", gpu_info);
 
-                match allocator.detect_gpu_memory(&config.device) {
-                    Ok(gpu_info) => {
-                        println!("🔍 GPU Detection: {}", gpu_info);
+                    let vram_limit = if config.vram_limit_gb > 0 {
+                        Some(config.vram_limit_gb as f32)
+                    } else {
+                        None
+                    };
 
-                        let vram_limit = if config.vram_limit_gb > 0 {
-                            Some(config.vram_limit_gb as f32)
-                        } else {
-                            None
-                        };
+                    // Estimate model size (this would ideally come from model metadata)
+                    let estimated_model_size_mb = 4096;
+                    let estimated_total_layers = 32;
 
-                        // Estimate model size (this would ideally come from model metadata)
-                        let estimated_model_size_mb = 4096;
-                        let estimated_total_layers = 32;
+                    // Use the new optimized allocation method
+                    let allocation = allocator.calculate_optimal_layers_v2(
+                        &gpu_info,
+                        &config.llm_model_path,
+                        estimated_model_size_mb,
+                        estimated_total_layers,
+                        vram_limit,
+                    );
 
-                        // Use the new optimized allocation method
-                        let allocation = allocator.calculate_optimal_layers_v2(
-                            &gpu_info,
-                            &config.llm_model_path,
-                            estimated_model_size_mb,
-                            estimated_total_layers,
-                            vram_limit,
-                        );
-
-                        println!("🎯 Dynamic Allocation: {}", allocation);
-                        params.gpu_layers = Some(allocation.gpu_layers);
-                    }
-                    Err(e) => {
-                        eprintln!("⚠️ GPU detection failed, using configured layers: {}", e);
-                        params.gpu_layers = Some(config.gpu_layers);
-                    }
+                    println!("🎯 Dynamic Allocation: {}", allocation);
+                    allocation.gpu_layers as u32
                 }
-            } else {
-                println!("📌 Static Allocation: {} GPU layers", config.gpu_layers);
-                params.gpu_layers = Some(config.gpu_layers);
+                Err(e) => {
+                    eprintln!("⚠️ GPU detection failed, using configured layers: {}", e);
+                    config.gpu_layers as u32
+                }
             }
         } else {
-            params.use_gpu = false;
-            params.gpu_layers = None;
-            println!("💻 CPU-only inference mode");
+            println!("📌 Static Allocation: {} GPU layers", config.gpu_layers);
+            config.gpu_layers as u32
         }
-        params
+    } else {
+        println!("💻 CPU-only inference mode");
+        0
     };
 
-    let llama = llm::load(
-        std::path::Path::new(&config.llm_model_path),
-        llm::TokenizerSource::Embedded,
-        llama_model_params,
-        // Use a quiet callback that only shows essential information
-        |progress| {
-            match progress {
-                llm::LoadProgress::HyperparametersLoaded => {
-                    print!("📚 Loading model... ");
-                    std::io::stdout().flush().unwrap();
-                }
-                llm::LoadProgress::Loaded { file_size, tensor_count } => {
-                    println!("✓ Model loaded ({} tensors, {:.2} MB)", tensor_count, file_size as f32 / 1024.0 / 1024.0);
-                }
-                // Suppress tensor loading messages
-                _ => {}
-            }
-        },
-    );
+    let model_params = LlamaModelParams::default()
+        .with_n_gpu_layers(gpu_layers)
+        .with_use_mmap(true); // Memory-mapped model loading reduces RAM usage
 
-    let llama = match llama {
-        Ok(llama) => llama,
+    let backend = llama_backend()?;
+
+    print!("📚 Loading model... ");
+    std::io::stdout().flush().unwrap();
+    let model = match LlamaModel::load_from_file(
+        backend,
+        std::path::Path::new(&config.llm_model_path),
+        &model_params,
+    ) {
+        Ok(model) => model,
         Err(e) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("Failed to load llm model: {}", e.to_string()),
+                format!("Failed to load llm model: {}", e),
             ))
         }
     };
+    println!("✓ Model loaded");
 
     // Calculate CPU cores for optimizations
     let cpu_cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4); // Fallback to 4 cores if detection fails
 
-    // Create optimized session configuration for better caching
-    let session_config = llm::InferenceSessionConfig {
-        n_threads: cpu_cores,                         // Use all CPU cores for session
-        n_batch: 512,                                // Larger batch size
-        memory_k_type: llm::ModelKVMemoryType::Float16, // Use F16 for KV cache
-        memory_v_type: llm::ModelKVMemoryType::Float16,
-    };
-    
-    let mut session = llama.start_session(session_config);
     println!("🚀 Generating AI response with optimized session...");
     let mut base_prompt: String;
     let mut rp: &str = "";
@@ -440,63 +456,147 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
         tracker.start_session(session_id.clone(), model_config.clone(), input_tokens);
     }
 
-    // Create optimized inference parameters for better performance        
-    let optimized_inference_params = llm::InferenceParameters::default();
+    // The old `llm` crate hid sampling behind InferenceParameters::default().
+    // llama.cpp requires an explicit sampler chain, so these values reproduce
+    // a conventional chat preset.
+    let mut sampler = LlamaSampler::chain_simple([
+        LlamaSampler::penalties(model.n_vocab(), 64, 1.1, 0.0, 0.0),
+        LlamaSampler::top_k(40),
+        LlamaSampler::top_p(0.9, 1),
+        LlamaSampler::min_p(0.05, 1),
+        LlamaSampler::temp(0.8),
+        LlamaSampler::dist(rand::random::<u32>()),
+    ]);
+
+    // Size the KV cache from the budget the ContextManager already computed.
+    let context_size = context_manager.token_budget.total.max(512) as u32;
+    let context_params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(context_size))
+        .with_n_batch(N_BATCH)
+        .with_n_threads(cpu_cores as i32)
+        .with_n_threads_batch(cpu_cores as i32);
+
+    let mut llama_context = match model.new_context(backend, context_params) {
+        Ok(context) => context,
+        Err(e) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to create llama context: {}", e),
+            ))
+        }
+    };
+
+    let full_prompt = format!("{}{}: ", &base_prompt, companion.name);
+    let prompt_tokens = match model.str_to_token(&full_prompt, AddBos::Always) {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to tokenize prompt: {}", e),
+            ))
+        }
+    };
+
+    if prompt_tokens.len() >= context_size as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "Prompt is {} tokens but the context window is only {}",
+                prompt_tokens.len(),
+                context_size
+            ),
+        ));
+    }
+
+    // Feed the prompt in n_batch-sized chunks; only the final token needs logits.
+    let last_prompt_index = prompt_tokens.len() - 1;
+    let mut batch = LlamaBatch::new(N_BATCH as usize, 1);
+    for (i, token) in prompt_tokens.iter().enumerate() {
+        let is_last = i == last_prompt_index;
+        if let Err(e) = batch.add(*token, i as i32, &[0], is_last) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to build prompt batch: {}", e),
+            ));
+        }
+        if batch.n_tokens() as u32 == N_BATCH || is_last {
+            if let Err(e) = llama_context.decode(&mut batch) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to evaluate prompt: {}", e),
+                ));
+            }
+            batch.clear();
+        }
+    }
 
     let mut end_of_generation = String::new();
     let mut tokens_generated = 0u32;
     let mut first_token_recorded = false;
     let eog = format!("\n{}:", user.name);
-    
-    let res = session.infer::<std::convert::Infallible>(
-        llama.as_ref(),
-        &mut rand::thread_rng(),
-        &llm::InferenceRequest {
-            prompt: llm::Prompt::Text(&format!("{}{}: ", &base_prompt, companion.name)),
-            parameters: &optimized_inference_params,
-            play_back_previous_tokens: false,
-            maximum_token_count: Some(response_token_limit),
-        },
-        &mut Default::default(),
-        |t| {
-            match t {
-                llm::InferenceResponse::SnapshotToken(_) => { /*print!("{token}");*/ }
-                llm::InferenceResponse::PromptToken(_) => { /*print!("{token}");*/ }
-                llm::InferenceResponse::InferredToken(token) => {
-                    // Track first token for time-to-first-token metric
-                    if !first_token_recorded {
-                        if let Ok(mut tracker) = INFERENCE_TRACKER.lock() {
-                            tracker.record_first_token(&session_id);
-                        }
-                        first_token_recorded = true;
-                    }
-                    
-                    tokens_generated += 1;
-                    end_of_generation.push_str(&token);
-                    print!("{token}");
-                    
-                    // Update token count for progress tracking
-                    if let Ok(mut tracker) = INFERENCE_TRACKER.lock() {
-                        tracker.update_token_count(&session_id, tokens_generated);
-                    }
-                    
-                    if end_of_generation.contains(&eog)
-                        || end_of_generation.contains("[/INST]")
-                        || end_of_generation.contains("<</SYS>>")
-                        || end_of_generation.contains("[s]")
-                        || end_of_generation.contains(&format!("{}:", &companion.name))
-                        || end_of_generation.contains(&format!("{}:", &user.name))
-                        || end_of_generation.contains("<|user|>")
-                    {
-                        return Ok(llm::InferenceFeedback::Halt);
-                    }
-                }
-                llm::InferenceResponse::EotToken => {}
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    let mut n_cur = prompt_tokens.len() as i32;
+
+    while (tokens_generated as usize) < response_token_limit && (n_cur as u32) < context_size {
+        let token = sampler.sample(&llama_context, -1);
+        sampler.accept(token);
+
+        // Honour the model's own end-of-generation tokens, which the previous
+        // string-only halting could not see.
+        if model.is_eog_token(token) {
+            break;
+        }
+
+        let piece = match model.token_to_piece(token, &mut decoder, false, None) {
+            Ok(piece) => piece,
+            Err(e) => {
+                eprintln!("Failed to decode token: {}", e);
+                break;
             }
-            std::io::stdout().flush().unwrap();
-            Ok(llm::InferenceFeedback::Continue)
-        },
-    );
+        };
+
+        // Track first token for time-to-first-token metric
+        if !first_token_recorded {
+            if let Ok(mut tracker) = INFERENCE_TRACKER.lock() {
+                tracker.record_first_token(&session_id);
+            }
+            first_token_recorded = true;
+        }
+
+        tokens_generated += 1;
+        end_of_generation.push_str(&piece);
+        print!("{piece}");
+        std::io::stdout().flush().unwrap();
+
+        // Update token count for progress tracking
+        if let Ok(mut tracker) = INFERENCE_TRACKER.lock() {
+            tracker.update_token_count(&session_id, tokens_generated);
+        }
+
+        if end_of_generation.contains(&eog)
+            || end_of_generation.contains("[/INST]")
+            || end_of_generation.contains("<</SYS>>")
+            || end_of_generation.contains("[s]")
+            || end_of_generation.contains(&format!("{}:", &companion.name))
+            || end_of_generation.contains(&format!("{}:", &user.name))
+            || end_of_generation.contains("<|user|>")
+        {
+            break;
+        }
+
+        batch.clear();
+        if let Err(e) = batch.add(token, n_cur, &[0], true) {
+            eprintln!("Failed to queue generated token: {}", e);
+            break;
+        }
+        if let Err(e) = llama_context.decode(&mut batch) {
+            eprintln!("Failed to decode generated token: {}", e);
+            break;
+        }
+        n_cur += 1;
+    }
+    println!();
+
     let x: String = end_of_generation
         .replace(&eog, "")
         .replace("[INST]", "")
@@ -505,10 +605,6 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
         .replace("<s>", "")
         .replace("</s>", "")
         .replace("<|user|>", "");
-    match res {
-        Ok(result) => println!("\n\nInference stats:\n{result}"),
-        Err(err) => println!("\n{err}"),
-    }
     let companion_text = x
         .split(&format!("\n{}: ", &companion.name))
         .next()
