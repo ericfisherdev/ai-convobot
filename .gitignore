@@ -48,3 +48,8 @@ longterm_memory/*.lock
 longterm_memory/.tantivy-*
 backend/longterm_memory/*.lock
 backend/longterm_memory/.tantivy-*
+
+# Local model weights
+*.gguf
+*.bin
+models/
