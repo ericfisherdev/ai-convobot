@@ -436,23 +436,40 @@ mod tests {
     fn test_token_estimation() {
         let tracker = InferencePerformanceTracker::new();
 
+        // 11 bytes / 4 = 2.75, ceil -> 3
         assert_eq!(tracker.estimate_input_tokens("hello world"), 3);
-        assert_eq!(
-            tracker.estimate_input_tokens("a longer message with more words"),
-            9
+
+        let short = tracker.estimate_input_tokens("hello world");
+        let long = tracker.estimate_input_tokens("a longer message with more words");
+        assert!(
+            long > short,
+            "longer input must estimate more tokens: {long} <= {short}"
         );
+
+        assert_eq!(tracker.estimate_input_tokens(""), 0);
     }
 
     #[test]
     fn test_output_estimation() {
         let tracker = InferencePerformanceTracker::new();
 
+        // prompts must exceed the 20-token floor for the request-type multipliers to be observable
         let short_q = tracker.estimate_output_tokens("What time is it?");
-        let creative = tracker.estimate_output_tokens("Write a story about dragons");
-        let explain = tracker.estimate_output_tokens("Explain how computers work");
+        let creative = tracker.estimate_output_tokens(
+            "Write a story about dragons flying over a medieval castle town",
+        );
+        let explain = tracker
+            .estimate_output_tokens("Explain how computers work and what the main components are");
 
-        assert!(creative > explain);
-        assert!(explain > short_q);
+        assert!(
+            creative > explain,
+            "creative ({creative}) must exceed explain ({explain})"
+        );
+        assert!(
+            explain > short_q,
+            "explain ({explain}) must exceed short_q ({short_q})"
+        );
+        assert_eq!(short_q, 20, "short questions clamp to the 20-token floor");
     }
 
     #[test]

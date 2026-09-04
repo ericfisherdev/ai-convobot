@@ -727,7 +727,20 @@ mod tests {
         };
 
         let emotional_state = formatter.analyze_emotional_state(&happy_attitude);
-        assert!(emotional_state.contains("pleased"));
+        // joy > 70 -> "very happy"
+        assert!(
+            emotional_state.contains("very happy"),
+            "joy 80 is above the 70 'very happy' band, got: {emotional_state}"
+        );
+
+        let mut pleased_attitude = happy_attitude.clone();
+        pleased_attitude.joy = 60.0;
+        let emotional_state = formatter.analyze_emotional_state(&pleased_attitude);
+        // 50 < joy <= 70 -> "pleased"
+        assert!(
+            emotional_state.contains("pleased"),
+            "joy 60 is within the 50-70 'pleased' band, got: {emotional_state}"
+        );
     }
 
     #[test]
