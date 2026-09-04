@@ -127,9 +127,9 @@ Binary will be available in `backend/target/release/`
 ### Quality Checks
 
 `make check` runs formatting, lint, typecheck, frontend tests, frontend build,
-clippy, and backend tests, in that order. CI and the git hooks call the same
-Makefile targets, so there is a single source of truth for what "passing"
-means.
+clippy, and backend tests, in that order. These targets are the single source
+of truth for what "passing" means; CI (#53) and the git hooks (#52) are being
+migrated to call them.
 
 | Target | What it does |
 | --- | --- |
