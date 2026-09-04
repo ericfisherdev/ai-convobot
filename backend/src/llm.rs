@@ -17,7 +17,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use std::num::NonZeroU32;
 use std::sync::{Mutex, OnceLock};
@@ -53,6 +53,59 @@ fn llama_backend() -> Result<&'static LlamaBackend, std::io::Error> {
         )
     })?;
     Ok(LLAMA_BACKEND.get_or_init(|| backend))
+}
+
+/// Renders the prompt using the chat template stored inside the GGUF file.
+///
+/// Consecutive turns from the same speaker are merged, because several chat
+/// templates reject a history that does not strictly alternate.
+///
+/// # Errors
+/// Returns a message describing why the model's template could not be used,
+/// so the caller can fall back to the plain-text transcript format.
+fn apply_gguf_chat_template(
+    model: &LlamaModel,
+    system_content: &str,
+    history: &[(bool, String)],
+) -> Result<String, String> {
+    let template = model
+        .chat_template(None)
+        .map_err(|e| format!("model does not carry a usable chat template: {}", e))?;
+
+    let mut messages: Vec<LlamaChatMessage> = Vec::with_capacity(history.len() + 1);
+    if !system_content.trim().is_empty() {
+        messages.push(
+            LlamaChatMessage::new("system".to_string(), system_content.to_string())
+                .map_err(|e| format!("invalid system message: {}", e))?,
+        );
+    }
+
+    let mut merged: Vec<(bool, String)> = Vec::with_capacity(history.len());
+    for (is_ai, content) in history {
+        match merged.last_mut() {
+            Some((last_is_ai, last_content)) if last_is_ai == is_ai => {
+                last_content.push('\n');
+                last_content.push_str(content);
+            }
+            _ => merged.push((*is_ai, content.clone())),
+        }
+    }
+
+    for (is_ai, content) in &merged {
+        let role = if *is_ai { "assistant" } else { "user" };
+        messages.push(
+            LlamaChatMessage::new(role.to_string(), content.clone())
+                .map_err(|e| format!("invalid chat message: {}", e))?,
+        );
+    }
+
+    if messages.is_empty() {
+        return Err("no messages to render".to_string());
+    }
+
+    model
+        .apply_chat_template(&template, &messages, true)
+        .map_err(|e| format!("failed to apply chat template: {}", e))
 }
 
 pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
@@ -349,6 +402,9 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
     let managed_messages = context_manager.manage_message_context(short_term_memory_entries);
     let mut message_counter = 1;
     let short_term_mem_len = managed_messages.len();
+    // Role-tagged history, used only by the Auto template. The string templates
+    // below keep splicing turns straight into base_prompt.
+    let mut chat_history: Vec<(bool, String)> = Vec::with_capacity(managed_messages.len());
     for message in &managed_messages {
         let prefix = if message.ai {
             &companion.name
@@ -364,7 +420,15 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
                 formatted_message
             );
         }
-        if config.prompt_template == PromptTemplate::Llama2 {
+        if config.prompt_template == PromptTemplate::Auto {
+            // The chat template supplies the speaker framing, so the message
+            // carries its own text rather than a "Name: " prefix.
+            let mut content = text.clone();
+            if message_counter == short_term_mem_len && contains_time_question(&formatted_message) {
+                content = format!("* it's currently {} *\n{}", get_current_date(), content);
+            }
+            chat_history.push((message.ai, content));
+        } else if config.prompt_template == PromptTemplate::Llama2 {
             if !message.ai {
                 base_prompt += &format!("[INST]{}", formatted_message);
             } else {
@@ -486,7 +550,27 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
         }
     };
 
-    let full_prompt = format!("{}{}: ", &base_prompt, companion.name);
+    let full_prompt = if config.prompt_template == PromptTemplate::Auto {
+        match apply_gguf_chat_template(&model, &base_prompt, &chat_history) {
+            Ok(rendered) => {
+                println!("🧩 Using the chat template embedded in the GGUF file");
+                rendered
+            }
+            Err(e) => {
+                // Not fatal: fall back to the plain transcript the Default
+                // template produces, which works with any model.
+                eprintln!("⚠️ Auto template unavailable ({}), falling back to the transcript format", e);
+                let mut fallback = base_prompt.clone();
+                for (is_ai, content) in &chat_history {
+                    let speaker = if *is_ai { &companion.name } else { &user.name };
+                    fallback += &format!("{}: {}\n", speaker, content);
+                }
+                format!("{}{}: ", fallback, companion.name)
+            }
+        }
+    } else {
+        format!("{}{}: ", &base_prompt, companion.name)
+    };
     let prompt_tokens = match model.str_to_token(&full_prompt, AddBos::Always) {
         Ok(tokens) => tokens,
         Err(e) => {

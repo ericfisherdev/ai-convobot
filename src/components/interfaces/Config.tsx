@@ -5,6 +5,7 @@ export enum Device {
 }
 
 export enum PromptTemplate {
+    Auto = "Auto",
     Default = "Default",
     Llama2 = "Llama2",
     Mistral = "Mistral"

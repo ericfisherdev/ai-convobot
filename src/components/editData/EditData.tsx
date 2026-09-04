@@ -882,6 +882,7 @@ export function EditData() {
                   <SelectValue placeholder="default" />
                 </SelectTrigger>
                 <SelectContent>
+                  <SelectItem value="Auto">Auto (model's own template)</SelectItem>
                   <SelectItem value="Default">Default</SelectItem>
                   <SelectItem value="Llama2">Llama2</SelectItem>
                   <SelectItem value="Mistral">Mistral</SelectItem>

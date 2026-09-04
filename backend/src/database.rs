@@ -255,6 +255,9 @@ impl ToSql for Device {
 
 #[derive(PartialEq, Serialize, Deserialize, Clone)]
 pub enum PromptTemplate {
+    /// Render the prompt with the chat template embedded in the GGUF file.
+    /// Falls back to `Default` when the model does not carry one.
+    Auto,
     Default,
     Llama2,
     Mistral,
@@ -265,6 +268,7 @@ impl FromSql for PromptTemplate {
         match value {
             ValueRef::Text(i) => match std::str::from_utf8(i) {
                 Ok(s) => match s {
+                    "Auto" => Ok(PromptTemplate::Auto),
                     "Default" => Ok(PromptTemplate::Default),
                     "Llama2" => Ok(PromptTemplate::Llama2),
                     "Mistral" => Ok(PromptTemplate::Mistral),
@@ -280,6 +284,7 @@ impl FromSql for PromptTemplate {
 impl ToSql for PromptTemplate {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         match self {
+            PromptTemplate::Auto => Ok(ToSqlOutput::from("Auto")),
             PromptTemplate::Default => Ok(ToSqlOutput::from("Default")),
             PromptTemplate::Llama2 => Ok(ToSqlOutput::from("Llama2")),
             PromptTemplate::Mistral => Ok(ToSqlOutput::from("Mistral")),
@@ -798,7 +803,7 @@ impl Database {
                 &[
                     &Device::CPU as &dyn ToSql,
                     &"path/to/your/gguf/model.gguf",
-                    &PromptTemplate::Default as &dyn ToSql
+                    &PromptTemplate::Auto as &dyn ToSql
                 ]
             )?;
         }
@@ -1188,6 +1193,7 @@ impl Database {
         };
 
         let prompt_template = match config.prompt_template.as_str() {
+            "Auto" => PromptTemplate::Auto,
             "Default" => PromptTemplate::Default,
             "Llama2" => PromptTemplate::Llama2,
             "Mistral" => PromptTemplate::Mistral,
