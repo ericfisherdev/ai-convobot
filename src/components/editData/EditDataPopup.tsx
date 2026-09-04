@@ -23,7 +23,7 @@ export function EditDataPopup() {
     const useMobileLayout = isMobile || isTablet;
   return (
     <>
-    {useMobileLayout ? 
+    {useMobileLayout ?
     <Drawer>
     <DrawerTrigger asChild>
       <Button variant="outline" size={"sm"} className="touch-target">

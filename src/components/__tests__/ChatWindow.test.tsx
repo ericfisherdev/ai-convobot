@@ -43,7 +43,7 @@ describe('ChatWindow Component', () => {
         <ChatWindow />
       </MockProviders>
     )
-    
+
     // Check if main chat elements are present
     expect(screen.getByRole('main')).toBeInTheDocument()
   })
@@ -54,7 +54,7 @@ describe('ChatWindow Component', () => {
         <ChatWindow />
       </MockProviders>
     )
-    
+
     const textarea = screen.getByRole('textbox')
     expect(textarea).toBeInTheDocument()
   })
@@ -65,20 +65,20 @@ describe('ChatWindow Component', () => {
         <ChatWindow />
       </MockProviders>
     )
-    
+
     const sendButton = screen.getByRole('button', { name: /send/i })
     expect(sendButton).toBeInTheDocument()
   })
 
   it('handles message input', async () => {
     const user = userEvent.setup()
-    
+
     render(
       <MockProviders>
         <ChatWindow />
       </MockProviders>
     )
-    
+
     const textarea = screen.getByRole('textbox')
     await user.type(textarea, 'Hello, this is a test message')
     expect(textarea).toHaveValue('Hello, this is a test message')

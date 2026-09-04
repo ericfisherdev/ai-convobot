@@ -12,7 +12,7 @@ import { toast } from "sonner";
 
 export function ThemeSettings() {
   const { theme, setTheme, resetTheme } = useThemeCustomization();
-  
+
   const handleReset = () => {
     resetTheme();
     toast.success("Theme settings reset to defaults");
@@ -108,7 +108,7 @@ export function ThemeSettings() {
                 onClick={() => setTheme({ colorScheme: scheme.value })}
               >
                 <div className="flex items-center gap-2">
-                  <div 
+                  <div
                     className="w-4 h-4 rounded-full border-2 border-background shadow-sm"
                     style={{ backgroundColor: scheme.color }}
                   />
@@ -152,7 +152,7 @@ export function ThemeSettings() {
               </SelectContent>
             </Select>
           </div>
-          
+
           <div className="space-y-2">
             <Label htmlFor="fontFamily">Font Family</Label>
             <Select value={theme.fontFamily} onValueChange={(value) => setTheme({ fontFamily: value as FontFamily })}>
@@ -192,9 +192,9 @@ export function ThemeSettings() {
               onCheckedChange={(checked) => setTheme({ animations: checked })}
             />
           </div>
-          
+
           <Separator />
-          
+
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="compactMode">Compact Mode</Label>
@@ -208,9 +208,9 @@ export function ThemeSettings() {
               onCheckedChange={(checked) => setTheme({ compactMode: checked })}
             />
           </div>
-          
+
           <Separator />
-          
+
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="highContrast">High Contrast</Label>

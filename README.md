@@ -52,7 +52,7 @@ AI Companion is a full-stack local chatbot application that runs entirely on you
 ## Core Features (Preserved from Original)
 
 - **Complete Privacy**: All data stored locally in SQLite database
-- **No Internet Required**: Fully offline operation after initial setup  
+- **No Internet Required**: Fully offline operation after initial setup
 - **GPU Acceleration**: CUDA, OpenCL, and Metal support
 - **Advanced Memory System**: Both short-term and long-term memory with associative recall
 - **Character Cards**: Import .json and .png character card formats
@@ -91,7 +91,7 @@ The new model selection system makes managing multiple LLM models effortless:
 
 Works with any GGUF format models including:
 - Llama 2/3/3.1/3.2 series
-- Mistral 7B/8x7B series  
+- Mistral 7B/8x7B series
 - Code Llama variants
 - Zephyr models
 - Phi-3 models

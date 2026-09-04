@@ -119,7 +119,7 @@ const UserMessage = ({ id, content, created_at }: MessageProps) => {
               <TooltipProvider delayDuration={250}>
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <button 
+                    <button
                       onClick={() => setShowReactions(!showReactions)}
                       className="hover:bg-secondary rounded p-1 transition-colors"
                     >
@@ -134,7 +134,7 @@ const UserMessage = ({ id, content, created_at }: MessageProps) => {
               <TooltipProvider delayDuration={250}>
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <button 
+                    <button
                       onClick={handleEdit}
                       className="hover:bg-secondary rounded p-1 transition-colors"
                     >
@@ -149,7 +149,7 @@ const UserMessage = ({ id, content, created_at }: MessageProps) => {
               <TooltipProvider delayDuration={250}>
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <button 
+                    <button
                       onClick={handleDelete}
                       className="hover:bg-secondary rounded p-1 transition-colors"
                     >
@@ -179,7 +179,7 @@ const UserMessage = ({ id, content, created_at }: MessageProps) => {
               <Markdown>{content}</Markdown>
             )}
           </div>
-          
+
           {/* Message status indicators */}
           <div className="flex items-center justify-end mt-1 gap-1 opacity-70">
             {isDelivered && (
@@ -192,7 +192,7 @@ const UserMessage = ({ id, content, created_at }: MessageProps) => {
               </div>
             )}
           </div>
-          
+
           {/* Reaction emoji display */}
           {(isLiked || showReactions) && (
             <div className="absolute -bottom-2 -right-2 flex gap-1 animate-in zoom-in-50 duration-200">
@@ -203,31 +203,31 @@ const UserMessage = ({ id, content, created_at }: MessageProps) => {
               )}
             </div>
           )}
-          
+
           {/* Quick reaction hover menu */}
           <div className={cn(
             "absolute -top-12 right-0 bg-background border rounded-lg shadow-lg p-2 gap-1 transition-all duration-200",
             showReactions ? "flex animate-in fade-in-0 scale-in-95" : "hidden"
           )}>
-            <button 
+            <button
               onClick={() => { setIsLiked(!isLiked); setShowReactions(false); }}
               className="hover:bg-secondary rounded p-1 text-lg transition-colors"
             >
               ❤️
             </button>
-            <button 
+            <button
               onClick={() => setShowReactions(false)}
               className="hover:bg-secondary rounded p-1 text-lg transition-colors"
             >
               👍
             </button>
-            <button 
+            <button
               onClick={() => setShowReactions(false)}
               className="hover:bg-secondary rounded p-1 text-lg transition-colors"
             >
               😂
             </button>
-            <button 
+            <button
               onClick={() => setShowReactions(false)}
               className="hover:bg-secondary rounded p-1 text-lg transition-colors"
             >
@@ -394,7 +394,7 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
               <TooltipProvider delayDuration={250}>
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <button 
+                    <button
                       onClick={() => setShowReactions(!showReactions)}
                       className="hover:bg-secondary rounded p-1 transition-colors"
                     >
@@ -409,7 +409,7 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
               <TooltipProvider delayDuration={250}>
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <button 
+                    <button
                       onClick={handleEdit}
                       className="hover:bg-secondary rounded p-1 transition-colors"
                     >
@@ -421,11 +421,11 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
                   </TooltipContent>
                 </Tooltip>
               </TooltipProvider>
-              {regenerate && 
+              {regenerate &&
                 <TooltipProvider delayDuration={250}>
                   <Tooltip>
                     <TooltipTrigger asChild>
-                      <button 
+                      <button
                         onClick={handleTuning}
                         className="hover:bg-secondary rounded p-1 transition-colors"
                       >
@@ -441,7 +441,7 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
               <TooltipProvider delayDuration={250}>
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <button 
+                    <button
                       onClick={handleDelete}
                       className="hover:bg-secondary rounded p-1 transition-colors"
                     >
@@ -484,7 +484,7 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
                 <TooltipProvider delayDuration={350}>
                   <Tooltip>
                     <TooltipTrigger asChild>
-                      <button 
+                      <button
                         onClick={handleRegenerate}
                         className="hover:bg-primary/10 rounded p-1 transition-colors"
                       >
@@ -517,7 +517,7 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
               )}
             </div>
           )}
-          
+
           {/* Reaction display */}
           {reactions.length > 0 && (
             <div className="absolute -bottom-2 -left-2 flex gap-1 animate-in zoom-in-50 duration-200">
@@ -528,31 +528,31 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
               ))}
             </div>
           )}
-          
+
           {/* Quick reaction hover menu */}
           <div className={cn(
             "absolute -top-12 left-0 bg-background border rounded-lg shadow-lg p-2 gap-1 transition-all duration-200",
             showReactions ? "flex animate-in fade-in-0 scale-in-95" : "hidden"
           )}>
-            <button 
+            <button
               onClick={() => { setReactions([...reactions, '❤️']); setShowReactions(false); }}
               className="hover:bg-secondary rounded p-1 text-lg transition-colors"
             >
               ❤️
             </button>
-            <button 
+            <button
               onClick={() => { setReactions([...reactions, '👍']); setShowReactions(false); }}
               className="hover:bg-secondary rounded p-1 text-lg transition-colors"
             >
               👍
             </button>
-            <button 
+            <button
               onClick={() => { setReactions([...reactions, '😂']); setShowReactions(false); }}
               className="hover:bg-secondary rounded p-1 text-lg transition-colors"
             >
               😂
             </button>
-            <button 
+            <button
               onClick={() => { setReactions([...reactions, '😮']); setShowReactions(false); }}
               className="hover:bg-secondary rounded p-1 text-lg transition-colors"
             >

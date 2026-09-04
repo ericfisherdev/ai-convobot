@@ -30,7 +30,7 @@ export function PWAInstallPrompt() {
       e.preventDefault();
       const promptEvent = e as BeforeInstallPromptEvent;
       setDeferredPrompt(promptEvent);
-      
+
       // Show prompt after user has been using the app for a bit
       setTimeout(() => {
         if (!isInstalled && !localStorage.getItem('pwa-install-dismissed')) {
@@ -62,7 +62,7 @@ export function PWAInstallPrompt() {
     try {
       await deferredPrompt.prompt();
       const { outcome } = await deferredPrompt.userChoice;
-      
+
       if (outcome === 'accepted') {
         console.log('User accepted the install prompt');
         setIsInstalled(true);
@@ -70,7 +70,7 @@ export function PWAInstallPrompt() {
         console.log('User dismissed the install prompt');
         localStorage.setItem('pwa-install-dismissed', Date.now().toString());
       }
-      
+
       setDeferredPrompt(null);
       setShowPrompt(false);
     } catch (error) {
@@ -118,8 +118,8 @@ export function PWAInstallPrompt() {
           <div className="space-y-1">
             <CardTitle className="text-base">Install AI Companion</CardTitle>
             <CardDescription className="text-sm">
-              {isIOS 
-                ? "Get the full app experience" 
+              {isIOS
+                ? "Get the full app experience"
                 : "Install for offline access and better performance"
               }
             </CardDescription>
@@ -133,7 +133,7 @@ export function PWAInstallPrompt() {
             <X className="h-4 w-4" />
           </Button>
         </CardHeader>
-        
+
         {isIOS ? (
           getIOSInstallInstructions()
         ) : (

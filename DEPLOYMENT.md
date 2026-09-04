@@ -69,10 +69,10 @@ docker run --gpus all -p 3000:3000 \
    ```bash
    # Linux/macOS
    ./ai-companion
-   
+
    # Or use the launcher script
    ./start.sh
-   
+
    # Windows
    ai-companion.exe
    # Or double-click start.bat
@@ -119,10 +119,10 @@ ai-companion/
    ```bash
    # CPU-only version
    docker-compose --profile cpu up -d
-   
+
    # CUDA version (requires NVIDIA Docker)
    docker-compose --profile cuda up -d
-   
+
    # Using pre-built images
    docker-compose --profile prebuilt-cpu up -d
    docker-compose --profile prebuilt-cuda up -d
@@ -171,13 +171,13 @@ docker run -d --name ai-companion-cuda \
    ```bash
    # CPU-only build
    npm run build-full
-   
+
    # CUDA build (requires CUDA toolkit)
    npm run build-full-cuda
-   
+
    # OpenCL build (requires OpenCL headers)
    npm run build-full-opencl
-   
+
    # Metal build (macOS only)
    npm run build-full-metal
    ```
@@ -186,7 +186,7 @@ docker run -d --name ai-companion-cuda \
    ```bash
    # Frontend + backend with auto-reload
    npm run dev-rs
-   
+
    # Frontend only
    npm run dev
    ```
@@ -228,10 +228,10 @@ NVIDIA_DRIVER_CAPABILITIES=compute,utility
 ### Model Configuration
 
 1. **Supported Formats**: GGUF models only
-2. **Model Location**: 
+2. **Model Location**:
    - Native: Any accessible path
    - Docker: Place in mounted `/app/models` directory
-3. **Recommended Models**: 
+3. **Recommended Models**:
    - 7B models: 4-8GB VRAM
    - 13B models: 8-16GB VRAM
    - 30B+ models: 24GB+ VRAM
@@ -251,7 +251,7 @@ NVIDIA_DRIVER_CAPABILITIES=compute,utility
    server {
        listen 80;
        server_name your-domain.com;
-       
+
        location / {
            proxy_pass http://localhost:3000;
            proxy_http_version 1.1;

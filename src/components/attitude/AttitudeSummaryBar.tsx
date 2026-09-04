@@ -32,7 +32,7 @@ export const AttitudeSummaryBar: React.FC<AttitudeSummaryBarProps> = ({ companio
             if (response.ok) {
                 const data: AttitudeSummaryResponse = await response.json();
                 setAttitude(data.attitude);
-                
+
                 // Replace placeholders with actual names
                 const formattedSummary = data.summary
                     .replace(/\{\{companion\}\}/g, companionData?.name || 'Companion')
@@ -64,7 +64,7 @@ export const AttitudeSummaryBar: React.FC<AttitudeSummaryBarProps> = ({ companio
     const generateLocalSummary = useCallback((attitudeData: AttitudeData) => {
         const companionName = companionData?.name || 'Companion';
         const userName = userData?.name || 'User';
-        
+
         // Find dominant emotions
         const emotions = [
             { key: 'love', value: attitudeData.love },
@@ -123,7 +123,7 @@ export const AttitudeSummaryBar: React.FC<AttitudeSummaryBarProps> = ({ companio
     // Filter for significant attitudes (> 30 or < -30)
     const significantAttitudes = useMemo(() => {
         if (!attitude) return [];
-        
+
         return ATTITUDE_DIMENSIONS.filter(dimension => {
             const value = attitude[dimension.key as keyof AttitudeData] as number;
             return Math.abs(value) > 30;
@@ -178,26 +178,26 @@ export const AttitudeSummaryBar: React.FC<AttitudeSummaryBarProps> = ({ companio
             <p className="text-center mb-3 text-sm text-muted-foreground italic">
                 {summary}
             </p>
-            
+
             {/* Attitude bars grid */}
             <div className={`grid ${getGridColumns()} gap-3 max-w-4xl mx-auto`}>
                 {significantAttitudes.map(attitude => (
                     <div key={attitude.key} className="space-y-1">
                         <div className="flex justify-between items-center">
                             <span className="text-xs font-medium">{attitude.label}</span>
-                            <span 
+                            <span
                                 className="text-xs font-mono"
                                 style={{ color: attitude.color }}
                             >
                                 {formatValue(attitude.value)}
                             </span>
                         </div>
-                        <Progress 
-                            value={getProgressValue(attitude.value)} 
+                        <Progress
+                            value={getProgressValue(attitude.value)}
                             className="h-1.5"
-                            style={{ 
+                            style={{
                                 '--progress-background': attitude.color + '20',
-                                '--progress-foreground': attitude.color 
+                                '--progress-foreground': attitude.color
                             } as React.CSSProperties}
                         />
                     </div>

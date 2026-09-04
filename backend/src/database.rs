@@ -1203,10 +1203,10 @@ impl Database {
 
         if let Some(id) = existing_id {
             con.execute(
-                "UPDATE companion_attitudes SET 
+                "UPDATE companion_attitudes SET
                     attraction = ?, trust = ?, fear = ?, anger = ?, joy = ?, sorrow = ?,
                     disgust = ?, surprise = ?, curiosity = ?, respect = ?, suspicion = ?,
-                    gratitude = ?, jealousy = ?, empathy = ?, lust = ?, love = ?, 
+                    gratitude = ?, jealousy = ?, empathy = ?, lust = ?, love = ?,
                     anxiety = ?, butterflies = ?, submissiveness = ?, dominance = ?, last_updated = ?
                 WHERE id = ?",
                 params![
@@ -1341,7 +1341,7 @@ impl Database {
         let current_time = get_current_date();
 
         let query = format!(
-            "UPDATE companion_attitudes 
+            "UPDATE companion_attitudes
              SET {} = MAX(-100, MIN(100, {} + ?)), last_updated = ?
              WHERE companion_id = ? AND target_id = ? AND target_type = ?",
             dimension, dimension
@@ -1444,7 +1444,7 @@ impl Database {
         };
 
         let query = format!(
-            "UPDATE attitude_metadata 
+            "UPDATE attitude_metadata
              SET interaction_count = interaction_count + 1, {} = {} + 1, last_significant_event = COALESCE(?, last_significant_event)
              WHERE attitude_id = ?",
             field, field
@@ -1604,7 +1604,7 @@ impl Database {
         if let Some(id) = existing_id {
             if let Some(data) = initial_data {
                 con.execute(
-                    "UPDATE third_party_individuals SET 
+                    "UPDATE third_party_individuals SET
                         relationship_to_user = COALESCE(?, relationship_to_user),
                         relationship_to_companion = COALESCE(?, relationship_to_companion),
                         occupation = COALESCE(?, occupation),
@@ -1627,7 +1627,7 @@ impl Database {
                 )?;
             } else {
                 con.execute(
-                    "UPDATE third_party_individuals SET 
+                    "UPDATE third_party_individuals SET
                         last_mentioned = ?, mention_count = mention_count + 1, updated_at = ?
                     WHERE id = ?",
                     params![&current_time, &current_time, &id],
@@ -1654,7 +1654,7 @@ impl Database {
             con.execute(
                 "INSERT INTO third_party_individuals (
                     name, relationship_to_user, relationship_to_companion, occupation,
-                    personality_traits, physical_description, first_mentioned, 
+                    personality_traits, physical_description, first_mentioned,
                     mention_count, importance_score, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
@@ -1787,10 +1787,10 @@ impl Database {
         let current_time = get_current_date();
 
         con.execute(
-            "UPDATE third_party_interactions 
-             SET interaction_type = 'completed', 
-                 actual_date = ?, 
-                 outcome = ?, 
+            "UPDATE third_party_interactions
+             SET interaction_type = 'completed',
+                 actual_date = ?,
+                 outcome = ?,
                  impact_on_relationship = ?,
                  updated_at = ?
              WHERE id = ?",
@@ -1876,7 +1876,7 @@ impl Database {
             "SELECT id, name, relationship_to_user, relationship_to_companion, occupation,
                     personality_traits, physical_description, first_mentioned, last_mentioned,
                     mention_count, importance_score, created_at, updated_at
-             FROM third_party_individuals 
+             FROM third_party_individuals
              ORDER BY importance_score DESC, mention_count DESC",
         )?;
 
@@ -1960,7 +1960,7 @@ impl Database {
         let current_time = get_current_date();
 
         con.execute(
-            "UPDATE third_party_individuals 
+            "UPDATE third_party_individuals
              SET importance_score = ?, updated_at = ?
              WHERE id = ?",
             params![&new_importance, &current_time, &third_party_id],
@@ -1993,7 +1993,7 @@ impl Database {
 
         // Create index for priority queries
         con.execute(
-            "CREATE INDEX IF NOT EXISTS idx_attitude_memories_priority 
+            "CREATE INDEX IF NOT EXISTS idx_attitude_memories_priority
              ON attitude_memories(companion_id, priority_score DESC)",
             [],
         )?;
@@ -2054,7 +2054,7 @@ impl Database {
         let mut stmt = con.prepare(
             "SELECT id, companion_id, target_id, target_type, memory_type, description,
                     priority_score, attitude_delta_json, impact_score, message_context, created_at
-             FROM attitude_memories 
+             FROM attitude_memories
              WHERE companion_id = ?
              ORDER BY priority_score DESC
              LIMIT ?",
@@ -2152,9 +2152,9 @@ impl Database {
         // Find all duplicate names (case-insensitive)
         let mut stmt = con.prepare(
             "
-            SELECT LOWER(name) as lower_name, COUNT(*) as count 
-            FROM third_party_individuals 
-            GROUP BY LOWER(name) 
+            SELECT LOWER(name) as lower_name, COUNT(*) as count
+            FROM third_party_individuals
+            GROUP BY LOWER(name)
             HAVING COUNT(*) > 1
         ",
         )?;
@@ -2170,8 +2170,8 @@ impl Database {
                 SELECT id, name, relationship_to_user, relationship_to_companion, occupation,
                        personality_traits, physical_description, first_mentioned, last_mentioned,
                        mention_count, importance_score, created_at, updated_at
-                FROM third_party_individuals 
-                WHERE LOWER(name) = ? 
+                FROM third_party_individuals
+                WHERE LOWER(name) = ?
                 ORDER BY created_at ASC
             ",
             )?;
@@ -2225,7 +2225,7 @@ impl Database {
                 // Update the kept instance with merged data
                 con.execute(
                     "
-                    UPDATE third_party_individuals SET 
+                    UPDATE third_party_individuals SET
                         mention_count = ?,
                         importance_score = ?,
                         first_mentioned = ?,
@@ -2248,7 +2248,7 @@ impl Database {
                     if let Some(delete_id) = instance.id {
                         con.execute(
                             "
-                            UPDATE companion_attitudes SET target_id = ? 
+                            UPDATE companion_attitudes SET target_id = ?
                             WHERE target_id = ? AND target_type = 'third_party'
                         ",
                             params![keep_id, delete_id],
@@ -2383,7 +2383,7 @@ impl Database {
             // Find and delete invalid third parties
             let mut stmt = con.prepare(
                 "
-                SELECT id FROM third_party_individuals 
+                SELECT id FROM third_party_individuals
                 WHERE LOWER(name) = LOWER(?)
             ",
             )?;
@@ -3918,8 +3918,8 @@ impl Database {
                 let current_time = get_current_date();
 
                 con.execute(
-                    "UPDATE third_party_individuals 
-                     SET mention_count = mention_count + 1, 
+                    "UPDATE third_party_individuals
+                     SET mention_count = mention_count + 1,
                          last_mentioned = ?,
                          updated_at = ?
                      WHERE id = ?",

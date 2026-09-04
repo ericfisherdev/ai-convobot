@@ -735,14 +735,14 @@ export function EditData() {
                             </Tooltip>
                           </TooltipProvider>
                         </Label>
-                        <Input 
-                          id="gpuSafetyMargin" 
-                          type="number" 
-                          step="0.1" 
-                          min="0.1" 
+                        <Input
+                          id="gpuSafetyMargin"
+                          type="number"
+                          step="0.1"
+                          min="0.1"
                           max="1.0"
-                          value={configFormData.gpu_safety_margin} 
-                          onChange={(e) => setConfigFormData({ ...configFormData, gpu_safety_margin: parseFloat(e.target.value) })} 
+                          value={configFormData.gpu_safety_margin}
+                          onChange={(e) => setConfigFormData({ ...configFormData, gpu_safety_margin: parseFloat(e.target.value) })}
                         />
                       </div>
                       <div className="space-y-1">
@@ -757,11 +757,11 @@ export function EditData() {
                             </Tooltip>
                           </TooltipProvider>
                         </Label>
-                        <Input 
-                          id="minFreeVramMb" 
-                          type="number" 
-                          value={configFormData.min_free_vram_mb} 
-                          onChange={(e) => setConfigFormData({ ...configFormData, min_free_vram_mb: parseInt(e.target.value) })} 
+                        <Input
+                          id="minFreeVramMb"
+                          type="number"
+                          value={configFormData.min_free_vram_mb}
+                          onChange={(e) => setConfigFormData({ ...configFormData, min_free_vram_mb: parseInt(e.target.value) })}
                         />
                       </div>
                     </div>
@@ -819,9 +819,9 @@ export function EditData() {
                               size="sm"
                               className="mt-2"
                               onClick={() => {
-                                setConfigFormData({ 
-                                  ...configFormData, 
-                                  gpu_layers: layerAllocation.gpu_layers 
+                                setConfigFormData({
+                                  ...configFormData,
+                                  gpu_layers: layerAllocation.gpu_layers
                                 });
                                 toast.success('Applied recommended GPU layer allocation');
                               }}
@@ -853,19 +853,19 @@ export function EditData() {
               <div className="border-b pb-4">
                 <Label className="text-base font-semibold mb-2">LLM Model Management</Label>
                 <div className="mt-4">
-                  <DirectoryManager 
+                  <DirectoryManager
                     onDirectoriesChange={() => setModelRefreshTrigger(prev => prev + 1)}
                   />
                 </div>
               </div>
-              
+
               <div className="space-y-4">
                 <LlmModelSelector
                   selectedModel={configFormData.llm_model_path}
                   onModelSelect={(modelPath) => setConfigFormData({ ...configFormData, llm_model_path: modelPath })}
                   refreshTrigger={modelRefreshTrigger}
                 />
-                
+
                 <div className="max-h-96 overflow-y-auto">
                   <ModelList
                     selectedModel={configFormData.llm_model_path}
@@ -889,7 +889,7 @@ export function EditData() {
                 </SelectContent>
               </Select>
             </div>
-            
+
             <div className="border-t pt-4">
               <h3 className="text-lg font-semibold mb-4">Context Window & Token Management</h3>
               <div className="space-y-4">
@@ -907,16 +907,16 @@ export function EditData() {
                       </TooltipProvider>
                     </div>
                   </Label>
-                  <Input 
-                    id="contextWindowSize" 
-                    type="number" 
-                    min="512" 
-                    max="8192" 
-                    value={configFormData.context_window_size} 
-                    onChange={(e) => setConfigFormData({ ...configFormData, context_window_size: parseInt(e.target.value) })} 
+                  <Input
+                    id="contextWindowSize"
+                    type="number"
+                    min="512"
+                    max="8192"
+                    value={configFormData.context_window_size}
+                    onChange={(e) => setConfigFormData({ ...configFormData, context_window_size: parseInt(e.target.value) })}
                   />
                 </div>
-                
+
                 <div className="space-y-1">
                   <Label htmlFor="maxResponseTokens" className="flex flex-row gap-2">
                     <div className="flex items-center gap-2">
@@ -931,16 +931,16 @@ export function EditData() {
                       </TooltipProvider>
                     </div>
                   </Label>
-                  <Input 
-                    id="maxResponseTokens" 
-                    type="number" 
-                    min="128" 
-                    max="2048" 
-                    value={configFormData.max_response_tokens} 
-                    onChange={(e) => setConfigFormData({ ...configFormData, max_response_tokens: parseInt(e.target.value) })} 
+                  <Input
+                    id="maxResponseTokens"
+                    type="number"
+                    min="128"
+                    max="2048"
+                    value={configFormData.max_response_tokens}
+                    onChange={(e) => setConfigFormData({ ...configFormData, max_response_tokens: parseInt(e.target.value) })}
                   />
                 </div>
-                
+
                 <div className="space-y-1">
                   <Label htmlFor="vramLimit" className="flex flex-row gap-2">
                     <div className="flex items-center gap-2">
@@ -955,16 +955,16 @@ export function EditData() {
                       </TooltipProvider>
                     </div>
                   </Label>
-                  <Input 
-                    id="vramLimit" 
-                    type="number" 
-                    min="1" 
-                    max="24" 
-                    value={configFormData.vram_limit_gb} 
-                    onChange={(e) => setConfigFormData({ ...configFormData, vram_limit_gb: parseInt(e.target.value) })} 
+                  <Input
+                    id="vramLimit"
+                    type="number"
+                    min="1"
+                    max="24"
+                    value={configFormData.vram_limit_gb}
+                    onChange={(e) => setConfigFormData({ ...configFormData, vram_limit_gb: parseInt(e.target.value) })}
                   />
                 </div>
-                
+
                 <div className="flex items-center space-x-2">
                   <input
                     type="checkbox"

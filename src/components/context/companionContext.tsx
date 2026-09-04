@@ -75,4 +75,3 @@ export const updateCompanionData = async (companionData: CompanionData) => {
     toast.error(`Error while sending companion data to backend: ${error}`);
   }
 };
-

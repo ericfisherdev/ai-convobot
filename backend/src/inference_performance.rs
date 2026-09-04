@@ -320,7 +320,7 @@ impl InferencePerformanceTracker {
 
         con.execute(
             "INSERT INTO inference_metrics (
-                model_path, gpu_layers, device_type, tokens_per_second, 
+                model_path, gpu_layers, device_type, tokens_per_second,
                 time_to_first_token, input_tokens, output_tokens, created_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))",
             params![
@@ -370,12 +370,12 @@ impl InferencePerformanceTracker {
         // Get aggregated metrics for this configuration
         let mut stmt = con.prepare(
             "
-            SELECT 
+            SELECT
                 AVG(tokens_per_second) as avg_tps,
                 AVG(time_to_first_token) as avg_ttft,
                 COUNT(*) as sample_count,
                 MAX(created_at) as last_updated
-            FROM inference_metrics 
+            FROM inference_metrics
             WHERE model_path = ?1 AND gpu_layers = ?2
             AND created_at > datetime('now', '-30 days')
         ",

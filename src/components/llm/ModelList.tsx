@@ -97,8 +97,8 @@ export const ModelList: React.FC<ModelListProps> = ({
                             <Card
                                 key={model.path}
                                 className={`cursor-pointer transition-colors ${
-                                    selectedModel === model.path 
-                                        ? 'border-primary bg-primary/5' 
+                                    selectedModel === model.path
+                                        ? 'border-primary bg-primary/5'
                                         : 'hover:bg-secondary/50'
                                 }`}
                                 onClick={() => onModelSelect && onModelSelect(model.path)}

@@ -17,7 +17,7 @@ interface SessionContextType {
     sessionId: string | null;
     loading: boolean;
     error: string | null;
-    
+
     // Methods
     initializeSession: () => Promise<void>;
     endSession: () => Promise<void>;
@@ -35,12 +35,12 @@ export const SessionProvider: React.FC<SessionProviderProps> = ({ children }) =>
     const [sessionId, setSessionId] = useState<string | null>(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
-    
+
     const companionContext = useCompanionData();
     const { fetchAttitudes } = useAttitude();
-    
+
     const companionData = companionContext?.companionData;
-    
+
     // Initialize session on component mount
     useEffect(() => {
         const storedSessionId = localStorage.getItem('ai_companion_session_id');
@@ -51,18 +51,18 @@ export const SessionProvider: React.FC<SessionProviderProps> = ({ children }) =>
             initializeSession();
         }
     }, [companionData]); // eslint-disable-line react-hooks/exhaustive-deps
-    
+
     // Auto-save session activity every 5 minutes
     useEffect(() => {
         if (!sessionId) return;
-        
+
         const interval = setInterval(() => {
             updateSessionActivity();
         }, 5 * 60 * 1000); // 5 minutes
-        
+
         return () => clearInterval(interval);
     }, [sessionId]); // eslint-disable-line react-hooks/exhaustive-deps
-    
+
     // Clean up on unmount
     useEffect(() => {
         return () => {
@@ -73,11 +73,11 @@ export const SessionProvider: React.FC<SessionProviderProps> = ({ children }) =>
             }
         };
     }, [sessionId]);
-    
+
     const loadSession = async (id: string): Promise<void> => {
         setLoading(true);
         setError(null);
-        
+
         try {
             const response = await fetch(`/api/session/${id}`);
             if (!response.ok) {
@@ -85,38 +85,38 @@ export const SessionProvider: React.FC<SessionProviderProps> = ({ children }) =>
                 await initializeSession();
                 return;
             }
-            
+
             const sessionData = await response.json();
             setSession(sessionData);
-            
+
             // Load attitudes from session
             // Using companion_id 1 as there's only one companion in the system
             if (companionData && sessionData.attitude_state.length > 0) {
                 await fetchAttitudes(1);
             }
-            
+
             console.log('✅ Session loaded:', id);
         } catch (err) {
             const errorMessage = err instanceof Error ? err.message : 'Failed to load session';
             setError(errorMessage);
             console.error('Error loading session:', err);
-            
+
             // Try to create new session on error
             await initializeSession();
         } finally {
             setLoading(false);
         }
     };
-    
+
     const initializeSession = async (): Promise<void> => {
         if (!companionData) {
             console.warn('Cannot initialize session without companion data');
             return;
         }
-        
+
         setLoading(true);
         setError(null);
-        
+
         try {
             const response = await fetch('/api/session', {
                 method: 'POST',
@@ -128,23 +128,23 @@ export const SessionProvider: React.FC<SessionProviderProps> = ({ children }) =>
                     user_id: 1, // Using default user_id
                 }),
             });
-            
+
             if (!response.ok) {
                 throw new Error(`HTTP error! status: ${response.status}`);
             }
-            
+
             const sessionData = await response.json();
             setSession(sessionData);
             setSessionId(sessionData.id);
-            
+
             // Store session ID in localStorage for persistence
             localStorage.setItem('ai_companion_session_id', sessionData.id);
-            
+
             // Load attitudes from session
             if (sessionData.attitude_state.length > 0) {
                 await fetchAttitudes(1); // Using default companion_id
             }
-            
+
             console.log('🚀 New session initialized:', sessionData.id);
         } catch (err) {
             const errorMessage = err instanceof Error ? err.message : 'Failed to initialize session';
@@ -154,27 +154,27 @@ export const SessionProvider: React.FC<SessionProviderProps> = ({ children }) =>
             setLoading(false);
         }
     };
-    
+
     const endSession = async (): Promise<void> => {
         if (!sessionId) return;
-        
+
         setLoading(true);
         setError(null);
-        
+
         try {
             const response = await fetch(`/api/session/${sessionId}/end`, {
                 method: 'POST',
             });
-            
+
             if (!response.ok) {
                 throw new Error(`HTTP error! status: ${response.status}`);
             }
-            
+
             // Clear session data
             setSession(null);
             setSessionId(null);
             localStorage.removeItem('ai_companion_session_id');
-            
+
             console.log('🔚 Session ended:', sessionId);
         } catch (err) {
             const errorMessage = err instanceof Error ? err.message : 'Failed to end session';
@@ -184,10 +184,10 @@ export const SessionProvider: React.FC<SessionProviderProps> = ({ children }) =>
             setLoading(false);
         }
     };
-    
+
     const updateSessionActivity = async (): Promise<void> => {
         if (!sessionId) return;
-        
+
         try {
             // The backend automatically updates activity when we get the session
             const response = await fetch(`/api/session/${sessionId}`);
@@ -199,7 +199,7 @@ export const SessionProvider: React.FC<SessionProviderProps> = ({ children }) =>
             console.error('Error updating session activity:', err);
         }
     };
-    
+
     return (
         <SessionContext.Provider
             value={{

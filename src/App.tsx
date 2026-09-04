@@ -17,7 +17,7 @@ import { Toaster } from "@/components/ui/sonner"
 
 function App() {
   const { isMobile, isStandalone } = useMobile();
-  
+
   return (
     <ThemeProvider defaultTheme="dark" storageKey="vite-ui-theme">
       <ThemeCustomizationProvider>

@@ -156,13 +156,13 @@ const ChatWindow = () => {
         },
         body: JSON.stringify({ ai: true, content: companionMessage }),
       });
-      
+
       if (sendPromise.ok) {
         await refreshMessages();
         setUserMessage('');
         setCompanionMessage('');
         setIsImpersonating(false);
-        
+
         // Trigger attitude update
         window.dispatchEvent(new CustomEvent('attitude-update'));
       }
@@ -208,18 +208,18 @@ const ChatWindow = () => {
                 <h1 className="font-semibold">{companionData.name || "AI Companion"}</h1>
               )}
             </div>
-            
+
             <div className="flex items-center gap-2">
               <EditDataPopup />
               <ModeToggle />
             </div>
           </div>
-          
+
           {/* Messages - takes remaining space and allows scrolling */}
           <div className="flex-1 min-h-0">
             <MessageScroll />
           </div>
-          
+
           {/* Input - mobile optimized (moved above attitude summary) */}
           {isMobile ? (
             <MobileChatInput
@@ -247,16 +247,16 @@ const ChatWindow = () => {
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
-                
-                <Textarea 
-                  value={isImpersonating ? companionMessage : userMessage} 
-                  onChange={handleMessageChange} 
-                  cols={1} 
-                  placeholder={isImpersonating ? `🥸 Type your message as ${companionData?.name}` : "Type your message"} 
+
+                <Textarea
+                  value={isImpersonating ? companionMessage : userMessage}
+                  onChange={handleMessageChange}
+                  cols={1}
+                  placeholder={isImpersonating ? `🥸 Type your message as ${companionData?.name}` : "Type your message"}
                   onKeyDown={handleKeyDown}
                   className="min-h-[44px] max-h-[120px] resize-none"
                 />
-                
+
                 <TooltipProvider>
                   <Tooltip>
                     <TooltipTrigger asChild>
@@ -277,7 +277,7 @@ const ChatWindow = () => {
               </div>
             </div>
           )}
-          
+
           {/* Attitude Summary Bar (moved to bottom as status indicator) */}
           <AttitudeSummaryBar companionId={1} userId={1} />
         </main>

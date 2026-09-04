@@ -147,8 +147,8 @@ export const AttitudeManager: React.FC<AttitudeManagerProps> = ({ companionId })
                 // Update selected attitude
                 const updatedAttitudes = await fetch(`/api/attitude/companion/${companionId}`)
                     .then(res => res.json());
-                const updated = updatedAttitudes.find((a: AttitudeData) => 
-                    a.companion_id === selectedAttitude.companion_id && 
+                const updated = updatedAttitudes.find((a: AttitudeData) =>
+                    a.companion_id === selectedAttitude.companion_id &&
                     a.target_id === selectedAttitude.target_id &&
                     a.target_type === selectedAttitude.target_type
                 );
@@ -163,14 +163,14 @@ export const AttitudeManager: React.FC<AttitudeManagerProps> = ({ companionId })
         <div className="space-y-6" data-testid="attitude-manager">
             <Card className="p-6">
                 <h2 className="text-xl font-semibold mb-4">Attitude Tracking System</h2>
-                
+
                 <Tabs defaultValue="overview" className="w-full">
                     <TabsList className="grid w-full grid-cols-3">
                         <TabsTrigger value="overview">Overview</TabsTrigger>
                         <TabsTrigger value="details">Details</TabsTrigger>
                         <TabsTrigger value="manage">Manage</TabsTrigger>
                     </TabsList>
-                    
+
                     <TabsContent value="overview" className="space-y-4">
                         <div className="grid gap-4">
                             {attitudes.length === 0 ? (
@@ -187,16 +187,16 @@ export const AttitudeManager: React.FC<AttitudeManagerProps> = ({ companionId })
                             )}
                         </div>
                     </TabsContent>
-                    
+
                     <TabsContent value="details" className="space-y-4">
                         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                             <div className="space-y-2">
                                 <Label>Select Attitude to View</Label>
-                                <Select 
+                                <Select
                                     value={selectedAttitude ? `${selectedAttitude.target_id}-${selectedAttitude.target_type}` : ''}
                                     onValueChange={(value) => {
                                         const [targetId, targetType] = value.split('-');
-                                        const attitude = attitudes.find(a => 
+                                        const attitude = attitudes.find(a =>
                                             a.target_id === parseInt(targetId) && a.target_type === targetType
                                         );
                                         setSelectedAttitude(attitude || null);
@@ -207,7 +207,7 @@ export const AttitudeManager: React.FC<AttitudeManagerProps> = ({ companionId })
                                     </SelectTrigger>
                                     <SelectContent>
                                         {attitudes.map(attitude => (
-                                            <SelectItem 
+                                            <SelectItem
                                                 key={`${attitude.target_id}-${attitude.target_type}`}
                                                 value={`${attitude.target_id}-${attitude.target_type}`}
                                             >
@@ -218,7 +218,7 @@ export const AttitudeManager: React.FC<AttitudeManagerProps> = ({ companionId })
                                 </Select>
                             </div>
                         </div>
-                        
+
                         {selectedAttitude && (
                             <div className="space-y-4">
                                 <AttitudeDisplay
@@ -226,7 +226,7 @@ export const AttitudeManager: React.FC<AttitudeManagerProps> = ({ companionId })
                                     targetName={getTargetName(selectedAttitude)}
                                     showDetails={true}
                                 />
-                                
+
                                 <Card className="p-4">
                                     <h4 className="font-semibold mb-3">Quick Adjustments</h4>
                                     <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
@@ -234,16 +234,16 @@ export const AttitudeManager: React.FC<AttitudeManagerProps> = ({ companionId })
                                             <div key={dimension.key} className="space-y-1">
                                                 <Label className="text-xs">{dimension.label}</Label>
                                                 <div className="flex gap-1">
-                                                    <Button 
-                                                        size="sm" 
+                                                    <Button
+                                                        size="sm"
                                                         variant="outline"
                                                         onClick={() => updateAttitudeDimension(dimension.key, -5)}
                                                         className="px-2 text-xs"
                                                     >
                                                         -5
                                                     </Button>
-                                                    <Button 
-                                                        size="sm" 
+                                                    <Button
+                                                        size="sm"
                                                         variant="outline"
                                                         onClick={() => updateAttitudeDimension(dimension.key, 5)}
                                                         className="px-2 text-xs"
@@ -258,7 +258,7 @@ export const AttitudeManager: React.FC<AttitudeManagerProps> = ({ companionId })
                             </div>
                         )}
                     </TabsContent>
-                    
+
                     <TabsContent value="manage" className="space-y-4">
                         <Card className="p-4">
                             <h4 className="font-semibold mb-3">Create New Attitude</h4>
@@ -278,7 +278,7 @@ export const AttitudeManager: React.FC<AttitudeManagerProps> = ({ companionId })
                                 </div>
                                 <div className="space-y-2">
                                     <Label htmlFor="targetType">Target Type</Label>
-                                    <Select 
+                                    <Select
                                         value={newAttitude.target_type}
                                         onValueChange={(value: 'user' | 'third_party') => setNewAttitude(prev => ({
                                             ...prev,
@@ -307,7 +307,7 @@ export const AttitudeManager: React.FC<AttitudeManagerProps> = ({ companionId })
                                     />
                                 </div>
                             </div>
-                            <Button 
+                            <Button
                                 onClick={createNewAttitude}
                                 className="mt-4"
                                 disabled={!newAttitude.target_id || !newAttitude.targetName}

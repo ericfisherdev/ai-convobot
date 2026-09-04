@@ -36,7 +36,7 @@ describe('API Integration Tests', () => {
 
     it('sends a message successfully', async () => {
       const newMessage = { ai: false, content: 'Test message' }
-      
+
       mockFetch.mockResolvedValueOnce({
         ok: true,
         json: () => Promise.resolve({ success: true })
