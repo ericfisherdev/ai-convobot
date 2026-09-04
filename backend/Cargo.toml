@@ -4,6 +4,7 @@ version = "1.0.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+# path-filter-verify: throwaway probe, see #53
 
 [build-dependencies]
 winres = "0.1.12"
