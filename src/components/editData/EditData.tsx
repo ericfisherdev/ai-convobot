@@ -136,7 +136,7 @@ export function EditData() {
     if (companionDataContext?.companionData) {
       setCompanionFormData(companionDataContext.companionData as CompanionData);
     }
-  }, [companionDataContext?.companionData]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [companionDataContext?.companionData]);
 
   useEffect(() => {
     if (configContext && configContext.config) {
