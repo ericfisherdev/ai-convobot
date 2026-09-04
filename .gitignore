@@ -56,3 +56,9 @@ backend/longterm_memory/
 *.gguf
 *.bin
 models/
+
+# Runtime companion assets. The avatar is written by the avatar upload and
+# character card import endpoints, so the directory has to exist on a fresh
+# clone while its contents stay untracked.
+assets/*
+!assets/.gitkeep
