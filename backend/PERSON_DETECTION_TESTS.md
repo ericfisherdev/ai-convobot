@@ -110,7 +110,7 @@ Expected: Should process the message normally AND automatically detect "David" i
 ## Architecture Summary
 
 - **Person Detection**: Regex-based NLP patterns identify person names in messages
-- **Context Analysis**: Extracts relationships, occupations, and personality traits  
+- **Context Analysis**: Extracts relationships, occupations, and personality traits
 - **Attitude Initialization**: Creates context-based initial 14-dimensional attitudes
 - **Database Integration**: Stores in existing third_party_individuals table
 - **API Integration**: Automatic detection in /api/prompt + dedicated person endpoints

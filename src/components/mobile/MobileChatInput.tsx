@@ -75,7 +75,7 @@ export function MobileChatInput({
     }
 
     window.addEventListener('resize', handleResize);
-    
+
     return () => {
       window.removeEventListener('resize', handleResize);
       if (textarea) {
@@ -105,13 +105,13 @@ export function MobileChatInput({
   };
 
   return (
-    <div 
+    <div
       className={cn(
         "sticky bottom-0 bg-background border-t z-50 transition-all duration-200",
         "mobile-safe-area",
         isFocused && "shadow-lg"
       )}
-      style={{ 
+      style={{
         paddingBottom: keyboardHeight > 0 ? '8px' : undefined,
         transform: keyboardHeight > 0 ? `translateY(-${Math.min(keyboardHeight, 100)}px)` : 'none'
       }}
@@ -120,9 +120,9 @@ export function MobileChatInput({
         {/* Menu Button */}
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button 
-              variant="outline" 
-              size="sm" 
+            <Button
+              variant="outline"
+              size="sm"
               className="touch-target flex-shrink-0"
               disabled={disabled}
             >
@@ -158,7 +158,7 @@ export function MobileChatInput({
             )}
             rows={1}
           />
-          
+
           {/* Character count for long messages */}
           {value.length > 200 && (
             <div className="absolute top-2 right-2 text-xs text-muted-foreground bg-background px-1 rounded">
@@ -177,8 +177,8 @@ export function MobileChatInput({
                 disabled={disabled || !value.trim()}
                 className={cn(
                   "touch-target flex-shrink-0 rounded-full transition-all duration-200",
-                  value.trim() && !disabled 
-                    ? "bg-primary hover:bg-primary/90 scale-110" 
+                  value.trim() && !disabled
+                    ? "bg-primary hover:bg-primary/90 scale-110"
                     : "scale-100"
                 )}
               >
@@ -187,8 +187,8 @@ export function MobileChatInput({
             </TooltipTrigger>
             <TooltipContent side="top">
               <p>
-                {isImpersonating 
-                  ? `Send message as ${companionName}` 
+                {isImpersonating
+                  ? `Send message as ${companionName}`
                   : "Send message"
                 }
               </p>

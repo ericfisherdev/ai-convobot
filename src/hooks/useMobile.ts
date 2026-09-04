@@ -61,31 +61,31 @@ function getMobileInfo(): MobileInfo {
   const width = window.innerWidth;
   const height = window.innerHeight;
   const userAgent = navigator.userAgent;
-  
+
   // Device detection
   const isMobileUserAgent = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(userAgent);
   const isTouchDevice = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
-  
+
   // Screen size based detection
   const isMobileScreen = width < 768;
   const isTabletScreen = width >= 768 && width < 1024;
-  
+
   // Combine user agent and screen size for more accurate mobile detection
   const isMobile = isMobileScreen || (isMobileUserAgent && width < 1024);
   const isTablet = (isTabletScreen && isTouchDevice) || (isMobileUserAgent && width >= 768 && width < 1024);
   const isDesktop = !isMobile && !isTablet;
-  
+
   // Platform detection
   const isIOS = /iPad|iPhone|iPod/.test(userAgent);
   const isAndroid = /Android/.test(userAgent);
-  
+
   // PWA detection
-  const isStandalone = window.matchMedia('(display-mode: standalone)').matches || 
+  const isStandalone = window.matchMedia('(display-mode: standalone)').matches ||
                       (window.navigator as Navigator & { standalone?: boolean }).standalone === true;
-  
+
   // Orientation
   const orientation = height > width ? 'portrait' : 'landscape';
-  
+
   return {
     isMobile,
     isTablet,

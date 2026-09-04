@@ -13,7 +13,7 @@ jobs:
   test-frontend:
     name: Test Frontend
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -46,7 +46,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -85,7 +85,7 @@ jobs:
     name: Integration Test
     runs-on: ubuntu-latest
     needs: [test-frontend, test-backend]
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -117,15 +117,15 @@ jobs:
           # Start the application in background
           timeout 30s ./backend/target/release/ai-companion &
           APP_PID=$!
-          
+
           # Wait for startup
           sleep 10
-          
+
           # Test if application responds
           curl -f http://localhost:3000/ || exit 1
-          
+
           # Clean shutdown
           kill $APP_PID 2>/dev/null || true
           wait $APP_PID 2>/dev/null || true
-          
+
           echo "Integration test passed!"

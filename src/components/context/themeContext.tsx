@@ -2,9 +2,9 @@ import { createContext, useContext, useEffect, useState } from "react";
 
 export type ThemeMode = "dark" | "light" | "system";
 
-export type ColorScheme = 
+export type ColorScheme =
   | "default"
-  | "blue" 
+  | "blue"
   | "green"
   | "purple"
   | "orange"
@@ -62,14 +62,14 @@ export function ThemeCustomizationProvider({ children }: { children: React.React
 
   useEffect(() => {
     const root = document.documentElement;
-    
+
     // Clear previous classes
     root.classList.remove('light', 'dark', 'system');
     root.classList.remove('scheme-blue', 'scheme-green', 'scheme-purple', 'scheme-orange', 'scheme-red', 'scheme-pink', 'scheme-cyan');
     root.classList.remove('font-xs', 'font-sm', 'font-md', 'font-lg', 'font-xl');
     root.classList.remove('font-system', 'font-mono', 'font-serif', 'font-sans');
     root.classList.remove('animations-disabled', 'compact-mode', 'high-contrast');
-    
+
     // Apply theme mode
     if (theme.mode === "system") {
       const systemTheme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
@@ -77,16 +77,16 @@ export function ThemeCustomizationProvider({ children }: { children: React.React
     } else {
       root.classList.add(theme.mode);
     }
-    
+
     // Apply color scheme
     if (theme.colorScheme !== 'default') {
       root.classList.add(`scheme-${theme.colorScheme}`);
     }
-    
+
     // Apply font settings
     root.classList.add(`font-${theme.fontSize}`);
     root.classList.add(`font-${theme.fontFamily}`);
-    
+
     // Apply accessibility options
     if (!theme.animations) {
       root.classList.add('animations-disabled');
@@ -97,7 +97,7 @@ export function ThemeCustomizationProvider({ children }: { children: React.React
     if (theme.highContrast) {
       root.classList.add('high-contrast');
     }
-    
+
     // Update CSS custom properties for dynamic theming
     if (theme.colorScheme !== 'default') {
       updateColorScheme(theme.colorScheme);
@@ -121,7 +121,7 @@ export function useThemeCustomization() {
 
 function updateColorScheme(scheme: ColorScheme) {
   const root = document.documentElement;
-  
+
   const colorSchemes: Record<Exclude<ColorScheme, 'default'>, Record<string, string>> = {
     blue: {
       primary: '214 100% 60%',
@@ -132,7 +132,7 @@ function updateColorScheme(scheme: ColorScheme) {
     green: {
       primary: '142 76% 36%',
       primaryForeground: '0 0% 98%',
-      secondary: '142 13% 15%', 
+      secondary: '142 13% 15%',
       accent: '142 16% 20%',
     },
     purple: {
@@ -166,7 +166,7 @@ function updateColorScheme(scheme: ColorScheme) {
       accent: '180 20% 20%',
     },
   };
-  
+
   if (scheme !== 'default') {
     const colors = colorSchemes[scheme];
     if (colors) {

@@ -2,7 +2,7 @@ const CACHE_NAME = 'ai-companion-v1';
 const STATIC_CACHE_URLS = [
   '/',
   '/assets/index-4rust.js',
-  '/assets/index-4rust2.js', 
+  '/assets/index-4rust2.js',
   '/assets/index-4rust.css',
   '/ai_companion_logo.jpg',
   '/assets/companion_avatar-4rust.jpg',
@@ -49,7 +49,7 @@ self.addEventListener('activate', (event) => {
 // Fetch event - serve from cache with network fallback
 self.addEventListener('fetch', (event) => {
   const { request } = event;
-  
+
   // Handle API requests with network-first strategy
   if (request.url.includes('/api/')) {
     event.respondWith(
@@ -57,14 +57,14 @@ self.addEventListener('fetch', (event) => {
         .then((response) => {
           // Clone response for caching
           const responseClone = response.clone();
-          
+
           // Cache successful API responses
           if (response.status === 200) {
             caches.open(CACHE_NAME).then((cache) => {
               cache.put(request, responseClone);
             });
           }
-          
+
           return response;
         })
         .catch(() => {
@@ -87,27 +87,27 @@ self.addEventListener('fetch', (event) => {
     );
     return;
   }
-  
+
   // Handle static assets with cache-first strategy
   event.respondWith(
     caches.match(request).then((response) => {
       if (response) {
         return response;
       }
-      
+
       return fetch(request).then((response) => {
         // Don't cache non-successful responses
         if (!response || response.status !== 200 || response.type !== 'basic') {
           return response;
         }
-        
+
         // Clone the response for caching
         const responseClone = response.clone();
-        
+
         caches.open(CACHE_NAME).then((cache) => {
           cache.put(request, responseClone);
         });
-        
+
         return response;
       });
     })
@@ -128,13 +128,13 @@ async function sendPendingMessages() {
   try {
     // This would integrate with your message sending logic
     console.log('Attempting to send pending messages...');
-    
+
     // In a real implementation, you'd:
     // 1. Get pending messages from IndexedDB
     // 2. Try to send each one
     // 3. Remove successful sends from the pending queue
     // 4. Keep failed sends for next sync attempt
-    
+
   } catch (error) {
     console.error('Failed to send pending messages:', error);
   }
@@ -164,7 +164,7 @@ self.addEventListener('push', (event) => {
       }
     ]
   };
-  
+
   event.waitUntil(
     self.registration.showNotification('AI Companion', options)
   );
@@ -173,7 +173,7 @@ self.addEventListener('push', (event) => {
 // Handle notification clicks
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  
+
   if (event.action === 'explore') {
     // Open the app
     event.waitUntil(

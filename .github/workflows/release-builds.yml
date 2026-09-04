@@ -105,11 +105,11 @@ jobs:
         run: |
           # Install Visual Studio Build Tools if needed
           choco install visualstudio2022buildtools --package-parameters "--add Microsoft.VisualStudio.Workload.VCTools"
-          
+
           # Set up CUDA for Windows builds
           if ("${{ matrix.build_type }}" -eq "cuda") {
             Write-Host "Setting up CUDA for Windows build..."
-            
+
             # Try to install CUDA toolkit on Windows
             try {
               # Download and install CUDA toolkit 12.2
@@ -117,7 +117,7 @@ jobs:
               $cudaUrl = "https://developer.download.nvidia.com/compute/cuda/12.2.2/network_installers/cuda_12.2.2_windows_network.exe"
               $cudaInstaller = "$env:TEMP\cuda_installer.exe"
               Invoke-WebRequest -Uri $cudaUrl -OutFile $cudaInstaller -UseBasicParsing
-              
+
               Write-Host "Installing CUDA toolkit (silent install with timeout)..."
               $process = Start-Process -FilePath $cudaInstaller -ArgumentList "/S" -PassThru -NoNewWindow
               if (-not $process.WaitForExit(600000)) { # 10 minute timeout
@@ -127,7 +127,7 @@ jobs:
               if ($process.ExitCode -ne 0) {
                 throw "CUDA installer exited with code $($process.ExitCode)"
               }
-              
+
               # Set CUDA environment variables
               $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.2"
               if (Test-Path $cudaPath) {
@@ -139,7 +139,7 @@ jobs:
               } else {
                 throw "CUDA installation directory not found"
               }
-              
+
             } catch {
               Write-Host "ERROR: CUDA installation failed: $_"
               Write-Host "CUDA build was requested but CUDA toolkit could not be installed."
@@ -149,7 +149,7 @@ jobs:
           } else {
             echo "CUDA_AVAILABLE=false" | Out-File -FilePath $env:GITHUB_ENV -Append
           }
-          
+
           if ("${{ matrix.build_type }}" -eq "opencl") {
             # For Windows OpenCL, assume availability
             echo "OPENCL_AVAILABLE=true" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -164,32 +164,32 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libssl-dev
-          
+
           # Install CUDA toolkit for CUDA builds (with proper error handling)
           if [ "${{ matrix.build_type }}" = "cuda" ]; then
             echo "Setting up CUDA environment..."
-            
+
             # Set up proper environment first
             export DEBIAN_FRONTEND=noninteractive
-            
+
             # Install CUDA toolkit with more robust error handling
             {
               echo "Downloading CUDA keyring..."
               wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb
-              
+
               echo "Installing CUDA keyring..."
               sudo dpkg -i cuda-keyring_1.0-1_all.deb
-              
+
               echo "Updating package lists..."
               sudo apt-get update -qq
-              
+
               echo "Installing CUDA toolkit (this may take several minutes)..."
               sudo apt-get install -y --no-install-recommends \
                 cuda-toolkit-12-2 \
                 cuda-compiler-12-2 \
                 cuda-libraries-dev-12-2 \
                 cuda-driver-dev-12-2
-              
+
               # Verify CUDA installation
               export PATH="/usr/local/cuda-12.2/bin:$PATH"
               export LD_LIBRARY_PATH="/usr/local/cuda-12.2/lib64:$LD_LIBRARY_PATH"
@@ -198,7 +198,7 @@ jobs:
               export CUDA_HOME="/usr/local/cuda-12.2"
               export CUDA_INCLUDE_PATH="/usr/local/cuda-12.2/include"
               export CUDA_LIB_PATH="/usr/local/cuda-12.2/lib64"
-              
+
               # Add to GitHub environment for subsequent steps
               echo "PATH=/usr/local/cuda-12.2/bin:$PATH" >> $GITHUB_ENV
               echo "LD_LIBRARY_PATH=/usr/local/cuda-12.2/lib64:$LD_LIBRARY_PATH" >> $GITHUB_ENV
@@ -207,7 +207,7 @@ jobs:
               echo "CUDA_HOME=/usr/local/cuda-12.2" >> $GITHUB_ENV
               echo "CUDA_INCLUDE_PATH=/usr/local/cuda-12.2/include" >> $GITHUB_ENV
               echo "CUDA_LIB_PATH=/usr/local/cuda-12.2/lib64" >> $GITHUB_ENV
-              
+
               # Verify nvcc is available
               if command -v nvcc >/dev/null 2>&1; then
                 nvcc --version
@@ -218,7 +218,7 @@ jobs:
                 echo "CUDA_AVAILABLE=false" >> $GITHUB_ENV
                 exit 1
               fi
-              
+
             } || {
               echo "ERROR: CUDA installation failed!"
               echo "CUDA build was requested but CUDA toolkit could not be installed."
@@ -228,7 +228,7 @@ jobs:
           else
             echo "CUDA_AVAILABLE=false" >> $GITHUB_ENV
           fi
-          
+
           # Install OpenCL for OpenCL builds (with better error handling)
           if [ "${{ matrix.build_type }}" = "opencl" ]; then
             echo "Setting up OpenCL environment..."
@@ -252,19 +252,19 @@ jobs:
         run: |
           # Install required dependencies
           brew install pkg-config openssl
-          
+
           # For cross-compilation to ARM64
           if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
             rustup target add aarch64-apple-darwin
           fi
-          
+
           # Set up GPU availability flags for macOS
           # Metal is generally available on all modern Macs
           if [ "${{ matrix.build_type }}" = "metal" ]; then
             echo "METAL_AVAILABLE=true" >> $GITHUB_ENV
             echo "macOS Metal build - Metal should be available on modern Macs"
           fi
-          
+
           # macOS doesn't typically use CUDA or OpenCL in our builds
           echo "CUDA_AVAILABLE=false" >> $GITHUB_ENV
           echo "OPENCL_AVAILABLE=false" >> $GITHUB_ENV
@@ -305,7 +305,7 @@ jobs:
               fi
               ;;
             "metal")
-              # Metal builds must have Metal available - no fallback  
+              # Metal builds must have Metal available - no fallback
               if [ "${METAL_AVAILABLE:-true}" = "true" ]; then
                 echo "features=metal" >> $GITHUB_OUTPUT
                 echo "build_name=Metal" >> $GITHUB_OUTPUT
@@ -325,16 +325,16 @@ jobs:
         shell: bash
         run: |
           cd backend
-          
+
           # Set environment variables for cross-compilation
           if [ "${{ matrix.target }}" = "aarch64-apple-darwin" ] && [ "${{ runner.os }}" = "macOS" ]; then
             export MACOSX_DEPLOYMENT_TARGET=11.0
             export SDKROOT=$(xcrun --sdk macosx --show-sdk-path)
           fi
-          
+
           # Allow warnings in release builds
           export RUSTFLAGS=""
-          
+
           # Build with appropriate features
           if [ -n "${{ steps.features.outputs.features }}" ]; then
             echo "Building ${{ steps.features.outputs.build_name }} version with features: ${{ steps.features.outputs.features }}"
@@ -349,26 +349,26 @@ jobs:
         run: |
           # Create package directory
           mkdir -p release-package
-          
+
           # Copy binary
           binary_name="ai-companion${{ matrix.executable_suffix }}"
           cp "backend/target/${{ matrix.target }}/release/${binary_name}" "release-package/"
-          
+
           # Create README for the release
           cat > release-package/README.md << 'EOF'
           # AI Companion - ${{ steps.features.outputs.build_name }} Build
-          
+
           ## About
           This is a release build of AI Companion with ${{ steps.features.outputs.build_name }} acceleration support.
-          
+
           ## System Requirements
           - Operating System: ${{ runner.os }}
           - Architecture: ${{ matrix.target }}
           - Acceleration: ${{ steps.features.outputs.build_name }}
-          
+
           ### Additional Requirements for ${{ steps.features.outputs.build_name }} builds:
           EOF
-          
+
           # Add specific requirements based on build type
           case "${{ matrix.build_type }}" in
             "cuda")
@@ -399,58 +399,58 @@ jobs:
           EOF
               ;;
           esac
-          
+
           cat >> release-package/README.md << 'EOF'
-          
+
           ## Usage
           1. Extract the package to a directory of your choice
           2. Run the executable: `./ai-companion` (Linux/macOS) or `ai-companion.exe` (Windows)
           3. Open your browser to `http://localhost:3000`
           4. Configure your LLM model path in the settings
           5. Start chatting with your AI companion!
-          
+
           ## Configuration
           - The application will create a `companion_database.db` file in the current directory
           - Default port is 3000 (configurable in the application)
           - LLM models must be in GGUF format
-          
+
           ## GPU Memory Management
           This build includes dynamic GPU layer allocation:
           - Automatically detects available VRAM
           - Optimizes GPU layer allocation based on memory
           - Provides fallback to CPU if GPU memory is insufficient
           - Configurable safety margins and allocation strategies
-          
+
           ## Support
           For issues and documentation, visit: https://github.com/ericfisherdev/ai-convobot
           EOF
-          
+
           # Create version info
           echo "${{ github.event.inputs.version || github.ref_name }}" > release-package/VERSION
-          
+
           # Create a simple launcher script for Unix systems
           if [ "${{ runner.os }}" != "Windows" ]; then
             cat > release-package/start.sh << 'EOF'
           #!/bin/bash
           # AI Companion Launcher Script
-          
+
           echo "Starting AI Companion..."
           echo "Build: ${{ steps.features.outputs.build_name }}"
           echo "Target: ${{ matrix.target }}"
           echo ""
-          
+
           # Check if model file exists
           if [ ! -f "companion_database.db" ]; then
               echo "First run detected. The application will create necessary files."
               echo ""
           fi
-          
+
           # Start the application
           ./ai-companion
           EOF
             chmod +x release-package/start.sh
           fi
-          
+
           # Create batch file for Windows
           if [ "${{ runner.os }}" = "Windows" ]; then
             cat > release-package/start.bat << 'EOF'
@@ -459,13 +459,13 @@ jobs:
           echo Build: ${{ steps.features.outputs.build_name }}
           echo Target: ${{ matrix.target }}
           echo.
-          
+
           REM Check if database exists
           if not exist "companion_database.db" (
               echo First run detected. The application will create necessary files.
               echo.
           )
-          
+
           REM Start the application
           ai-companion.exe
           pause
@@ -476,7 +476,7 @@ jobs:
         shell: bash
         run: |
           cd release-package
-          
+
           if [ "${{ runner.os }}" = "Windows" ]; then
             # Create ZIP for Windows
             7z a "../${{ matrix.artifact_name }}.zip" *
@@ -499,7 +499,7 @@ jobs:
     needs: build-releases
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -522,7 +522,7 @@ jobs:
         run: |
           cat > release_notes.md << 'EOF'
           # AI Companion Release ${{ github.ref_name }}
-          
+
           ## Features
           - Dynamic GPU Layer Allocation with intelligent VRAM management
           - Support for CUDA, OpenCL, and Metal acceleration
@@ -531,25 +531,25 @@ jobs:
           - Advanced context management and token optimization
           - Character card import support (JSON and PNG formats)
           - Long-term memory with semantic search capabilities
-          
+
           ## Available Builds
-          
+
           ### Windows (x64)
           - **CPU Only**: `ai-companion-windows-x64-cpu.zip` - Compatible with all Windows systems
           - **CUDA**: `ai-companion-windows-x64-cuda.zip` - Requires NVIDIA GPU with CUDA support
           - **OpenCL**: `ai-companion-windows-x64-opencl.zip` - Compatible with NVIDIA, AMD, and Intel GPUs
-          
+
           ### Linux (x64)
           - **CPU Only**: `ai-companion-linux-x64-cpu.tar.gz` - Compatible with all Linux systems
           - **CUDA**: `ai-companion-linux-x64-cuda.tar.gz` - Requires NVIDIA GPU with CUDA support
           - **OpenCL**: `ai-companion-linux-x64-opencl.tar.gz` - Compatible with NVIDIA, AMD, and Intel GPUs
-          
+
           ### macOS
           - **Intel CPU Only**: `ai-companion-macos-x64-cpu.tar.gz` - For Intel-based Macs
           - **Intel + Metal**: `ai-companion-macos-x64-metal.tar.gz` - For Intel Macs with Metal support
           - **Apple Silicon CPU**: `ai-companion-macos-arm64-cpu.tar.gz` - For M1/M2/M3 Macs
           - **Apple Silicon + Metal**: `ai-companion-macos-arm64-metal.tar.gz` - For M1/M2/M3 Macs with Metal acceleration
-          
+
           ## Quick Start
           1. Download the appropriate build for your system
           2. Extract the archive
@@ -557,7 +557,7 @@ jobs:
           4. Open `http://localhost:3000` in your browser
           5. Configure your GGUF model path in settings
           6. Start chatting!
-          
+
           ## GPU Memory Management
           This release includes intelligent GPU layer allocation:
           - Automatically detects available VRAM
@@ -565,20 +565,20 @@ jobs:
           - Provides real-time memory monitoring
           - Supports multiple allocation strategies
           - Graceful fallback to CPU when needed
-          
+
           ## System Requirements
           - **Minimum RAM**: 4GB (8GB recommended)
           - **Storage**: 500MB free space (plus space for LLM models)
           - **Models**: GGUF format LLM models
           - **GPU** (optional): See build-specific requirements above
-          
+
           ## What's New in This Release
           - Dynamic GPU layer allocation system
           - Enhanced memory management and monitoring
           - Improved frontend interface with GPU status display
           - Better error handling and fallback mechanisms
           - Performance optimizations and bug fixes
-          
+
           For detailed documentation and support, visit: https://github.com/ericfisherdev/ai-convobot
           EOF
 

@@ -15,12 +15,12 @@ interface VirtualMessageListProps {
 const ITEM_HEIGHT = 120; // Approximate height of a message
 const OVERSCAN = 5; // Number of items to render outside of visible area
 
-export function VirtualMessageList({ 
-  messages, 
-  onLoadMore, 
-  isLoadingMore, 
+export function VirtualMessageList({
+  messages,
+  onLoadMore,
+  isLoadingMore,
   hasMoreMessages,
-  className 
+  className
 }: VirtualMessageListProps) {
   const { isMobile } = useMobile();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -32,7 +32,7 @@ export function VirtualMessageList({
   const BOTTOM_PADDING_MOBILE = 80; // 80px for mobile (input area + buffer)
   const BOTTOM_PADDING_DESKTOP = 96; // 96px for desktop (input area + buffer)
   const bottomPadding = isMobile ? BOTTOM_PADDING_MOBILE : BOTTOM_PADDING_DESKTOP;
-  
+
   // Calculate visible range accounting for bottom padding
   const adjustedContainerHeight = containerHeight - bottomPadding;
   const startIndex = Math.max(0, Math.floor(scrollTop / ITEM_HEIGHT) - OVERSCAN);
@@ -63,7 +63,7 @@ export function VirtualMessageList({
     if (isScrolledToBottom && containerRef.current) {
       const container = containerRef.current;
       const targetScrollTop = container.scrollHeight - container.clientHeight;
-      
+
       // Smooth scroll to bottom
       container.scrollTo({
         top: targetScrollTop,
@@ -79,7 +79,7 @@ export function VirtualMessageList({
     // Account for bottom padding when detecting if near bottom
     const scrollBuffer = bottomPadding + 50; // Add 50px extra buffer
     const isNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < scrollBuffer;
-    
+
     setScrollTop(newScrollTop);
     setIsScrolledToBottom(isNearBottom);
 
@@ -128,7 +128,7 @@ export function VirtualMessageList({
           )}
         </div>
       )}
-      
+
       {/* Virtual scrolling container */}
       <div style={{ height: totalHeight, position: 'relative' }}>
         <div
@@ -169,11 +169,11 @@ export function VirtualMessageList({
       </div>
 
       {/* Bottom padding for proper message visibility */}
-      <div 
-        className="flex-shrink-0" 
+      <div
+        className="flex-shrink-0"
         style={{ height: `${bottomPadding}px` }}
       />
-      
+
       {/* Scroll to bottom button */}
       {!isScrolledToBottom && (
         <button
@@ -181,7 +181,7 @@ export function VirtualMessageList({
             if (containerRef.current) {
               const container = containerRef.current;
               const targetScrollTop = container.scrollHeight - container.clientHeight;
-              
+
               container.scrollTo({
                 top: targetScrollTop,
                 behavior: 'smooth'

@@ -5,13 +5,13 @@ interface AttitudeContextType {
     attitudes: AttitudeData[];
     loading: boolean;
     error: string | null;
-    
+
     // Methods
     fetchAttitudes: (companionId: number) => Promise<void>;
     getAttitude: (companionId: number, targetId: number, targetType: string) => Promise<AttitudeData | null>;
     createOrUpdateAttitude: (attitude: Partial<AttitudeData>) => Promise<boolean>;
     updateAttitudeDimension: (update: AttitudeDimensionUpdate) => Promise<boolean>;
-    
+
     // Current selection
     selectedAttitude: AttitudeData | null;
     setSelectedAttitude: (attitude: AttitudeData | null) => void;
@@ -32,13 +32,13 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
     const fetchAttitudes = async (companionId: number): Promise<void> => {
         setLoading(true);
         setError(null);
-        
+
         try {
             const response = await fetch(`/api/attitude/companion/${companionId}`);
             if (!response.ok) {
                 throw new Error(`HTTP error! status: ${response.status}`);
             }
-            
+
             const data = await response.json();
             setAttitudes(data);
         } catch (err) {
@@ -53,7 +53,7 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
     const getAttitude = async (companionId: number, targetId: number, targetType: string): Promise<AttitudeData | null> => {
         setLoading(true);
         setError(null);
-        
+
         try {
             const response = await fetch(`/api/attitude?companion_id=${companionId}&target_id=${targetId}&target_type=${targetType}`);
             if (response.status === 404) {
@@ -62,7 +62,7 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
             if (!response.ok) {
                 throw new Error(`HTTP error! status: ${response.status}`);
             }
-            
+
             const data = await response.json();
             return data;
         } catch (err) {
@@ -78,7 +78,7 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
     const createOrUpdateAttitude = async (attitude: Partial<AttitudeData>): Promise<boolean> => {
         setLoading(true);
         setError(null);
-        
+
         try {
             const response = await fetch('/api/attitude', {
                 method: 'POST',
@@ -91,16 +91,16 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
                     created_at: attitude.created_at || new Date().toISOString()
                 }),
             });
-            
+
             if (!response.ok) {
                 throw new Error(`HTTP error! status: ${response.status}`);
             }
-            
+
             // Refresh attitudes if we have a companion_id
             if (attitude.companion_id) {
                 await fetchAttitudes(attitude.companion_id);
             }
-            
+
             return true;
         } catch (err) {
             const errorMessage = err instanceof Error ? err.message : 'Failed to create/update attitude';
@@ -115,7 +115,7 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
     const updateAttitudeDimension = async (update: AttitudeDimensionUpdate): Promise<boolean> => {
         setLoading(true);
         setError(null);
-        
+
         try {
             const response = await fetch('/api/attitude/dimension', {
                 method: 'PUT',
@@ -124,24 +124,24 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
                 },
                 body: JSON.stringify(update),
             });
-            
+
             if (!response.ok) {
                 throw new Error(`HTTP error! status: ${response.status}`);
             }
-            
+
             // Refresh attitudes
             await fetchAttitudes(update.companion_id);
-            
+
             // Update selected attitude if it matches
-            if (selectedAttitude && 
+            if (selectedAttitude &&
                 selectedAttitude.companion_id === update.companion_id &&
                 selectedAttitude.target_id === update.target_id &&
                 selectedAttitude.target_type === update.target_type) {
-                
+
                 const updatedAttitude = await getAttitude(update.companion_id, update.target_id, update.target_type);
                 setSelectedAttitude(updatedAttitude);
             }
-            
+
             return true;
         } catch (err) {
             const errorMessage = err instanceof Error ? err.message : 'Failed to update attitude dimension';

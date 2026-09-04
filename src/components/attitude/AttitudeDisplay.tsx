@@ -10,8 +10,8 @@ interface AttitudeDisplayProps {
     showDetails?: boolean;
 }
 
-export const AttitudeDisplay: React.FC<AttitudeDisplayProps> = ({ 
-    attitude, 
+export const AttitudeDisplay: React.FC<AttitudeDisplayProps> = ({
+    attitude,
     targetName = "Unknown",
     showDetails = true
 }) => {
@@ -44,11 +44,11 @@ export const AttitudeDisplay: React.FC<AttitudeDisplayProps> = ({
                     </p>
                 </div>
                 <div className="text-right">
-                    <Badge 
-                        variant="outline" 
-                        style={{ 
+                    <Badge
+                        variant="outline"
+                        style={{
                             borderColor: relationshipStatus.color,
-                            color: relationshipStatus.color 
+                            color: relationshipStatus.color
                         }}
                     >
                         {relationshipStatus.label}
@@ -68,26 +68,26 @@ export const AttitudeDisplay: React.FC<AttitudeDisplayProps> = ({
                                 <div key={dimension.key} className="space-y-1">
                                     <div className="flex justify-between items-center">
                                         <span className="text-sm font-medium">{dimension.label}</span>
-                                        <span 
+                                        <span
                                             className="text-sm font-mono"
                                             style={{ color: dimension.color }}
                                         >
                                             {formatValue(value)}
                                         </span>
                                     </div>
-                                    <Progress 
-                                        value={getProgressValue(value)} 
+                                    <Progress
+                                        value={getProgressValue(value)}
                                         className="h-2"
-                                        style={{ 
+                                        style={{
                                             '--progress-background': dimension.color + '20',
-                                            '--progress-foreground': dimension.color 
+                                            '--progress-foreground': dimension.color
                                         } as React.CSSProperties}
                                     />
                                 </div>
                             );
                         })}
                     </div>
-                    
+
                     <div className="pt-2 border-t text-xs text-muted-foreground">
                         <p>Last updated: {new Date(attitude.last_updated).toLocaleString()}</p>
                         <p>Created: {new Date(attitude.created_at).toLocaleString()}</p>

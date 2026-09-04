@@ -19,8 +19,8 @@ export const MockUserDataContext = createContext({
 })
 
 export const MockCompanionDataContext = createContext({
-  companionData: { 
-    name: 'Test Companion', 
+  companionData: {
+    name: 'Test Companion',
     persona: 'Test companion persona',
     example_dialogue: 'Hello!',
     first_message: 'Welcome!',

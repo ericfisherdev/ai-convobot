@@ -47,7 +47,7 @@ export const MessagesProvider: React.FC<MessagesProviderProps> = ({ children }) 
         throw new Error('Failed to fetch messages');
       }
       const data = await response.json();
-      
+
       // Handle both old format (array) and new format (object with pagination)
       if (Array.isArray(data)) {
         return { messages: data, hasMore: data.length === limit };
@@ -88,18 +88,18 @@ export const MessagesProvider: React.FC<MessagesProviderProps> = ({ children }) 
     try {
       const newStartIndex = messages.length;
       const result = await fetchMessages(newStartIndex, 50);
-      
+
       if (result.messages.length === 0) {
         setHasMoreMessages(false);
         return false;
       }
-      
+
       // Prepend older messages to maintain chronological order
       setMessages(prevMessages => [...result.messages, ...prevMessages]);
-      
+
       // Update hasMoreMessages based on API response
       setHasMoreMessages(result.hasMore);
-      
+
       return true;
     } catch (error) {
       console.error('Error loading more messages:', error);
@@ -115,15 +115,15 @@ export const MessagesProvider: React.FC<MessagesProviderProps> = ({ children }) 
   }
 
   return (
-    <MessagesContext.Provider value={{ 
-      messages, 
-      refreshMessages, 
-      pushMessage, 
+    <MessagesContext.Provider value={{
+      messages,
+      refreshMessages,
+      pushMessage,
       updateMessage,
-      loadMoreMessages, 
+      loadMoreMessages,
       resetStart,
       isLoadingMore,
-      hasMoreMessages 
+      hasMoreMessages
     }}>
       {children}
     </MessagesContext.Provider>

@@ -28,10 +28,10 @@ describe('Button Component', () => {
   it('handles click events', async () => {
     const user = userEvent.setup()
     const handleClick = vi.fn()
-    
+
     render(<Button onClick={handleClick}>Click me</Button>)
     const button = screen.getByRole('button', { name: /click me/i })
-    
+
     await user.click(button)
     expect(handleClick).toHaveBeenCalledOnce()
   })

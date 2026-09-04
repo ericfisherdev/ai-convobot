@@ -22,7 +22,7 @@ export function MessageScroll() {
       }
     }
   }, [messages]);
-  
+
   // Handle mobile scroll behavior
   useEffect(() => {
     if (isMobile && scrollRef.current) {
@@ -54,7 +54,7 @@ export function MessageScroll() {
     await loadMoreMessages();
     setTimeout(() => setIsTyping(false), 1000);
   };
-  
+
   // Expose typing state for parent components
   useEffect(() => {
     (window as Window & { setMessageTyping?: (typing: boolean) => void }).setMessageTyping = setIsTyping;
@@ -120,17 +120,17 @@ export function MessageScroll() {
           isMobile ? "gap-3" : "gap-4"
         )}>
           {messages.map((message, index) => (
-            <div 
-              key={message.id || index} 
-              className="animate-in fade-in-0 duration-300" 
+            <div
+              key={message.id || index}
+              className="animate-in fade-in-0 duration-300"
               style={{ animationDelay: `${Math.min(index * 50, 500)}ms` }}
             >
-              <Message 
-                received={message.ai} 
-                id={message.id} 
-                regenerate={index === messages.length - 1 && index !== 0} 
-                content={message.content} 
-                created_at={message.created_at} 
+              <Message
+                received={message.ai}
+                id={message.id}
+                regenerate={index === messages.length - 1 && index !== 0}
+                content={message.content}
+                created_at={message.created_at}
               />
             </div>
           ))}

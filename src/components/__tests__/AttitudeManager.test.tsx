@@ -41,7 +41,7 @@ describe('AttitudeManager Component', () => {
         <AttitudeManager companionId={1} />
       </MockAttitudeProvider>
     )
-    
+
     // Check if the attitude manager container is present
     expect(screen.getByTestId('attitude-manager')).toBeInTheDocument()
   })
@@ -52,11 +52,11 @@ describe('AttitudeManager Component', () => {
         <AttitudeManager companionId={1} />
       </MockAttitudeProvider>
     )
-    
+
     // Click on Details tab to view attitude dimensions
     const detailsTab = screen.getByRole('tab', { name: /details/i })
     expect(detailsTab).toBeInTheDocument()
-    
+
     // For now, just check that the component renders without error
     // The actual attitude dimensions will be shown when data is loaded
     expect(screen.getByTestId('attitude-manager')).toBeInTheDocument()
@@ -98,7 +98,7 @@ describe('AttitudeManager Component', () => {
         <AttitudeManager companionId={1} />
       </MockAttitudeProvider>
     )
-    
+
     // The component should render without errors
     // Progress bars are only shown in the AttitudeDisplay component when showDetails is true
     // and when there is attitude data loaded
