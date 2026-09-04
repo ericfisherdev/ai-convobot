@@ -74,6 +74,7 @@ impl SessionManager {
     }
 
     /// Get an existing session or create a new one
+    #[allow(dead_code)]
     pub fn get_or_create_session(
         &self,
         session_id: Option<&str>,
@@ -107,6 +108,7 @@ impl SessionManager {
     }
 
     /// Update session activity timestamp
+    #[allow(dead_code)]
     pub fn update_activity(&self, session_id: &str) -> Result<(), String> {
         let mut sessions = self.sessions.lock().map_err(|e| e.to_string())?;
 
@@ -160,6 +162,7 @@ impl SessionManager {
     }
 
     /// Get current attitude state for a session
+    #[allow(dead_code)]
     pub fn get_attitude_state(&self, session_id: &str) -> Result<Vec<CompanionAttitude>, String> {
         let sessions = self.sessions.lock().map_err(|e| e.to_string())?;
 
@@ -218,6 +221,7 @@ impl SessionManager {
     }
 
     /// Clean up expired sessions
+    #[allow(dead_code)]
     pub fn cleanup_expired_sessions(&self) -> Result<usize, String> {
         let mut sessions = self.sessions.lock().map_err(|e| e.to_string())?;
         let initial_count = sessions.len();

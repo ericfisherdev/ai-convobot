@@ -353,6 +353,7 @@ impl GpuAllocator {
     }
 
     /// Monitor memory usage and suggest reallocation if needed
+    #[allow(dead_code)]
     pub fn monitor_and_suggest_reallocation(
         &self,
         current_allocation: &LayerAllocation,
@@ -416,6 +417,7 @@ impl GpuAllocator {
     }
 
     /// Get recommended settings for different scenarios
+    #[allow(dead_code)]
     pub fn get_recommended_settings(gpu_info: &GpuMemoryInfo) -> (f32, u64) {
         let safety_margin = if gpu_info.total_vram_mb > 16000 {
             0.9 // High-end GPU: can use 90%

@@ -404,6 +404,7 @@ impl InferencePerformanceTracker {
     }
 
     /// Get real-time progress estimate during generation
+    #[allow(dead_code)]
     pub fn get_progress_estimate(&self, session_id: &str) -> Option<(f64, u32)> {
         if let Some(session) = self.current_sessions.get(session_id) {
             let elapsed = session.start_time.elapsed().as_secs_f64();

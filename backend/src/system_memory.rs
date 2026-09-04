@@ -13,6 +13,7 @@ pub struct SystemMemoryInfo {
 #[derive(Debug, Clone)]
 pub struct MemoryAllocation {
     pub available_for_context_gb: f32,
+    #[allow(dead_code)]
     pub safety_margin_gb: f32,
     pub recommended_usage_gb: f32,
     pub allocation_strategy: MemoryStrategy,

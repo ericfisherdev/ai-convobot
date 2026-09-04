@@ -51,6 +51,7 @@ pub struct NewMessage {
 }
 
 #[derive(Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct Companion {
     pub id: i32,
     pub name: String,
@@ -78,6 +79,7 @@ pub struct CompanionView {
 }
 
 #[derive(Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct User {
     pub id: i32,
     pub name: String,
@@ -122,37 +124,6 @@ pub struct CompanionAttitude {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct AttitudeMetadata {
-    pub id: Option<i32>,
-    pub attitude_id: i32,
-    pub interaction_count: i32,
-    pub positive_interactions: i32,
-    pub negative_interactions: i32,
-    pub neutral_interactions: i32,
-    pub last_significant_event: Option<String>,
-    pub relationship_status: String,
-    pub notes: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct AttitudeUpdate {
-    pub attraction: Option<f32>,
-    pub trust: Option<f32>,
-    pub fear: Option<f32>,
-    pub anger: Option<f32>,
-    pub joy: Option<f32>,
-    pub sorrow: Option<f32>,
-    pub disgust: Option<f32>,
-    pub surprise: Option<f32>,
-    pub curiosity: Option<f32>,
-    pub respect: Option<f32>,
-    pub suspicion: Option<f32>,
-    pub gratitude: Option<f32>,
-    pub jealousy: Option<f32>,
-    pub empathy: Option<f32>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ThirdPartyIndividual {
     pub id: Option<i32>,
     pub name: String,
@@ -193,18 +164,6 @@ pub struct ThirdPartyInteraction {
     pub actual_date: Option<String>,
     pub outcome: Option<String>,
     pub impact_on_relationship: f32,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ThirdPartyRelationship {
-    pub id: Option<i32>,
-    pub from_party_id: i32,
-    pub to_party_id: i32,
-    pub relationship_type: String,
-    pub strength: f32,
-    pub description: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -503,7 +462,6 @@ type MessageCache = Arc<Mutex<HashMap<String, (Vec<Message>, Instant)>>>;
 
 // Database query cache for performance optimization
 lazy_static::lazy_static! {
-    static ref DB_CACHE: Arc<Mutex<HashMap<String, (String, Instant)>>> = Arc::new(Mutex::new(HashMap::new()));
     static ref MESSAGE_CACHE: MessageCache = Arc::new(Mutex::new(HashMap::new()));
 }
 
@@ -512,12 +470,6 @@ pub struct Database {}
 impl Database {
     pub fn clear_message_cache() {
         if let Ok(mut cache) = MESSAGE_CACHE.lock() {
-            cache.clear();
-        }
-    }
-
-    pub fn clear_db_cache() {
-        if let Ok(mut cache) = DB_CACHE.lock() {
             cache.clear();
         }
     }
@@ -1472,6 +1424,7 @@ impl Database {
         Ok(result)
     }
 
+    #[allow(dead_code)]
     pub fn update_attitude_metadata(
         attitude_id: i32,
         interaction_type: &str,
@@ -1953,6 +1906,7 @@ impl Database {
         Ok(result)
     }
 
+    #[allow(dead_code)]
     pub fn get_third_party_memories(
         third_party_id: i32,
         limit: Option<usize>,
@@ -2000,6 +1954,7 @@ impl Database {
         Ok(result)
     }
 
+    #[allow(dead_code)]
     pub fn update_third_party_importance(third_party_id: i32, new_importance: f32) -> Result<()> {
         let con = Connection::open("companion_database.db")?;
         let current_time = get_current_date();
