@@ -13,7 +13,7 @@ mod character_card;
 use character_card::CharacterCard;
 use serde::Deserialize;
 mod llm;
-use crate::llm::prompt;
+use crate::llm::{prompt, prompt_streaming};
 mod context_manager;
 mod inference_optimizer;
 use crate::inference_optimizer::{StreamChunk, INFERENCE_OPTIMIZER};
@@ -1144,45 +1144,91 @@ async fn estimate_response_time_endpoint(req: web::Json<EstimateRequest>) -> Htt
     HttpResponse::Ok().json(response)
 }
 
+/// Streams a reply token by token as Server-Sent Events.
+///
+/// Each event carries a `StreamChunk` as JSON. The final event has
+/// `is_complete: true` and no content.
 #[post("/api/prompt/stream")]
 async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpResponse {
     let request = received.into_inner();
     let session_id = request.session_id.clone();
-    let session_id_clone = session_id.clone();
+    let user_message = request.prompt.clone();
 
-    // Start streaming session
-    let mut _rx = INFERENCE_OPTIMIZER.start_streaming_session(session_id.clone());
+    // The generator reads recent messages back out of the database, so the
+    // user's turn has to be persisted before generation starts.
+    if let Err(e) = Database::insert_message(NewMessage {
+        ai: false,
+        content: user_message.clone(),
+    }) {
+        eprintln!("Failed to add message to database: {}", e);
+        return HttpResponse::InternalServerError()
+            .body("Error while adding message to database, check logs for more information");
+    }
 
-    // In a real implementation, this would start async LLM inference
-    // For now, we'll simulate streaming by sending chunks
-    tokio::spawn(async move {
-        // Simulate processing chunks
-        for i in 1..=5 {
-            let chunk = StreamChunk {
-                request_id: session_id_clone.clone(),
-                content: format!("Chunk {} of response... ", i),
-                is_complete: i == 5,
-                token_count: Some(i * 10),
-            };
+    let rx = INFERENCE_OPTIMIZER.start_streaming_session(session_id.clone());
 
-            if INFERENCE_OPTIMIZER
-                .stream_chunk(&session_id_clone, chunk)
-                .is_err()
-            {
-                break;
+    // Generation is CPU-bound and blocking, so it runs on its own thread rather
+    // than occupying an actix worker for the whole response.
+    let worker_session = session_id.clone();
+    std::thread::spawn(move || {
+        let mut token_count = 0usize;
+        let result = prompt_streaming(&user_message, &mut |token| {
+            token_count += 1;
+            // A send failure means the client hung up; generation still runs to
+            // completion so the reply is persisted.
+            let _ = INFERENCE_OPTIMIZER.stream_chunk(
+                &worker_session,
+                StreamChunk {
+                    request_id: worker_session.clone(),
+                    content: token.to_string(),
+                    is_complete: false,
+                    token_count: Some(token_count),
+                },
+            );
+        });
+
+        let final_chunk = match result {
+            Ok(_) => StreamChunk {
+                request_id: worker_session.clone(),
+                content: String::new(),
+                is_complete: true,
+                token_count: Some(token_count),
+            },
+            Err(e) => {
+                eprintln!("Failed to generate streamed prompt: {}", e);
+                StreamChunk {
+                    request_id: worker_session.clone(),
+                    content: String::new(),
+                    is_complete: true,
+                    token_count: Some(token_count),
+                }
             }
+        };
 
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        }
-
-        // End session
-        INFERENCE_OPTIMIZER.end_streaming_session(&session_id_clone);
+        let _ = INFERENCE_OPTIMIZER.stream_chunk(&worker_session, final_chunk);
+        INFERENCE_OPTIMIZER.end_streaming_session(&worker_session);
     });
 
-    HttpResponse::Ok().json(serde_json::json!({
-        "session_id": session_id,
-        "status": "streaming_started"
-    }))
+    let event_stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        let chunk = rx.recv().await?;
+        // JSON-encoding the chunk keeps newlines inside a token from being read
+        // as SSE record separators.
+        let payload = match serde_json::to_string(&chunk) {
+            Ok(payload) => payload,
+            Err(e) => {
+                eprintln!("Failed to serialize stream chunk: {}", e);
+                return None;
+            }
+        };
+        let bytes = web::Bytes::from(format!("data: {}\n\n", payload));
+        Some((Ok::<web::Bytes, actix_web::Error>(bytes), rx))
+    });
+
+    HttpResponse::Ok()
+        .content_type("text/event-stream")
+        .append_header(("Cache-Control", "no-cache"))
+        .append_header(("X-Accel-Buffering", "no"))
+        .streaming(event_stream)
 }
 
 #[get("/api/inference/stats")]

@@ -27,6 +27,10 @@ const N_BATCH: u32 = 512;
 
 /// llama.cpp keeps process-global state, so its backend must be initialised
 /// exactly once. Later calls reuse the handle stored here.
+/// Serialises generation. Each call loads its own copy of the model, so two
+/// concurrent requests would hold two full copies in memory at once.
+static GENERATION_LOCK: Mutex<()> = Mutex::new(());
+
 static LLAMA_BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
 static LLAMA_BACKEND_INIT_LOCK: Mutex<()> = Mutex::new(());
 
@@ -108,7 +112,33 @@ fn apply_gguf_chat_template(
         .map_err(|e| format!("failed to apply chat template: {}", e))
 }
 
+/// Generates a reply and returns it once generation finishes.
+///
+/// # Errors
+/// Propagates model load, tokenization and decode failures as
+/// `std::io::ErrorKind::Other`.
 pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
+    generate(prompt, &mut |_token| {})
+}
+
+/// Generates a reply, invoking `on_token` with each token as it is produced.
+///
+/// The callback runs on the generating thread, so it must not block.
+///
+/// # Errors
+/// Propagates model load, tokenization and decode failures as
+/// `std::io::ErrorKind::Other`.
+pub fn prompt_streaming(
+    prompt: &str,
+    on_token: &mut dyn FnMut(&str),
+) -> Result<String, std::io::Error> {
+    generate(prompt, on_token)
+}
+
+fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std::io::Error> {
+    let _generation_guard = GENERATION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let start_time = std::time::Instant::now();
     let long_term_memory = match LongTermMem::connect() {
         Ok(ltm) => ltm,
@@ -656,6 +686,7 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
 
         tokens_generated += 1;
         end_of_generation.push_str(&piece);
+        on_token(&piece);
         print!("{piece}");
         std::io::stdout().flush().unwrap();
 

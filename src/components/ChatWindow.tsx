@@ -30,7 +30,7 @@ const ChatWindow = () => {
   const companionData: CompanionData = companionDataContext?.companionData ?? {} as CompanionData;
   const { isMobile, isStandalone } = useMobile();
 
-  const { refreshMessages, pushMessage } = useMessages();
+  const { refreshMessages, pushMessage, updateMessage } = useMessages();
 
   const [userMessage, setUserMessage] = useState('');
   const [companionMessage, setCompanionMessage] = useState('');
@@ -53,44 +53,77 @@ const ChatWindow = () => {
   };
 
   const promptMessage = async () => {
+    const sentMessage = userMessage;
+    // Negative ids mark optimistic messages that refreshMessages later replaces
+    // with the persisted rows.
+    const streamingMessageId = -2;
     try {
-      const sendPromise = fetch('/api/prompt', {
+      setUserMessage('');
+      pushMessage({
+        id: -1,
+        ai: false,
+        content: sentMessage,
+        created_at: new Date().toISOString(),
+      });
+      pushMessage({
+        id: streamingMessageId,
+        ai: true,
+        content: `${companionData.name} is typing...`,
+        created_at: new Date().toISOString(),
+      });
+
+      const response = await fetch('/api/prompt/stream', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ prompt: userMessage }),
+        body: JSON.stringify({
+          prompt: sentMessage,
+          session_id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        }),
       });
-  
-      const clearPromise = new Promise<void>(resolve => {
-        setUserMessage('');
-        resolve();
-      });
-  
-      const pushSentMessagePromise = new Promise<void>(resolve => {
-        pushMessage({
-          id: -1,
-          ai: false,
-          content: userMessage,
-          created_at: new Date().toISOString(),
-        });
-        pushMessage({
-          id: -2,
-          ai: true,
-          content: `${companionData.name} is typing...`,
-          created_at: new Date().toISOString(),
-        })
-        resolve();
-      });
-  
-      await Promise.all([sendPromise, clearPromise, pushSentMessagePromise]);
+
+      if (!response.ok || !response.body) {
+        throw new Error(`Streaming request failed with status ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let streamed = '';
+
+      // Server-Sent Events arrive as "data: {json}\n\n" records, and a single
+      // read can contain a partial record, so hold the remainder in a buffer.
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const records = buffer.split('\n\n');
+        buffer = records.pop() ?? '';
+
+        for (const record of records) {
+          const line = record.split('\n').find(part => part.startsWith('data: '));
+          if (!line) continue;
+          try {
+            const chunk = JSON.parse(line.slice('data: '.length));
+            if (chunk.is_complete) continue;
+            streamed += chunk.content;
+            updateMessage(streamingMessageId, streamed);
+          } catch (parseError) {
+            console.error('Failed to parse stream chunk:', parseError);
+          }
+        }
+      }
+
       refreshMessages();
-      
+
       // Trigger attitude update
       window.dispatchEvent(new CustomEvent('attitude-update'));
-  
+
     } catch (error) {
       console.error('Error sending message:', error);
+      refreshMessages();
       toast.error(`Error while sending a message: ${error}`);
     }
   };
