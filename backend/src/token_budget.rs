@@ -5,9 +5,11 @@ pub struct TokenBudget {
     pub total: usize,
     pub system_prompt: usize,
     pub attitude_data: usize,
+    #[allow(dead_code)]
     pub third_party_info: usize,
     pub recent_messages: usize,
     pub response_buffer: usize,
+    #[allow(dead_code)]
     pub vram_tier: VramTier,
 }
 
@@ -49,6 +51,7 @@ impl TokenBudget {
         }
     }
 
+    #[allow(dead_code)]
     pub fn get_allocation_summary(&self) -> String {
         format!(
             "Token Budget ({}): System: {}, Attitude: {}, Third-party: {}, Messages: {}, Response: {}",
@@ -64,26 +67,39 @@ impl TokenBudget {
 
 #[derive(Debug)]
 pub struct TokenUsageMonitor {
+    #[allow(dead_code)]
     pub budget: TokenBudget,
+    #[allow(dead_code)]
     pub current_usage: TokenUsage,
+    #[allow(dead_code)]
     pub optimization_stats: OptimizationStats,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct TokenUsage {
+    #[allow(dead_code)]
     pub system_tokens: usize,
+    #[allow(dead_code)]
     pub attitude_tokens: usize,
+    #[allow(dead_code)]
     pub third_party_tokens: usize,
+    #[allow(dead_code)]
     pub message_tokens: usize,
+    #[allow(dead_code)]
     pub total_context_tokens: usize,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct OptimizationStats {
+    #[allow(dead_code)]
     pub messages_compressed: usize,
+    #[allow(dead_code)]
     pub attitudes_filtered: usize,
+    #[allow(dead_code)]
     pub third_parties_filtered: usize,
+    #[allow(dead_code)]
     pub total_savings: usize,
+    #[allow(dead_code)]
     pub overflow_events: usize,
 }
 
@@ -97,6 +113,7 @@ impl TokenUsageMonitor {
     }
 
     /// Estimate token count for text (improved approximation)
+    #[allow(dead_code)]
     pub fn estimate_tokens(text: &str) -> usize {
         if text.is_empty() {
             return 0;
@@ -118,6 +135,7 @@ impl TokenUsageMonitor {
     }
 
     /// Filter and prioritize attitudes based on significance and token budget
+    #[allow(dead_code)]
     pub fn optimize_attitude_context(
         &mut self,
         attitudes: Vec<CompanionAttitude>,
@@ -175,6 +193,7 @@ impl TokenUsageMonitor {
     }
 
     /// Calculate significance score for an attitude
+    #[allow(dead_code)]
     fn calculate_attitude_significance(attitude: &CompanionAttitude) -> f32 {
         let dimensions = [
             attitude.attraction,
@@ -208,6 +227,7 @@ impl TokenUsageMonitor {
     }
 
     /// Format attitude for context inclusion
+    #[allow(dead_code)]
     fn format_attitude_for_context(&self, attitude: &CompanionAttitude) -> String {
         let significant_dimensions = self.get_significant_dimensions(attitude);
         if significant_dimensions.is_empty() {
@@ -226,6 +246,7 @@ impl TokenUsageMonitor {
     }
 
     /// Get significant attitude dimensions above threshold
+    #[allow(dead_code)]
     fn get_significant_dimensions(&self, attitude: &CompanionAttitude) -> Vec<String> {
         let threshold = 15.0;
         let mut dimensions = Vec::new();
@@ -257,12 +278,14 @@ impl TokenUsageMonitor {
     }
 
     /// Compress attitude representation for token efficiency
+    #[allow(dead_code)]
     fn compress_attitude(&self, attitude: &CompanionAttitude) -> String {
         let top_dimensions = self.get_top_dimensions(attitude, 3);
         format!("#{}: {}", attitude.target_type, top_dimensions.join(", "))
     }
 
     /// Get top N most significant dimensions
+    #[allow(dead_code)]
     fn get_top_dimensions(&self, attitude: &CompanionAttitude, n: usize) -> Vec<String> {
         let mut dimensions = vec![
             ("trust", attitude.trust),
@@ -288,6 +311,7 @@ impl TokenUsageMonitor {
     }
 
     /// Optimize message context with intelligent summarization
+    #[allow(dead_code)]
     pub fn optimize_message_context(&mut self, messages: Vec<Message>) -> Vec<Message> {
         if messages.is_empty() {
             return messages;
@@ -326,6 +350,7 @@ impl TokenUsageMonitor {
     }
 
     /// Compress message content while preserving key information
+    #[allow(dead_code)]
     fn compress_message(&self, content: &str) -> String {
         let max_length = (self.budget.recent_messages / 3) * 4; // Approximate character limit
 
@@ -343,6 +368,7 @@ impl TokenUsageMonitor {
     }
 
     /// Filter third-party information based on relevance and recency
+    #[allow(dead_code)]
     pub fn optimize_third_party_context(
         &mut self,
         third_parties: Vec<ThirdPartyIndividual>,
@@ -377,6 +403,7 @@ impl TokenUsageMonitor {
     }
 
     /// Format third-party individual for context inclusion
+    #[allow(dead_code)]
     fn format_third_party_for_context(&self, party: &ThirdPartyIndividual) -> String {
         let mut details = vec![party.name.clone()];
 
@@ -405,6 +432,7 @@ impl TokenUsageMonitor {
     }
 
     /// Get comprehensive usage statistics
+    #[allow(dead_code)]
     pub fn get_usage_statistics(&mut self) -> TokenUsageStatistics {
         self.current_usage.total_context_tokens = self.current_usage.system_tokens
             + self.current_usage.attitude_tokens
@@ -439,6 +467,7 @@ impl TokenUsageMonitor {
     }
 
     /// Suggest optimizations based on current usage patterns
+    #[allow(dead_code)]
     pub fn get_optimization_suggestions(&self) -> Vec<String> {
         let mut suggestions = Vec::new();
         let stats = &self.optimization_stats;
@@ -485,6 +514,7 @@ impl TokenUsageMonitor {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct TokenUsageStatistics {
     pub budget: TokenBudget,
     pub current_usage: TokenUsage,
@@ -495,6 +525,7 @@ pub struct TokenUsageStatistics {
 }
 
 impl TokenUsageStatistics {
+    #[allow(dead_code)]
     pub fn print_detailed_stats(&self) {
         println!("🧠 Comprehensive Token Budget Analysis:");
         println!("   VRAM Tier: {:?}", self.budget.vram_tier);

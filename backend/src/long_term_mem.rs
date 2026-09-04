@@ -133,12 +133,14 @@ impl LongTermMem {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn refresh_reader(&self) -> Result<(), TantivyError> {
         // Force refresh the reader to see latest changes
         self.reader.reload()?;
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn get_cache_stats(&self) -> (usize, usize) {
         if let Ok(cache) = self.query_cache.lock() {
             let total_entries = cache.len();

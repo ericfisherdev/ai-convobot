@@ -1,7 +1,7 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -10,20 +10,13 @@ use crate::database::Message;
 /// Cache entry for frequently used prompts
 #[derive(Debug, Clone)]
 pub struct CachedPrompt {
+    #[allow(dead_code)]
     pub prompt_hash: String,
     pub base_prompt: String,
     pub timestamp: Instant,
     pub hit_count: usize,
+    #[allow(dead_code)]
     pub estimated_tokens: usize,
-}
-
-/// Batch inference request for multiple prompts
-#[derive(Clone)]
-pub struct BatchInferenceRequest {
-    pub id: String,
-    pub prompts: Vec<String>,
-    pub max_tokens: Option<usize>,
-    pub temperature: Option<f32>,
 }
 
 /// Response streaming chunk
@@ -54,8 +47,6 @@ pub struct InferenceStats {
 pub struct InferenceOptimizer {
     /// Cache for frequently used prompt segments
     prompt_cache: Arc<RwLock<HashMap<String, CachedPrompt>>>,
-    /// Batch processing queue
-    batch_queue: Arc<Mutex<Vec<BatchInferenceRequest>>>,
     /// Active streaming sessions
     streaming_sessions: Arc<RwLock<HashMap<String, mpsc::UnboundedSender<StreamChunk>>>>,
     /// Performance statistics
@@ -63,8 +54,6 @@ pub struct InferenceOptimizer {
     /// Configuration
     cache_max_size: usize,
     cache_ttl: Duration,
-    batch_size: usize,
-    batch_timeout: Duration,
 }
 
 impl InferenceOptimizer {
@@ -72,7 +61,6 @@ impl InferenceOptimizer {
     pub fn new() -> Self {
         Self {
             prompt_cache: Arc::new(RwLock::new(HashMap::new())),
-            batch_queue: Arc::new(Mutex::new(Vec::new())),
             streaming_sessions: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(InferenceStats {
                 total_requests: 0,
@@ -84,8 +72,6 @@ impl InferenceOptimizer {
             })),
             cache_max_size: 1000,
             cache_ttl: Duration::from_secs(3600), // 1 hour
-            batch_size: 4,
-            batch_timeout: Duration::from_millis(100),
         }
     }
 
@@ -185,46 +171,6 @@ impl InferenceOptimizer {
 
         let full_prompt = format!("{}{}", base_prompt, dynamic_content);
         (full_prompt, false)
-    }
-
-    /// Add request to batch processing queue
-    pub async fn add_to_batch(&self, request: BatchInferenceRequest) -> Result<String, String> {
-        let mut queue = self.batch_queue.lock().unwrap();
-        let request_id = request.id.clone();
-        queue.push(request);
-
-        // Process batch if it reaches target size
-        if queue.len() >= self.batch_size {
-            drop(queue);
-            self.process_batch().await?;
-        }
-
-        Ok(request_id)
-    }
-
-    /// Process batch of inference requests
-    async fn process_batch(&self) -> Result<(), String> {
-        let mut queue = self.batch_queue.lock().unwrap();
-        if queue.is_empty() {
-            return Ok(());
-        }
-
-        let batch: Vec<_> = queue.drain(..).collect();
-        drop(queue);
-
-        println!("Processing batch of {} requests", batch.len());
-
-        // In a real implementation, this would use the LLM's batch inference capabilities
-        // For now, we'll process them sequentially but track batch statistics
-        for _request in batch {
-            // Simulate batch processing - in reality this would be optimized
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-
-        let mut stats = self.stats.write().unwrap();
-        stats.batch_processed += 1;
-
-        Ok(())
     }
 
     /// Start response streaming session

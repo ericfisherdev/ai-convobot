@@ -1515,12 +1515,6 @@ fn estimate_response_time_enhanced(msg: &str) -> ResponseEstimate {
     tracker.estimate_response_time(msg, &model_config)
 }
 
-// Keep old function for backward compatibility during transition
-fn estimate_response_time(msg: &str) -> u32 {
-    let enhanced = estimate_response_time_enhanced(msg);
-    enhanced.expected_seconds
-}
-
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = 3000;

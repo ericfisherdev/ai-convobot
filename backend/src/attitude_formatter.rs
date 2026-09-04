@@ -352,6 +352,7 @@ impl AttitudeFormatter {
     }
 
     /// Estimate token count for attitude context
+    #[allow(dead_code)]
     pub fn estimate_attitude_tokens(
         &self,
         attitudes: &[CompanionAttitude],
@@ -362,6 +363,7 @@ impl AttitudeFormatter {
     }
 
     /// Filter attitudes to most significant ones based on token budget
+    #[allow(dead_code)]
     pub fn prioritize_attitudes_for_context(
         &self,
         attitudes: Vec<CompanionAttitude>,
@@ -411,6 +413,7 @@ impl AttitudeFormatter {
     }
 
     /// Calculate how significant an attitude is for context inclusion
+    #[allow(dead_code)]
     fn calculate_attitude_significance(&self, attitude: &CompanionAttitude) -> f32 {
         let relationship_weight = attitude.relationship_score.unwrap_or(0.0).abs() / 100.0;
         let emotion_intensity = (attitude.anger.abs()

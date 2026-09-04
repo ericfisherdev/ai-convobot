@@ -5,11 +5,16 @@ use crate::token_budget::{TokenBudget, TokenUsageMonitor, TokenUsageStatistics};
 pub struct ContextManager {
     pub config: ConfigView,
     pub token_budget: TokenBudget,
+    #[allow(dead_code)]
     pub usage_monitor: TokenUsageMonitor,
+    #[allow(dead_code)]
     pub system_memory_detector: SystemMemoryDetector,
+    #[allow(dead_code)]
     pub hybrid_context_allocation: Option<HybridContextAllocation>,
     // Legacy fields for backward compatibility
+    #[allow(dead_code)]
     pub system_token_budget: usize,
+    #[allow(dead_code)]
     pub attitude_token_budget: usize,
     pub message_token_budget: usize,
     pub response_token_budget: usize,
@@ -17,10 +22,14 @@ pub struct ContextManager {
 
 #[derive(Debug, Clone)]
 pub struct HybridContextAllocation {
+    #[allow(dead_code)]
     pub total_context_tokens: usize,
+    #[allow(dead_code)]
     pub vram_context_tokens: usize,
+    #[allow(dead_code)]
     pub system_ram_context_tokens: usize,
     pub allocation_strategy: HybridStrategy,
+    #[allow(dead_code)]
     pub system_memory_info: SystemMemoryInfo,
 }
 
@@ -268,6 +277,7 @@ impl ContextManager {
     }
 
     /// Check if context management is working within memory constraints
+    #[allow(dead_code)]
     pub fn validate_context_size(
         &self,
         system_tokens: usize,
@@ -303,6 +313,7 @@ impl ContextManager {
     }
 
     /// Comprehensive context optimization using the new token budget system
+    #[allow(dead_code)]
     pub fn optimize_full_context(
         &mut self,
         system_prompt: &str,
@@ -337,6 +348,7 @@ impl ContextManager {
     }
 
     /// Check if we're at risk of context overflow
+    #[allow(dead_code)]
     fn check_overflow_risk(&self) -> bool {
         let total_context = self.usage_monitor.current_usage.total_context_tokens;
         let safety_threshold = (self.token_budget.total as f32 * 0.85) as usize;
@@ -344,21 +356,25 @@ impl ContextManager {
     }
 
     /// Get token budget allocation summary
+    #[allow(dead_code)]
     pub fn get_budget_summary(&self) -> String {
         self.token_budget.get_allocation_summary()
     }
 
     /// Reset usage monitor for new conversation
+    #[allow(dead_code)]
     pub fn reset_usage_monitor(&mut self) {
         self.usage_monitor = TokenUsageMonitor::new(self.token_budget.clone());
     }
 
     /// Get optimization suggestions based on usage patterns
+    #[allow(dead_code)]
     pub fn get_context_optimization_suggestions(&self) -> Vec<String> {
         self.usage_monitor.get_optimization_suggestions()
     }
 
     /// Format context for LLM prompt with priority-based inclusion
+    #[allow(dead_code)]
     pub fn format_optimized_prompt(&self, context: &OptimizedContext) -> String {
         let mut prompt_parts = Vec::new();
 
@@ -412,6 +428,7 @@ impl ContextManager {
     }
 
     /// Handle context overflow by intelligently trimming content
+    #[allow(dead_code)]
     pub fn handle_context_overflow(&mut self, context: &mut OptimizedContext) -> bool {
         if !context.overflow_detected {
             return false;
@@ -450,6 +467,7 @@ impl ContextManager {
     }
 
     /// Compress message history to essential messages
+    #[allow(dead_code)]
     fn compress_message_history(&self, messages: &[Message], target_count: usize) -> Vec<Message> {
         if messages.len() <= target_count {
             return messages.to_vec();
@@ -482,6 +500,7 @@ impl ContextManager {
     }
 
     /// Check if response budget is critically low and attempt to resolve it
+    #[allow(dead_code)]
     pub fn handle_response_budget_crisis(&mut self, current_response_budget: usize) -> bool {
         if current_response_budget >= 100 {
             return false; // No crisis
@@ -522,6 +541,7 @@ impl ContextManager {
     }
 
     /// Try to expand context window using system RAM
+    #[allow(dead_code)]
     fn try_expand_context_window(&self) -> Option<HybridContextAllocation> {
         let (_, hybrid_allocation) =
             Self::calculate_hybrid_context_size(&self.config, &self.system_memory_detector);
@@ -530,6 +550,7 @@ impl ContextManager {
     }
 
     /// Check if we can expand RAM allocation for context
+    #[allow(dead_code)]
     fn can_expand_ram_allocation(&self, _current_allocation: &HybridContextAllocation) -> bool {
         // Check if system memory situation has improved
         match self.system_memory_detector.detect_system_memory() {
@@ -545,6 +566,7 @@ impl ContextManager {
     }
 
     /// Expand RAM allocation for context
+    #[allow(dead_code)]
     fn expand_ram_allocation(&self) -> Option<HybridContextAllocation> {
         if let Some(ref current) = self.hybrid_context_allocation {
             let _current_ram_gb = current.system_ram_context_tokens as f32 / (1024.0 * 256.0);
@@ -575,6 +597,7 @@ impl ContextManager {
     }
 
     /// Reallocate token budget to prioritize response generation
+    #[allow(dead_code)]
     fn reallocate_token_budget_for_response(&mut self) {
         // Temporarily reduce other allocations to boost response budget
         let _current_total = self.token_budget.total;
@@ -597,6 +620,7 @@ impl ContextManager {
     }
 
     /// Recalculate token budget based on new context size
+    #[allow(dead_code)]
     fn recalculate_token_budget(&mut self) {
         if let Some(ref hybrid_allocation) = self.hybrid_context_allocation {
             self.token_budget = TokenBudget::from_vram_limit(
@@ -616,6 +640,7 @@ impl ContextManager {
     }
 
     /// Get current memory usage summary including hybrid allocation
+    #[allow(dead_code)]
     pub fn get_hybrid_memory_summary(&self) -> String {
         let base_summary = self.get_budget_summary();
 
@@ -634,6 +659,7 @@ impl ContextManager {
     }
 
     /// Check if system can benefit from hybrid context expansion
+    #[allow(dead_code)]
     pub fn can_benefit_from_hybrid_expansion(&self) -> bool {
         if !self.config.enable_hybrid_context || self.hybrid_context_allocation.is_some() {
             return false;
@@ -653,6 +679,7 @@ impl ContextManager {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct OptimizedContext {
     pub system_prompt: String,
     pub messages: Vec<Message>,
@@ -664,6 +691,7 @@ pub struct OptimizedContext {
 }
 
 impl OptimizedContext {
+    #[allow(dead_code)]
     pub fn print_optimization_summary(&self) {
         println!("🔧 Context Optimization Summary:");
         println!("   Messages included: {}", self.messages.len());
