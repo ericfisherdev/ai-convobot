@@ -285,7 +285,7 @@ jobs:
             "cuda")
               # CUDA builds must have CUDA available - no fallback
               if [ "${CUDA_AVAILABLE:-false}" = "true" ]; then
-                echo "features=cublas" >> $GITHUB_OUTPUT
+                echo "features=cuda" >> $GITHUB_OUTPUT
                 echo "build_name=CUDA" >> $GITHUB_OUTPUT
               else
                 echo "ERROR: CUDA build requested but CUDA is not available!"
@@ -296,7 +296,7 @@ jobs:
             "opencl")
               # OpenCL builds must have OpenCL available - no fallback
               if [ "${OPENCL_AVAILABLE:-false}" = "true" ]; then
-                echo "features=clblast" >> $GITHUB_OUTPUT
+                echo "features=opencl" >> $GITHUB_OUTPUT
                 echo "build_name=OpenCL" >> $GITHUB_OUTPUT
               else
                 echo "ERROR: OpenCL build requested but OpenCL is not available!"

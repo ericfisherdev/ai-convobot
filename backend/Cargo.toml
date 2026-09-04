@@ -25,17 +25,15 @@ sha2 = "0.10.8"
 lazy_static = "1.4.0"
 uuid = { version = "1.6", features = ["v4", "serde"] }
 walkdir = "2.4"
-llm = { git = "https://github.com/rustformers/llm" , branch = "gguf" }
-# Force console to include std feature to fix indicatif compatibility
-console = { version = "*", features = ["std"] }
-# Fix zstd version mismatches by pinning compatible versions  
-zstd-safe = "=5.0.2"
-zstd-sys = "=2.0.9"
+llama-cpp-2 = "0.1.156"
+encoding_rs = "0.8"
 
 [features]
-cublas = ["llm/cublas"]
-clblast = ["llm/clblast"]
-metal = ["llm/metal"]
+cuda = ["llama-cpp-2/cuda"]
+opencl = ["llama-cpp-2/opencl"]
+vulkan = ["llama-cpp-2/vulkan"]
+rocm = ["llama-cpp-2/rocm"]
+metal = ["llama-cpp-2/metal"]
 
 [dev-dependencies]
 tempfile = "3.8"
