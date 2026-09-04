@@ -746,7 +746,7 @@ impl Database {
         if Database::is_table_empty("companion", &con)? {
             con.execute(
                 "INSERT INTO companion (name, persona, example_dialogue, first_message, long_term_mem, short_term_mem, roleplay, dialogue_tuning, avatar_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                &[
+                [
                     "Assistant",
                     "{{char}} is an artificial intelligence chatbot designed to help {{user}}. {{char}} is an artificial intelligence created in ai-companion backend",
                     "{{user}}: What is ai-companion?\n{{char}}: AI Companion is a open-source project, wrote in Rust, Typescript and React, that aims to provide users with their own personal AI chatbot on their computer. It allows users to engage in friendly and natural conversations with their AI, creating a unique and personalized experience. This software can also be used as a backend or API for other projects that require a personalised AI chatbot. Very light size, simple installation, simple configuration, quick cold start and ease of use are some of the strengths of AI Companion in comparison to other similar projects.\n{{user}}: Can you tell me about the creator of ai-companion?\n{{char}}: the creator of the ai-companion program is 'Hubert Kasperek', he is a young programmer from Poland who is mostly interested in web development and computer science concepts, he has account on GitHub under nickname \"Hukasx0\"",
@@ -762,7 +762,7 @@ impl Database {
         if Database::is_table_empty("user", &con)? {
             con.execute(
                 "INSERT INTO user (name, persona, avatar_path) VALUES (?, ?, ?)",
-                &[
+                [
                     "User",
                     "{{user}} is chatting with {{char}} using ai-companion web user interface",
                     "/assets/user_avatar-4rust.jpg",
@@ -783,11 +783,11 @@ impl Database {
                 })?;
             let user_name: String =
                 con.query_row("SELECT name, persona FROM user LIMIT 1", [], |row| {
-                    Ok(row.get(0)?)
+                    row.get(0)
                 })?;
             con.execute(
                 "INSERT INTO messages (ai, content, created_at) VALUES (?, ?, ?)",
-                &[
+                [
                     "1",
                     &companion_data
                         .first_message
@@ -800,7 +800,7 @@ impl Database {
         if Database::is_table_empty("config", &con)? {
             con.execute(
                 "INSERT INTO config (device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb, dynamic_gpu_allocation, gpu_safety_margin, min_free_vram_mb, enable_hybrid_context, max_system_ram_usage_gb, context_expansion_strategy, ram_safety_margin_gb) VALUES (?, ?, 20, ?, 2048, 512, true, 4, true, 0.8, 512, true, 8, 'balanced', 2)",
-                &[
+                [
                     &Device::CPU as &dyn ToSql,
                     &"path/to/your/gguf/model.gguf",
                     &PromptTemplate::Auto as &dyn ToSql
@@ -1016,7 +1016,7 @@ impl Database {
                 "INSERT INTO messages (ai, content, created_at) VALUES ({}, ?, ?)",
                 message.ai
             ),
-            &[&message.content, &get_current_date()],
+            [&message.content, &get_current_date()],
         )?;
 
         // Clear message cache when new message is inserted
@@ -1032,7 +1032,7 @@ impl Database {
                 "UPDATE messages SET ai = {}, content = ? WHERE id = ?",
                 message.ai
             ),
-            &[&message.content, &id.to_string()],
+            [&message.content, &id.to_string()],
         )?;
 
         // Clear message cache when message is edited
@@ -1081,11 +1081,11 @@ impl Database {
             })?;
         let user_name: String =
             con.query_row("SELECT name, persona FROM user LIMIT 1", [], |row| {
-                Ok(row.get(0)?)
+                row.get(0)
             })?;
         con.execute(
             "INSERT INTO messages (ai, content, created_at) VALUES (?, ?, ?)",
-            &[
+            [
                 "1",
                 &companion_data
                     .first_message
@@ -1101,7 +1101,7 @@ impl Database {
         let con = Connection::open("companion_database.db")?;
         con.execute(
             &format!("UPDATE companion SET name = ?, persona = ?, example_dialogue = ?, first_message = ?, long_term_mem = {}, short_term_mem = {}, roleplay = {}, dialogue_tuning = {}, avatar_path = ?", companion.long_term_mem, companion.short_term_mem, companion.roleplay, companion.dialogue_tuning),
-            &[
+            [
                 &companion.name,
                 &companion.persona,
                 &companion.example_dialogue,
@@ -1116,7 +1116,7 @@ impl Database {
         let con = Connection::open("companion_database.db")?;
         con.execute(
             "UPDATE companion SET name = ?, persona = ?, example_dialogue = ?, first_message = ?",
-            &[
+            [
                 &companion.name,
                 &companion.description,
                 &companion.mes_example,
@@ -1130,7 +1130,7 @@ impl Database {
         let con = Connection::open("companion_database.db")?;
         con.execute(
             "UPDATE companion SET name = ?, persona = ?, example_dialogue = ?, first_message = ?, avatar_path = ?",
-            &[
+            [
                 &companion.name,
                 &companion.description,
                 &companion.mes_example,
@@ -1143,7 +1143,7 @@ impl Database {
 
     pub fn change_companion_avatar(avatar_path: &str) -> Result<(), Error> {
         let con = Connection::open("companion_database.db")?;
-        con.execute("UPDATE companion SET avatar_path = ?", &[avatar_path])?;
+        con.execute("UPDATE companion SET avatar_path = ?", [avatar_path])?;
         Ok(())
     }
 
@@ -1151,7 +1151,7 @@ impl Database {
         let con = Connection::open("companion_database.db")?;
         con.execute(
             "UPDATE user SET name = ?, persona = ?",
-            &[&user.name, &user.persona],
+            [&user.name, &user.persona],
         )?;
         Ok(())
     }
@@ -1210,7 +1210,7 @@ impl Database {
         let con = Connection::open("companion_database.db")?;
         con.execute(
             "UPDATE config SET device = ?, llm_model_path = ?, gpu_layers = ?, prompt_template = ?, context_window_size = ?, max_response_tokens = ?, enable_dynamic_context = ?, vram_limit_gb = ?, dynamic_gpu_allocation = ?, gpu_safety_margin = ?, min_free_vram_mb = ?, enable_hybrid_context = ?, max_system_ram_usage_gb = ?, context_expansion_strategy = ?, ram_safety_margin_gb = ?",
-            &[
+            [
                 &device as &dyn ToSql,
                 &config.llm_model_path,
                 &config.gpu_layers,
@@ -1429,7 +1429,7 @@ impl Database {
              ORDER BY relationship_score DESC",
         )?;
 
-        let attitudes = stmt.query_map(&[&companion_id], |row| {
+        let attitudes = stmt.query_map([&companion_id], |row| {
             Ok(CompanionAttitude {
                 id: Some(row.get(0)?),
                 companion_id: row.get(1)?,
@@ -1640,7 +1640,7 @@ impl Database {
         let existing_id: Option<i32> = con
             .query_row(
                 "SELECT id FROM third_party_individuals WHERE name = ?",
-                &[name],
+                [name],
                 |row| row.get(0),
             )
             .ok();
@@ -1802,7 +1802,7 @@ impl Database {
         };
 
         let mut stmt = con.prepare(&query)?;
-        let interactions = stmt.query_map(&[&companion_id], |row| {
+        let interactions = stmt.query_map([&companion_id], |row| {
             Ok(ThirdPartyInteraction {
                 id: Some(row.get(0)?),
                 third_party_id: row.get(1)?,
@@ -1892,7 +1892,7 @@ impl Database {
         )?;
 
         let individual = stmt
-            .query_row(&[name], |row| {
+            .query_row([name], |row| {
                 Ok(ThirdPartyIndividual {
                     id: Some(row.get(0)?),
                     name: row.get(1)?,
@@ -1975,7 +1975,7 @@ impl Database {
         };
 
         let mut stmt = con.prepare(&query)?;
-        let memories = stmt.query_map(&[&third_party_id], |row| {
+        let memories = stmt.query_map([&third_party_id], |row| {
             Ok(ThirdPartyMemory {
                 id: Some(row.get(0)?),
                 third_party_id: row.get(1)?,
@@ -2202,7 +2202,7 @@ impl Database {
         )?;
 
         let duplicate_names: Vec<String> = stmt
-            .query_map([], |row| Ok(row.get::<_, String>(0)?))?
+            .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         for lower_name in duplicate_names {
@@ -2431,7 +2431,7 @@ impl Database {
             )?;
 
             let ids: Vec<i32> = stmt
-                .query_map([invalid_name], |row| Ok(row.get::<_, i32>(0)?))?
+                .query_map([invalid_name], |row| row.get::<_, i32>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
             for id in ids {
@@ -2513,7 +2513,7 @@ impl Database {
 
         // Keep original text for proper name detection (with capitalization)
         let text_original = text;
-        let text_lower = text.to_lowercase();
+        let _text_lower = text.to_lowercase();
 
         // More specific patterns for person references
         // Note: These patterns now focus on clearer indicators of person names
@@ -2547,7 +2547,7 @@ impl Database {
                             let potential_name = name_match.as_str().trim();
 
                             // Check if this looks like a proper name (starts with capital)
-                            if potential_name.len() > 0
+                            if !potential_name.is_empty()
                                 && potential_name.chars().next().unwrap().is_uppercase()
                                 && Database::is_likely_person_name(potential_name)
                                 && Database::is_proper_name_context(potential_name, text_original)
@@ -3300,20 +3300,20 @@ impl Database {
     }
 
     fn clamp_attitude_values(attitude: &mut CompanionAttitude) {
-        attitude.attraction = attitude.attraction.max(-100.0).min(100.0);
-        attitude.trust = attitude.trust.max(-100.0).min(100.0);
-        attitude.fear = attitude.fear.max(-100.0).min(100.0);
-        attitude.anger = attitude.anger.max(-100.0).min(100.0);
-        attitude.joy = attitude.joy.max(-100.0).min(100.0);
-        attitude.sorrow = attitude.sorrow.max(-100.0).min(100.0);
-        attitude.disgust = attitude.disgust.max(-100.0).min(100.0);
-        attitude.surprise = attitude.surprise.max(-100.0).min(100.0);
-        attitude.curiosity = attitude.curiosity.max(-100.0).min(100.0);
-        attitude.respect = attitude.respect.max(-100.0).min(100.0);
-        attitude.suspicion = attitude.suspicion.max(-100.0).min(100.0);
-        attitude.gratitude = attitude.gratitude.max(-100.0).min(100.0);
-        attitude.jealousy = attitude.jealousy.max(-100.0).min(100.0);
-        attitude.empathy = attitude.empathy.max(-100.0).min(100.0);
+        attitude.attraction = attitude.attraction.clamp(-100.0, 100.0);
+        attitude.trust = attitude.trust.clamp(-100.0, 100.0);
+        attitude.fear = attitude.fear.clamp(-100.0, 100.0);
+        attitude.anger = attitude.anger.clamp(-100.0, 100.0);
+        attitude.joy = attitude.joy.clamp(-100.0, 100.0);
+        attitude.sorrow = attitude.sorrow.clamp(-100.0, 100.0);
+        attitude.disgust = attitude.disgust.clamp(-100.0, 100.0);
+        attitude.surprise = attitude.surprise.clamp(-100.0, 100.0);
+        attitude.curiosity = attitude.curiosity.clamp(-100.0, 100.0);
+        attitude.respect = attitude.respect.clamp(-100.0, 100.0);
+        attitude.suspicion = attitude.suspicion.clamp(-100.0, 100.0);
+        attitude.gratitude = attitude.gratitude.clamp(-100.0, 100.0);
+        attitude.jealousy = attitude.jealousy.clamp(-100.0, 100.0);
+        attitude.empathy = attitude.empathy.clamp(-100.0, 100.0);
     }
 
     // Companion Interaction Tracking System
@@ -3327,7 +3327,7 @@ impl Database {
                     planned_date, actual_date, outcome, impact_on_relationship,
                     created_at, updated_at
              FROM third_party_interactions WHERE id = ?",
-            &[&interaction_id],
+            [&interaction_id],
             |row| {
                 Ok(ThirdPartyInteraction {
                     id: Some(row.get(0)?),
@@ -3484,7 +3484,7 @@ impl Database {
         }
 
         // Clamp impact to reasonable range
-        impact.max(-25.0).min(25.0)
+        impact.clamp(-25.0, 25.0)
     }
 
     fn update_attitude_from_interaction(
@@ -3575,7 +3575,7 @@ impl Database {
         )?;
 
         let individual = stmt
-            .query_row(&[&id], |row| {
+            .query_row([&id], |row| {
                 Ok(ThirdPartyIndividual {
                     id: Some(row.get(0)?),
                     name: row.get(1)?,
@@ -3769,7 +3769,7 @@ impl Database {
         )?;
 
         let interaction = stmt
-            .query_row(&[&id], |row| {
+            .query_row([&id], |row| {
                 Ok(ThirdPartyInteraction {
                     id: Some(row.get(0)?),
                     third_party_id: row.get(1)?,

@@ -161,7 +161,7 @@ impl TokenUsageMonitor {
                     let compressed_attitude = self.compress_attitude(&attitude);
                     let compressed_tokens = Self::estimate_tokens(&compressed_attitude);
                     if current_tokens + compressed_tokens <= self.budget.attitude_data {
-                        let mut compressed_attitude_obj = attitude.clone();
+                        let compressed_attitude_obj = attitude.clone();
                         // Store compressed version in a special way (this is a simplified approach)
                         filtered_attitudes.push(compressed_attitude_obj);
                         current_tokens += compressed_tokens;
@@ -580,11 +580,11 @@ mod tests {
         assert!((total_allocated as i32 - budget.total as i32).abs() <= 2); // Allow small rounding differences
 
         // Check specific allocations
-        assert_eq!(budget.system_prompt, (2048 as f32 * 0.15) as usize);
-        assert_eq!(budget.attitude_data, (2048 as f32 * 0.20) as usize);
-        assert_eq!(budget.third_party_info, (2048 as f32 * 0.10) as usize);
-        assert_eq!(budget.recent_messages, (2048 as f32 * 0.40) as usize);
-        assert_eq!(budget.response_buffer, (2048 as f32 * 0.15) as usize);
+        assert_eq!(budget.system_prompt, (2048_f32 * 0.15) as usize);
+        assert_eq!(budget.attitude_data, (2048_f32 * 0.20) as usize);
+        assert_eq!(budget.third_party_info, (2048_f32 * 0.10) as usize);
+        assert_eq!(budget.recent_messages, (2048_f32 * 0.40) as usize);
+        assert_eq!(budget.response_buffer, (2048_f32 * 0.15) as usize);
     }
 
     #[test]
@@ -623,7 +623,7 @@ mod tests {
 
     #[test]
     fn test_attitude_significance_calculation() {
-        let monitor = TokenUsageMonitor::new(TokenBudget::from_vram_limit(4, 2048));
+        let _monitor = TokenUsageMonitor::new(TokenBudget::from_vram_limit(4, 2048));
 
         let high_significance_attitude = CompanionAttitude {
             id: Some(1),
@@ -710,7 +710,7 @@ mod tests {
 
         // Should filter out low significance attitudes
         assert!(filtered.len() < 4);
-        assert!(filtered.len() >= 1); // At least the high significance one should remain
+        assert!(!filtered.is_empty()); // At least the high significance one should remain
 
         // Check that we have some usage statistics
         assert!(monitor.current_usage.attitude_tokens > 0);

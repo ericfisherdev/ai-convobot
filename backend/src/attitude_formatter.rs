@@ -505,7 +505,7 @@ impl AttitudeFormatter {
 
         let dominant = emotions[0];
         let secondary = emotions[1];
-        let tertiary = emotions[2];
+        let _tertiary = emotions[2];
 
         // Generate contextual summary based on emotional combinations
         match dominant {

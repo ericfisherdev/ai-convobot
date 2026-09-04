@@ -51,10 +51,7 @@ fn llama_backend() -> Result<&'static LlamaBackend, std::io::Error> {
         return Ok(backend);
     }
     let backend = LlamaBackend::init().map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to initialize llama.cpp backend: {}", e),
-        )
+        std::io::Error::other(format!("Failed to initialize llama.cpp backend: {}", e))
     })?;
     Ok(LLAMA_BACKEND.get_or_init(|| backend))
 }
@@ -144,10 +141,7 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
         Ok(ltm) => ltm,
         Err(e) => {
             eprintln!("Error while connecting to tantivy: {}", e);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Error while connecting to tantivy",
-            ));
+            return Err(std::io::Error::other("Error while connecting to tantivy"));
         }
     };
     let local: DateTime<Local> = Local::now();
@@ -156,30 +150,21 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
         Ok(config) => config,
         Err(e) => {
             eprintln!("Error while getting config: {}", e);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Error while getting config",
-            ));
+            return Err(std::io::Error::other("Error while getting config"));
         }
     };
     let user: UserView = match Database::get_user_data() {
         Ok(user) => user,
         Err(e) => {
             eprintln!("Error while getting user data: {}", e);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Error while getting user data",
-            ));
+            return Err(std::io::Error::other("Error while getting user data"));
         }
     };
     let companion: CompanionView = match Database::get_companion_data() {
         Ok(companion) => companion,
         Err(e) => {
             eprintln!("Error while getting companion data: {}", e);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Error while getting companion data",
-            ));
+            return Err(std::io::Error::other("Error while getting companion data"));
         }
     };
 
@@ -246,10 +231,10 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
     ) {
         Ok(model) => model,
         Err(e) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to load llm model: {}", e),
-            ))
+            return Err(std::io::Error::other(format!(
+                "Failed to load llm model: {}",
+                e
+            )))
         }
     };
     println!("✓ Model loaded");
@@ -267,14 +252,11 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
         rp = "gestures and other non-verbal actions are written between asterisks (for example, *waves hello* or *moves closer*)";
     }
     if companion.dialogue_tuning {
-        match DialogueTuning::get_random_dialogue() {
-            Ok(dialogue) => {
-                tuned_dialogue = format!(
-                    "{}: {}\n{}: {}",
-                    &user.name, &dialogue.user_msg, &companion.name, &dialogue.ai_msg
-                );
-            }
-            Err(_) => {}
+        if let Ok(dialogue) = DialogueTuning::get_random_dialogue() {
+            tuned_dialogue = format!(
+                "{}: {}\n{}: {}",
+                &user.name, &dialogue.user_msg, &companion.name, &dialogue.ai_msg
+            );
         };
     }
     // Build base prompt components for caching optimization
@@ -389,8 +371,7 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
                 Ok(entries) => entries,
                 Err(e) => {
                     eprintln!("Error while getting long term memory entries: {}", e);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    return Err(std::io::Error::other(
                         "Error while getting long term memory entries",
                     ));
                 }
@@ -425,8 +406,7 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
         Ok(entries) => entries,
         Err(e) => {
             eprintln!("Error while getting short term memory entries: {}", e);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "Error while getting short term memory entries",
             ));
         }
@@ -582,10 +562,10 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
     let mut llama_context = match model.new_context(backend, context_params) {
         Ok(context) => context,
         Err(e) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to create llama context: {}", e),
-            ))
+            return Err(std::io::Error::other(format!(
+                "Failed to create llama context: {}",
+                e
+            )))
         }
     };
 
@@ -616,22 +596,19 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
     let prompt_tokens = match model.str_to_token(&full_prompt, AddBos::Always) {
         Ok(tokens) => tokens,
         Err(e) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to tokenize prompt: {}", e),
-            ))
+            return Err(std::io::Error::other(format!(
+                "Failed to tokenize prompt: {}",
+                e
+            )))
         }
     };
 
     if prompt_tokens.len() >= context_size as usize {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "Prompt is {} tokens but the context window is only {}",
-                prompt_tokens.len(),
-                context_size
-            ),
-        ));
+        return Err(std::io::Error::other(format!(
+            "Prompt is {} tokens but the context window is only {}",
+            prompt_tokens.len(),
+            context_size
+        )));
     }
 
     // Feed the prompt in n_batch-sized chunks; only the final token needs logits.
@@ -640,17 +617,17 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
     for (i, token) in prompt_tokens.iter().enumerate() {
         let is_last = i == last_prompt_index;
         if let Err(e) = batch.add(*token, i as i32, &[0], is_last) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to build prompt batch: {}", e),
-            ));
+            return Err(std::io::Error::other(format!(
+                "Failed to build prompt batch: {}",
+                e
+            )));
         }
         if batch.n_tokens() as u32 == N_BATCH || is_last {
             if let Err(e) = llama_context.decode(&mut batch) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to evaluate prompt: {}", e),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "Failed to evaluate prompt: {}",
+                    e
+                )));
             }
             batch.clear();
         }
@@ -782,7 +759,7 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
 
     // Print cache statistics periodically
     let stats = INFERENCE_OPTIMIZER.get_stats();
-    if stats.total_requests % 10 == 0 {
+    if stats.total_requests.is_multiple_of(10) {
         let (cache_size, cache_hits, hit_rate) = INFERENCE_OPTIMIZER.get_cache_stats();
         println!(
             "📊 Cache Stats: {} entries, {} hits, {:.2}% hit rate",

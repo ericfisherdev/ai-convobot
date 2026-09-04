@@ -80,7 +80,7 @@ impl LlmScanner {
             // Check if it's a file with .gguf extension (case-insensitive)
             if path.is_file() {
                 if let Some(extension) = path.extension() {
-                    if extension.to_ascii_lowercase() == "gguf" {
+                    if extension.eq_ignore_ascii_case("gguf") {
                         if let Ok(metadata) = fs::metadata(path) {
                             let size_bytes = metadata.len();
 
