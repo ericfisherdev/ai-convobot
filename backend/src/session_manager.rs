@@ -303,11 +303,12 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a mock database before update_attitude can be exercised; see #63"]
     fn test_attitude_update() {
         let manager = SessionManager::new(30);
-        let _session = manager.create_session(1, Some(1)).unwrap();
+        let session = manager.create_session(1, Some(1)).unwrap();
 
-        let _attitude = CompanionAttitude {
+        let attitude = CompanionAttitude {
             id: None,
             companion_id: 1,
             target_id: 1,
@@ -337,7 +338,6 @@ mod tests {
             created_at: Utc::now().to_string(),
         };
 
-        // Note: This test would need a mock database to fully work
-        // manager.update_attitude(&session.id, attitude).unwrap();
+        manager.update_attitude(&session.id, attitude).unwrap();
     }
 }
