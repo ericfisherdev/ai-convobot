@@ -337,7 +337,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   - `device` (string) ("CPU" || "GPU" || "Metal"): The device used for processing (CPU, GPU, Metal).
   - `llm_model_path` (string): Path to the language model.
   - `gpu_layers` (integer): Number of GPU layers.
-  - `prompt_template` (string) ("Default" || "Llama2" || "Mistral"): Prompt template for generating responses (Default, Llama2, Mistral).
+  - `prompt_template` (string) ("Auto" || "Default" || "Llama2" || "Mistral"): Prompt template used to format the prompt. `Auto` renders the prompt with the chat template stored inside the GGUF file and falls back to `Default` when the model does not carry one. It is the default for new installs.
 - **Response:**
   - Status: 200 OK
   - Body: Config updated!
@@ -417,7 +417,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 
 ### 6. Prompting
 
-#### 6.1 Update Configuration
+#### 6.1 Prompt the AI
 
 - **URL:** `/prompt`
 - **Method:** `POST`
@@ -437,7 +437,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   }
   ```
 
-#### 6.2 Update Configuration
+#### 6.2 Regenerate the last answer
 
 - **URL:** `/prompt/regenerate`
 - **Method:** `GET`
@@ -449,6 +449,101 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   ```http
   GET /prompt/regenerate
   ```
+
+#### 6.3 Stream a prompt response
+
+- **URL:** `/prompt/stream`
+- **Method:** `POST`
+- **Description:** Prompt the AI and receive the reply token by token as Server-Sent Events. The user message and the finished reply are saved in short-term memory, long-term memory and the chat log, exactly as with `/prompt`.
+- **Request Body:**
+  - `prompt` (string): Prompt to the AI
+  - `session_id` (string): Caller-supplied identifier, echoed back on every chunk as `request_id`
+- **Response:**
+  - Status: 200 OK
+  - Content-Type: `text/event-stream`
+  - Body: a sequence of `data:` events, each carrying one JSON chunk. Chunks arrive with `is_complete: false` and one token in `content`; the final chunk has `is_complete: true` and an empty `content`.
+- **Example Request:**
+  ```http
+  POST /prompt/stream
+  Content-Type: application/json
+
+  {
+    "prompt": "what time is it currently?",
+    "session_id": "abc123"
+  }
+  ```
+- **Example Response:**
+  ```
+  data: {"request_id":"abc123","content":"It","is_complete":false,"token_count":1}
+
+  data: {"request_id":"abc123","content":"'s","is_complete":false,"token_count":2}
+
+  data: {"request_id":"abc123","content":"","is_complete":true,"token_count":41}
+  ```
+- **Notes:**
+  - Generation is serialised: a request that arrives while another is generating waits its turn.
+  - If the client disconnects mid-stream, generation still runs to completion so the reply is persisted.
+
+## Route index
+
+Endpoint sections above cover the core messaging, companion, user, configuration, memory and prompting routes. The table below lists every route the backend registers, including those not yet written up in full. It is generated from the handler attributes in `backend/src/main.rs`.
+
+| Method | Path |
+| --- | --- |
+| `GET` | `/api/attitude` |
+| `POST` | `/api/attitude` |
+| `DELETE` | `/api/attitude/clear` |
+| `GET` | `/api/attitude/companion/{companion_id}` |
+| `PUT` | `/api/attitude/dimension` |
+| `GET` | `/api/attitude/memories/{companion_id}` |
+| `GET` | `/api/attitude/summary/{companion_id}/{user_id}` |
+| `GET` | `/api/companion` |
+| `PUT` | `/api/companion` |
+| `POST` | `/api/companion/avatar` |
+| `POST` | `/api/companion/card` |
+| `GET` | `/api/companion/characterJson` |
+| `POST` | `/api/companion/characterJson` |
+| `GET` | `/api/config` |
+| `PUT` | `/api/config` |
+| `POST` | `/api/estimate-response-time` |
+| `GET` | `/api/gpu/allocation` |
+| `GET` | `/api/gpu/memory` |
+| `POST` | `/api/inference/cache/cleanup` |
+| `GET` | `/api/inference/stats` |
+| `POST` | `/api/interactions/detect` |
+| `GET` | `/api/interactions/history/{companion_id}/{third_party_id}` |
+| `POST` | `/api/interactions/{interaction_id}/complete` |
+| `POST` | `/api/interactions/plan` |
+| `GET` | `/api/interactions/planned/{companion_id}` |
+| `GET` | `/api/llm/directories` |
+| `POST` | `/api/llm/directories` |
+| `DELETE` | `/api/llm/directories/{id}` |
+| `GET` | `/api/llm/models` |
+| `DELETE` | `/api/memory/dialogueTuning` |
+| `POST` | `/api/memory/dialogueTuning` |
+| `DELETE` | `/api/memory/longTerm` |
+| `POST` | `/api/memory/longTerm` |
+| `DELETE` | `/api/message` |
+| `GET` | `/api/message` |
+| `POST` | `/api/message` |
+| `DELETE` | `/api/message/{id}` |
+| `GET` | `/api/message/{id}` |
+| `PUT` | `/api/message/{id}` |
+| `GET` | `/api/persons` |
+| `POST` | `/api/persons/cleanup-duplicates` |
+| `POST` | `/api/persons/cleanup-invalid` |
+| `POST` | `/api/persons/detect` |
+| `GET` | `/api/persons/{name}` |
+| `POST` | `/api/prompt` |
+| `GET` | `/api/prompt/regenerate` |
+| `POST` | `/api/prompt/stream` |
+| `POST` | `/api/session` |
+| `PUT` | `/api/session/attitude` |
+| `GET` | `/api/session/{session_id}` |
+| `POST` | `/api/session/{session_id}/end` |
+| `GET` | `/api/session/stats/summary` |
+| `GET` | `/api/user` |
+| `PUT` | `/api/user` |
 
 ---
 

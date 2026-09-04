@@ -10,6 +10,7 @@ interface MessagesContextType {
   messages: MessageInterface[];
   refreshMessages: () => void;
   pushMessage: (message: MessageInterface) => void;
+  updateMessage: (id: number, content: string) => void;
   loadMoreMessages: () => Promise<boolean>;
   resetStart : () => void;
   isLoadingMore: boolean;
@@ -68,6 +69,16 @@ export const MessagesProvider: React.FC<MessagesProviderProps> = ({ children }) 
     setMessages(prevMessages => [...prevMessages, message]);
   };
 
+  // Replaces the body of an already-rendered message, used to grow the
+  // placeholder reply as streamed tokens arrive.
+  const updateMessage = (id: number, content: string) => {
+    setMessages(prevMessages =>
+      prevMessages.map(message =>
+        message.id === id ? { ...message, content } : message
+      )
+    );
+  };
+
   const loadMoreMessages = async (): Promise<boolean> => {
     if (isLoadingMore || !hasMoreMessages) {
       return false;
@@ -108,6 +119,7 @@ export const MessagesProvider: React.FC<MessagesProviderProps> = ({ children }) 
       messages, 
       refreshMessages, 
       pushMessage, 
+      updateMessage,
       loadMoreMessages, 
       resetStart,
       isLoadingMore,

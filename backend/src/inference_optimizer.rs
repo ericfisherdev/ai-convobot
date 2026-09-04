@@ -33,6 +33,10 @@ pub struct StreamChunk {
     pub content: String,
     pub is_complete: bool,
     pub token_count: Option<usize>,
+    /// Set on the final chunk when generation failed, so a client can tell a
+    /// failure apart from a normal completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Inference optimization statistics

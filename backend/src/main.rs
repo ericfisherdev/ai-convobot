@@ -13,7 +13,8 @@ mod character_card;
 use character_card::CharacterCard;
 use serde::Deserialize;
 mod llm;
-use crate::llm::prompt;
+use crate::llm::{prompt, prompt_streaming};
+use uuid::Uuid;
 mod context_manager;
 mod inference_optimizer;
 use crate::inference_optimizer::{StreamChunk, INFERENCE_OPTIMIZER};
@@ -509,7 +510,46 @@ struct Prompt {
 #[derive(Deserialize)]
 struct StreamingRequest {
     prompt: String,
-    session_id: String,
+}
+
+/// Pre-processing shared by `/api/prompt` and `/api/prompt/stream`: third-party
+/// mention tracking, new-person detection and interaction detection.
+///
+/// Returns the prompt to generate from when an interaction with a recorded
+/// outcome matched, so the caller can generate with that added context.
+fn preprocess_user_message(user_message: &str, companion_id: i32) -> Option<String> {
+    // Track third-party mentions and display console output
+    match Database::track_third_party_mentions(user_message) {
+        Ok(mention_output) => {
+            if !mention_output.is_empty() {
+                println!("{}", mention_output);
+            }
+        }
+        Err(e) => eprintln!("Failed to track third-party mentions: {}", e),
+    }
+
+    // Automatically detect new persons in the message
+    if let Err(e) = Database::detect_new_persons_in_message(user_message, companion_id) {
+        eprintln!("Failed to detect persons in message: {}", e);
+        // Continue processing even if person detection fails
+    }
+
+    // Detect and handle interaction requests
+    if let Ok(Some(interaction)) = Database::detect_interaction_request(user_message, companion_id) {
+        if let Some(outcome) = interaction.outcome.as_ref() {
+            let third_party_name = Database::get_third_party_by_id(interaction.third_party_id)
+                .ok()
+                .flatten()
+                .map(|p| p.name)
+                .unwrap_or_else(|| "unknown".to_string());
+            return Some(format!(
+                "{}\n[Context: Interaction with {} - {}]",
+                user_message, third_party_name, outcome
+            ));
+        }
+    }
+
+    None
 }
 
 #[post("/api/prompt")]
@@ -517,22 +557,8 @@ async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
     let prompt_message = received.into_inner().prompt.clone();
     let start_time = std::time::Instant::now();
 
-    // Track third-party mentions and display console output
-    match Database::track_third_party_mentions(&prompt_message) {
-        Ok(mention_output) => {
-            if !mention_output.is_empty() {
-                println!("{}", mention_output);
-            }
-        },
-        Err(e) => eprintln!("Failed to track third-party mentions: {}", e),
-    }
-
-    // Automatically detect new persons in the message
     let companion_id = 1; // Default companion ID
-    if let Err(e) = Database::detect_new_persons_in_message(&prompt_message, companion_id) {
-        eprintln!("Failed to detect persons in message: {}", e);
-        // Continue processing even if person detection fails
-    }
+    let interaction_prompt = preprocess_user_message(&prompt_message, companion_id);
 
     // Get current attitude for comparison (before processing)
     let user_id = 1; // Default user ID
@@ -557,43 +583,25 @@ async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
         println!("   Factors: {}", estimate.factors.join(", "));
     }
 
-    // Detect and handle interaction requests
-    if let Ok(Some(interaction)) =
-        Database::detect_interaction_request(&prompt_message, companion_id)
-    {
-        // Store interaction context for LLM to use
-        if interaction.outcome.is_some() {
-            // If interaction has outcome, include it in the context
-            let enhanced_prompt = format!(
-                "{}\n[Context: Interaction with {} - {}]",
-                prompt_message,
-                Database::get_third_party_by_id(interaction.third_party_id)
-                    .ok()
-                    .flatten()
-                    .map(|p| p.name)
-                    .unwrap_or_else(|| "unknown".to_string()),
-                interaction.outcome.as_ref().unwrap_or(&"".to_string())
-            );
+    if let Some(enhanced_prompt) = interaction_prompt.as_ref() {
+        match Database::insert_message(NewMessage {
+            ai: false,
+            content: prompt_message.to_string(),
+        }) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Failed to add message to database: {}", e);
+                return HttpResponse::InternalServerError().body(
+                    "Error while adding message to database, check logs for more information",
+                );
+            }
+        };
 
-            match Database::insert_message(NewMessage {
-                ai: false,
-                content: prompt_message.to_string(),
-            }) {
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!("Failed to add message to database: {}", e);
-                    return HttpResponse::InternalServerError().body(
-                        "Error while adding message to database, check logs for more information",
-                    );
-                }
-            };
-
-            // Generate response with interaction context
-            match prompt(&enhanced_prompt) {
-                Ok(v) => return HttpResponse::Ok().body(v),
-                Err(e) => {
-                    println!("Failed to generate prompt with interaction context: {}", e);
-                }
+        // Generate response with interaction context
+        match prompt(enhanced_prompt) {
+            Ok(v) => return HttpResponse::Ok().body(v),
+            Err(e) => {
+                println!("Failed to generate prompt with interaction context: {}", e);
             }
         }
     }
@@ -1144,45 +1152,103 @@ async fn estimate_response_time_endpoint(req: web::Json<EstimateRequest>) -> Htt
     HttpResponse::Ok().json(response)
 }
 
+/// Streams a reply token by token as Server-Sent Events.
+///
+/// Each event carries a `StreamChunk` as JSON. The final event has
+/// `is_complete: true` and no content.
 #[post("/api/prompt/stream")]
 async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpResponse {
     let request = received.into_inner();
-    let session_id = request.session_id.clone();
-    let session_id_clone = session_id.clone();
+    let user_message = request.prompt.clone();
+    // Generated server-side: a caller-supplied id could collide with a live
+    // session and cross-wire the two streams.
+    let session_id = format!("stream-{}", Uuid::new_v4());
 
-    // Start streaming session
-    let mut _rx = INFERENCE_OPTIMIZER.start_streaming_session(session_id.clone());
+    let companion_id = 1; // Default companion ID
+    let interaction_prompt = preprocess_user_message(&user_message, companion_id);
 
-    // In a real implementation, this would start async LLM inference
-    // For now, we'll simulate streaming by sending chunks
-    tokio::spawn(async move {
-        // Simulate processing chunks
-        for i in 1..=5 {
-            let chunk = StreamChunk {
-                request_id: session_id_clone.clone(),
-                content: format!("Chunk {} of response... ", i),
-                is_complete: i == 5,
-                token_count: Some(i * 10),
-            };
+    // The generator reads recent messages back out of the database, so the
+    // user's turn has to be persisted before generation starts.
+    if let Err(e) = Database::insert_message(NewMessage {
+        ai: false,
+        content: user_message.clone(),
+    }) {
+        eprintln!("Failed to add message to database: {}", e);
+        return HttpResponse::InternalServerError()
+            .body("Error while adding message to database, check logs for more information");
+    }
 
-            if INFERENCE_OPTIMIZER
-                .stream_chunk(&session_id_clone, chunk)
-                .is_err()
-            {
-                break;
+    let rx = INFERENCE_OPTIMIZER.start_streaming_session(session_id.clone());
+
+    // Generation is CPU-bound and blocking, so it runs on its own thread rather
+    // than occupying an actix worker for the whole response.
+    let worker_session = session_id.clone();
+    let generation_prompt = interaction_prompt.unwrap_or(user_message);
+    std::thread::spawn(move || {
+        let mut token_count = 0usize;
+        let result = prompt_streaming(&generation_prompt, &mut |token| {
+            token_count += 1;
+            // A send failure means the client hung up; generation still runs to
+            // completion so the reply is persisted.
+            let _ = INFERENCE_OPTIMIZER.stream_chunk(
+                &worker_session,
+                StreamChunk {
+                    request_id: worker_session.clone(),
+                    content: token.to_string(),
+                    is_complete: false,
+                    token_count: Some(token_count),
+                    error: None,
+                },
+            );
+        });
+
+        let final_chunk = match result {
+            // The streamed pieces include stop markers that are stripped before
+            // the reply is persisted, so the final chunk carries the cleaned
+            // text for the client to settle on.
+            Ok(reply) => StreamChunk {
+                request_id: worker_session.clone(),
+                content: reply,
+                is_complete: true,
+                token_count: Some(token_count),
+                error: None,
+            },
+            Err(e) => {
+                eprintln!("Failed to generate streamed prompt: {}", e);
+                StreamChunk {
+                    request_id: worker_session.clone(),
+                    content: String::new(),
+                    is_complete: true,
+                    token_count: Some(token_count),
+                    error: Some(e.to_string()),
+                }
             }
+        };
 
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        }
-
-        // End session
-        INFERENCE_OPTIMIZER.end_streaming_session(&session_id_clone);
+        let _ = INFERENCE_OPTIMIZER.stream_chunk(&worker_session, final_chunk);
+        INFERENCE_OPTIMIZER.end_streaming_session(&worker_session);
     });
 
-    HttpResponse::Ok().json(serde_json::json!({
-        "session_id": session_id,
-        "status": "streaming_started"
-    }))
+    let event_stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        let chunk = rx.recv().await?;
+        // JSON-encoding the chunk keeps newlines inside a token from being read
+        // as SSE record separators.
+        let payload = match serde_json::to_string(&chunk) {
+            Ok(payload) => payload,
+            Err(e) => {
+                eprintln!("Failed to serialize stream chunk: {}", e);
+                return None;
+            }
+        };
+        let bytes = web::Bytes::from(format!("data: {}\n\n", payload));
+        Some((Ok::<web::Bytes, actix_web::Error>(bytes), rx))
+    });
+
+    HttpResponse::Ok()
+        .content_type("text/event-stream")
+        .append_header(("Cache-Control", "no-cache"))
+        .append_header(("X-Accel-Buffering", "no"))
+        .streaming(event_stream)
 }
 
 #[get("/api/inference/stats")]
