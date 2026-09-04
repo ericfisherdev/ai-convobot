@@ -212,7 +212,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 
 - **URL:** `/companion/card`
 - **Method:** `POST`
-- **Description:** Update information about the companion via character card file (you can create character files, e.g. using [this tool](https://github.com/Hukasx0/character-factory)).
+- **Description:** Update information about the companion via character card file (character card files follow the standard character card format).
 - **Response:**
   - Status: 200 OK
   - Body: Updated companion data via character card!
@@ -225,7 +225,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 
 - **URL:** `/companion/characterJson`
 - **Method:** `POST`
-- **Description:** Update information about the companion via character json (you can create character json, e.g. using [this tool](https://github.com/Hukasx0/character-factory)).
+- **Description:** Update information about the companion via character json (character JSON follows the standard character card format).
 - **Request Body:**
   - `name` (string): The name of the companion.
   - `description` (string): The persona or description of the companion.

@@ -1540,7 +1540,9 @@ async fn main() -> std::io::Result<()> {
 
     println!("Listening on:\n  -> http://{}:{}/", hostname, port);
     println!("  -> http://localhost:{}/\n", port);
-    println!("https://github.com/Hukasx0/ai-companion\n   By Hubert \"Hukasx0\" Kasperek\n");
+    // Credit is retained per the MIT license; the upstream URL no longer
+    // resolves, so it is not printed.
+    println!("Originally by Hubert \"Hukasx0\" Kasperek\n");
 
     // Initialize session manager with 30 minute timeout
     let session_manager = web::Data::new(SessionManager::new(30));
