@@ -2,24 +2,27 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import ChatWindow from '../ChatWindow'
-import { MessageProvider } from '../context/messageContext'
+import { MessagesProvider } from '../context/messageContext'
 import { UserDataProvider } from '../context/userContext'
 import { CompanionDataProvider } from '../context/companionContext'
 import { ConfigProvider } from '../context/configContext'
+import { AttitudeProvider } from '../context/attitudeContext'
 import { ThemeProvider } from '../theme-provider'
 
 // Mock the contexts with minimal implementations
 const MockProviders: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   <ThemeProvider attribute="class" defaultTheme="system" enableSystem>
-    <MessageProvider>
+    <MessagesProvider>
       <UserDataProvider>
         <CompanionDataProvider>
           <ConfigProvider>
-            {children}
+            <AttitudeProvider>
+              {children}
+            </AttitudeProvider>
           </ConfigProvider>
         </CompanionDataProvider>
       </UserDataProvider>
-    </MessageProvider>
+    </MessagesProvider>
   </ThemeProvider>
 )
 
