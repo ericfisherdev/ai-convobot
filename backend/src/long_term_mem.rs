@@ -9,11 +9,13 @@ use tantivy::query::QueryParser;
 use tantivy::schema::*;
 use tantivy::{Index, IndexReader};
 
+type QueryCache = Arc<Mutex<HashMap<String, (Vec<String>, Instant)>>>;
+
 pub struct LongTermMem {
     index: Index,
     chat_field: Field,
     reader: Arc<IndexReader>,
-    query_cache: Arc<Mutex<HashMap<String, (Vec<String>, Instant)>>>,
+    query_cache: QueryCache,
 }
 
 impl LongTermMem {

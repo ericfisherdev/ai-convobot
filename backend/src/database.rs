@@ -210,6 +210,7 @@ pub struct ThirdPartyRelationship {
 }
 
 #[derive(PartialEq, Serialize, Deserialize, Clone)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum Device {
     CPU,
     GPU,
@@ -498,10 +499,12 @@ fn generate_memory_description(
     }
 }
 
+type MessageCache = Arc<Mutex<HashMap<String, (Vec<Message>, Instant)>>>;
+
 // Database query cache for performance optimization
 lazy_static::lazy_static! {
     static ref DB_CACHE: Arc<Mutex<HashMap<String, (String, Instant)>>> = Arc::new(Mutex::new(HashMap::new()));
-    static ref MESSAGE_CACHE: Arc<Mutex<HashMap<String, (Vec<Message>, Instant)>>> = Arc::new(Mutex::new(HashMap::new()));
+    static ref MESSAGE_CACHE: MessageCache = Arc::new(Mutex::new(HashMap::new()));
 }
 
 pub struct Database {}
@@ -521,7 +524,7 @@ impl Database {
 }
 
 impl Database {
-    pub fn new() -> Result<usize> {
+    pub fn init() -> Result<usize> {
         let con = Connection::open("companion_database.db")?;
         con.execute(
             "CREATE TABLE IF NOT EXISTS messages (
@@ -3183,9 +3186,11 @@ impl Database {
         // Increase importance based on relationship closeness
         if text.contains("best friend") || text.contains("family") {
             importance += 0.3;
-        } else if text.contains("friend") || text.contains("colleague") {
-            importance += 0.2;
-        } else if text.contains("boss") || text.contains("manager") {
+        } else if text.contains("friend")
+            || text.contains("colleague")
+            || text.contains("boss")
+            || text.contains("manager")
+        {
             importance += 0.2;
         }
 
@@ -3442,46 +3447,45 @@ impl Database {
         attitude: &CompanionAttitude,
     ) -> f32 {
         let base_relationship = attitude.relationship_score.unwrap_or(0.0);
-        let mut impact = 0.0;
 
         // Positive interactions have more impact when relationship is already good
-        if interaction.description.contains("fun")
+        let impact = if interaction.description.contains("fun")
             || interaction.description.contains("enjoy")
             || interaction.description.contains("great")
         {
-            impact = 5.0 + (base_relationship * 0.1);
+            5.0 + (base_relationship * 0.1)
         }
         // Helping interactions build trust and gratitude
         else if interaction.description.contains("help")
             || interaction.description.contains("assist")
             || interaction.description.contains("support")
         {
-            impact = 8.0 + (attitude.trust * 0.05);
+            8.0 + (attitude.trust * 0.05)
         }
         // Conflict reduces relationship quality
         else if interaction.description.contains("argue")
             || interaction.description.contains("fight")
             || interaction.description.contains("disagree")
         {
-            impact = -10.0 - (attitude.anger * 0.1);
+            -10.0 - (attitude.anger * 0.1)
         }
         // Casual interactions have mild impact
         else if interaction.description.contains("meet")
             || interaction.description.contains("talk")
             || interaction.description.contains("chat")
         {
-            impact = 2.0 * (1.0 + base_relationship / 100.0);
+            2.0 * (1.0 + base_relationship / 100.0)
         }
         // Professional interactions are neutral to positive
         else if interaction.description.contains("work")
             || interaction.description.contains("project")
             || interaction.description.contains("business")
         {
-            impact = 1.0 + (attitude.respect * 0.02);
+            1.0 + (attitude.respect * 0.02)
         } else {
             // Default small positive impact
-            impact = 1.0;
-        }
+            1.0
+        };
 
         // Clamp impact to reasonable range
         impact.clamp(-25.0, 25.0)

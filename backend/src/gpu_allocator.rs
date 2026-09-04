@@ -31,6 +31,7 @@ pub enum AllocationStrategy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(non_camel_case_types)]
 pub enum ModelQuantization {
     F16,    // 16 bits per parameter
     Q8_0,   // 8 bits per parameter
