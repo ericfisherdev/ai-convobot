@@ -202,7 +202,7 @@ impl InferencePerformanceTracker {
             max_seconds: (total_time * 2.0) as u32,
             confidence: 0.3, // Low confidence without historical data
             factors: vec![
-                format!("No historical data - using conservative estimate"),
+                "No historical data - using conservative estimate".to_string(),
                 format!("Expected {} output tokens", expected_output_tokens),
                 format!("Message complexity factor: {:.1}", complexity_bonus),
             ],
