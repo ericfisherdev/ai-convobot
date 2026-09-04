@@ -1,6 +1,6 @@
 use crate::database::{CompanionAttitude, ConfigView, Message, ThirdPartyIndividual};
+use crate::system_memory::{MemoryStrategy, SystemMemoryDetector, SystemMemoryInfo};
 use crate::token_budget::{TokenBudget, TokenUsageMonitor, TokenUsageStatistics};
-use crate::system_memory::{SystemMemoryDetector, SystemMemoryInfo, MemoryStrategy};
 
 pub struct ContextManager {
     pub config: ConfigView,
@@ -43,7 +43,10 @@ impl ContextManager {
         let (context_size, hybrid_allocation) = if config.enable_hybrid_context {
             Self::calculate_hybrid_context_size(&config, &system_memory_detector)
         } else if config.enable_dynamic_context {
-            let size = Self::calculate_dynamic_context_size(config.vram_limit_gb, config.context_window_size);
+            let size = Self::calculate_dynamic_context_size(
+                config.vram_limit_gb,
+                config.context_window_size,
+            );
             (size, None)
         } else {
             (config.context_window_size, None)
@@ -94,25 +97,38 @@ impl ContextManager {
         let system_memory_info = match system_memory_detector.detect_system_memory() {
             Ok(info) => info,
             Err(e) => {
-                eprintln!("Warning: Failed to detect system memory, falling back to VRAM-only: {}", e);
-                let vram_size = Self::calculate_dynamic_context_size(config.vram_limit_gb, config.context_window_size);
+                eprintln!(
+                    "Warning: Failed to detect system memory, falling back to VRAM-only: {}",
+                    e
+                );
+                let vram_size = Self::calculate_dynamic_context_size(
+                    config.vram_limit_gb,
+                    config.context_window_size,
+                );
                 return (vram_size, None);
             }
         };
 
         // Get memory allocation recommendation
-        let memory_allocation = system_memory_detector.calculate_memory_allocation(&system_memory_info);
+        let memory_allocation =
+            system_memory_detector.calculate_memory_allocation(&system_memory_info);
 
         // Check if we should use hybrid approach
-        if memory_allocation.recommended_usage_gb < 1.0 || system_memory_detector.is_memory_pressure(&system_memory_info) {
+        if memory_allocation.recommended_usage_gb < 1.0
+            || system_memory_detector.is_memory_pressure(&system_memory_info)
+        {
             // Not enough RAM or system under pressure, use VRAM-only
-            let vram_size = Self::calculate_dynamic_context_size(config.vram_limit_gb, config.context_window_size);
+            let vram_size = Self::calculate_dynamic_context_size(
+                config.vram_limit_gb,
+                config.context_window_size,
+            );
             return (vram_size, None);
         }
 
         // Calculate base VRAM context size
-        let base_vram_context = Self::calculate_dynamic_context_size(config.vram_limit_gb, config.context_window_size);
-        
+        let base_vram_context =
+            Self::calculate_dynamic_context_size(config.vram_limit_gb, config.context_window_size);
+
         // Determine hybrid strategy based on configuration and available RAM
         let hybrid_strategy = match config.context_expansion_strategy.as_str() {
             "conservative" => HybridStrategy::Conservative,
@@ -141,9 +157,9 @@ impl ContextManager {
         // Ensure we don't exceed configured limits
         let max_ram_tokens = (memory_allocation.recommended_usage_gb * 1024.0 * 256.0) as usize; // ~256 tokens per MB
         let final_ram_context_tokens = ram_context_tokens.min(max_ram_tokens);
-        
+
         let total_context_tokens = base_vram_context + final_ram_context_tokens;
-        
+
         // Don't exceed user's configured maximum
         let final_total_context = total_context_tokens.min(config.context_window_size);
         let final_ram_context = if final_total_context > base_vram_context {
@@ -160,9 +176,17 @@ impl ContextManager {
             system_memory_info: system_memory_info.clone(),
         };
 
-        println!("🧠 Hybrid Context Allocation: {} total tokens (VRAM: {}, RAM: {}) - Strategy: {:?}", 
-                 final_total_context, base_vram_context, final_ram_context, hybrid_allocation.allocation_strategy);
-        println!("📊 {}", system_memory_detector.get_memory_summary(&system_memory_info));
+        println!(
+            "🧠 Hybrid Context Allocation: {} total tokens (VRAM: {}, RAM: {}) - Strategy: {:?}",
+            final_total_context,
+            base_vram_context,
+            final_ram_context,
+            hybrid_allocation.allocation_strategy
+        );
+        println!(
+            "📊 {}",
+            system_memory_detector.get_memory_summary(&system_memory_info)
+        );
 
         (final_total_context, Some(hybrid_allocation))
     }
@@ -468,7 +492,10 @@ impl ContextManager {
             return false; // No crisis
         }
 
-        println!("⚠️  Response budget crisis detected: {} tokens available", current_response_budget);
+        println!(
+            "⚠️  Response budget crisis detected: {} tokens available",
+            current_response_budget
+        );
 
         // Strategy 1: Try to expand context window if hybrid mode is available
         if self.config.enable_hybrid_context && self.hybrid_context_allocation.is_none() {
@@ -495,17 +522,15 @@ impl ContextManager {
         // Strategy 3: Reallocate existing tokens more efficiently
         self.reallocate_token_budget_for_response();
         println!("🔄 Reallocated token budget to prioritize response generation");
-        
+
         false
     }
 
     /// Try to expand context window using system RAM
     fn try_expand_context_window(&self) -> Option<HybridContextAllocation> {
-        let (_, hybrid_allocation) = Self::calculate_hybrid_context_size(
-            &self.config,
-            &self.system_memory_detector,
-        );
-        
+        let (_, hybrid_allocation) =
+            Self::calculate_hybrid_context_size(&self.config, &self.system_memory_detector);
+
         hybrid_allocation
     }
 
@@ -514,8 +539,11 @@ impl ContextManager {
         // Check if system memory situation has improved
         match self.system_memory_detector.detect_system_memory() {
             Ok(memory_info) => {
-                let allocation = self.system_memory_detector.calculate_memory_allocation(&memory_info);
-                allocation.recommended_usage_gb > 1.0 && !self.system_memory_detector.is_memory_pressure(&memory_info)
+                let allocation = self
+                    .system_memory_detector
+                    .calculate_memory_allocation(&memory_info);
+                allocation.recommended_usage_gb > 1.0
+                    && !self.system_memory_detector.is_memory_pressure(&memory_info)
             }
             Err(_) => false,
         }
@@ -525,11 +553,11 @@ impl ContextManager {
     fn expand_ram_allocation(&self) -> Option<HybridContextAllocation> {
         if let Some(ref current) = self.hybrid_context_allocation {
             let current_ram_gb = current.system_ram_context_tokens as f32 / (1024.0 * 256.0);
-            
+
             // Try to increase RAM allocation by 50%
             let new_ram_tokens = (current.system_ram_context_tokens as f32 * 1.5) as usize;
             let new_total_tokens = current.vram_context_tokens + new_ram_tokens;
-            
+
             // Don't exceed configured maximum
             let final_total = new_total_tokens.min(self.config.context_window_size);
             let final_ram = if final_total > current.vram_context_tokens {
@@ -537,7 +565,7 @@ impl ContextManager {
             } else {
                 current.system_ram_context_tokens
             };
-            
+
             if final_ram > current.system_ram_context_tokens {
                 return Some(HybridContextAllocation {
                     total_context_tokens: final_total,
@@ -555,19 +583,19 @@ impl ContextManager {
     fn reallocate_token_budget_for_response(&mut self) {
         // Temporarily reduce other allocations to boost response budget
         let current_total = self.token_budget.total;
-        
+
         // Reduce attitude allocation by 25%
         let attitude_reduction = (self.token_budget.attitude_data as f32 * 0.25) as usize;
         // Reduce third-party allocation by 50%
         let third_party_reduction = (self.token_budget.third_party_info as f32 * 0.50) as usize;
-        
+
         // Increase response buffer with the freed tokens
         let additional_response_tokens = attitude_reduction + third_party_reduction;
-        
+
         self.token_budget.attitude_data -= attitude_reduction;
         self.token_budget.third_party_info -= third_party_reduction;
         self.token_budget.response_buffer += additional_response_tokens;
-        
+
         // Update legacy fields
         self.attitude_token_budget = self.token_budget.attitude_data;
         self.response_token_budget = self.token_budget.response_buffer;
@@ -580,10 +608,10 @@ impl ContextManager {
                 self.config.vram_limit_gb,
                 hybrid_allocation.total_context_tokens,
             );
-            
+
             // Update usage monitor with new budget
             self.usage_monitor = TokenUsageMonitor::new(self.token_budget.clone());
-            
+
             // Update legacy fields
             self.system_token_budget = self.token_budget.system_prompt;
             self.attitude_token_budget = self.token_budget.attitude_data;
@@ -595,7 +623,7 @@ impl ContextManager {
     /// Get current memory usage summary including hybrid allocation
     pub fn get_hybrid_memory_summary(&self) -> String {
         let base_summary = self.get_budget_summary();
-        
+
         if let Some(ref hybrid_allocation) = self.hybrid_context_allocation {
             format!(
                 "{}\nHybrid Context: {} total tokens (VRAM: {}, RAM: {}) - Strategy: {:?}",
@@ -615,11 +643,14 @@ impl ContextManager {
         if !self.config.enable_hybrid_context || self.hybrid_context_allocation.is_some() {
             return false;
         }
-        
+
         match self.system_memory_detector.detect_system_memory() {
             Ok(memory_info) => {
-                let allocation = self.system_memory_detector.calculate_memory_allocation(&memory_info);
-                allocation.recommended_usage_gb > 1.0 && !self.system_memory_detector.is_memory_pressure(&memory_info)
+                let allocation = self
+                    .system_memory_detector
+                    .calculate_memory_allocation(&memory_info);
+                allocation.recommended_usage_gb > 1.0
+                    && !self.system_memory_detector.is_memory_pressure(&memory_info)
             }
             Err(_) => false,
         }

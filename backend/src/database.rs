@@ -847,7 +847,8 @@ impl Database {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 path TEXT UNIQUE NOT NULL,
                 created_at TEXT NOT NULL
-            )", []
+            )",
+            [],
         )?;
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_llm_directories_path ON llm_directories(path)",
@@ -1173,7 +1174,9 @@ impl Database {
                 min_free_vram_mb: row.get::<_, Option<u64>>(10)?.unwrap_or(512),
                 enable_hybrid_context: row.get::<_, Option<bool>>(11)?.unwrap_or(true),
                 max_system_ram_usage_gb: row.get::<_, Option<usize>>(12)?.unwrap_or(8),
-                context_expansion_strategy: row.get::<_, Option<String>>(13)?.unwrap_or("balanced".to_string()),
+                context_expansion_strategy: row
+                    .get::<_, Option<String>>(13)?
+                    .unwrap_or("balanced".to_string()),
                 ram_safety_margin_gb: row.get::<_, Option<usize>>(14)?.unwrap_or(2),
             })
         })?;
@@ -1505,7 +1508,11 @@ impl Database {
         Ok(())
     }
 
-    pub fn create_initial_user_attitude(companion_id: i32, user_id: i32, companion_persona: &str) -> Result<i32> {
+    pub fn create_initial_user_attitude(
+        companion_id: i32,
+        user_id: i32,
+        companion_persona: &str,
+    ) -> Result<i32> {
         let base_attitude = CompanionAttitude {
             id: None,
             companion_id,
@@ -1536,11 +1543,15 @@ impl Database {
             created_at: get_current_date(),
         };
 
-        let adjusted_attitude = Database::adjust_attitude_for_persona(&base_attitude, companion_persona);
+        let adjusted_attitude =
+            Database::adjust_attitude_for_persona(&base_attitude, companion_persona);
         Database::create_or_update_attitude(companion_id, user_id, "user", &adjusted_attitude)
     }
 
-    pub fn adjust_attitude_for_persona(base_attitude: &CompanionAttitude, persona: &str) -> CompanionAttitude {
+    pub fn adjust_attitude_for_persona(
+        base_attitude: &CompanionAttitude,
+        persona: &str,
+    ) -> CompanionAttitude {
         let mut attitude = base_attitude.clone();
         let persona_lower = persona.to_lowercase();
 
@@ -2181,45 +2192,51 @@ impl Database {
         let mut cleaned_count = 0;
 
         // Find all duplicate names (case-insensitive)
-        let mut stmt = con.prepare("
+        let mut stmt = con.prepare(
+            "
             SELECT LOWER(name) as lower_name, COUNT(*) as count 
             FROM third_party_individuals 
             GROUP BY LOWER(name) 
             HAVING COUNT(*) > 1
-        ")?;
+        ",
+        )?;
 
-        let duplicate_names: Vec<String> = stmt.query_map([], |row| {
-            Ok(row.get::<_, String>(0)?)
-        })?.collect::<std::result::Result<Vec<_>, _>>()?;
+        let duplicate_names: Vec<String> = stmt
+            .query_map([], |row| Ok(row.get::<_, String>(0)?))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
         for lower_name in duplicate_names {
             // Get all instances of this name
-            let mut instances_stmt = con.prepare("
+            let mut instances_stmt = con.prepare(
+                "
                 SELECT id, name, relationship_to_user, relationship_to_companion, occupation,
                        personality_traits, physical_description, first_mentioned, last_mentioned,
                        mention_count, importance_score, created_at, updated_at
                 FROM third_party_individuals 
                 WHERE LOWER(name) = ? 
                 ORDER BY created_at ASC
-            ")?;
+            ",
+            )?;
 
-            let instances: Vec<ThirdPartyIndividual> = instances_stmt.query_map([&lower_name], |row| {
-                Ok(ThirdPartyIndividual {
-                    id: Some(row.get(0)?),
-                    name: row.get(1)?,
-                    relationship_to_user: row.get(2)?,
-                    relationship_to_companion: row.get(3)?,
-                    occupation: row.get(4)?,
-                    personality_traits: row.get(5)?,
-                    physical_description: row.get(6)?,
-                    first_mentioned: row.get(7)?,
-                    last_mentioned: row.get(8)?,
-                    mention_count: row.get(9)?,
-                    importance_score: row.get(10)?,
-                    created_at: row.get(11)?,
-                    updated_at: row.get(12)?,
-                })
-            })?.collect::<std::result::Result<Vec<_>, _>>()?;
+            let instances: Vec<ThirdPartyIndividual> = instances_stmt
+                .query_map([&lower_name], |row| {
+                    Ok(ThirdPartyIndividual {
+                        id: Some(row.get(0)?),
+                        name: row.get(1)?,
+                        relationship_to_user: row.get(2)?,
+                        relationship_to_companion: row.get(3)?,
+                        occupation: row.get(4)?,
+                        personality_traits: row.get(5)?,
+                        physical_description: row.get(6)?,
+                        first_mentioned: row.get(7)?,
+                        last_mentioned: row.get(8)?,
+                        mention_count: row.get(9)?,
+                        importance_score: row.get(10)?,
+                        created_at: row.get(11)?,
+                        updated_at: row.get(12)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
 
             if instances.len() > 1 {
                 // Keep the first instance, merge data from others
@@ -2239,14 +2256,17 @@ impl Database {
                         earliest_first_mentioned = instance.first_mentioned.clone();
                     }
                     if let Some(ref last) = instance.last_mentioned {
-                        if latest_last_mentioned.is_none() || last > latest_last_mentioned.as_ref().unwrap() {
+                        if latest_last_mentioned.is_none()
+                            || last > latest_last_mentioned.as_ref().unwrap()
+                        {
                             latest_last_mentioned = Some(last.clone());
                         }
                     }
                 }
 
                 // Update the kept instance with merged data
-                con.execute("
+                con.execute(
+                    "
                     UPDATE third_party_individuals SET 
                         mention_count = ?,
                         importance_score = ?,
@@ -2254,31 +2274,42 @@ impl Database {
                         last_mentioned = ?,
                         updated_at = ?
                     WHERE id = ?
-                ", params![
-                    total_mentions,
-                    max_importance,
-                    earliest_first_mentioned,
-                    latest_last_mentioned,
-                    get_current_date(),
-                    keep_id
-                ])?;
+                ",
+                    params![
+                        total_mentions,
+                        max_importance,
+                        earliest_first_mentioned,
+                        latest_last_mentioned,
+                        get_current_date(),
+                        keep_id
+                    ],
+                )?;
 
                 // Update attitudes to point to the kept instance
                 for instance in &instances[1..] {
                     if let Some(delete_id) = instance.id {
-                        con.execute("
+                        con.execute(
+                            "
                             UPDATE companion_attitudes SET target_id = ? 
                             WHERE target_id = ? AND target_type = 'third_party'
-                        ", params![keep_id, delete_id])?;
+                        ",
+                            params![keep_id, delete_id],
+                        )?;
 
-                        // Update memories to point to the kept instance  
-                        con.execute("
+                        // Update memories to point to the kept instance
+                        con.execute(
+                            "
                             UPDATE third_party_memories SET third_party_id = ?
                             WHERE third_party_id = ?
-                        ", params![keep_id, delete_id])?;
+                        ",
+                            params![keep_id, delete_id],
+                        )?;
 
                         // Delete the duplicate instance
-                        con.execute("DELETE FROM third_party_individuals WHERE id = ?", [delete_id])?;
+                        con.execute(
+                            "DELETE FROM third_party_individuals WHERE id = ?",
+                            [delete_id],
+                        )?;
                         cleaned_count += 1;
                     }
                 }
@@ -2291,112 +2322,195 @@ impl Database {
     pub fn cleanup_invalid_third_parties() -> Result<i32> {
         let con = Connection::open("companion_database.db")?;
         let mut cleaned_count = 0;
-        
+
         // List of invalid names that should be removed
         let invalid_names = [
             // Body parts
-            "hand", "hands", "shoulder", "shoulders", "head", "heads", "arm", "arms",
-            "leg", "legs", "foot", "feet", "eye", "eyes", "ear", "ears", "nose", "mouth",
-            "face", "hair", "neck", "back", "chest", "stomach", "knee", "knees", "elbow",
-            "elbows", "finger", "fingers", "thumb", "thumbs", "toe", "toes",
-            
+            "hand",
+            "hands",
+            "shoulder",
+            "shoulders",
+            "head",
+            "heads",
+            "arm",
+            "arms",
+            "leg",
+            "legs",
+            "foot",
+            "feet",
+            "eye",
+            "eyes",
+            "ear",
+            "ears",
+            "nose",
+            "mouth",
+            "face",
+            "hair",
+            "neck",
+            "back",
+            "chest",
+            "stomach",
+            "knee",
+            "knees",
+            "elbow",
+            "elbows",
+            "finger",
+            "fingers",
+            "thumb",
+            "thumbs",
+            "toe",
+            "toes",
             // Common objects
-            "class", "classes", "book", "books", "table", "tables", "chair", "chairs",
-            "door", "doors", "window", "windows", "desk", "desks", "computer", "computers",
-            "phone", "phones", "car", "cars", "house", "houses", "room", "rooms",
-            
+            "class",
+            "classes",
+            "book",
+            "books",
+            "table",
+            "tables",
+            "chair",
+            "chairs",
+            "door",
+            "doors",
+            "window",
+            "windows",
+            "desk",
+            "desks",
+            "computer",
+            "computers",
+            "phone",
+            "phones",
+            "car",
+            "cars",
+            "house",
+            "houses",
+            "room",
+            "rooms",
             // Abstract concepts
-            "should", "could", "would", "thing", "things", "stuff", "matter", "matters",
-            "way", "ways", "time", "times", "place", "places", "work", "works",
-            
+            "should",
+            "could",
+            "would",
+            "thing",
+            "things",
+            "stuff",
+            "matter",
+            "matters",
+            "way",
+            "ways",
+            "time",
+            "times",
+            "place",
+            "places",
+            "work",
+            "works",
             // Common verbs/actions
-            "walk", "walks", "talk", "talks", "look", "looks", "feel", "feels",
-            "want", "wants", "need", "needs", "use", "uses", "make", "makes",
+            "walk",
+            "walks",
+            "talk",
+            "talks",
+            "look",
+            "looks",
+            "feel",
+            "feels",
+            "want",
+            "wants",
+            "need",
+            "needs",
+            "use",
+            "uses",
+            "make",
+            "makes",
         ];
-        
+
         for invalid_name in &invalid_names {
             // Find and delete invalid third parties
-            let mut stmt = con.prepare("
+            let mut stmt = con.prepare(
+                "
                 SELECT id FROM third_party_individuals 
                 WHERE LOWER(name) = LOWER(?)
-            ")?;
-            
-            let ids: Vec<i32> = stmt.query_map([invalid_name], |row| {
-                Ok(row.get::<_, i32>(0)?)
-            })?.collect::<std::result::Result<Vec<_>, _>>()?;
-            
+            ",
+            )?;
+
+            let ids: Vec<i32> = stmt
+                .query_map([invalid_name], |row| Ok(row.get::<_, i32>(0)?))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
             for id in ids {
                 // Delete associated attitudes
                 con.execute(
                     "DELETE FROM companion_attitudes WHERE target_id = ? AND target_type = 'third_party'",
                     params![id]
                 )?;
-                
+
                 // Delete associated memories
                 con.execute(
                     "DELETE FROM third_party_memories WHERE third_party_id = ?",
-                    params![id]
+                    params![id],
                 )?;
-                
+
                 // Delete the third party record
                 con.execute(
                     "DELETE FROM third_party_individuals WHERE id = ?",
-                    params![id]
+                    params![id],
                 )?;
-                
+
                 cleaned_count += 1;
                 println!("Removed invalid third party: {} (id: {})", invalid_name, id);
             }
         }
-        
+
         // Also check for entries that don't look like proper names
-        let mut stmt = con.prepare("
+        let mut stmt = con.prepare(
+            "
             SELECT id, name FROM third_party_individuals
-        ")?;
-        
-        let entries: Vec<(i32, String)> = stmt.query_map([], |row| {
-            Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?))
-        })?.collect::<std::result::Result<Vec<_>, _>>()?;
-        
+        ",
+        )?;
+
+        let entries: Vec<(i32, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
         for (id, name) in entries {
             // Check if this is likely NOT a person name
-            if !Database::is_likely_person_name(&name) || 
-               !name.chars().next().unwrap_or('a').is_uppercase() {
+            if !Database::is_likely_person_name(&name)
+                || !name.chars().next().unwrap_or('a').is_uppercase()
+            {
                 // Delete associated attitudes
                 con.execute(
                     "DELETE FROM companion_attitudes WHERE target_id = ? AND target_type = 'third_party'",
                     params![id]
                 )?;
-                
+
                 // Delete associated memories
                 con.execute(
                     "DELETE FROM third_party_memories WHERE third_party_id = ?",
-                    params![id]
+                    params![id],
                 )?;
-                
+
                 // Delete the third party record
                 con.execute(
                     "DELETE FROM third_party_individuals WHERE id = ?",
-                    params![id]
+                    params![id],
                 )?;
-                
+
                 cleaned_count += 1;
                 println!("Removed invalid third party: {} (id: {})", name, id);
             }
         }
-        
+
         if cleaned_count > 0 {
             println!("Cleaned up {} invalid third party entries", cleaned_count);
         } else {
             println!("No invalid third party entries found");
         }
-        
+
         Ok(cleaned_count)
     }
 
     fn extract_person_names(text: &str) -> Vec<String> {
         let mut names = Vec::new();
-        
+
         // Keep original text for proper name detection (with capitalization)
         let text_original = text;
         let text_lower = text.to_lowercase();
@@ -2406,21 +2520,16 @@ impl Database {
         let patterns = [
             // Family relationships with names
             r"(?i)(my|our|their|his|her) (friend|colleague|boss|manager|teacher|doctor|neighbor|brother|sister|mother|father|mom|dad|parent|cousin|uncle|aunt|grandmother|grandfather|grandma|grandpa) ([A-Z][a-z]+)",
-            
             // Names with clear person indicators
             r"(?i)(talked to|spoke with|met|saw|visited|called|texted|emailed) ([A-Z][a-z]+)",
             r"(?i)([A-Z][a-z]+) (called|texted|emailed|visited|invited|asked|told|said)",
-            
             // Professional titles with names
             r"(?i)(dr\.|mr\.|mrs\.|ms\.|prof\.|professor) ([A-Z][a-z]+)",
-            
             // Names in possessive contexts
             r"(?i)([A-Z][a-z]+)'s (house|place|car|office|room|family|friend|work)",
-            
             // Names with relationship descriptors
             r"(?i)(friend|colleague|neighbor) ([A-Z][a-z]+)",
             r"(?i)([A-Z][a-z]+) is my (friend|colleague|boss|teacher|doctor|neighbor)",
-            
             // Proper names (capitalized) that appear independently
             // Only match if preceded/followed by clear context
             r"(?i)(with|and|or|met|saw|told|asked) ([A-Z][a-z]{2,})\b",
@@ -2436,12 +2545,13 @@ impl Database {
                     for i in (1..cap.len()).rev() {
                         if let Some(name_match) = cap.get(i) {
                             let potential_name = name_match.as_str().trim();
-                            
+
                             // Check if this looks like a proper name (starts with capital)
-                            if potential_name.len() > 0 
+                            if potential_name.len() > 0
                                 && potential_name.chars().next().unwrap().is_uppercase()
-                                && Database::is_likely_person_name(potential_name) 
-                                && Database::is_proper_name_context(potential_name, text_original) {
+                                && Database::is_likely_person_name(potential_name)
+                                && Database::is_proper_name_context(potential_name, text_original)
+                            {
                                 names.push(potential_name.to_string());
                                 break;
                             }
@@ -2456,18 +2566,19 @@ impl Database {
         let words: Vec<&str> = text_original.split_whitespace().collect();
         for (i, word) in words.iter().enumerate() {
             let clean_word = word.trim_matches(|c: char| !c.is_alphabetic());
-            
+
             // Check if it's a capitalized word
-            if clean_word.len() > 2 
+            if clean_word.len() > 2
                 && clean_word.chars().next().unwrap().is_uppercase()
                 && clean_word.chars().skip(1).all(|c| c.is_lowercase())
-                && Database::is_likely_person_name(clean_word) {
-                
+                && Database::is_likely_person_name(clean_word)
+            {
                 // Check surrounding context for person indicators
-                let has_person_context = 
-                    (i > 0 && Database::is_person_indicator(&words[i-1].to_lowercase())) ||
-                    (i < words.len() - 1 && Database::is_person_indicator(&words[i+1].to_lowercase()));
-                
+                let has_person_context = (i > 0
+                    && Database::is_person_indicator(&words[i - 1].to_lowercase()))
+                    || (i < words.len() - 1
+                        && Database::is_person_indicator(&words[i + 1].to_lowercase()));
+
                 if has_person_context {
                     names.push(clean_word.to_string());
                 }
@@ -2479,88 +2590,304 @@ impl Database {
         names.dedup();
         names
             .into_iter()
-            .filter(|name| !Database::is_common_word(name) && name.chars().next().unwrap().is_uppercase())
+            .filter(|name| {
+                !Database::is_common_word(name) && name.chars().next().unwrap().is_uppercase()
+            })
             .collect()
     }
 
     fn is_likely_person_name(name: &str) -> bool {
         let name_lower = name.to_lowercase();
-        
+
         // Filter out common non-name words
         let non_names = [
             // Original words
-            "the", "and", "or", "but", "if", "when", "where", "what", "who", "how", "why",
-            "this", "that", "these", "those", "here", "there", "now", "then",
-            "today", "tomorrow", "yesterday", "said", "told", "asked", "mentioned", "think", "know",
-            
+            "the",
+            "and",
+            "or",
+            "but",
+            "if",
+            "when",
+            "where",
+            "what",
+            "who",
+            "how",
+            "why",
+            "this",
+            "that",
+            "these",
+            "those",
+            "here",
+            "there",
+            "now",
+            "then",
+            "today",
+            "tomorrow",
+            "yesterday",
+            "said",
+            "told",
+            "asked",
+            "mentioned",
+            "think",
+            "know",
             // Body parts
-            "hand", "hands", "shoulder", "shoulders", "head", "heads", "arm", "arms", 
-            "leg", "legs", "foot", "feet", "eye", "eyes", "ear", "ears", "nose", "mouth",
-            "face", "hair", "neck", "back", "chest", "stomach", "knee", "knees", "elbow", 
-            "elbows", "finger", "fingers", "thumb", "thumbs", "toe", "toes", "ankle", "ankles",
-            "wrist", "wrists", "hip", "hips", "body", "skin", "bone", "bones", "muscle", "muscles",
-            
+            "hand",
+            "hands",
+            "shoulder",
+            "shoulders",
+            "head",
+            "heads",
+            "arm",
+            "arms",
+            "leg",
+            "legs",
+            "foot",
+            "feet",
+            "eye",
+            "eyes",
+            "ear",
+            "ears",
+            "nose",
+            "mouth",
+            "face",
+            "hair",
+            "neck",
+            "back",
+            "chest",
+            "stomach",
+            "knee",
+            "knees",
+            "elbow",
+            "elbows",
+            "finger",
+            "fingers",
+            "thumb",
+            "thumbs",
+            "toe",
+            "toes",
+            "ankle",
+            "ankles",
+            "wrist",
+            "wrists",
+            "hip",
+            "hips",
+            "body",
+            "skin",
+            "bone",
+            "bones",
+            "muscle",
+            "muscles",
             // Common objects
-            "class", "classes", "book", "books", "table", "tables", "chair", "chairs",
-            "door", "doors", "window", "windows", "desk", "desks", "computer", "computers",
-            "phone", "phones", "car", "cars", "house", "houses", "room", "rooms",
-            "wall", "walls", "floor", "floors", "ceiling", "ceilings", "roof", "roofs",
-            "street", "streets", "road", "roads", "building", "buildings", "office", "offices",
-            
+            "class",
+            "classes",
+            "book",
+            "books",
+            "table",
+            "tables",
+            "chair",
+            "chairs",
+            "door",
+            "doors",
+            "window",
+            "windows",
+            "desk",
+            "desks",
+            "computer",
+            "computers",
+            "phone",
+            "phones",
+            "car",
+            "cars",
+            "house",
+            "houses",
+            "room",
+            "rooms",
+            "wall",
+            "walls",
+            "floor",
+            "floors",
+            "ceiling",
+            "ceilings",
+            "roof",
+            "roofs",
+            "street",
+            "streets",
+            "road",
+            "roads",
+            "building",
+            "buildings",
+            "office",
+            "offices",
             // Abstract concepts and common words
-            "should", "could", "would", "must", "might", "may", "can", "will", "shall",
-            "thing", "things", "stuff", "matter", "matters", "way", "ways", "time", "times",
-            "place", "places", "work", "works", "play", "plays", "run", "runs", "walk", "walks",
-            "talk", "talks", "look", "looks", "feel", "feels", "want", "wants", "need", "needs",
-            "use", "uses", "make", "makes", "take", "takes", "give", "gives", "get", "gets",
-            "keep", "keeps", "let", "lets", "help", "helps", "show", "shows", "try", "tries",
-            
+            "should",
+            "could",
+            "would",
+            "must",
+            "might",
+            "may",
+            "can",
+            "will",
+            "shall",
+            "thing",
+            "things",
+            "stuff",
+            "matter",
+            "matters",
+            "way",
+            "ways",
+            "time",
+            "times",
+            "place",
+            "places",
+            "work",
+            "works",
+            "play",
+            "plays",
+            "run",
+            "runs",
+            "walk",
+            "walks",
+            "talk",
+            "talks",
+            "look",
+            "looks",
+            "feel",
+            "feels",
+            "want",
+            "wants",
+            "need",
+            "needs",
+            "use",
+            "uses",
+            "make",
+            "makes",
+            "take",
+            "takes",
+            "give",
+            "gives",
+            "get",
+            "gets",
+            "keep",
+            "keeps",
+            "let",
+            "lets",
+            "help",
+            "helps",
+            "show",
+            "shows",
+            "try",
+            "tries",
             // Nature and environment
-            "tree", "trees", "plant", "plants", "flower", "flowers", "grass", "ground",
-            "sky", "sun", "moon", "star", "stars", "cloud", "clouds", "rain", "snow",
-            "wind", "air", "water", "fire", "earth", "stone", "stones", "rock", "rocks",
-            
+            "tree",
+            "trees",
+            "plant",
+            "plants",
+            "flower",
+            "flowers",
+            "grass",
+            "ground",
+            "sky",
+            "sun",
+            "moon",
+            "star",
+            "stars",
+            "cloud",
+            "clouds",
+            "rain",
+            "snow",
+            "wind",
+            "air",
+            "water",
+            "fire",
+            "earth",
+            "stone",
+            "stones",
+            "rock",
+            "rocks",
             // Common activities/states
-            "sleep", "wake", "eat", "drink", "sit", "stand", "lie", "move", "stop", "start",
-            "end", "begin", "open", "close", "break", "fix", "clean", "wash", "dry", "cut",
-            
+            "sleep",
+            "wake",
+            "eat",
+            "drink",
+            "sit",
+            "stand",
+            "lie",
+            "move",
+            "stop",
+            "start",
+            "end",
+            "begin",
+            "open",
+            "close",
+            "break",
+            "fix",
+            "clean",
+            "wash",
+            "dry",
+            "cut",
             // Pronouns and determiners
-            "it", "its", "them", "their", "theirs", "some", "any", "all", "each", "every",
-            "few", "many", "much", "more", "most", "less", "least", "other", "another",
-            "such", "own", "same", "different", "various", "several", "both", "either", "neither",
+            "it",
+            "its",
+            "them",
+            "their",
+            "theirs",
+            "some",
+            "any",
+            "all",
+            "each",
+            "every",
+            "few",
+            "many",
+            "much",
+            "more",
+            "most",
+            "less",
+            "least",
+            "other",
+            "another",
+            "such",
+            "own",
+            "same",
+            "different",
+            "various",
+            "several",
+            "both",
+            "either",
+            "neither",
         ];
 
         // Check if in non-names list
         if non_names.contains(&name_lower.as_str()) {
             return false;
         }
-        
+
         // Filter out words with certain suffixes that are unlikely to be names
-        if name_lower.ends_with("ing") || 
-           name_lower.ends_with("tion") || 
-           name_lower.ends_with("sion") ||
-           name_lower.ends_with("ness") ||
-           name_lower.ends_with("ment") || 
-           name_lower.ends_with("ity") ||
-           name_lower.ends_with("ance") ||
-           name_lower.ends_with("ence") ||
-           name_lower.ends_with("ship") ||
-           name_lower.ends_with("hood") ||
-           name_lower.ends_with("dom") ||
-           name_lower.ends_with("ism") ||
-           name_lower.ends_with("ist") ||
-           name_lower.ends_with("able") ||
-           name_lower.ends_with("ible") ||
-           name_lower.ends_with("ful") ||
-           name_lower.ends_with("less") ||
-           name_lower.ends_with("ous") ||
-           name_lower.ends_with("ive") ||
-           name_lower.ends_with("ly") {
+        if name_lower.ends_with("ing")
+            || name_lower.ends_with("tion")
+            || name_lower.ends_with("sion")
+            || name_lower.ends_with("ness")
+            || name_lower.ends_with("ment")
+            || name_lower.ends_with("ity")
+            || name_lower.ends_with("ance")
+            || name_lower.ends_with("ence")
+            || name_lower.ends_with("ship")
+            || name_lower.ends_with("hood")
+            || name_lower.ends_with("dom")
+            || name_lower.ends_with("ism")
+            || name_lower.ends_with("ist")
+            || name_lower.ends_with("able")
+            || name_lower.ends_with("ible")
+            || name_lower.ends_with("ful")
+            || name_lower.ends_with("less")
+            || name_lower.ends_with("ous")
+            || name_lower.ends_with("ive")
+            || name_lower.ends_with("ly")
+        {
             return false;
         }
-        
+
         // Basic validation: length and character checks
-        name.len() > 2 
+        name.len() > 2
             && name.len() < 20  // Most names are shorter than 20 characters
             && name.chars().all(|c| c.is_alphabetic() || c == '\'' || c == '-')
     }
@@ -2611,15 +2938,15 @@ impl Database {
     fn is_proper_name_context(name: &str, text: &str) -> bool {
         // Check if the name appears in a context that suggests it's a person
         // This helps filter out words that might be capitalized for other reasons
-        
+
         let name_lower = name.to_lowercase();
         let text_lower = text.to_lowercase();
-        
+
         // Check for possessive forms
         if text.contains(&format!("{}'s", name)) || text.contains(&format!("{}' ", name)) {
             return true;
         }
-        
+
         // Check for titles before the name
         let titles = ["mr.", "mrs.", "ms.", "dr.", "prof.", "professor"];
         for title in &titles {
@@ -2627,29 +2954,58 @@ impl Database {
                 return true;
             }
         }
-        
+
         // Check for person-related verbs around the name
-        let person_verbs = ["said", "told", "asked", "called", "visited", "met", "saw", "knows", "likes"];
+        let person_verbs = [
+            "said", "told", "asked", "called", "visited", "met", "saw", "knows", "likes",
+        ];
         for verb in &person_verbs {
-            if text_lower.contains(&format!("{} {}", name_lower, verb)) ||
-               text_lower.contains(&format!("{} {}", verb, name_lower)) {
+            if text_lower.contains(&format!("{} {}", name_lower, verb))
+                || text_lower.contains(&format!("{} {}", verb, name_lower))
+            {
                 return true;
             }
         }
-        
+
         // If none of the above, be conservative
         true // We'll rely on other filters to catch non-names
     }
-    
+
     fn is_person_indicator(word: &str) -> bool {
         // Words that often appear before or after person names
         let indicators = [
-            "with", "and", "met", "saw", "told", "asked", "called", "visited",
-            "friend", "colleague", "neighbor", "brother", "sister", "mother", "father",
-            "uncle", "aunt", "cousin", "boss", "teacher", "doctor", "said", "says",
-            "thinks", "believes", "wants", "needs", "likes", "loves", "hates"
+            "with",
+            "and",
+            "met",
+            "saw",
+            "told",
+            "asked",
+            "called",
+            "visited",
+            "friend",
+            "colleague",
+            "neighbor",
+            "brother",
+            "sister",
+            "mother",
+            "father",
+            "uncle",
+            "aunt",
+            "cousin",
+            "boss",
+            "teacher",
+            "doctor",
+            "said",
+            "says",
+            "thinks",
+            "believes",
+            "wants",
+            "needs",
+            "likes",
+            "loves",
+            "hates",
         ];
-        
+
         indicators.contains(&word.trim_matches(|c: char| !c.is_alphabetic()))
     }
 
@@ -3570,7 +3926,13 @@ impl Database {
 
         // Update the relationship_score calculation in the database by dropping the generated column and recreating it
         // Note: SQLite doesn't support modifying generated columns directly
-        if !has_lust || !has_love || !has_anxiety || !has_butterflies || !has_submissiveness || !has_dominance {
+        if !has_lust
+            || !has_love
+            || !has_anxiety
+            || !has_butterflies
+            || !has_submissiveness
+            || !has_dominance
+        {
             // The relationship_score column will be recalculated automatically with the new formula
             // when the table structure is updated
         }
@@ -3581,21 +3943,21 @@ impl Database {
     /// Check for third-party mentions in message and track them, returning console output
     pub fn track_third_party_mentions(message: &str) -> Result<String> {
         let mut console_output = Vec::new();
-        
+
         // Get all existing third parties to check for mentions
         let third_parties = Database::get_all_third_party_individuals()?;
-        
+
         let message_lower = message.to_lowercase();
-        
+
         for party in &third_parties {
             let name_lower = party.name.to_lowercase();
-            
+
             // Check if this person is mentioned in the message
             if message_lower.contains(&name_lower) {
                 // Update mention count and last_mentioned
                 let con = Connection::open("companion_database.db")?;
                 let current_time = get_current_date();
-                
+
                 con.execute(
                     "UPDATE third_party_individuals 
                      SET mention_count = mention_count + 1, 
@@ -3604,22 +3966,22 @@ impl Database {
                      WHERE id = ?",
                     params![current_time, current_time, party.id.unwrap()],
                 )?;
-                
+
                 let new_count = party.mention_count + 1;
                 let suffix = match new_count {
                     1 => "st",
-                    2 => "nd", 
+                    2 => "nd",
                     3 => "rd",
                     _ => "th",
                 };
-                
+
                 console_output.push(format!(
                     "👥 {} mentioned for the {}{} time",
                     party.name, new_count, suffix
                 ));
             }
         }
-        
+
         // Also check for new person names that might not be in the database yet
         // This is a simplified detection - in practice you might want more sophisticated NER
         let potential_names = Database::extract_potential_names(&message_lower);
@@ -3634,33 +3996,36 @@ impl Database {
                 ));
             }
         }
-        
+
         Ok(console_output.join("\n"))
     }
-    
+
     /// Extract potential person names from message (simplified approach)
     fn extract_potential_names(message: &str) -> Vec<String> {
         let mut names = Vec::new();
         let words: Vec<&str> = message.split_whitespace().collect();
-        
+
         for (i, word) in words.iter().enumerate() {
             // Look for capitalized words that might be names
-            if word.chars().next().unwrap_or('a').is_uppercase() 
-                && word.len() > 2 
-                && word.chars().all(|c| c.is_alphabetic()) {
-                
+            if word.chars().next().unwrap_or('a').is_uppercase()
+                && word.len() > 2
+                && word.chars().all(|c| c.is_alphabetic())
+            {
                 // Skip common non-name words
                 let skip_words = [
-                    "the", "and", "but", "for", "nor", "yet", "so", "at", "by", "in", "of", "on", "to", "up", "as", "is", "it", "or", "be", "do", "go", "he", "if", "me", "my", "no", "we", "I"
+                    "the", "and", "but", "for", "nor", "yet", "so", "at", "by", "in", "of", "on",
+                    "to", "up", "as", "is", "it", "or", "be", "do", "go", "he", "if", "me", "my",
+                    "no", "we", "I",
                 ];
-                
+
                 if !skip_words.contains(&word.to_lowercase().as_str()) {
                     // Check if the next word might be a last name
                     if i + 1 < words.len() {
                         let next_word = words[i + 1];
-                        if next_word.chars().next().unwrap_or('a').is_uppercase() 
-                            && next_word.len() > 2 
-                            && next_word.chars().all(|c| c.is_alphabetic()) {
+                        if next_word.chars().next().unwrap_or('a').is_uppercase()
+                            && next_word.len() > 2
+                            && next_word.chars().all(|c| c.is_alphabetic())
+                        {
                             names.push(format!("{} {}", word, next_word));
                         } else {
                             names.push(word.to_string());
@@ -3671,7 +4036,7 @@ impl Database {
                 }
             }
         }
-        
+
         names
     }
 }
@@ -3731,16 +4096,15 @@ mod tests {
         assert!(names.contains(&"Sarah".to_string()));
 
         // Test with relationship indicators
-        let names2 = Database::extract_person_names(
-            "My friend Alex called me. Dr. Smith visited today.",
-        );
+        let names2 =
+            Database::extract_person_names("My friend Alex called me. Dr. Smith visited today.");
         assert!(names2.contains(&"Alex".to_string()));
         assert!(names2.contains(&"Smith".to_string()));
 
         // Test empty string
         let names3 = Database::extract_person_names("The weather is nice today.");
         assert!(names3.is_empty());
-        
+
         // Test that body parts are NOT extracted
         let names4 = Database::extract_person_names(
             "Put your hand on your shoulder. The class starts at 9.",
@@ -3748,11 +4112,10 @@ mod tests {
         assert!(!names4.contains(&"Hand".to_string()));
         assert!(!names4.contains(&"Shoulder".to_string()));
         assert!(!names4.contains(&"Class".to_string()));
-        
+
         // Test that objects are NOT extracted
-        let names5 = Database::extract_person_names(
-            "The door is open. The table has a book on it.",
-        );
+        let names5 =
+            Database::extract_person_names("The door is open. The table has a book on it.");
         assert!(!names5.contains(&"Door".to_string()));
         assert!(!names5.contains(&"Table".to_string()));
         assert!(!names5.contains(&"Book".to_string()));
@@ -3766,27 +4129,27 @@ mod tests {
         assert!(Database::is_likely_person_name("O'Connor"));
         assert!(Database::is_likely_person_name("Sarah"));
         assert!(Database::is_likely_person_name("Michael"));
-        
+
         // Common words that should be filtered
         assert!(!Database::is_likely_person_name("the"));
         assert!(!Database::is_likely_person_name("and"));
         assert!(!Database::is_likely_person_name("if"));
         assert!(!Database::is_likely_person_name("a"));
-        
+
         // Body parts that should be filtered
         assert!(!Database::is_likely_person_name("hand"));
         assert!(!Database::is_likely_person_name("shoulder"));
         assert!(!Database::is_likely_person_name("head"));
         assert!(!Database::is_likely_person_name("arm"));
         assert!(!Database::is_likely_person_name("leg"));
-        
+
         // Objects that should be filtered
         assert!(!Database::is_likely_person_name("class"));
         assert!(!Database::is_likely_person_name("table"));
         assert!(!Database::is_likely_person_name("door"));
         assert!(!Database::is_likely_person_name("book"));
         assert!(!Database::is_likely_person_name("computer"));
-        
+
         // Words with non-name suffixes
         assert!(!Database::is_likely_person_name("walking"));
         assert!(!Database::is_likely_person_name("creation"));
@@ -3794,22 +4157,37 @@ mod tests {
         assert!(!Database::is_likely_person_name("movement"));
         assert!(!Database::is_likely_person_name("quickly"));
     }
-    
+
     #[test]
     fn test_is_proper_name_context() {
         // Test possessive forms
-        assert!(Database::is_proper_name_context("John", "John's car is red"));
-        assert!(Database::is_proper_name_context("Sarah", "Sarah's house is nearby"));
-        
+        assert!(Database::is_proper_name_context(
+            "John",
+            "John's car is red"
+        ));
+        assert!(Database::is_proper_name_context(
+            "Sarah",
+            "Sarah's house is nearby"
+        ));
+
         // Test with titles
-        assert!(Database::is_proper_name_context("Smith", "Dr. Smith arrived"));
-        assert!(Database::is_proper_name_context("Johnson", "Mrs. Johnson called"));
-        
+        assert!(Database::is_proper_name_context(
+            "Smith",
+            "Dr. Smith arrived"
+        ));
+        assert!(Database::is_proper_name_context(
+            "Johnson",
+            "Mrs. Johnson called"
+        ));
+
         // Test with person-related verbs
         assert!(Database::is_proper_name_context("Alex", "Alex said hello"));
-        assert!(Database::is_proper_name_context("Maria", "I met Maria yesterday"));
+        assert!(Database::is_proper_name_context(
+            "Maria",
+            "I met Maria yesterday"
+        ));
     }
-    
+
     #[test]
     fn test_is_person_indicator() {
         // Words that indicate person context
@@ -3817,7 +4195,7 @@ mod tests {
         assert!(Database::is_person_indicator("friend"));
         assert!(Database::is_person_indicator("told"));
         assert!(Database::is_person_indicator("colleague"));
-        
+
         // Words that don't indicate person context
         assert!(!Database::is_person_indicator("table"));
         assert!(!Database::is_person_indicator("quickly"));

@@ -538,19 +538,22 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
     memory_stats.print_stats();
 
     // Initialize performance tracking
-    let session_id = format!("llm_{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis());
-    
+    let session_id = format!(
+        "llm_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+
     let model_config = ModelConfig {
         model_path: config.llm_model_path.clone(),
         gpu_layers: config.gpu_layers as i32,
         device_type: config.device.to_string(),
     };
-    
+
     let input_tokens = (system_tokens + attitude_tokens + message_tokens) as u32;
-    
+
     // Start performance tracking
     if let Ok(mut tracker) = INFERENCE_TRACKER.lock() {
         tracker.start_session(session_id.clone(), model_config.clone(), input_tokens);
@@ -595,7 +598,10 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
             Err(e) => {
                 // Not fatal: fall back to the plain transcript the Default
                 // template produces, which works with any model.
-                eprintln!("⚠️ Auto template unavailable ({}), falling back to the transcript format", e);
+                eprintln!(
+                    "⚠️ Auto template unavailable ({}), falling back to the transcript format",
+                    e
+                );
                 let mut fallback = base_prompt.clone();
                 for (is_ai, content) in &chat_history {
                     let speaker = if *is_ai { &companion.name } else { &user.name };
@@ -766,7 +772,7 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
     } else {
         0.0
     };
-    
+
     println!("⚡ Performance Metrics:");
     println!("  • Total time: {:.2}s", response_time.as_secs_f64());
     println!("  • Tokens generated: {}", tokens_generated);
