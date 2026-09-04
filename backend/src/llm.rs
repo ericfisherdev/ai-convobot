@@ -248,7 +248,11 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
         };
     }
     // Build base prompt components for caching optimization
-    let base_components = if config.prompt_template == PromptTemplate::Default {
+    // Auto renders through the model's own chat template, so its system content
+    // must be plain prose; the Mistral branch below would embed [INST] markers.
+    let base_components = if config.prompt_template == PromptTemplate::Default
+        || config.prompt_template == PromptTemplate::Auto
+    {
         vec![
             format!(
                 "Text transcript of a conversation between {} and {}. {}\n",
@@ -413,7 +417,9 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
         };
         let text = &message.content;
         let mut formatted_message = format!("{}: {}\n", prefix, text);
-        if message_counter == short_term_mem_len && contains_time_question(&formatted_message) {
+        let inject_time =
+            message_counter == short_term_mem_len && contains_time_question(&formatted_message);
+        if inject_time {
             formatted_message = format!(
                 "\n* it's currently {} *\n{}",
                 get_current_date(),
@@ -424,7 +430,7 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
             // The chat template supplies the speaker framing, so the message
             // carries its own text rather than a "Name: " prefix.
             let mut content = text.clone();
-            if message_counter == short_term_mem_len && contains_time_question(&formatted_message) {
+            if inject_time {
                 content = format!("* it's currently {} *\n{}", get_current_date(), content);
             }
             chat_history.push((message.ai, content));
