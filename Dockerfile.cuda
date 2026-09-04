@@ -21,7 +21,7 @@ COPY postcss.config.js ./
 RUN npm run build
 
 # Rust build stage with CUDA
-FROM nvidia/cuda:12.2-devel-ubuntu22.04 AS backend-builder
+FROM nvidia/cuda:12.2.2-devel-ubuntu22.04 AS backend-builder
 
 # Install Rust
 RUN apt-get update && apt-get install -y \
@@ -29,6 +29,9 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     pkg-config \
     libssl-dev \
+    cmake \
+    clang \
+    libclang-dev \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && rm -rf /var/lib/apt/lists/*
 
@@ -47,7 +50,7 @@ WORKDIR /app/backend
 RUN cargo build --release --features cuda
 
 # Runtime stage with CUDA runtime
-FROM nvidia/cuda:12.2-runtime-ubuntu22.04
+FROM nvidia/cuda:12.2.2-runtime-ubuntu22.04
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
