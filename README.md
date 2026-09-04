@@ -1,12 +1,12 @@
-# AI Companion - Enhanced Fork
+# AI Companion
 
-A fork of [https://github.com/Hukasx0/ai-companion](https://github.com/Hukasx0/ai-companion) with significant enhancements and improvements.
+A full-stack local AI chatbot, maintained as a standalone project.
 
 **Release builds coming soon!**
 
-## About This Fork
+## About This Project
 
-This enhanced version of AI Companion includes numerous improvements, bug fixes, and new features designed to provide a better user experience and more robust functionality. All core features from the original project are preserved while adding significant quality-of-life improvements.
+This codebase began as a fork of Hubert "Hukasx0" Kasperek's AI Companion. That upstream repository is no longer publicly accessible, and this repository is no longer part of its fork network, so development continues here independently. The original work remains credited under its MIT license (see [Acknowledgments](#acknowledgments) and [License](#license)); the core features it established are preserved alongside substantial later changes.
 
 ## What's AI Companion?
 
@@ -130,7 +130,7 @@ Complete REST API documentation available at [/docs/api_docs.md](/docs/api_docs.
 
 ## Contributing
 
-This fork welcomes contributions! Please:
+Contributions are welcome! Please:
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes with tests
@@ -138,7 +138,7 @@ This fork welcomes contributions! Please:
 
 ## Roadmap
 
-- [ ] Streaming responses for real-time generation
+- [x] Streaming responses for real-time generation
 - [ ] Plugin system for extensibility
 - [ ] Multi-language UI support
 - [ ] Enhanced voice synthesis integration
@@ -147,14 +147,12 @@ This fork welcomes contributions! Please:
 
 ## Acknowledgments
 
-- Original project by [Hukasx0](https://github.com/Hukasx0/ai-companion)
-- Built on [rustformers/llm](https://github.com/rustformers/llm)
+- Original AI Companion by Hubert "Hukasx0" Kasperek. The upstream repository and its author's GitHub account are no longer reachable, so no link is given.
+- Inference via [llama-cpp-2](https://github.com/utilityai/llama-cpp-rs), bindings to [llama.cpp](https://github.com/ggml-org/llama.cpp). Earlier versions used rustformers/llm, which was archived in June 2024.
 - UI components from [shadcn/ui](https://ui.shadcn.com/)
 
 ## License
 
-This project maintains the same license as the original AI Companion project.
-
----
-
-**Note**: This is an independent fork focused on improvements and bug fixes. For the original project, visit [Hukasx0/ai-companion](https://github.com/Hukasx0/ai-companion).
+MIT, Copyright (c) 2025 Hubert Kasperek. See [LICENSE](LICENSE). The original
+copyright notice is retained as the license requires; later changes are
+released under the same terms.
