@@ -124,6 +124,28 @@ npm run build-full-metal   # Apple Metal (macOS)
 
 Binary will be available in `backend/target/release/`
 
+### Quality Checks
+
+`make check` runs formatting, lint, typecheck, frontend tests, frontend build,
+clippy, and backend tests, in that order. CI and the git hooks call the same
+Makefile targets, so there is a single source of truth for what "passing"
+means.
+
+| Target | What it does |
+| --- | --- |
+| `make fmt` | Auto-formats Rust code with `cargo fmt` |
+| `make fmt-check` | Checks Rust formatting without modifying files |
+| `make lint` | Runs ESLint on the frontend |
+| `make typecheck` | Runs the TypeScript compiler in `--noEmit` mode |
+| `make test-fe` | Runs the frontend test suite (Vitest) |
+| `make build-fe` | Builds the frontend (required before backend checks compile) |
+| `make clippy` | Runs `cargo clippy` on the backend |
+| `make test-be` | Runs the backend test suite (`cargo test`) |
+| `make check` | Runs all of the above, in order |
+
+On a fresh clone, run `npm ci` first. The `llama-cpp-2` build also requires
+`cmake` and `pkg-config` on your `PATH`.
+
 ## API Documentation
 
 Complete REST API documentation available at [/docs/api_docs.md](/docs/api_docs.md)
