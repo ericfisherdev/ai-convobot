@@ -4,7 +4,6 @@ version = "1.0.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-# CI path-filter verification: this line will be reverted in the next commit.
 
 [build-dependencies]
 winres = "0.1.12"
