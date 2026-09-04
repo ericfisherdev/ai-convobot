@@ -14,24 +14,24 @@ repos:
       - id: cargo-fmt-check
         name: cargo fmt --check
         entry: cargo fmt --manifest-path backend/Cargo.toml --check
-        language: unsupported
+        language: system
         files: ^backend/.*\.rs$
         pass_filenames: false
       - id: eslint
         name: eslint (staged files)
         entry: node_modules/.bin/eslint --ext ts,tsx --report-unused-disable-directives --max-warnings 50
-        language: unsupported
+        language: system
         types_or: [ts, tsx]
       - id: tsc
         name: tsc --noEmit
         entry: node_modules/.bin/tsc --noEmit
-        language: unsupported
+        language: system
         files: ^(src/.*\.(ts|tsx)|tsconfig.*\.json)$
         pass_filenames: false
       - id: make-check
         name: make check (pre-push)
         entry: make check
-        language: unsupported
+        language: system
         pass_filenames: false
         always_run: true
         stages: [pre-push]
