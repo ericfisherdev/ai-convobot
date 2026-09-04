@@ -73,7 +73,7 @@ jobs:
         run: cd backend && cargo fmt --check
 
       - name: Run clippy
-        run: cd backend && cargo clippy --all-targets --all-features
+        run: cd backend && cargo clippy --all-targets -- -D warnings
 
       - name: Run tests
         run: cd backend && cargo test --verbose
