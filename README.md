@@ -128,8 +128,7 @@ Binary will be available in `backend/target/release/`
 
 `make check` runs formatting, lint, typecheck, frontend tests, frontend build,
 clippy, and backend tests, in that order. These targets are the single source
-of truth for what "passing" means; CI (#53) and the git hooks (#52) are being
-migrated to call them.
+of truth for what "passing" means; CI (#53) and the git hooks below call them.
 
 | Target | What it does |
 | --- | --- |
@@ -145,6 +144,20 @@ migrated to call them.
 
 On a fresh clone, run `npm ci` first. The `llama-cpp-2` build also requires
 `cmake` and `pkg-config` on your `PATH`.
+
+### Git hooks
+
+```bash
+# Install git hooks (pre-commit: fmt/eslint/tsc/whitespace; pre-push: make check)
+pre-commit install
+```
+
+`pre-commit install` wires up both hook types in one command. The pre-commit
+hook runs fast checks (`cargo fmt --check`, ESLint, `tsc --noEmit`, and
+whitespace fixers) against staged files; the pre-push hook runs `make check`
+in full, so a push rarely fails CI on something local checks could have
+caught. To install only the pre-push hook explicitly, run
+`pre-commit install --hook-type pre-push`.
 
 ## API Documentation
 

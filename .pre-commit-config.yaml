@@ -1,0 +1,37 @@
+default_install_hook_types: [pre-commit, pre-push]
+default_stages: [pre-commit]
+exclude: ^(dist/|backend/target/|release-package/|backend/release-package/)
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt-check
+        name: cargo fmt --check
+        entry: cargo fmt --manifest-path backend/Cargo.toml --check
+        language: unsupported
+        files: ^backend/.*\.rs$
+        pass_filenames: false
+      - id: eslint
+        name: eslint (staged files)
+        entry: node_modules/.bin/eslint --ext ts,tsx --report-unused-disable-directives --max-warnings 50
+        language: unsupported
+        types_or: [ts, tsx]
+      - id: tsc
+        name: tsc --noEmit
+        entry: node_modules/.bin/tsc --noEmit
+        language: unsupported
+        files: ^(src/.*\.(ts|tsx)|tsconfig.*\.json)$
+        pass_filenames: false
+      - id: make-check
+        name: make check (pre-push)
+        entry: make check
+        language: unsupported
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
