@@ -44,7 +44,7 @@ COPY --from=frontend-builder /app/frontend/dist ./dist
 
 # Build backend with CUDA support
 WORKDIR /app/backend
-RUN cargo build --release --features cublas
+RUN cargo build --release --features cuda
 
 # Runtime stage with CUDA runtime
 FROM nvidia/cuda:12.2-runtime-ubuntu22.04
