@@ -255,7 +255,7 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
         if let Ok(dialogue) = DialogueTuning::get_random_dialogue() {
             tuned_dialogue = format!(
                 "{}: {}\n{}: {}",
-                &user.name, &dialogue.user_msg, &companion.name, &dialogue.ai_msg
+                user.name, dialogue.user_msg, companion.name, dialogue.ai_msg
             );
         };
     }
@@ -589,7 +589,7 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
             }
         }
     } else {
-        format!("{}{}: ", &base_prompt, companion.name)
+        format!("{}{}: ", base_prompt, companion.name)
     };
     let prompt_tokens = match model.str_to_token(&full_prompt, AddBos::Always) {
         Ok(tokens) => tokens,
@@ -680,8 +680,8 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
             || end_of_generation.contains("[/INST]")
             || end_of_generation.contains("<</SYS>>")
             || end_of_generation.contains("[s]")
-            || end_of_generation.contains(&format!("{}:", &companion.name))
-            || end_of_generation.contains(&format!("{}:", &user.name))
+            || end_of_generation.contains(&format!("{}:", companion.name))
+            || end_of_generation.contains(&format!("{}:", user.name))
             || end_of_generation.contains("<|user|>")
         {
             break;
@@ -709,7 +709,7 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
         .replace("</s>", "")
         .replace("<|user|>", "");
     let companion_text = x
-        .split(&format!("\n{}: ", &companion.name))
+        .split(&format!("\n{}: ", companion.name))
         .next()
         .unwrap_or("");
     match Database::insert_message(NewMessage {
@@ -724,7 +724,7 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
     };
     match long_term_memory.add_entry(&format!(
         "{}{}: {}\n{}: {}\n",
-        formatted_date, "{{user}}", &prompt, "{{char}}", &companion_text
+        formatted_date, "{{user}}", prompt, "{{char}}", companion_text
     )) {
         Ok(_) => {}
         Err(e) => eprintln!("Error while adding message to long-term memory: {}", e),
