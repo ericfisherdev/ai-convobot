@@ -21,10 +21,10 @@ pub struct MemoryAllocation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MemoryStrategy {
-    VramOnly,      // <8GB system RAM or high utilization
-    Conservative,  // 8-16GB system RAM: use 25% of available
-    Balanced,      // 16-32GB system RAM: use 50% of available
-    Aggressive,    // 32GB+ system RAM: use up to 75% of available
+    VramOnly,     // <8GB system RAM or high utilization
+    Conservative, // 8-16GB system RAM: use 25% of available
+    Balanced,     // 16-32GB system RAM: use 50% of available
+    Aggressive,   // 32GB+ system RAM: use up to 75% of available
 }
 
 pub struct SystemMemoryDetector {
@@ -87,7 +87,7 @@ impl SystemMemoryDetector {
 
         // Read /proc/meminfo for detailed memory information
         let meminfo = fs::read_to_string("/proc/meminfo")?;
-        
+
         let mut total_kb = 0u64;
         let mut available_kb = 0u64;
         let mut free_kb = 0u64;
@@ -141,12 +141,16 @@ impl SystemMemoryDetector {
 
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            
+
             // Try to parse JSON output
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
-                let total_kb = json["TotalVisibleMemorySize"].as_u64().unwrap_or(8 * 1024 * 1024);
-                let free_kb = json["FreePhysicalMemory"].as_u64().unwrap_or(4 * 1024 * 1024);
-                
+                let total_kb = json["TotalVisibleMemorySize"]
+                    .as_u64()
+                    .unwrap_or(8 * 1024 * 1024);
+                let free_kb = json["FreePhysicalMemory"]
+                    .as_u64()
+                    .unwrap_or(4 * 1024 * 1024);
+
                 let total_ram_gb = total_kb as f32 / 1024.0 / 1024.0;
                 let available_ram_gb = free_kb as f32 / 1024.0 / 1024.0;
                 let used_ram_gb = total_ram_gb - available_ram_gb;
@@ -165,12 +169,18 @@ impl SystemMemoryDetector {
 
         // Fallback: try wmic command
         let output = Command::new("wmic")
-            .args(&["OS", "get", "TotalVisibleMemorySize,FreePhysicalMemory", "/format:csv"])
+            .args(&[
+                "OS",
+                "get",
+                "TotalVisibleMemorySize,FreePhysicalMemory",
+                "/format:csv",
+            ])
             .output()?;
 
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines().skip(1) { // Skip header
+            for line in stdout.lines().skip(1) {
+                // Skip header
                 let fields: Vec<&str> = line.split(',').collect();
                 if fields.len() >= 3 {
                     if let (Ok(free_kb), Ok(total_kb)) = (
@@ -210,9 +220,7 @@ impl SystemMemoryDetector {
     fn detect_macos_memory(&self) -> Result<SystemMemoryInfo, Box<dyn std::error::Error>> {
         // Use vm_stat and system_profiler for macOS memory detection
         let vm_stat_output = Command::new("vm_stat").output()?;
-        let sysctl_output = Command::new("sysctl")
-            .args(&["hw.memsize"])
-            .output()?;
+        let sysctl_output = Command::new("sysctl").args(&["hw.memsize"]).output()?;
 
         let mut total_ram_gb = 16.0; // Fallback
         let mut free_pages = 0u64;
@@ -262,14 +270,12 @@ impl SystemMemoryDetector {
     }
 
     /// Calculate optimal memory allocation for context expansion
-    pub fn calculate_memory_allocation(
-        &self,
-        memory_info: &SystemMemoryInfo,
-    ) -> MemoryAllocation {
-        let available_after_safety = (memory_info.available_ram_gb - self.safety_margin_gb).max(0.0);
-        
+    pub fn calculate_memory_allocation(&self, memory_info: &SystemMemoryInfo) -> MemoryAllocation {
+        let available_after_safety =
+            (memory_info.available_ram_gb - self.safety_margin_gb).max(0.0);
+
         let strategy = self.determine_strategy(memory_info);
-        
+
         let recommended_usage_gb = match strategy {
             MemoryStrategy::VramOnly => 0.0,
             MemoryStrategy::Conservative => (available_after_safety * 0.25).min(self.max_usage_gb),
@@ -303,7 +309,8 @@ impl SystemMemoryDetector {
 
     /// Check if system memory is under pressure
     pub fn is_memory_pressure(&self, memory_info: &SystemMemoryInfo) -> bool {
-        memory_info.utilization_percent > 85.0 || memory_info.available_ram_gb < self.safety_margin_gb
+        memory_info.utilization_percent > 85.0
+            || memory_info.available_ram_gb < self.safety_margin_gb
     }
 
     /// Get memory status summary for logging
@@ -424,7 +431,10 @@ mod tests {
         assert_eq!(allocation.safety_margin_gb, 2.0);
         // Should be Balanced strategy (16GB RAM), so 50% of available = 4.0GB
         assert_eq!(allocation.recommended_usage_gb, 4.0);
-        assert!(matches!(allocation.allocation_strategy, MemoryStrategy::Balanced));
+        assert!(matches!(
+            allocation.allocation_strategy,
+            MemoryStrategy::Balanced
+        ));
     }
 
     #[test]

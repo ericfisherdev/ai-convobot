@@ -33,7 +33,7 @@ pub enum AllocationStrategy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ModelQuantization {
     F16,    // 16 bits per parameter
-    Q8_0,   // 8 bits per parameter  
+    Q8_0,   // 8 bits per parameter
     Q5_K_M, // ~5.1 bits per parameter
     Q4_K_M, // ~4.83 bits per parameter
     Q4_0,   // 4 bits per parameter
@@ -53,7 +53,7 @@ impl ModelQuantization {
             ModelQuantization::Q2_K => 0.33,
         }
     }
-    
+
     pub fn from_model_name(model_path: &str) -> Self {
         let path_lower = model_path.to_lowercase();
         if path_lower.contains("q2_k") {
@@ -222,7 +222,7 @@ impl GpuAllocator {
         vram_limit_gb: Option<f32>,
     ) -> LayerAllocation {
         let quantization = ModelQuantization::from_model_name(model_path);
-        
+
         // Apply VRAM limit if specified
         let effective_available_vram = if let Some(limit_gb) = vram_limit_gb {
             let limit_mb = (limit_gb * 1024.0) as u64;
@@ -250,14 +250,18 @@ impl GpuAllocator {
         let params_per_layer = base_model_params / total_layers as f32;
         let kv_cache_overhead_mb = 200; // Reserve for KV cache and context
         let arch_overhead_mb = 100; // Reserve for model architecture overhead
-        
-        let vram_per_layer_mb = ((params_per_layer * quantization.bytes_per_param()) / 1024.0 / 1024.0).ceil() as u64;
+
+        let vram_per_layer_mb =
+            ((params_per_layer * quantization.bytes_per_param()) / 1024.0 / 1024.0).ceil() as u64;
         let reserved_vram = kv_cache_overhead_mb + arch_overhead_mb;
         let layers_vram_budget = usable_vram_mb.saturating_sub(reserved_vram);
 
         // Calculate maximum layers that fit in VRAM
         let max_gpu_layers = if vram_per_layer_mb > 0 && layers_vram_budget > 0 {
-            std::cmp::min((layers_vram_budget / vram_per_layer_mb) as usize, total_layers)
+            std::cmp::min(
+                (layers_vram_budget / vram_per_layer_mb) as usize,
+                total_layers,
+            )
         } else {
             0
         };
@@ -267,7 +271,9 @@ impl GpuAllocator {
             (0, AllocationStrategy::CpuFallback)
         } else if max_gpu_layers >= total_layers {
             (total_layers, AllocationStrategy::MaxGpu)
-        } else if gpu_info.total_vram_mb >= 3500 && max_gpu_layers >= (total_layers as f32 * 0.8) as usize {
+        } else if gpu_info.total_vram_mb >= 3500
+            && max_gpu_layers >= (total_layers as f32 * 0.8) as usize
+        {
             // Use aggressive strategy for high VRAM systems that can fit 80%+ of layers
             (max_gpu_layers, AllocationStrategy::Aggressive)
         } else if max_gpu_layers >= total_layers / 2 {

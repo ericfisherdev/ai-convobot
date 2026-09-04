@@ -535,7 +535,8 @@ fn preprocess_user_message(user_message: &str, companion_id: i32) -> Option<Stri
     }
 
     // Detect and handle interaction requests
-    if let Ok(Some(interaction)) = Database::detect_interaction_request(user_message, companion_id) {
+    if let Ok(Some(interaction)) = Database::detect_interaction_request(user_message, companion_id)
+    {
         if let Some(outcome) = interaction.outcome.as_ref() {
             let third_party_name = Database::get_third_party_by_id(interaction.third_party_id)
                 .ok()
@@ -565,8 +566,10 @@ async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
     let previous_attitude = match Database::get_all_companion_attitudes(companion_id) {
         Ok(attitudes) => {
             // Find the user attitude
-            attitudes.into_iter().find(|a| a.target_id == user_id && a.target_type == "user")
-        },
+            attitudes
+                .into_iter()
+                .find(|a| a.target_id == user_id && a.target_type == "user")
+        }
         _ => None,
     };
 
@@ -622,9 +625,13 @@ async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
             // Check for attitude changes after processing
             if let Some(prev_attitude) = previous_attitude {
                 if let Ok(attitudes) = Database::get_all_companion_attitudes(companion_id) {
-                    if let Some(current_attitude) = attitudes.into_iter().find(|a| a.target_id == user_id && a.target_type == "user") {
+                    if let Some(current_attitude) = attitudes
+                        .into_iter()
+                        .find(|a| a.target_id == user_id && a.target_type == "user")
+                    {
                         let formatter = crate::attitude_formatter::AttitudeFormatter::new();
-                        let attitude_changes = formatter.format_attitude_changes_for_console(&prev_attitude, &current_attitude);
+                        let attitude_changes = formatter
+                            .format_attitude_changes_for_console(&prev_attitude, &current_attitude);
                         if !attitude_changes.is_empty() {
                             println!("{}", attitude_changes);
                         }
@@ -637,7 +644,7 @@ async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
             println!("✓ Response completed in {:.1}s", elapsed.as_secs_f32());
 
             HttpResponse::Ok().body(v)
-        },
+        }
         Err(e) => {
             println!("Failed to generate prompt: {}", e);
             HttpResponse::InternalServerError()
@@ -708,12 +715,12 @@ async fn config_post(received: web::Json<ConfigModify>) -> HttpResponse {
 #[get("/api/llm/models")]
 async fn get_llm_models() -> HttpResponse {
     let scanner = LlmScanner::new();
-    
+
     // Perform migration of existing config if needed
     if let Err(e) = scanner.migrate_existing_config() {
         println!("Warning: Failed to migrate existing config: {}", e);
     }
-    
+
     match scanner.scan_for_models() {
         Ok(models) => {
             let models_json = serde_json::to_string(&models)
@@ -845,17 +852,14 @@ struct AttitudeSummaryResponse {
 #[get("/api/attitude/summary/{companion_id}/{user_id}")]
 async fn get_attitude_summary(path: web::Path<(i32, i32)>) -> HttpResponse {
     let (companion_id, user_id) = path.into_inner();
-    
+
     match Database::get_attitude(companion_id, user_id, "user") {
         Ok(Some(attitude)) => {
             let formatter = attitude_formatter::AttitudeFormatter::new();
             let summary = formatter.generate_natural_language_summary(&attitude);
-            
-            let response = AttitudeSummaryResponse {
-                attitude,
-                summary,
-            };
-            
+
+            let response = AttitudeSummaryResponse { attitude, summary };
+
             match serde_json::to_string(&response) {
                 Ok(json) => HttpResponse::Ok().body(json),
                 Err(e) => {
@@ -934,8 +938,10 @@ async fn clear_attitudes() -> HttpResponse {
 
     match Database::clear_companion_attitudes(companion_id) {
         Ok(_) => {
-            match Database::create_initial_user_attitude(companion_id, user_id, &companion_persona) {
-                Ok(_) => HttpResponse::Ok().body("Attitudes cleared and reset based on companion persona!"),
+            match Database::create_initial_user_attitude(companion_id, user_id, &companion_persona)
+            {
+                Ok(_) => HttpResponse::Ok()
+                    .body("Attitudes cleared and reset based on companion persona!"),
                 Err(e) => {
                     println!("Failed to create initial attitude: {}", e);
                     HttpResponse::InternalServerError()
@@ -1499,7 +1505,9 @@ fn estimate_response_time_enhanced(msg: &str) -> ResponseEstimate {
                 expected_seconds: 25,
                 max_seconds: 90,
                 confidence: 0.4,
-                factors: vec!["Performance tracker unavailable - using fallback estimate".to_string()],
+                factors: vec![
+                    "Performance tracker unavailable - using fallback estimate".to_string()
+                ],
             };
         }
     };
