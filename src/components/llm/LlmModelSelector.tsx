@@ -73,9 +73,9 @@ export const LlmModelSelector: React.FC<LlmModelSelectorProps> = ({
                 </SelectTrigger>
                 <SelectContent>
                     {models.length === 0 && !loading ? (
-                        <SelectItem value="" disabled>
+                        <div className="px-2 py-1.5 text-sm text-muted-foreground">
                             No models found
-                        </SelectItem>
+                        </div>
                     ) : (
                         Object.entries(groupedModels).map(([directory, dirModels]) => (
                             <div key={directory}>
