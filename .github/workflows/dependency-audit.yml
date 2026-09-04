@@ -2,21 +2,23 @@ name: Dependency Audit
 
 on:
   schedule:
-    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+    - cron: '23 6 * * 1'   # Mondays 06:23 UTC (off the top-of-hour peak-load window)
   workflow_dispatch:
 
 permissions:
   contents: read
-  checks: write   # rustsec/audit-check creates a check run
-  issues: write   # on schedule runs it opens one issue per new advisory
 
 jobs:
   cargo-audit:
     name: cargo audit (backend)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write   # rustsec/audit-check creates a check run
+      issues: write   # on schedule runs it opens one issue per new advisory
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2.0.0
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           working-directory: backend
@@ -24,6 +26,9 @@ jobs:
   npm-audit:
     name: npm audit (frontend)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write   # files an issue when the scheduled run finds a high/critical advisory
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -31,3 +36,13 @@ jobs:
           node-version-file: '.nvmrc'
           cache: 'npm'
       - run: npm audit --audit-level=high
+      - name: File issue for new npm advisories
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "npm audit: high/critical advisory found ($(date -u +%Y-%m-%d))" \
+            --body "Scheduled \`npm audit --audit-level=high\` failed. See the run for details: ${RUN_URL}"
