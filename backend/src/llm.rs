@@ -414,12 +414,11 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
 
     // Apply context management to optimize memory usage
     let managed_messages = context_manager.manage_message_context(short_term_memory_entries);
-    let mut message_counter = 1;
     let short_term_mem_len = managed_messages.len();
     // Role-tagged history, used only by the Auto template. The string templates
     // below keep splicing turns straight into base_prompt.
     let mut chat_history: Vec<(bool, String)> = Vec::with_capacity(managed_messages.len());
-    for message in &managed_messages {
+    for (message_counter, message) in (1..).zip(managed_messages.iter()) {
         let prefix = if message.ai {
             &companion.name
         } else {
@@ -459,7 +458,6 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
         } else {
             base_prompt += &formatted_message;
         }
-        message_counter += 1;
     }
 
     // Load and integrate attitude context

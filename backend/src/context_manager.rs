@@ -231,7 +231,6 @@ impl ContextManager {
                         let mut truncated_message = message.clone();
                         truncated_message.content = truncated_content;
                         selected_messages.insert(0, truncated_message);
-                        current_tokens += truncated_tokens;
                     }
                 }
                 break; // Stop adding more messages
