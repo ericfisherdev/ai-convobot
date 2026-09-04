@@ -264,13 +264,13 @@ const ChatWindow = () => {
                         size="sm"
                         onClick={() => {isImpersonating ? sendMessageAsAi() : promptMessage()}}
                         disabled={!(isImpersonating ? companionMessage : userMessage).trim()}
-                        aria-label={isImpersonating ? `Send message as ${companionData?.name}` : "Send message"}
+                        aria-label={isImpersonating ? `Send message as ${companionData.name || "AI Companion"}` : "Send message"}
                       >
                         <SendHorizontal className="h-4 w-4" />
                       </Button>
                     </TooltipTrigger>
                     <TooltipContent>
-                      <p>{isImpersonating ? `Send message as ${companionData?.name}` : "Send message"}</p>
+                      <p>{isImpersonating ? `Send message as ${companionData.name || "AI Companion"}` : "Send message"}</p>
                     </TooltipContent>
                   </Tooltip>
                 </TooltipProvider>
