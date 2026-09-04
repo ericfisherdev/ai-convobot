@@ -1,16 +1,19 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import EditData from '../editData/EditData'
+import { EditData } from '../editData/EditData'
 import { UserDataProvider } from '../context/userContext'
 import { CompanionDataProvider } from '../context/companionContext'
 import { ConfigProvider } from '../context/configContext'
+import { MessagesProvider } from '../context/messageContext'
 
 const MockProviders: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   <UserDataProvider>
     <CompanionDataProvider>
       <ConfigProvider>
-        {children}
+        <MessagesProvider>
+          {children}
+        </MessagesProvider>
       </ConfigProvider>
     </CompanionDataProvider>
   </UserDataProvider>
@@ -18,13 +21,24 @@ const MockProviders: React.FC<{ children: React.ReactNode }> = ({ children }) =>
 
 describe('EditData Component', () => {
   beforeEach(() => {
-    // Mock fetch for API calls
-    global.fetch = vi.fn(() =>
-      Promise.resolve({
+    vi.stubGlobal('fetch', vi.fn((url: string) => {
+      if (url.startsWith('/api/llm') || url.startsWith('/api/message')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve([]),
+          text: () => Promise.resolve(''),
+        })
+      }
+      return Promise.resolve({
         ok: true,
         json: () => Promise.resolve({}),
+        text: () => Promise.resolve(''),
       })
-    ) as vi.Mock
+    }))
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
   })
 
   it('renders edit data tabs', () => {
@@ -33,79 +47,62 @@ describe('EditData Component', () => {
         <EditData />
       </MockProviders>
     )
-    
-    // Check for tab navigation
+
     expect(screen.getByRole('tablist')).toBeInTheDocument()
+    const tabs = screen.getAllByRole('tab').map(t => t.textContent)
+    expect(tabs).toEqual(['Companion', 'User', 'Attitudes', 'Theme', 'Config'])
   })
 
-  it('shows user data tab', () => {
+  it('shows user data tab', async () => {
+    const user = userEvent.setup()
+
     render(
       <MockProviders>
         <EditData />
       </MockProviders>
     )
-    
-    // Look for user-related form elements
-    const nameInput = screen.getByLabelText(/name/i) || screen.getByPlaceholderText(/name/i)
-    expect(nameInput).toBeInTheDocument()
+
+    await user.click(screen.getByRole('tab', { name: 'User' }))
+    expect(await screen.findByLabelText('Your name')).toBeInTheDocument()
   })
 
   it('shows companion data tab', async () => {
-    const user = userEvent.setup()
-    
     render(
       <MockProviders>
         <EditData />
       </MockProviders>
     )
-    
-    // Click on companion tab if it exists
-    const companionTab = screen.getByText(/companion/i)
-    if (companionTab) {
-      await user.click(companionTab)
-    }
-    
-    // Check for companion-related elements
-    expect(screen.getByText(/companion/i)).toBeInTheDocument()
+
+    expect(screen.getByRole('tab', { name: 'Companion' })).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByLabelText('Your companion name')).toBeInTheDocument()
   })
 
   it('shows config data tab', async () => {
     const user = userEvent.setup()
-    
+
     render(
       <MockProviders>
         <EditData />
       </MockProviders>
     )
-    
-    // Click on config tab if it exists
-    const configTab = screen.getByText(/config/i)
-    if (configTab) {
-      await user.click(configTab)
-    }
-    
-    // Check for config-related elements
-    expect(screen.getByText(/config/i)).toBeInTheDocument()
+
+    await user.click(screen.getByRole('tab', { name: 'Config' }))
+    expect(await screen.findByText('Prompt template')).toBeInTheDocument()
   })
 
   it('handles form submission', async () => {
     const user = userEvent.setup()
-    
+
     render(
       <MockProviders>
         <EditData />
       </MockProviders>
     )
-    
-    // Find and interact with form elements
-    const saveButton = screen.getByRole('button', { name: /save/i }) || screen.getByRole('button', { name: /update/i })
-    if (saveButton) {
-      await user.click(saveButton)
-      
-      // Verify that fetch was called for saving
-      await waitFor(() => {
-        expect(global.fetch).toHaveBeenCalled()
-      })
-    }
+
+    await user.click(screen.getByRole('button', { name: /save changes/i }))
+
+    await waitFor(() => {
+      expect(fetch).toHaveBeenCalledWith('/api/companion', expect.objectContaining({ method: 'PUT' }))
+    })
   })
 })
