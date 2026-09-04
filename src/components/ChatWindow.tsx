@@ -184,7 +184,7 @@ const ChatWindow = () => {
   };
 
     return (
-        <div className={cn(
+        <main className={cn(
           "h-full flex flex-col",
           isStandalone && "mobile-safe-area"
         )}>
@@ -260,10 +260,11 @@ const ChatWindow = () => {
                 <TooltipProvider>
                   <Tooltip>
                     <TooltipTrigger asChild>
-                      <Button 
-                        size="sm" 
+                      <Button
+                        size="sm"
                         onClick={() => {isImpersonating ? sendMessageAsAi() : promptMessage()}}
                         disabled={!(isImpersonating ? companionMessage : userMessage).trim()}
+                        aria-label={isImpersonating ? `Send message as ${companionData?.name}` : "Send message"}
                       >
                         <SendHorizontal className="h-4 w-4" />
                       </Button>
@@ -279,7 +280,7 @@ const ChatWindow = () => {
           
           {/* Attitude Summary Bar (moved to bottom as status indicator) */}
           <AttitudeSummaryBar companionId={1} userId={1} />
-        </div>
+        </main>
     )
 }
 
