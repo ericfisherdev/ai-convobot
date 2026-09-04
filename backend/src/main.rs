@@ -29,7 +29,7 @@ mod system_memory;
 mod inference_performance;
 use crate::inference_performance::{ModelConfig, ResponseEstimate, INFERENCE_TRACKER};
 mod llm_scanner;
-use crate::llm_scanner::{DirectoryInfo, LlmScanner, ModelInfo};
+use crate::llm_scanner::LlmScanner;
 #[cfg(test)]
 mod simple_tests;
 
@@ -329,14 +329,14 @@ async fn get_companion_character_json() -> HttpResponse {
         Ok(v) => {
             let character_json: String = serde_json::to_string_pretty(&v as &CharacterCard)
                 .unwrap_or(String::from("Error serializing companion data as JSON"));
-            return HttpResponse::Ok().body(character_json);
+            HttpResponse::Ok().body(character_json)
         }
         Err(e) => {
             println!("Failed to get companion card data: {}", e);
-            return HttpResponse::InternalServerError()
-                .body("Error while getting companion card data, check logs for more information");
+            HttpResponse::InternalServerError()
+                .body("Error while getting companion card data, check logs for more information")
         }
-    };
+    }
 }
 
 #[post("/api/companion/avatar")]

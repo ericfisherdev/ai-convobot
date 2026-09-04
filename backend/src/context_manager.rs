@@ -162,11 +162,7 @@ impl ContextManager {
 
         // Don't exceed user's configured maximum
         let final_total_context = total_context_tokens.min(config.context_window_size);
-        let final_ram_context = if final_total_context > base_vram_context {
-            final_total_context - base_vram_context
-        } else {
-            0
-        };
+        let final_ram_context = final_total_context.saturating_sub(base_vram_context);
 
         let hybrid_allocation = HybridContextAllocation {
             total_context_tokens: final_total_context,
@@ -535,7 +531,7 @@ impl ContextManager {
     }
 
     /// Check if we can expand RAM allocation for context
-    fn can_expand_ram_allocation(&self, current_allocation: &HybridContextAllocation) -> bool {
+    fn can_expand_ram_allocation(&self, _current_allocation: &HybridContextAllocation) -> bool {
         // Check if system memory situation has improved
         match self.system_memory_detector.detect_system_memory() {
             Ok(memory_info) => {
@@ -552,7 +548,7 @@ impl ContextManager {
     /// Expand RAM allocation for context
     fn expand_ram_allocation(&self) -> Option<HybridContextAllocation> {
         if let Some(ref current) = self.hybrid_context_allocation {
-            let current_ram_gb = current.system_ram_context_tokens as f32 / (1024.0 * 256.0);
+            let _current_ram_gb = current.system_ram_context_tokens as f32 / (1024.0 * 256.0);
 
             // Try to increase RAM allocation by 50%
             let new_ram_tokens = (current.system_ram_context_tokens as f32 * 1.5) as usize;
@@ -582,7 +578,7 @@ impl ContextManager {
     /// Reallocate token budget to prioritize response generation
     fn reallocate_token_budget_for_response(&mut self) {
         // Temporarily reduce other allocations to boost response budget
-        let current_total = self.token_budget.total;
+        let _current_total = self.token_budget.total;
 
         // Reduce attitude allocation by 25%
         let attitude_reduction = (self.token_budget.attitude_data as f32 * 0.25) as usize;

@@ -301,9 +301,9 @@ mod tests {
     #[test]
     fn test_attitude_update() {
         let manager = SessionManager::new(30);
-        let session = manager.create_session(1, Some(1)).unwrap();
+        let _session = manager.create_session(1, Some(1)).unwrap();
 
-        let attitude = CompanionAttitude {
+        let _attitude = CompanionAttitude {
             id: None,
             companion_id: 1,
             target_id: 1,

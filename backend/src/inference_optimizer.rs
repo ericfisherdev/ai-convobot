@@ -266,7 +266,7 @@ impl InferenceOptimizer {
     pub fn estimate_tokens(&self, text: &str) -> usize {
         // Simple estimation: ~4 characters per token on average
         // In a real implementation, this would use proper tokenization
-        (text.len() + 3) / 4
+        text.len().div_ceil(4)
     }
 
     /// Get current performance statistics

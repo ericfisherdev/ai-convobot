@@ -125,7 +125,7 @@ impl GpuAllocator {
     /// Detect CUDA GPU memory using nvidia-smi
     fn detect_cuda_memory(&self) -> Result<GpuMemoryInfo, Box<dyn std::error::Error>> {
         let output = Command::new("nvidia-smi")
-            .args(&[
+            .args([
                 "--query-gpu=memory.total,memory.used,memory.free,utilization.gpu,name,driver_version",
                 "--format=csv,noheader,nounits"
             ])
@@ -167,7 +167,7 @@ impl GpuAllocator {
     /// Detect Metal GPU memory (macOS)
     fn detect_metal_memory(&self) -> Result<GpuMemoryInfo, Box<dyn std::error::Error>> {
         let output = Command::new("system_profiler")
-            .args(&["SPDisplaysDataType", "-json"])
+            .args(["SPDisplaysDataType", "-json"])
             .output();
 
         match output {
@@ -382,32 +382,33 @@ impl GpuAllocator {
             }
         }
         // If memory pressure is low (<50%) and we have available VRAM, suggest more GPU layers
-        else if memory_pressure < 50.0 && available_ratio > 0.3 {
-            if current_allocation.cpu_layers > 0 {
-                // Increase GPU layers by 10%
-                let additional_layers = (current_allocation.total_layers as f32 * 0.1) as usize;
-                let new_gpu_layers = std::cmp::min(
-                    current_allocation.gpu_layers + additional_layers,
-                    current_allocation.total_layers,
-                );
-                let new_cpu_layers = current_allocation
-                    .total_layers
-                    .saturating_sub(new_gpu_layers);
+        else if memory_pressure < 50.0
+            && available_ratio > 0.3
+            && current_allocation.cpu_layers > 0
+        {
+            // Increase GPU layers by 10%
+            let additional_layers = (current_allocation.total_layers as f32 * 0.1) as usize;
+            let new_gpu_layers = std::cmp::min(
+                current_allocation.gpu_layers + additional_layers,
+                current_allocation.total_layers,
+            );
+            let new_cpu_layers = current_allocation
+                .total_layers
+                .saturating_sub(new_gpu_layers);
 
-                return Some(LayerAllocation {
-                    gpu_layers: new_gpu_layers,
-                    cpu_layers: new_cpu_layers,
-                    total_layers: current_allocation.total_layers,
-                    estimated_vram_usage_mb: new_gpu_layers as u64
-                        * (current_allocation.estimated_vram_usage_mb
-                            / current_allocation.gpu_layers.max(1) as u64),
-                    allocation_strategy: if new_gpu_layers == current_allocation.total_layers {
-                        AllocationStrategy::MaxGpu
-                    } else {
-                        AllocationStrategy::Balanced
-                    },
-                });
-            }
+            return Some(LayerAllocation {
+                gpu_layers: new_gpu_layers,
+                cpu_layers: new_cpu_layers,
+                total_layers: current_allocation.total_layers,
+                estimated_vram_usage_mb: new_gpu_layers as u64
+                    * (current_allocation.estimated_vram_usage_mb
+                        / current_allocation.gpu_layers.max(1) as u64),
+                allocation_strategy: if new_gpu_layers == current_allocation.total_layers {
+                    AllocationStrategy::MaxGpu
+                } else {
+                    AllocationStrategy::Balanced
+                },
+            });
         }
 
         None
