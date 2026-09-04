@@ -44,10 +44,10 @@ backend/release-package/
 *.db-wal
 *.sqlite
 *.sqlite3
-longterm_memory/*.lock
-longterm_memory/.tantivy-*
-backend/longterm_memory/*.lock
-backend/longterm_memory/.tantivy-*
+# The tantivy long-term memory index stores conversation text verbatim in
+# its segment files, so the whole directory stays out of git.
+longterm_memory/
+backend/longterm_memory/
 
 # Local model weights
 *.gguf
