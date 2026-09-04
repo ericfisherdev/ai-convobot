@@ -55,8 +55,10 @@ const ChatWindow = () => {
   const promptMessage = async () => {
     const sentMessage = userMessage;
     // Negative ids mark optimistic messages that refreshMessages later replaces
-    // with the persisted rows.
-    const streamingMessageId = -2;
+    // with the persisted rows. Each send needs its own id, because
+    // updateMessage matches by id and a shared one would let two in-flight
+    // streams write into each other's bubble.
+    const streamingMessageId = -Date.now();
     try {
       setUserMessage('');
       pushMessage({
@@ -77,10 +79,7 @@ const ChatWindow = () => {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          prompt: sentMessage,
-          session_id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-        }),
+        body: JSON.stringify({ prompt: sentMessage }),
       });
 
       if (!response.ok || !response.body) {
@@ -91,6 +90,7 @@ const ChatWindow = () => {
       const decoder = new TextDecoder();
       let buffer = '';
       let streamed = '';
+      let streamError: string | null = null;
 
       // Server-Sent Events arrive as "data: {json}\n\n" records, and a single
       // read can contain a partial record, so hold the remainder in a buffer.
@@ -105,15 +105,34 @@ const ChatWindow = () => {
         for (const record of records) {
           const line = record.split('\n').find(part => part.startsWith('data: '));
           if (!line) continue;
+          let chunk;
           try {
-            const chunk = JSON.parse(line.slice('data: '.length));
-            if (chunk.is_complete) continue;
-            streamed += chunk.content;
-            updateMessage(streamingMessageId, streamed);
+            chunk = JSON.parse(line.slice('data: '.length));
           } catch (parseError) {
+            // A single malformed record should not abandon the whole stream.
             console.error('Failed to parse stream chunk:', parseError);
+            continue;
           }
+
+          if (chunk.is_complete) {
+            if (chunk.error) {
+              streamError = chunk.error;
+            } else if (chunk.content) {
+              // The final chunk carries the sanitized reply, which drops the
+              // stop markers the raw token stream still contains.
+              streamed = chunk.content;
+              updateMessage(streamingMessageId, streamed);
+            }
+            continue;
+          }
+
+          streamed += chunk.content;
+          updateMessage(streamingMessageId, streamed);
         }
+      }
+
+      if (streamError) {
+        throw new Error(streamError);
       }
 
       refreshMessages();

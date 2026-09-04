@@ -25,12 +25,12 @@ use std::sync::{Mutex, OnceLock};
 /// Maximum tokens submitted to llama.cpp in a single decode call.
 const N_BATCH: u32 = 512;
 
-/// llama.cpp keeps process-global state, so its backend must be initialised
-/// exactly once. Later calls reuse the handle stored here.
 /// Serialises generation. Each call loads its own copy of the model, so two
 /// concurrent requests would hold two full copies in memory at once.
 static GENERATION_LOCK: Mutex<()> = Mutex::new(());
 
+/// llama.cpp keeps process-global state, so its backend must be initialised
+/// exactly once. Later calls reuse the handle stored here.
 static LLAMA_BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
 static LLAMA_BACKEND_INIT_LOCK: Mutex<()> = Mutex::new(());
 
