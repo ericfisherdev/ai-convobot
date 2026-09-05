@@ -921,6 +921,13 @@ impl Database {
         Ok(row)
     }
 
+    pub fn get_companion_id() -> Result<i32> {
+        let con = Connection::open("companion_database.db")?;
+        let mut stmt = con.prepare("SELECT id FROM companion LIMIT 1")?;
+        let row = stmt.query_row([], |row| row.get(0))?;
+        Ok(row)
+    }
+
     pub fn get_companion_card_data() -> Result<CharacterCard> {
         let con = Connection::open("companion_database.db")?;
         let mut stmt = con.prepare(

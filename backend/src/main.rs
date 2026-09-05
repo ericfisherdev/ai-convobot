@@ -572,7 +572,14 @@ async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
     let prompt_message = received.into_inner().prompt.clone();
     let start_time = std::time::Instant::now();
 
-    let companion_id = 1; // Default companion ID
+    let companion_id = match Database::get_companion_id() {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Failed to get companion id: {}", e);
+            return HttpResponse::InternalServerError()
+                .body("Error while getting companion data, check logs for more information");
+        }
+    };
     let interaction_prompt = preprocess_user_message(&prompt_message, companion_id);
 
     // Get current attitude for comparison (before processing)
@@ -615,7 +622,7 @@ async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
         };
 
         // Generate response with interaction context
-        match prompt(enhanced_prompt) {
+        match prompt(enhanced_prompt, companion_id) {
             Ok(v) => return HttpResponse::Ok().body(v),
             Err(e) => {
                 println!("Failed to generate prompt with interaction context: {}", e);
@@ -634,7 +641,7 @@ async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
                 .body("Error while adding message to database, check logs for more information");
         }
     };
-    match prompt(&prompt_message) {
+    match prompt(&prompt_message, companion_id) {
         Ok(v) => {
             // Check for attitude changes after processing
             if let Some(prev_attitude) = previous_attitude {
@@ -685,7 +692,15 @@ async fn regenerate_prompt() -> HttpResponse {
                 .body("Error while getting latest message, check logs for more information");
         }
     };
-    match prompt(&prompt_msg) {
+    let companion_id = match Database::get_companion_id() {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Failed to get companion id: {}", e);
+            return HttpResponse::InternalServerError()
+                .body("Error while getting companion data, check logs for more information");
+        }
+    };
+    match prompt(&prompt_msg, companion_id) {
         Ok(v) => HttpResponse::Ok().body(v),
         Err(e) => {
             println!("Failed to re-generate prompt: {}", e);
@@ -1184,7 +1199,14 @@ async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpR
     // session and cross-wire the two streams.
     let session_id = format!("stream-{}", Uuid::new_v4());
 
-    let companion_id = 1; // Default companion ID
+    let companion_id = match Database::get_companion_id() {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Failed to get companion id: {}", e);
+            return HttpResponse::InternalServerError()
+                .body("Error while getting companion data, check logs for more information");
+        }
+    };
     let interaction_prompt = preprocess_user_message(&user_message, companion_id);
 
     // The generator reads recent messages back out of the database, so the
@@ -1206,7 +1228,7 @@ async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpR
     let generation_prompt = interaction_prompt.unwrap_or(user_message);
     std::thread::spawn(move || {
         let mut token_count = 0usize;
-        let result = prompt_streaming(&generation_prompt, &mut |token| {
+        let result = prompt_streaming(&generation_prompt, companion_id, &mut |token| {
             token_count += 1;
             // A send failure means the client hung up; generation still runs to
             // completion so the reply is persisted.

@@ -109,13 +109,126 @@ fn apply_gguf_chat_template(
         .map_err(|e| format!("failed to apply chat template: {}", e))
 }
 
+/// Builds the system-portion components of the prompt for the given
+/// template, inserting `attitude_context` (when non-empty) as its own
+/// component before the template's instruct terminator, so it always ends up
+/// inside the system block rather than after the conversation history.
+fn build_base_components(
+    template: &PromptTemplate,
+    user: &UserView,
+    companion: &CompanionView,
+    rp: &str,
+    tuned_dialogue: &str,
+    attitude_context: &str,
+) -> Vec<String> {
+    if *template == PromptTemplate::Default || *template == PromptTemplate::Auto {
+        let mut components = vec![
+            format!(
+                "Text transcript of a conversation between {} and {}. {}\n",
+                user.name, companion.name, rp
+            ),
+            format!(
+                "{}'s Persona: {}\n",
+                user.name,
+                user.persona
+                    .replace("{{char}}", &companion.name)
+                    .replace("{{user}}", &user.name)
+            ),
+        ];
+        if !attitude_context.is_empty() {
+            components.push(attitude_context.to_string());
+        }
+        components.push(format!(
+            "{}'s Persona: {}\n<START>\n",
+            companion.name,
+            companion
+                .persona
+                .replace("{{char}}", &companion.name)
+                .replace("{{user}}", &user.name)
+        ));
+        components.push(format!(
+            "{}\n<START>\n",
+            companion
+                .example_dialogue
+                .replace("{{char}}", &companion.name)
+                .replace("{{user}}", &user.name)
+        ));
+        components.push(format!("{}\n<START>\n", tuned_dialogue));
+        components
+    } else if *template == PromptTemplate::Llama2 {
+        let mut components = vec![format!(
+            "<<SYS>>\nYou are {}, {}\n",
+            companion.name,
+            companion
+                .persona
+                .replace("{{char}}", &companion.name)
+                .replace("{{user}}", &user.name)
+        )];
+        if !attitude_context.is_empty() {
+            components.push(attitude_context.to_string());
+        }
+        components.push(format!(
+            "you are talking with {}, {} is {}\n{}\n[INST]\n",
+            user.name,
+            user.name,
+            user.persona
+                .replace("{{char}}", &companion.name)
+                .replace("{{user}}", &user.name),
+            rp
+        ));
+        components.push(format!(
+            "{}\n",
+            companion
+                .example_dialogue
+                .replace("{{char}}", &companion.name)
+                .replace("{{user}}", &user.name)
+        ));
+        components.push(format!("{}\n[/INST]\n", tuned_dialogue));
+        components
+    } else {
+        let mut components = vec![
+            format!(
+                "<s>[INST]Text transcript of a conversation between {} and {}. {}\n",
+                user.name, companion.name, rp
+            ),
+            format!(
+                "{}'s Persona: {}\n",
+                user.name,
+                user.persona
+                    .replace("{{char}}", &companion.name)
+                    .replace("{{user}}", &user.name)
+            ),
+        ];
+        if !attitude_context.is_empty() {
+            components.push(attitude_context.to_string());
+        }
+        components.push(format!(
+            "{}'s Persona: {}[/INST]\n<s>[INST]\n",
+            companion.name,
+            companion
+                .persona
+                .replace("{{char}}", &companion.name)
+                .replace("{{user}}", &user.name)
+        ));
+        components.push(format!(
+            "{}[/INST]\n<s>[INST]\n",
+            companion
+                .example_dialogue
+                .replace("{{char}}", &companion.name)
+                .replace("{{user}}", &user.name)
+        ));
+        components.push(format!("{}[/INST]\n", tuned_dialogue));
+        components
+    }
+}
+
 /// Generates a reply and returns it once generation finishes.
 ///
 /// # Errors
 /// Propagates model load, tokenization and decode failures as
 /// `std::io::ErrorKind::Other`.
-pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
-    generate(prompt, &mut |_token| {})
+pub fn prompt(prompt: &str, companion_id: i32) -> Result<String, std::io::Error> {
+    generate(prompt, companion_id, &mut |_token| {})
 }
 
 /// Generates a reply, invoking `on_token` with each token as it is produced.
@@ -127,12 +240,17 @@ pub fn prompt(prompt: &str) -> Result<String, std::io::Error> {
 /// `std::io::ErrorKind::Other`.
 pub fn prompt_streaming(
     prompt: &str,
+    companion_id: i32,
     on_token: &mut dyn FnMut(&str),
 ) -> Result<String, std::io::Error> {
-    generate(prompt, on_token)
+    generate(prompt, companion_id, on_token)
 }
 
-fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std::io::Error> {
+fn generate(
+    prompt: &str,
+    companion_id: i32,
+    on_token: &mut dyn FnMut(&str),
+) -> Result<String, std::io::Error> {
     let _generation_guard = GENERATION_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -259,100 +377,58 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
             );
         };
     }
+    // Load and integrate attitude context. This must happen before
+    // base_components is built, so the attitude block lands inside the
+    // system portion of the prompt rather than after the conversation
+    // history (and the instruct terminator it ends with).
+    let attitude_formatter = AttitudeFormatter::new();
+    let attitudes = match Database::get_all_companion_attitudes(companion_id) {
+        Ok(attitudes) => attitudes,
+        Err(e) => {
+            eprintln!("Warning: Could not load attitudes: {}", e);
+            Vec::new()
+        }
+    };
+
+    let third_parties = match Database::get_all_third_party_individuals() {
+        Ok(parties) => parties,
+        Err(e) => {
+            eprintln!("Warning: Could not load third parties: {}", e);
+            Vec::new()
+        }
+    };
+
+    // Add attitude context to prompt if attitudes exist
+    let attitude_context = if !attitudes.is_empty() {
+        let context =
+            attitude_formatter.format_attitude_context(&attitudes, &third_parties, &user.name);
+        if !context.is_empty() {
+            format!("\n{}\n", context)
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    if !attitude_context.is_empty() {
+        println!(
+            "✓ Attitude context integrated: {} characters",
+            attitude_context.len()
+        );
+    }
+
     // Build base prompt components for caching optimization
     // Auto renders through the model's own chat template, so its system content
     // must be plain prose; the Mistral branch below would embed [INST] markers.
-    let base_components = if config.prompt_template == PromptTemplate::Default
-        || config.prompt_template == PromptTemplate::Auto
-    {
-        vec![
-            format!(
-                "Text transcript of a conversation between {} and {}. {}\n",
-                user.name, companion.name, rp
-            ),
-            format!(
-                "{}'s Persona: {}\n",
-                user.name,
-                user.persona
-                    .replace("{{char}}", &companion.name)
-                    .replace("{{user}}", &user.name)
-            ),
-            format!(
-                "{}'s Persona: {}\n<START>\n",
-                companion.name,
-                companion
-                    .persona
-                    .replace("{{char}}", &companion.name)
-                    .replace("{{user}}", &user.name)
-            ),
-            format!(
-                "{}\n<START>\n",
-                companion
-                    .example_dialogue
-                    .replace("{{char}}", &companion.name)
-                    .replace("{{user}}", &user.name)
-            ),
-            format!("{}\n<START>\n", &tuned_dialogue),
-        ]
-    } else if config.prompt_template == PromptTemplate::Llama2 {
-        vec![
-            format!(
-                "<<SYS>>\nYou are {}, {}\n",
-                companion.name,
-                companion
-                    .persona
-                    .replace("{{char}}", &companion.name)
-                    .replace("{{user}}", &user.name)
-            ),
-            format!(
-                "you are talking with {}, {} is {}\n{}\n[INST]\n",
-                user.name,
-                user.name,
-                user.persona
-                    .replace("{{char}}", &companion.name)
-                    .replace("{{user}}", &user.name),
-                rp
-            ),
-            format!(
-                "{}\n",
-                companion
-                    .example_dialogue
-                    .replace("{{char}}", &companion.name)
-                    .replace("{{user}}", &user.name)
-            ),
-            format!("{}\n[/INST]\n", &tuned_dialogue),
-        ]
-    } else {
-        vec![
-            format!(
-                "<s>[INST]Text transcript of a conversation between {} and {}. {}\n",
-                user.name, companion.name, rp
-            ),
-            format!(
-                "{}'s Persona: {}\n",
-                user.name,
-                user.persona
-                    .replace("{{char}}", &companion.name)
-                    .replace("{{user}}", &user.name)
-            ),
-            format!(
-                "{}'s Persona: {}[/INST]\n<s>[INST]\n",
-                companion.name,
-                companion
-                    .persona
-                    .replace("{{char}}", &companion.name)
-                    .replace("{{user}}", &user.name)
-            ),
-            format!(
-                "{}[/INST]\n<s>[INST]\n",
-                companion
-                    .example_dialogue
-                    .replace("{{char}}", &companion.name)
-                    .replace("{{user}}", &user.name)
-            ),
-            format!("{}[/INST]\n", &tuned_dialogue),
-        ]
-    };
+    let base_components = build_base_components(
+        &config.prompt_template,
+        &user,
+        &companion,
+        rp,
+        &tuned_dialogue,
+        &attitude_context,
+    );
 
     // Use cache optimization for base prompt construction
     let (optimized_base_prompt, cache_hit) =
@@ -460,49 +536,12 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
         }
     }
 
-    // Load and integrate attitude context
-    let attitude_formatter = AttitudeFormatter::new();
-    let attitudes = match Database::get_all_companion_attitudes(1) {
-        Ok(attitudes) => attitudes,
-        Err(e) => {
-            eprintln!("Warning: Could not load attitudes: {}", e);
-            Vec::new()
-        }
-    };
-
-    let third_parties = match Database::get_all_third_party_individuals() {
-        Ok(parties) => parties,
-        Err(e) => {
-            eprintln!("Warning: Could not load third parties: {}", e);
-            Vec::new()
-        }
-    };
-
-    // Add attitude context to prompt if attitudes exist
-    let attitude_context = if !attitudes.is_empty() {
-        let context =
-            attitude_formatter.format_attitude_context(&attitudes, &third_parties, &user.name);
-        if !context.is_empty() {
-            format!("\n{}\n", context)
-        } else {
-            String::new()
-        }
-    } else {
-        String::new()
-    };
-
-    // Insert attitude context before conversation history
-    if !attitude_context.is_empty() {
-        base_prompt += &attitude_context;
-        println!(
-            "✓ Attitude context integrated: {} characters",
-            attitude_context.len()
-        );
-    }
-
-    // Calculate token usage for memory management
-    let system_tokens = ContextManager::estimate_tokens(&base_prompt);
+    // Calculate token usage for memory management. base_prompt already
+    // contains the attitude text (it was folded into base_components above),
+    // so it is subtracted back out here to avoid double counting it.
     let attitude_tokens = ContextManager::estimate_tokens(&attitude_context);
+    let system_tokens =
+        ContextManager::estimate_tokens(&base_prompt).saturating_sub(attitude_tokens);
     let message_tokens = managed_messages
         .iter()
         .map(|msg| ContextManager::estimate_tokens(&msg.content))
@@ -772,4 +811,122 @@ fn generate(prompt: &str, on_token: &mut dyn FnMut(&str)) -> Result<String, std:
     }
 
     Ok(companion_text.trim_start().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ATTITUDE_MARKER: &str = "MARKER: current relationship context";
+
+    fn user() -> UserView {
+        UserView {
+            name: "TestUser".to_string(),
+            persona: "a curious tester".to_string(),
+        }
+    }
+
+    fn companion() -> CompanionView {
+        CompanionView {
+            name: "TestCompanion".to_string(),
+            persona: "a helpful companion".to_string(),
+            example_dialogue: "TestUser: Hi\nTestCompanion: Hello!".to_string(),
+            first_message: "Hello!".to_string(),
+            long_term_mem: 0,
+            short_term_mem: 0,
+            roleplay: false,
+            dialogue_tuning: false,
+            avatar_path: String::new(),
+        }
+    }
+
+    fn marker_index(joined: &str) -> usize {
+        joined
+            .find(ATTITUDE_MARKER)
+            .expect("attitude marker missing from rendered prompt")
+    }
+
+    #[test]
+    fn default_template_places_attitude_before_companion_start() {
+        let components = build_base_components(
+            &PromptTemplate::Default,
+            &user(),
+            &companion(),
+            "",
+            "",
+            ATTITUDE_MARKER,
+        );
+        let joined = components.join("");
+        let start_index = joined
+            .find("<START>")
+            .expect("no <START> marker in rendered prompt");
+        assert!(marker_index(&joined) < start_index);
+    }
+
+    #[test]
+    fn auto_template_places_attitude_before_companion_start() {
+        let components = build_base_components(
+            &PromptTemplate::Auto,
+            &user(),
+            &companion(),
+            "",
+            "",
+            ATTITUDE_MARKER,
+        );
+        let joined = components.join("");
+        let start_index = joined
+            .find("<START>")
+            .expect("no <START> marker in rendered prompt");
+        assert!(marker_index(&joined) < start_index);
+    }
+
+    #[test]
+    fn llama2_template_places_attitude_before_first_inst() {
+        let components = build_base_components(
+            &PromptTemplate::Llama2,
+            &user(),
+            &companion(),
+            "",
+            "",
+            ATTITUDE_MARKER,
+        );
+        let joined = components.join("");
+        let inst_index = joined
+            .find("[/INST]")
+            .expect("no [/INST] marker in rendered prompt");
+        assert!(marker_index(&joined) < inst_index);
+    }
+
+    #[test]
+    fn mistral_template_places_attitude_before_first_inst() {
+        let components = build_base_components(
+            &PromptTemplate::Mistral,
+            &user(),
+            &companion(),
+            "",
+            "",
+            ATTITUDE_MARKER,
+        );
+        let joined = components.join("");
+        let inst_index = joined
+            .find("[/INST]")
+            .expect("no [/INST] marker in rendered prompt");
+        assert!(marker_index(&joined) < inst_index);
+    }
+
+    #[test]
+    fn empty_attitude_context_adds_no_component() {
+        let with_attitude = build_base_components(
+            &PromptTemplate::Default,
+            &user(),
+            &companion(),
+            "",
+            "",
+            ATTITUDE_MARKER,
+        );
+        let without_attitude =
+            build_base_components(&PromptTemplate::Default, &user(), &companion(), "", "", "");
+        assert_eq!(with_attitude.len(), without_attitude.len() + 1);
+        assert!(!without_attitude.join("").contains(ATTITUDE_MARKER));
+    }
 }
