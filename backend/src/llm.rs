@@ -421,7 +421,10 @@ fn generate(
     // `attitude_context` keeps the block inside the same system portion and
     // counted by the same `attitude_tokens` figure below.
     let mut attitude_context = attitude_context;
-    match Database::get_priority_attitude_memories(companion_id, 5) {
+    // Filtered to user rows in the query: limiting across every target type
+    // first would let third-party rows take all five slots and render an empty
+    // block even with qualifying user memories just below the cutoff.
+    match Database::get_priority_attitude_memories_for_target(companion_id, "user", 5) {
         Ok(mut memories) => {
             // Trim from the tail (lowest priority first) until the whole
             // attitude block fits its budget, so memories can never starve

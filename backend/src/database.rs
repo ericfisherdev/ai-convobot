@@ -2271,6 +2271,11 @@ impl Database {
 
     /// Drops all but the `keep` highest-priority memories for one companion.
     ///
+    /// Ties on `priority_score` break on `id`, not `created_at`: the latter
+    /// holds `get_current_date()` strings ("Friday 05.09.2026 14:30"), which
+    /// sort by weekday name rather than chronologically. The rowid reflects
+    /// insert order, so it is the real recency tie-break.
+    ///
     /// Returns the number of rows deleted.
     pub fn prune_attitude_memories(companion_id: i32, keep: usize) -> Result<usize> {
         let con = Connection::open("companion_database.db")?;
@@ -2280,28 +2285,51 @@ impl Database {
                AND id NOT IN (
                    SELECT id FROM attitude_memories
                    WHERE companion_id = ?1
-                   ORDER BY priority_score DESC, created_at DESC
+                   ORDER BY priority_score DESC, id DESC
                    LIMIT ?2
                )",
             params![companion_id, keep],
         )
     }
 
+    /// Highest-priority memories for one companion, across every target type.
     pub fn get_priority_attitude_memories(
         companion_id: i32,
         limit: usize,
     ) -> Result<Vec<AttitudeMemory>> {
+        Self::query_priority_attitude_memories(companion_id, None, limit)
+    }
+
+    /// Highest-priority memories for one companion and one target type.
+    ///
+    /// The filter belongs in the query rather than after it: limiting across
+    /// every target type first lets third-party rows occupy all the slots and
+    /// starve out user memories that would have qualified.
+    pub fn get_priority_attitude_memories_for_target(
+        companion_id: i32,
+        target_type: &str,
+        limit: usize,
+    ) -> Result<Vec<AttitudeMemory>> {
+        Self::query_priority_attitude_memories(companion_id, Some(target_type), limit)
+    }
+
+    fn query_priority_attitude_memories(
+        companion_id: i32,
+        target_type: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AttitudeMemory>> {
         let con = Connection::open("companion_database.db")?;
-        let mut stmt = con.prepare(
-            "SELECT id, companion_id, target_id, target_type, memory_type, description,
+        let base = "SELECT id, companion_id, target_id, target_type, memory_type, description,
                     priority_score, attitude_delta_json, impact_score, message_context, created_at
              FROM attitude_memories
-             WHERE companion_id = ?
-             ORDER BY priority_score DESC
-             LIMIT ?",
-        )?;
+             WHERE companion_id = ?";
+        let query = match target_type {
+            Some(_) => format!("{} AND target_type = ?\n             ORDER BY priority_score DESC, id DESC\n             LIMIT ?", base),
+            None => format!("{}\n             ORDER BY priority_score DESC, id DESC\n             LIMIT ?", base),
+        };
+        let mut stmt = con.prepare(&query)?;
 
-        let memories = stmt.query_map(params![companion_id, limit], |row| {
+        let row_to_memory = |row: &rusqlite::Row| {
             Ok(AttitudeMemory {
                 id: row.get(0)?,
                 companion_id: row.get(1)?,
@@ -2315,7 +2343,14 @@ impl Database {
                 message_context: row.get(9)?,
                 created_at: row.get(10)?,
             })
-        })?;
+        };
+
+        let memories = match target_type {
+            Some(target_type) => {
+                stmt.query_map(params![companion_id, target_type, limit], row_to_memory)?
+            }
+            None => stmt.query_map(params![companion_id, limit], row_to_memory)?,
+        };
 
         let mut result = Vec::new();
         for memory in memories {
