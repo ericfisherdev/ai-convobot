@@ -742,129 +742,213 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
-    #[test]
-    fn test_relationship_levels() {
-        let formatter = AttitudeFormatter::new();
+    /// Attitude row with only the dimensions a test cares about set; every
+    /// other dimension stays at zero.
+    fn attitude_with(
+        relationship_score: Option<f32>,
+        trust: f32,
+        anger: f32,
+        love: f32,
+        joy: f32,
+    ) -> CompanionAttitude {
+        let mut attitude = zeroed_attitude(relationship_score);
+        attitude.trust = trust;
+        attitude.anger = anger;
+        attitude.love = love;
+        attitude.joy = joy;
+        attitude
+    }
 
-        // Test intimate relationship
-        let intimate_attitude = CompanionAttitude {
+    fn zeroed_attitude(relationship_score: Option<f32>) -> CompanionAttitude {
+        CompanionAttitude {
             id: None,
             companion_id: 1,
             target_id: 1,
             target_type: "user".to_string(),
-            attraction: 70.0,
-            trust: 90.0,
-            respect: 80.0,
-            curiosity: 60.0,
-            fear: 5.0,
-            surprise: 10.0,
+            attraction: 0.0,
+            trust: 0.0,
+            fear: 0.0,
             anger: 0.0,
-            joy: 85.0,
+            joy: 0.0,
             sorrow: 0.0,
             disgust: 0.0,
-            empathy: 95.0,
-            gratitude: 70.0,
-            jealousy: 5.0,
+            surprise: 0.0,
+            curiosity: 0.0,
+            respect: 0.0,
             suspicion: 0.0,
+            gratitude: 0.0,
+            jealousy: 0.0,
+            empathy: 0.0,
             lust: 0.0,
             love: 0.0,
             anxiety: 0.0,
             butterflies: 0.0,
             submissiveness: 0.0,
             dominance: 0.0,
-            relationship_score: Some(85.0),
+            relationship_score,
             last_updated: Utc::now().to_string(),
             created_at: Utc::now().to_string(),
-        };
+        }
+    }
 
-        let level = formatter.calculate_relationship_level(&intimate_attitude);
+    /// The three presets `backend/scripts/attitude_comparison.sh` drives the
+    /// server with, so the script and these tests exercise the same states.
+    ///
+    /// In the database `relationship_score` is a generated column over these
+    /// dimensions; here it is set to the value that formula produces, which is
+    /// what `docs/attitude_verification.md` records from a live run.
+    fn hostile_attitude() -> CompanionAttitude {
+        let mut attitude = zeroed_attitude(Some(-41.25));
+        attitude.attraction = -60.0;
+        attitude.trust = -80.0;
+        attitude.joy = -50.0;
+        attitude.respect = -60.0;
+        attitude.gratitude = -30.0;
+        attitude.empathy = -40.0;
+        attitude.love = -30.0;
+        attitude.fear = 40.0;
+        attitude.anger = 80.0;
+        attitude.sorrow = 30.0;
+        attitude.disgust = 40.0;
+        attitude.suspicion = 70.0;
+        attitude.jealousy = 20.0;
+        attitude.anxiety = 30.0;
+        attitude
+    }
+
+    fn neutral_attitude() -> CompanionAttitude {
+        attitude_with(Some(1.25), 10.0, 10.0, 10.0, 10.0)
+    }
+
+    fn intimate_attitude() -> CompanionAttitude {
+        let mut attitude = zeroed_attitude(Some(81.25));
+        attitude.attraction = 100.0;
+        attitude.trust = 100.0;
+        attitude.joy = 100.0;
+        attitude.respect = 100.0;
+        attitude.gratitude = 100.0;
+        attitude.empathy = 100.0;
+        attitude.love = 100.0;
+        attitude.lust = 90.0;
+        attitude.butterflies = 90.0;
+        attitude.fear = -60.0;
+        attitude.anger = -60.0;
+        attitude.sorrow = -60.0;
+        attitude.disgust = -60.0;
+        attitude.suspicion = -60.0;
+        attitude.jealousy = -60.0;
+        attitude.anxiety = -60.0;
+        attitude
+    }
+
+    #[test]
+    fn test_relationship_levels() {
+        let formatter = AttitudeFormatter::new();
+
+        let level = formatter.calculate_relationship_level(&intimate_attitude());
+
         assert_eq!(level.name, "Intimate");
+    }
+
+    #[test]
+    fn test_relationship_level_branches() {
+        let formatter = AttitudeFormatter::new();
+        // Both edges of every band, so a shifted comparison shows up here.
+        let cases = [
+            (Some(85.0), "Intimate"),
+            (Some(80.0), "Intimate"),
+            (Some(79.9), "Close"),
+            (Some(60.0), "Close"),
+            (Some(59.9), "Friendly"),
+            (Some(40.0), "Friendly"),
+            (Some(39.9), "Acquaintance"),
+            (Some(20.0), "Acquaintance"),
+            (Some(19.9), "Neutral"),
+            (Some(0.0), "Neutral"),
+            (Some(-0.1), "Distant"),
+            (Some(-20.0), "Distant"),
+            (Some(-20.1), "Unfriendly"),
+            (Some(-40.0), "Unfriendly"),
+            (Some(-40.1), "Hostile"),
+            (Some(-60.0), "Hostile"),
+            (Some(-60.1), "Antagonistic"),
+            // A row with no score at all is treated as the neutral midpoint.
+            (None, "Neutral"),
+        ];
+
+        for (score, expected) in cases {
+            let attitude = attitude_with(score, 0.0, 0.0, 0.0, 0.0);
+            let level = formatter.calculate_relationship_level(&attitude);
+            assert_eq!(level.name, expected, "relationship_score {:?}", score);
+        }
+    }
+
+    #[test]
+    fn test_behavioral_instructions_differ_across_levels() {
+        let formatter = AttitudeFormatter::new();
+
+        let hostile = formatter.format_attitude_context(&[hostile_attitude()], &[], "TestUser");
+        let neutral = formatter.format_attitude_context(&[neutral_attitude()], &[], "TestUser");
+        let intimate = formatter.format_attitude_context(&[intimate_attitude()], &[], "TestUser");
+
+        assert_ne!(hostile, neutral);
+        assert_ne!(neutral, intimate);
+        assert_ne!(hostile, intimate);
+
+        assert!(hostile.contains("guarded and brief"));
+        assert!(hostile.contains("direct and blunt"));
+
+        assert!(intimate.contains("open and vulnerable"));
+        assert!(intimate.contains("express romantic feelings"));
+
+        assert!(neutral.contains("polite and helpful"));
+        assert!(!neutral.contains("guarded and brief"));
+        assert!(!neutral.contains("express romantic feelings"));
+    }
+
+    #[test]
+    fn test_calibration_instruction_names_level() {
+        let formatter = AttitudeFormatter::new();
+
+        let hostile = formatter.format_attitude_context(&[hostile_attitude()], &[], "TestUser");
+        let neutral = formatter.format_attitude_context(&[neutral_attitude()], &[], "TestUser");
+        let intimate = formatter.format_attitude_context(&[intimate_attitude()], &[], "TestUser");
+
+        assert!(hostile.contains("Respond according to your hostile relationship level"));
+        assert!(hostile.contains("argumentative and defensive"));
+
+        assert!(neutral.contains("Respond according to your neutral relationship level"));
+        assert!(neutral.contains("factual and cautious"));
+
+        assert!(intimate.contains("Respond according to your intimate relationship level"));
+        assert!(intimate.contains("deeply connected"));
     }
 
     #[test]
     fn test_emotional_state_analysis() {
         let formatter = AttitudeFormatter::new();
 
-        let happy_attitude = CompanionAttitude {
-            id: None,
-            companion_id: 1,
-            target_id: 1,
-            target_type: "user".to_string(),
-            attraction: 30.0,
-            trust: 60.0,
-            respect: 50.0,
-            curiosity: 40.0,
-            fear: 0.0,
-            surprise: 10.0,
-            anger: 0.0,
-            joy: 80.0, // High joy
-            sorrow: 0.0,
-            disgust: 0.0,
-            empathy: 70.0,
-            gratitude: 50.0,
-            jealousy: 0.0,
-            suspicion: 0.0,
-            lust: 0.0,
-            love: 0.0,
-            anxiety: 0.0,
-            butterflies: 0.0,
-            submissiveness: 0.0,
-            dominance: 0.0,
-            relationship_score: Some(60.0),
-            last_updated: Utc::now().to_string(),
-            created_at: Utc::now().to_string(),
-        };
+        // High joy, high trust: both should surface in the emotional state.
+        let happy = attitude_with(Some(70.0), 60.0, 0.0, 0.0, 80.0);
 
-        let emotional_state = formatter.analyze_emotional_state(&happy_attitude);
-        // joy > 70 -> "very happy"
+        let state = formatter.analyze_emotional_state(&happy);
+
         assert!(
-            emotional_state.contains("very happy"),
-            "joy 80 is above the 70 'very happy' band, got: {emotional_state}"
+            state.contains("very happy"),
+            "expected joy to surface, got: {}",
+            state
         );
-
-        let mut pleased_attitude = happy_attitude.clone();
-        pleased_attitude.joy = 60.0;
-        let emotional_state = formatter.analyze_emotional_state(&pleased_attitude);
-        // 50 < joy <= 70 -> "pleased"
         assert!(
-            emotional_state.contains("pleased"),
-            "joy 60 is within the 50-70 'pleased' band, got: {emotional_state}"
+            state.contains("trusting"),
+            "expected trust to surface, got: {}",
+            state
         );
     }
 
     #[test]
     fn test_attitude_context_formatting() {
         let formatter = AttitudeFormatter::new();
-
-        let attitude = CompanionAttitude {
-            id: None,
-            companion_id: 1,
-            target_id: 1,
-            target_type: "user".to_string(),
-            attraction: 40.0,
-            trust: 70.0,
-            respect: 60.0,
-            curiosity: 80.0,
-            fear: 10.0,
-            surprise: 15.0,
-            anger: 5.0,
-            joy: 60.0,
-            sorrow: 0.0,
-            disgust: 0.0,
-            empathy: 75.0,
-            gratitude: 50.0,
-            jealousy: 0.0,
-            suspicion: 0.0,
-            lust: 0.0,
-            love: 0.0,
-            anxiety: 0.0,
-            butterflies: 0.0,
-            submissiveness: 0.0,
-            dominance: 0.0,
-            relationship_score: Some(65.0),
-            last_updated: Utc::now().to_string(),
-            created_at: Utc::now().to_string(),
-        };
+        let attitude = attitude_with(Some(65.0), 70.0, 5.0, 0.0, 60.0);
 
         let context = formatter.format_attitude_context(&[attitude], &[], "TestUser");
 

@@ -1,4 +1,5 @@
 use chrono::{DateTime, Local};
+use serde::Serialize;
 use std::io::Write;
 
 use crate::attitude_formatter::AttitudeFormatter;
@@ -246,6 +247,305 @@ pub fn prompt_streaming(
     generate(prompt, companion_id, on_token)
 }
 
+/// Whether each turn should print the full attitude block it injected.
+///
+/// Enabled with `AI_COMPANION_ATTITUDE_DEBUG=1`. Off by default, so normal
+/// console output is unchanged.
+fn attitude_debug_enabled() -> bool {
+    std::env::var("AI_COMPANION_ATTITUDE_DEBUG")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+/// Seed for multinomial sampling.
+///
+/// `AI_COMPANION_SAMPLER_SEED` pins it so two runs over the same prompt are
+/// comparable (the rest of the sampler chain is deterministic given the same
+/// logits); unset, each generation is seeded randomly as before.
+fn sampler_seed() -> u32 {
+    std::env::var("AI_COMPANION_SAMPLER_SEED")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or_else(rand::random::<u32>)
+}
+
+/// Everything a prompt is made of, before the model is involved.
+///
+/// Returned by `assemble_prompt` so the exact text a turn would send — the
+/// attitude block in particular — can be inspected without running inference.
+#[derive(Serialize)]
+pub struct AssembledPrompt {
+    /// The system portion plus, for every template but `Auto`, the conversation
+    /// history spliced into it.
+    pub system_prompt: String,
+    /// Role-tagged history, used only by the `Auto` template.
+    pub chat_history: Vec<(bool, String)>,
+    /// The attitude block that was folded into `system_prompt`.
+    pub attitude_context: String,
+    /// The history after `ContextManager` trimming.
+    pub managed_messages: Vec<Message>,
+}
+
+/// Builds the prompt for one turn without loading a model.
+///
+/// This is the whole of `generate`'s string assembly: `generate` calls it and
+/// consumes the result, and `GET /api/debug/prompt` calls it to show what would
+/// be sent. `user_message` is what the turn's long-term memory recall is keyed
+/// on, so an inspection with an empty message simply recalls nothing.
+///
+/// # Errors
+/// Propagates config, user and companion load failures as
+/// `std::io::ErrorKind::Other`.
+pub fn assemble_prompt(
+    user_message: &str,
+    companion_id: i32,
+    long_term_memory: &LongTermMem,
+) -> Result<AssembledPrompt, std::io::Error> {
+    let config: ConfigView = match Database::get_config() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("Error while getting config: {}", e);
+            return Err(std::io::Error::other("Error while getting config"));
+        }
+    };
+    let user: UserView = match Database::get_user_data() {
+        Ok(user) => user,
+        Err(e) => {
+            eprintln!("Error while getting user data: {}", e);
+            return Err(std::io::Error::other("Error while getting user data"));
+        }
+    };
+    let companion: CompanionView = match Database::get_companion_data() {
+        Ok(companion) => companion,
+        Err(e) => {
+            eprintln!("Error while getting companion data: {}", e);
+            return Err(std::io::Error::other("Error while getting companion data"));
+        }
+    };
+    let mut base_prompt: String;
+    let mut rp: &str = "";
+    let mut tuned_dialogue: String = String::from("");
+    if companion.roleplay {
+        rp = "gestures and other non-verbal actions are written between asterisks (for example, *waves hello* or *moves closer*)";
+    }
+    if companion.dialogue_tuning {
+        if let Ok(dialogue) = DialogueTuning::get_random_dialogue() {
+            tuned_dialogue = format!(
+                "{}: {}\n{}: {}",
+                user.name, dialogue.user_msg, companion.name, dialogue.ai_msg
+            );
+        };
+    }
+    // Initialize context manager for intelligent memory management. Built
+    // before the attitude block because the memory block below is trimmed
+    // against its attitude token budget.
+    let context_manager = ContextManager::new(config.clone());
+
+    // Load and integrate attitude context. This must happen before
+    // base_components is built, so the attitude block lands inside the
+    // system portion of the prompt rather than after the conversation
+    // history (and the instruct terminator it ends with).
+    let attitude_formatter = AttitudeFormatter::new();
+    let attitudes = match Database::get_all_companion_attitudes(companion_id) {
+        Ok(attitudes) => attitudes,
+        Err(e) => {
+            eprintln!("Warning: Could not load attitudes: {}", e);
+            Vec::new()
+        }
+    };
+
+    let third_parties = match Database::get_all_third_party_individuals() {
+        Ok(parties) => parties,
+        Err(e) => {
+            eprintln!("Warning: Could not load third parties: {}", e);
+            Vec::new()
+        }
+    };
+
+    // Add attitude context to prompt if attitudes exist
+    let attitude_context = if !attitudes.is_empty() {
+        let context =
+            attitude_formatter.format_attitude_context(&attitudes, &third_parties, &user.name);
+        if !context.is_empty() {
+            format!("\n{}\n", context)
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    // Append the moments that shaped those feelings, so the companion can say
+    // why it feels the way it does and not only how strongly. Appending to
+    // `attitude_context` keeps the block inside the same system portion and
+    // counted by the same `attitude_tokens` figure below.
+    let mut attitude_context = attitude_context;
+    // Filtered to user rows in the query: limiting across every target type
+    // first would let third-party rows take all five slots and render an empty
+    // block even with qualifying user memories just below the cutoff.
+    match Database::get_priority_attitude_memories_for_target(companion_id, "user", 5) {
+        Ok(mut memories) => {
+            // Trim from the tail (lowest priority first) until the whole
+            // attitude block fits its budget, so memories can never starve
+            // message history.
+            while !memories.is_empty() {
+                let block = attitude_formatter.format_attitude_memories(&memories);
+                if block.is_empty() {
+                    break;
+                }
+                let candidate = format!("{}{}\n", attitude_context, block);
+                if ContextManager::estimate_tokens(&candidate)
+                    <= context_manager.attitude_token_budget
+                {
+                    attitude_context = candidate;
+                    break;
+                }
+                memories.pop();
+            }
+        }
+        Err(e) => eprintln!("Warning: Could not load attitude memories: {}", e),
+    }
+
+    if !attitude_context.is_empty() {
+        println!(
+            "✓ Attitude context integrated: {} characters",
+            attitude_context.len()
+        );
+    }
+
+    // Build base prompt components for caching optimization
+    // Auto renders through the model's own chat template, so its system content
+    // must be plain prose; the Mistral branch below would embed [INST] markers.
+    let base_components = build_base_components(
+        &config.prompt_template,
+        &user,
+        &companion,
+        rp,
+        &tuned_dialogue,
+        &attitude_context,
+    );
+
+    // Use cache optimization for base prompt construction
+    let (optimized_base_prompt, cache_hit) =
+        INFERENCE_OPTIMIZER.optimize_prompt_construction(&base_components, "", &[]);
+
+    base_prompt = optimized_base_prompt;
+
+    if cache_hit {
+        println!("✓ Cache hit for base prompt construction");
+    } else {
+        println!("✗ Cache miss - caching base prompt for future use");
+    }
+    if companion.long_term_mem > 0 {
+        let long_term_memory_entries: Vec<String> =
+            match long_term_memory.get_matches(user_message, companion.long_term_mem) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    eprintln!("Error while getting long term memory entries: {}", e);
+                    return Err(std::io::Error::other(
+                        "Error while getting long term memory entries",
+                    ));
+                }
+            };
+        for entry in long_term_memory_entries {
+            if config.prompt_template == PromptTemplate::Llama2 {
+                base_prompt += &format!("[INST]{}[/INST]\n", entry)
+                    .replace("{{char}}", &companion.name)
+                    .replace("{{user}}", &user.name);
+            } else if config.prompt_template == PromptTemplate::Mistral {
+                base_prompt += &format!("<s>[INST]{}[/INST]\n", entry)
+                    .replace("{{char}}", &companion.name)
+                    .replace("{{user}}", &user.name);
+            } else {
+                base_prompt += &entry
+                    .replace("{{char}}", &companion.name)
+                    .replace("{{user}}", &user.name);
+            }
+        }
+    }
+    let short_term_memory_entries: Vec<Message> = match Database::get_x_messages(
+        if companion.short_term_mem > 0 {
+            companion.short_term_mem
+        } else {
+            50
+        },
+        0,
+    ) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("Error while getting short term memory entries: {}", e);
+            return Err(std::io::Error::other(
+                "Error while getting short term memory entries",
+            ));
+        }
+    };
+
+    // Apply context management to optimize memory usage
+    let managed_messages = context_manager.manage_message_context(short_term_memory_entries);
+    let short_term_mem_len = managed_messages.len();
+    // Role-tagged history, used only by the Auto template. The string templates
+    // below keep splicing turns straight into base_prompt.
+    let mut chat_history: Vec<(bool, String)> = Vec::with_capacity(managed_messages.len());
+    for (message_counter, message) in (1..).zip(managed_messages.iter()) {
+        let prefix = if message.ai {
+            &companion.name
+        } else {
+            &user.name
+        };
+        let text = &message.content;
+        let mut formatted_message = format!("{}: {}\n", prefix, text);
+        let inject_time =
+            message_counter == short_term_mem_len && contains_time_question(&formatted_message);
+        if inject_time {
+            formatted_message = format!(
+                "\n* it's currently {} *\n{}",
+                get_current_date(),
+                formatted_message
+            );
+        }
+        if config.prompt_template == PromptTemplate::Auto {
+            // The chat template supplies the speaker framing, so the message
+            // carries its own text rather than a "Name: " prefix.
+            let mut content = text.clone();
+            if inject_time {
+                content = format!("* it's currently {} *\n{}", get_current_date(), content);
+            }
+            chat_history.push((message.ai, content));
+        } else if config.prompt_template == PromptTemplate::Llama2 {
+            if !message.ai {
+                base_prompt += &format!("[INST]{}", formatted_message);
+            } else {
+                base_prompt += &format!("{}[/INST]\n", formatted_message);
+            }
+        } else if config.prompt_template == PromptTemplate::Mistral {
+            if !message.ai {
+                base_prompt += &format!("<s>[INST]{}", formatted_message);
+            } else {
+                base_prompt += &format!("{}[/INST]\n", formatted_message);
+            }
+        } else {
+            base_prompt += &formatted_message;
+        }
+    }
+
+    if attitude_debug_enabled() && !attitude_context.is_empty() {
+        // `managed_messages` is the trimmed history, so its length is the turn
+        // index a console transcript can be lined up against.
+        println!(
+            "🧭 Attitude block (turn {}):\n{}",
+            managed_messages.len(),
+            attitude_context
+        );
+    }
+
+    Ok(AssembledPrompt {
+        system_prompt: base_prompt,
+        chat_history,
+        attitude_context,
+        managed_messages,
+    })
+}
+
 fn generate(
     prompt: &str,
     companion_id: i32,
@@ -363,211 +663,16 @@ fn generate(
         .unwrap_or(4); // Fallback to 4 cores if detection fails
 
     println!("🚀 Generating AI response with optimized session...");
-    let mut base_prompt: String;
-    let mut rp: &str = "";
-    let mut tuned_dialogue: String = String::from("");
-    if companion.roleplay {
-        rp = "gestures and other non-verbal actions are written between asterisks (for example, *waves hello* or *moves closer*)";
-    }
-    if companion.dialogue_tuning {
-        if let Ok(dialogue) = DialogueTuning::get_random_dialogue() {
-            tuned_dialogue = format!(
-                "{}: {}\n{}: {}",
-                user.name, dialogue.user_msg, companion.name, dialogue.ai_msg
-            );
-        };
-    }
-    // Initialize context manager for intelligent memory management. Built
-    // before the attitude block because the memory block below is trimmed
-    // against its attitude token budget.
+    let assembled = assemble_prompt(prompt, companion_id, &long_term_memory)?;
+    let AssembledPrompt {
+        system_prompt: base_prompt,
+        chat_history,
+        attitude_context,
+        managed_messages,
+    } = assembled;
+    // Rebuilt from the same config `assemble_prompt` read, so the budgets below
+    // match the ones the assembly was trimmed against.
     let context_manager = ContextManager::new(config.clone());
-
-    // Load and integrate attitude context. This must happen before
-    // base_components is built, so the attitude block lands inside the
-    // system portion of the prompt rather than after the conversation
-    // history (and the instruct terminator it ends with).
-    let attitude_formatter = AttitudeFormatter::new();
-    let attitudes = match Database::get_all_companion_attitudes(companion_id) {
-        Ok(attitudes) => attitudes,
-        Err(e) => {
-            eprintln!("Warning: Could not load attitudes: {}", e);
-            Vec::new()
-        }
-    };
-
-    let third_parties = match Database::get_all_third_party_individuals() {
-        Ok(parties) => parties,
-        Err(e) => {
-            eprintln!("Warning: Could not load third parties: {}", e);
-            Vec::new()
-        }
-    };
-
-    // Add attitude context to prompt if attitudes exist
-    let attitude_context = if !attitudes.is_empty() {
-        let context =
-            attitude_formatter.format_attitude_context(&attitudes, &third_parties, &user.name);
-        if !context.is_empty() {
-            format!("\n{}\n", context)
-        } else {
-            String::new()
-        }
-    } else {
-        String::new()
-    };
-
-    // Append the moments that shaped those feelings, so the companion can say
-    // why it feels the way it does and not only how strongly. Appending to
-    // `attitude_context` keeps the block inside the same system portion and
-    // counted by the same `attitude_tokens` figure below.
-    let mut attitude_context = attitude_context;
-    // Filtered to user rows in the query: limiting across every target type
-    // first would let third-party rows take all five slots and render an empty
-    // block even with qualifying user memories just below the cutoff.
-    match Database::get_priority_attitude_memories_for_target(companion_id, "user", 5) {
-        Ok(mut memories) => {
-            // Trim from the tail (lowest priority first) until the whole
-            // attitude block fits its budget, so memories can never starve
-            // message history.
-            while !memories.is_empty() {
-                let block = attitude_formatter.format_attitude_memories(&memories);
-                if block.is_empty() {
-                    break;
-                }
-                let candidate = format!("{}{}\n", attitude_context, block);
-                if ContextManager::estimate_tokens(&candidate)
-                    <= context_manager.attitude_token_budget
-                {
-                    attitude_context = candidate;
-                    break;
-                }
-                memories.pop();
-            }
-        }
-        Err(e) => eprintln!("Warning: Could not load attitude memories: {}", e),
-    }
-
-    if !attitude_context.is_empty() {
-        println!(
-            "✓ Attitude context integrated: {} characters",
-            attitude_context.len()
-        );
-    }
-
-    // Build base prompt components for caching optimization
-    // Auto renders through the model's own chat template, so its system content
-    // must be plain prose; the Mistral branch below would embed [INST] markers.
-    let base_components = build_base_components(
-        &config.prompt_template,
-        &user,
-        &companion,
-        rp,
-        &tuned_dialogue,
-        &attitude_context,
-    );
-
-    // Use cache optimization for base prompt construction
-    let (optimized_base_prompt, cache_hit) =
-        INFERENCE_OPTIMIZER.optimize_prompt_construction(&base_components, "", &[]);
-
-    base_prompt = optimized_base_prompt;
-
-    if cache_hit {
-        println!("✓ Cache hit for base prompt construction");
-    } else {
-        println!("✗ Cache miss - caching base prompt for future use");
-    }
-    if companion.long_term_mem > 0 {
-        let long_term_memory_entries: Vec<String> =
-            match long_term_memory.get_matches(prompt, companion.long_term_mem) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    eprintln!("Error while getting long term memory entries: {}", e);
-                    return Err(std::io::Error::other(
-                        "Error while getting long term memory entries",
-                    ));
-                }
-            };
-        for entry in long_term_memory_entries {
-            if config.prompt_template == PromptTemplate::Llama2 {
-                base_prompt += &format!("[INST]{}[/INST]\n", entry)
-                    .replace("{{char}}", &companion.name)
-                    .replace("{{user}}", &user.name);
-            } else if config.prompt_template == PromptTemplate::Mistral {
-                base_prompt += &format!("<s>[INST]{}[/INST]\n", entry)
-                    .replace("{{char}}", &companion.name)
-                    .replace("{{user}}", &user.name);
-            } else {
-                base_prompt += &entry
-                    .replace("{{char}}", &companion.name)
-                    .replace("{{user}}", &user.name);
-            }
-        }
-    }
-    let short_term_memory_entries: Vec<Message> = match Database::get_x_messages(
-        if companion.short_term_mem > 0 {
-            companion.short_term_mem
-        } else {
-            50
-        },
-        0,
-    ) {
-        Ok(entries) => entries,
-        Err(e) => {
-            eprintln!("Error while getting short term memory entries: {}", e);
-            return Err(std::io::Error::other(
-                "Error while getting short term memory entries",
-            ));
-        }
-    };
-
-    // Apply context management to optimize memory usage
-    let managed_messages = context_manager.manage_message_context(short_term_memory_entries);
-    let short_term_mem_len = managed_messages.len();
-    // Role-tagged history, used only by the Auto template. The string templates
-    // below keep splicing turns straight into base_prompt.
-    let mut chat_history: Vec<(bool, String)> = Vec::with_capacity(managed_messages.len());
-    for (message_counter, message) in (1..).zip(managed_messages.iter()) {
-        let prefix = if message.ai {
-            &companion.name
-        } else {
-            &user.name
-        };
-        let text = &message.content;
-        let mut formatted_message = format!("{}: {}\n", prefix, text);
-        let inject_time =
-            message_counter == short_term_mem_len && contains_time_question(&formatted_message);
-        if inject_time {
-            formatted_message = format!(
-                "\n* it's currently {} *\n{}",
-                get_current_date(),
-                formatted_message
-            );
-        }
-        if config.prompt_template == PromptTemplate::Auto {
-            // The chat template supplies the speaker framing, so the message
-            // carries its own text rather than a "Name: " prefix.
-            let mut content = text.clone();
-            if inject_time {
-                content = format!("* it's currently {} *\n{}", get_current_date(), content);
-            }
-            chat_history.push((message.ai, content));
-        } else if config.prompt_template == PromptTemplate::Llama2 {
-            if !message.ai {
-                base_prompt += &format!("[INST]{}", formatted_message);
-            } else {
-                base_prompt += &format!("{}[/INST]\n", formatted_message);
-            }
-        } else if config.prompt_template == PromptTemplate::Mistral {
-            if !message.ai {
-                base_prompt += &format!("<s>[INST]{}", formatted_message);
-            } else {
-                base_prompt += &format!("{}[/INST]\n", formatted_message);
-            }
-        } else {
-            base_prompt += &formatted_message;
-        }
-    }
 
     // Calculate token usage for memory management. base_prompt already
     // contains the attitude text (it was folded into base_components above),
@@ -612,13 +717,15 @@ fn generate(
     // The old `llm` crate hid sampling behind InferenceParameters::default().
     // llama.cpp requires an explicit sampler chain, so these values reproduce
     // a conventional chat preset.
+    let seed = sampler_seed();
+    println!("🎲 Sampler seed: {}", seed);
     let mut sampler = LlamaSampler::chain_simple([
         LlamaSampler::penalties(model.n_vocab(), 64, 1.1, 0.0, 0.0),
         LlamaSampler::top_k(40),
         LlamaSampler::top_p(0.9, 1),
         LlamaSampler::min_p(0.05, 1),
         LlamaSampler::temp(0.8),
-        LlamaSampler::dist(rand::random::<u32>()),
+        LlamaSampler::dist(seed),
     ]);
 
     // Size the KV cache from the budget the ContextManager already computed.

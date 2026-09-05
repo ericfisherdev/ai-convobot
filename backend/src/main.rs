@@ -13,7 +13,7 @@ mod character_card;
 use character_card::CharacterCard;
 use serde::Deserialize;
 mod llm;
-use crate::llm::{prompt, prompt_streaming};
+use crate::llm::{assemble_prompt, prompt, prompt_streaming};
 use uuid::Uuid;
 mod context_manager;
 mod inference_optimizer;
@@ -945,6 +945,62 @@ async fn remove_llm_directory(id: web::Path<i32>) -> HttpResponse {
 
 //              Attitude Tracking
 
+/// Query for `GET /api/debug/prompt`.
+#[derive(Deserialize)]
+struct PromptInspectParams {
+    companion_id: Option<i32>,
+    /// Message the long-term memory recall is keyed on. Omitted, the block is
+    /// assembled without any recalled entries.
+    prompt: Option<String>,
+}
+
+/// Returns the prompt a turn would send, without loading a model.
+///
+/// The point is to make the attitude block inspectable: `attitude_context` in
+/// the response is exactly the text `generate` folds into the system portion.
+///
+/// Because no model is loaded, `PromptTemplate::Auto` cannot be rendered
+/// through the GGUF chat template here — for that template the response holds
+/// the pre-template system text plus the role-tagged `chat_history`, not the
+/// final rendered string. Every other template returns the finished prompt.
+#[get("/api/debug/prompt")]
+async fn inspect_prompt(query: web::Query<PromptInspectParams>) -> HttpResponse {
+    let long_term_memory = match LongTermMem::connect() {
+        Ok(ltm) => ltm,
+        Err(e) => {
+            println!("Failed to connect to long term memory: {}", e);
+            return HttpResponse::InternalServerError().body(
+                "Error while connecting to long term memory, check logs for more information",
+            );
+        }
+    };
+
+    let companion_id = match query.companion_id {
+        Some(id) => id,
+        None => match Database::get_companion_id() {
+            Ok(id) => id,
+            Err(e) => {
+                println!("Failed to get companion id: {}", e);
+                return HttpResponse::InternalServerError()
+                    .body("Error while getting companion data, check logs for more information");
+            }
+        },
+    };
+
+    match assemble_prompt(
+        query.prompt.as_deref().unwrap_or(""),
+        companion_id,
+        &long_term_memory,
+    ) {
+        Ok(assembled) => HttpResponse::Ok().json(assembled),
+        Err(e) => {
+            println!("Failed to assemble prompt: {}", e);
+            HttpResponse::InternalServerError()
+                .body("Error while assembling prompt, check logs for more information")
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct AttitudeParams {
     companion_id: i32,
@@ -1797,6 +1853,7 @@ async fn main() -> std::io::Result<()> {
             .service(get_llm_directories)
             .service(add_llm_directory)
             .service(remove_llm_directory)
+            .service(inspect_prompt)
             .service(get_attitude)
             .service(create_or_update_attitude)
             .service(get_companion_attitudes)
