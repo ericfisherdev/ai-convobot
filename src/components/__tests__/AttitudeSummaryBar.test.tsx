@@ -156,4 +156,47 @@ describe('AttitudeSummaryBar Component', () => {
 
     expect(await screen.findByText('Companion feels neutral toward User')).toBeInTheDocument()
   })
+
+  it('discards a refresh that resolves after a stream update', async () => {
+    renderBar(<StreamHarness />)
+    await screen.findByTestId('attitude-summary-bar')
+
+    // A refresh that will resolve late, carrying the pre-turn snapshot.
+    let resolveStale: (value: unknown) => void = () => {}
+    global.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.startsWith('/api/attitude/summary/')) {
+        return new Promise(resolve => {
+          resolveStale = resolve
+        })
+      }
+      return Promise.resolve(nonAttitudeResponse)
+    }) as unknown as typeof fetch
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('attitude-update'))
+    })
+
+    act(() => {
+      applyUpdate({
+        attitude: buildAttitude({ trust: 7 }),
+        summary: 'post-turn',
+        deltas: [{ dimension: 'trust', delta: 3 }],
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId('attitude-delta-trust')).toHaveTextContent('+3')
+    })
+
+    await act(async () => {
+      resolveStale(summaryResponse(buildAttitude({ trust: 4 }), 'pre-turn'))
+    })
+
+    // The stream update stays: no rollback to the stale values, and no delta
+    // inverted by diffing the older snapshot against the newer state.
+    expect(screen.getByTestId('attitude-delta-trust')).toHaveTextContent('+3')
+    expect(screen.getByText('+7')).toBeInTheDocument()
+    expect(screen.getByText('post-turn')).toBeInTheDocument()
+  })
 })

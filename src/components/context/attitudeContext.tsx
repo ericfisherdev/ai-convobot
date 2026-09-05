@@ -73,6 +73,11 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
     // Ids of the last refresh, so the `attitude-update` fallback can refetch
     // without the event carrying them.
     const userTargetRef = useRef<{ companionId: number; userId: number } | null>(null);
+    // Bumped by every refresh and every stream update. A refresh only applies
+    // its response while it is still the newest writer, so a slow request can
+    // never overwrite fresher state (and never mint inverted deltas by diffing
+    // a stale snapshot against it).
+    const userAttitudeWriteRef = useRef(0);
     const selectedAttitudeRef = useRef(selectedAttitude);
     useEffect(() => {
         selectedAttitudeRef.current = selectedAttitude;
@@ -208,8 +213,10 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
     // rendered for the whole request, so the bar never blanks mid-refetch.
     const refreshUserAttitude = useCallback(async (companionId: number, userId: number): Promise<void> => {
         userTargetRef.current = { companionId, userId };
+        const write = ++userAttitudeWriteRef.current;
 
         const applyRefreshed = (attitude: AttitudeData, summary: string | null) => {
+            if (write !== userAttitudeWriteRef.current) return;
             setLastTurnDeltas(diffAttitudes(userAttitudeRef.current, attitude));
             userAttitudeRef.current = attitude;
             setUserAttitude(attitude);
@@ -242,6 +249,10 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
     // The stream already carries the post-turn attitude, so this path costs no
     // request and reports the backend's own deltas rather than a local diff.
     const applyAttitudeStreamUpdate = useCallback((update: AttitudeStreamUpdate): void => {
+        // Supersedes any refresh already in flight: the stream carries the
+        // post-turn state, which is newer than anything a request in progress
+        // can return.
+        userAttitudeWriteRef.current += 1;
         const deltas: Record<string, number> = {};
         for (const { dimension, delta } of update.deltas) {
             deltas[dimension] = delta;
