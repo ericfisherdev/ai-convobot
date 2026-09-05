@@ -461,7 +461,11 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 - **Response:**
   - Status: 200 OK
   - Content-Type: `text/event-stream`
-  - Body: a sequence of `data:` events, each carrying one JSON chunk. Chunks arrive with `is_complete: false` and one token in `content`; the final chunk has `is_complete: true` and an empty `content`.
+  - Body: a sequence of `data:` events, each carrying one JSON chunk. Three kinds of chunk travel over the stream:
+    - token chunks: `is_complete: false`, one token in `content`;
+    - the attitude chunk: `is_complete: false`, empty `content`, and an `attitude` object. Sent once after generation, only when the turn moved at least one attitude dimension. `attitude.attitude` is the companion's full post-turn `CompanionAttitude` toward the user, `attitude.summary` is its natural language rendering (with `{{companion}}` and `{{user}}` placeholders), and `attitude.deltas` lists `{ dimension, delta }` for the dimensions that moved;
+    - the final chunk: `is_complete: true`, carrying the sanitized reply in `content`, or an `error` string when generation failed.
+    `attitude` and `error` are omitted when absent, so token and final chunks keep the shape older clients expect.
 - **Example Request:**
   ```http
   POST /prompt/stream
@@ -478,7 +482,9 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 
   data: {"request_id":"abc123","content":"'s","is_complete":false,"token_count":2}
 
-  data: {"request_id":"abc123","content":"","is_complete":true,"token_count":41}
+  data: {"request_id":"abc123","content":"","is_complete":false,"token_count":41,"attitude":{"attitude":{"companion_id":1,"target_id":1,"target_type":"user","trust":7.0,"...":0.0},"summary":"{{companion}} trusts {{user}}","deltas":[{"dimension":"trust","delta":3.0}]}}
+
+  data: {"request_id":"abc123","content":"It's 10:04.","is_complete":true,"token_count":41}
   ```
 - **Notes:**
   - Generation is serialised: a request that arrives while another is generating waits its turn.

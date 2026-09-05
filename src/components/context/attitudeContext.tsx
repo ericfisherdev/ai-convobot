@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, useRef, ReactNode } from 'react';
-import { AttitudeData, AttitudeDimensionUpdate } from '../interfaces/AttitudeData';
+import { AttitudeData, AttitudeDimensionUpdate, AttitudeStreamUpdate, ATTITUDE_DIMENSIONS } from '../interfaces/AttitudeData';
 
 interface AttitudeContextType {
     attitudes: AttitudeData[];
@@ -12,10 +12,45 @@ interface AttitudeContextType {
     createOrUpdateAttitude: (attitude: Partial<AttitudeData>) => Promise<boolean>;
     updateAttitudeDimension: (update: AttitudeDimensionUpdate) => Promise<boolean>;
 
+    // Companion's attitude toward the chatting user, owned here so the
+    // summary bar keeps rendering the last known values while a refetch or a
+    // stream update is in flight.
+    userAttitude: AttitudeData | null;
+    userAttitudeSummary: string;
+    // Dimensions moved by the most recent turn, keyed by dimension name.
+    lastTurnDeltas: Record<string, number>;
+    // False until the first `refreshUserAttitude` settles, so a consumer can
+    // tell "nothing yet" apart from "no attitude row".
+    userAttitudeLoaded: boolean;
+    refreshUserAttitude: (companionId: number, userId: number) => Promise<void>;
+    applyAttitudeStreamUpdate: (update: AttitudeStreamUpdate) => void;
+
     // Current selection
     selectedAttitude: AttitudeData | null;
     setSelectedAttitude: (attitude: AttitudeData | null) => void;
 }
+
+interface AttitudeSummaryResponse {
+    attitude: AttitudeData;
+    summary: string;
+}
+
+// Signed change per dimension between two snapshots, mirroring the backend's
+// `AttitudeFormatter::diff_attitudes` so both sides hide the same noise.
+const DELTA_THRESHOLD = 1;
+
+const diffAttitudes = (previous: AttitudeData | null, current: AttitudeData): Record<string, number> => {
+    if (!previous) return {};
+
+    const deltas: Record<string, number> = {};
+    for (const dimension of ATTITUDE_DIMENSIONS) {
+        const delta = (current[dimension.key] as number) - (previous[dimension.key] as number);
+        if (Math.abs(delta) >= DELTA_THRESHOLD) {
+            deltas[dimension.key] = delta;
+        }
+    }
+    return deltas;
+};
 
 const AttitudeContext = createContext<AttitudeContextType | undefined>(undefined);
 
@@ -28,10 +63,23 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [selectedAttitude, setSelectedAttitude] = useState<AttitudeData | null>(null);
+    const [userAttitude, setUserAttitude] = useState<AttitudeData | null>(null);
+    // Mirrors `userAttitude` so a refresh can diff against the current value
+    // without a state updater having to reach for it (updaters stay pure).
+    const userAttitudeRef = useRef<AttitudeData | null>(null);
+    const [userAttitudeSummary, setUserAttitudeSummary] = useState<string>('');
+    const [lastTurnDeltas, setLastTurnDeltas] = useState<Record<string, number>>({});
+    const [userAttitudeLoaded, setUserAttitudeLoaded] = useState(false);
+    // Ids of the last refresh, so the `attitude-update` fallback can refetch
+    // without the event carrying them.
+    const userTargetRef = useRef<{ companionId: number; userId: number } | null>(null);
     const selectedAttitudeRef = useRef(selectedAttitude);
     useEffect(() => {
         selectedAttitudeRef.current = selectedAttitude;
     }, [selectedAttitude]);
+    useEffect(() => {
+        userAttitudeRef.current = userAttitude;
+    }, [userAttitude]);
 
     const fetchAttitudes = useCallback(async (companionId: number): Promise<void> => {
         setLoading(true);
@@ -156,6 +204,71 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
         }
     }, [fetchAttitudes, getAttitude]);
 
+    // Replaces the user attitude in place: values already on screen stay
+    // rendered for the whole request, so the bar never blanks mid-refetch.
+    const refreshUserAttitude = useCallback(async (companionId: number, userId: number): Promise<void> => {
+        userTargetRef.current = { companionId, userId };
+
+        const applyRefreshed = (attitude: AttitudeData, summary: string | null) => {
+            setLastTurnDeltas(diffAttitudes(userAttitudeRef.current, attitude));
+            userAttitudeRef.current = attitude;
+            setUserAttitude(attitude);
+            if (summary !== null) {
+                setUserAttitudeSummary(summary);
+            }
+        };
+
+        try {
+            const response = await fetch(`/api/attitude/summary/${companionId}/${userId}`);
+            if (response.ok) {
+                const data: AttitudeSummaryResponse = await response.json();
+                applyRefreshed(data.attitude, data.summary);
+                return;
+            }
+
+            // Older backends have no summary endpoint; the raw attitude is
+            // enough for the bar, which can summarize it locally.
+            const attitude = await getAttitude(companionId, userId, 'user');
+            if (attitude) {
+                applyRefreshed(attitude, null);
+            }
+        } catch (err) {
+            console.error('Error refreshing user attitude:', err);
+        } finally {
+            setUserAttitudeLoaded(true);
+        }
+    }, [getAttitude]);
+
+    // The stream already carries the post-turn attitude, so this path costs no
+    // request and reports the backend's own deltas rather than a local diff.
+    const applyAttitudeStreamUpdate = useCallback((update: AttitudeStreamUpdate): void => {
+        const deltas: Record<string, number> = {};
+        for (const { dimension, delta } of update.deltas) {
+            deltas[dimension] = delta;
+        }
+        userAttitudeRef.current = update.attitude;
+        setUserAttitude(update.attitude);
+        setUserAttitudeSummary(update.summary);
+        setLastTurnDeltas(deltas);
+        setUserAttitudeLoaded(true);
+    }, []);
+
+    // Fallback for turns that deliver no attitude chunk (e.g. impersonation,
+    // which never runs the attitude engine).
+    useEffect(() => {
+        const handleAttitudeUpdate = () => {
+            const target = userTargetRef.current;
+            if (target) {
+                refreshUserAttitude(target.companionId, target.userId);
+            }
+        };
+
+        window.addEventListener('attitude-update', handleAttitudeUpdate);
+        return () => {
+            window.removeEventListener('attitude-update', handleAttitudeUpdate);
+        };
+    }, [refreshUserAttitude]);
+
     const contextValue: AttitudeContextType = {
         attitudes,
         loading,
@@ -164,6 +277,12 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
         getAttitude,
         createOrUpdateAttitude,
         updateAttitudeDimension,
+        userAttitude,
+        userAttitudeSummary,
+        lastTurnDeltas,
+        userAttitudeLoaded,
+        refreshUserAttitude,
+        applyAttitudeStreamUpdate,
         selectedAttitude,
         setSelectedAttitude,
     };

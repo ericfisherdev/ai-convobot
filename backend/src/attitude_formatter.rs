@@ -1,4 +1,18 @@
+use serde::Serialize;
+
+use crate::attitude_engine::AttitudeDimension;
 use crate::database::{CompanionAttitude, ThirdPartyIndividual};
+
+/// One dimension that moved over a single conversation turn.
+///
+/// `dimension` is the `companion_attitudes` column name, which is also the key
+/// the frontend's `ATTITUDE_DIMENSIONS` table uses, so this struct doubles as
+/// the wire format for the SSE attitude chunk.
+#[derive(Debug, Clone, Serialize)]
+pub struct AttitudeDelta {
+    pub dimension: String,
+    pub delta: f32,
+}
 
 /// Handles conversion of attitude data into LLM prompt context and response calibration
 pub struct AttitudeFormatter {
@@ -9,6 +23,10 @@ pub struct AttitudeFormatter {
 }
 
 impl AttitudeFormatter {
+    /// Smallest magnitude a dimension has to move by before it is reported as
+    /// a change, on the console or on the wire.
+    const CHANGE_THRESHOLD: f32 = 1.0;
+
     pub fn new() -> Self {
         Self {
             low_threshold: 20.0,
@@ -432,50 +450,53 @@ impl AttitudeFormatter {
         relationship_weight * 0.7 + emotion_intensity * 0.3
     }
 
+    /// Signed change per dimension between two snapshots of the same attitude row.
+    ///
+    /// Covers all 20 dimensions and drops anything under `CHANGE_THRESHOLD`, so
+    /// decay noise never reaches the console or the client.
+    pub fn diff_attitudes(
+        &self,
+        previous: &CompanionAttitude,
+        current: &CompanionAttitude,
+    ) -> Vec<AttitudeDelta> {
+        AttitudeDimension::ALL
+            .iter()
+            .filter_map(|dimension| {
+                let delta = dimension.value_of(current) - dimension.value_of(previous);
+                if delta.abs() < Self::CHANGE_THRESHOLD {
+                    return None;
+                }
+                Some(AttitudeDelta {
+                    dimension: dimension.column().to_string(),
+                    delta,
+                })
+            })
+            .collect()
+    }
+
     /// Format attitude changes for console output
     pub fn format_attitude_changes_for_console(
         &self,
         previous: &CompanionAttitude,
         current: &CompanionAttitude,
     ) -> String {
-        let mut changes = Vec::new();
-
-        // Define threshold for significant changes
-        let threshold = 1.0;
-
-        // Check each attitude dimension for significant changes
-        let attitude_pairs = [
-            ("Love", previous.love, current.love),
-            ("Attraction", previous.attraction, current.attraction),
-            ("Lust", previous.lust, current.lust),
-            ("Trust", previous.trust, current.trust),
-            ("Anger", previous.anger, current.anger),
-            ("Suspicion", previous.suspicion, current.suspicion),
-            ("Curiosity", previous.curiosity, current.curiosity),
-            ("Butterflies", previous.butterflies, current.butterflies),
-            ("Joy", previous.joy, current.joy),
-            ("Sorrow", previous.sorrow, current.sorrow),
-            ("Fear", previous.fear, current.fear),
-            ("Anxiety", previous.anxiety, current.anxiety),
-            ("Empathy", previous.empathy, current.empathy),
-            ("Respect", previous.respect, current.respect),
-        ];
-
-        for (name, prev, curr) in attitude_pairs {
-            let change = curr - prev;
-            if change.abs() >= threshold {
-                if change > 0.0 {
-                    changes.push(format!("{} +{:.0}", name, change));
+        let changes: Vec<String> = self
+            .diff_attitudes(previous, current)
+            .into_iter()
+            .map(|change| {
+                let label = capitalize(&change.dimension);
+                if change.delta > 0.0 {
+                    format!("{} +{:.0}", label, change.delta)
                 } else {
-                    changes.push(format!("{} {:.0}", name, change));
+                    format!("{} {:.0}", label, change.delta)
                 }
-            }
-        }
+            })
+            .collect();
 
         if changes.is_empty() {
             String::new()
         } else {
-            format!("💝 Attitude changes: {}", changes.join(" | "))
+            format!("\u{1f49d} Attitude changes: {}", changes.join(" | "))
         }
     }
 
@@ -649,6 +670,15 @@ struct RelationshipLevel {
     name: &'static str,
     score: f32,
     description: &'static str,
+}
+
+/// Title-cases a lowercase dimension column name for console output.
+fn capitalize(dimension: &str) -> String {
+    let mut chars = dimension.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 #[cfg(test)]

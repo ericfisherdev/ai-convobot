@@ -5,7 +5,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-use crate::database::Message;
+use crate::attitude_formatter::AttitudeDelta;
+use crate::database::{CompanionAttitude, Message};
 
 /// Cache entry for frequently used prompts
 #[derive(Debug, Clone)]
@@ -19,7 +20,29 @@ pub struct CachedPrompt {
     pub estimated_tokens: usize,
 }
 
-/// Response streaming chunk
+/// Post-turn attitude state, carried by the stream's attitude chunk.
+#[derive(Debug, Clone, Serialize)]
+pub struct AttitudeStreamUpdate {
+    /// The companion's attitude toward the user after the turn was scored.
+    pub attitude: CompanionAttitude,
+    /// Natural language rendering of `attitude`, with `{{companion}}` and
+    /// `{{user}}` placeholders the client substitutes names into.
+    pub summary: String,
+    /// Only the dimensions this turn actually moved.
+    pub deltas: Vec<AttitudeDelta>,
+}
+
+/// One Server-Sent Event on `/api/prompt/stream`.
+///
+/// Three kinds travel over the same struct:
+/// - token chunks: `is_complete: false`, `content` holds the next token;
+/// - the attitude chunk: `is_complete: false`, empty `content`, `attitude` set,
+///   sent once after generation when the turn moved any dimension;
+/// - the final chunk: `is_complete: true`, `content` holds the sanitized reply,
+///   or `error` is set when generation failed.
+///
+/// `attitude` and `error` are omitted when `None`, so token and final chunks
+/// keep the shape older clients expect.
 #[derive(Debug, Clone, Serialize)]
 pub struct StreamChunk {
     pub request_id: String,
@@ -30,6 +53,9 @@ pub struct StreamChunk {
     /// failure apart from a normal completion.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Set only on the attitude chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attitude: Option<AttitudeStreamUpdate>,
 }
 
 /// Inference optimization statistics

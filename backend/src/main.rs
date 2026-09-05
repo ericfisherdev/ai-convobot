@@ -17,7 +17,7 @@ use crate::llm::{prompt, prompt_streaming};
 use uuid::Uuid;
 mod context_manager;
 mod inference_optimizer;
-use crate::inference_optimizer::{StreamChunk, INFERENCE_OPTIMIZER};
+use crate::inference_optimizer::{AttitudeStreamUpdate, StreamChunk, INFERENCE_OPTIMIZER};
 mod session_manager;
 mod token_budget;
 use crate::session_manager::SessionManager;
@@ -663,6 +663,29 @@ fn finish_turn(
             None
         }
     }
+}
+
+/// Scores the turn and renders the result as the stream's attitude payload.
+///
+/// Returns `None` when the turn moved nothing, so the streaming worker only
+/// spends an extra SSE event when there is something to report.
+fn attitude_update_after_turn(
+    companion_id: i32,
+    user_id: i32,
+    user_message: &str,
+    companion_reply: &str,
+) -> Option<AttitudeStreamUpdate> {
+    let (previous, current) = finish_turn(companion_id, user_id, user_message, companion_reply)?;
+    let formatter = crate::attitude_formatter::AttitudeFormatter::new();
+    let deltas = formatter.diff_attitudes(&previous, &current);
+    if deltas.is_empty() {
+        return None;
+    }
+    Some(AttitudeStreamUpdate {
+        summary: formatter.generate_natural_language_summary(&current),
+        attitude: current,
+        deltas,
+    })
 }
 
 #[post("/api/prompt")]
@@ -1323,6 +1346,7 @@ async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpR
                     is_complete: false,
                     token_count: Some(token_count),
                     error: None,
+                    attitude: None,
                 },
             );
         });
@@ -1334,13 +1358,30 @@ async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpR
             Ok(reply) => {
                 // Persisted before the client sees `is_complete: true`, so the
                 // row is already updated by the time the caller can react to it.
-                finish_turn(companion_id, user_id, &scored_message, &reply);
+                if let Some(update) =
+                    attitude_update_after_turn(companion_id, user_id, &scored_message, &reply)
+                {
+                    // Sent ahead of the final chunk so the client has the new
+                    // attitude before it settles the reply bubble.
+                    let _ = INFERENCE_OPTIMIZER.stream_chunk(
+                        &worker_session,
+                        StreamChunk {
+                            request_id: worker_session.clone(),
+                            content: String::new(),
+                            is_complete: false,
+                            token_count: Some(token_count),
+                            error: None,
+                            attitude: Some(update),
+                        },
+                    );
+                }
                 StreamChunk {
                     request_id: worker_session.clone(),
                     content: reply,
                     is_complete: true,
                     token_count: Some(token_count),
                     error: None,
+                    attitude: None,
                 }
             }
             Err(e) => {
@@ -1351,6 +1392,7 @@ async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpR
                     is_complete: true,
                     token_count: Some(token_count),
                     error: Some(e.to_string()),
+                    attitude: None,
                 }
             }
         };
