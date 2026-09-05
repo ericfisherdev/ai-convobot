@@ -585,11 +585,18 @@ fn finish_turn(
     user_message: &str,
     companion_reply: &str,
 ) -> Option<(CompanionAttitude, CompanionAttitude)> {
+    // `get_attitude` propagates real SQL failures (e.g. a busy write lock) as
+    // `Err` rather than collapsing them into `Ok(None)`, so `Ok(None)` here
+    // reliably means the row is absent, never "the read failed".
     let current = match Database::get_attitude(companion_id, user_id, "user") {
         Ok(Some(attitude)) => attitude,
         Ok(None) => {
             // Fresh database: seed the row from the companion's persona before
             // scoring, otherwise the UPDATE below would silently touch zero rows.
+            // `seed_missing_user_attitude` is insert-only (never falls back to
+            // an UPDATE), so if this "row absent" read raced a concurrent
+            // writer that has since inserted the real row, the seed silently
+            // no-ops instead of wiping accumulated state.
             let persona = match Database::get_companion_data() {
                 Ok(companion_data) => companion_data.persona,
                 Err(e) => {
@@ -597,8 +604,7 @@ fn finish_turn(
                     return None;
                 }
             };
-            if let Err(e) = Database::create_initial_user_attitude(companion_id, user_id, &persona)
-            {
+            if let Err(e) = Database::seed_missing_user_attitude(companion_id, user_id, &persona) {
                 eprintln!("Failed to seed initial user attitude: {}", e);
                 return None;
             }

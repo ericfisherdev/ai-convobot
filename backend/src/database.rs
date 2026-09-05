@@ -1,6 +1,6 @@
 use chrono::{DateTime, Local};
 use rusqlite::types::{FromSql, FromSqlError, ToSqlOutput, ValueRef};
-use rusqlite::{params, Connection, Error, Result, ToSql};
+use rusqlite::{params, Connection, Error, OptionalExtension, Result, ToSql, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -463,6 +463,62 @@ type MessageCache = Arc<Mutex<HashMap<String, (Vec<Message>, Instant)>>>;
 // Database query cache for performance optimization
 lazy_static::lazy_static! {
     static ref MESSAGE_CACHE: MessageCache = Arc::new(Mutex::new(HashMap::new()));
+}
+
+/// Reads one `companion_attitudes` row on the given connection (or transaction,
+/// via its `Deref<Target = Connection>`).
+///
+/// Uses `.optional()?` rather than `.ok()` so a real SQL failure (e.g.
+/// `SQLITE_BUSY`) propagates as `Err` instead of being indistinguishable from
+/// "no row exists" — callers (like `finish_turn`'s seed-on-missing-row path)
+/// rely on `Ok(None)` meaning the row is actually absent.
+fn read_attitude_row(
+    con: &Connection,
+    companion_id: i32,
+    target_id: i32,
+    target_type: &str,
+) -> Result<Option<CompanionAttitude>> {
+    let mut stmt = con.prepare(
+        "SELECT id, companion_id, target_id, target_type, attraction, trust, fear, anger,
+                joy, sorrow, disgust, surprise, curiosity, respect, suspicion,
+                gratitude, jealousy, empathy, lust, love, anxiety, butterflies,
+                submissiveness, dominance, relationship_score, last_updated, created_at
+         FROM companion_attitudes
+         WHERE companion_id = ? AND target_id = ? AND target_type = ?",
+    )?;
+
+    stmt.query_row(params![companion_id, target_id, target_type], |row| {
+        Ok(CompanionAttitude {
+            id: Some(row.get(0)?),
+            companion_id: row.get(1)?,
+            target_id: row.get(2)?,
+            target_type: row.get(3)?,
+            attraction: row.get(4)?,
+            trust: row.get(5)?,
+            fear: row.get(6)?,
+            anger: row.get(7)?,
+            joy: row.get(8)?,
+            sorrow: row.get(9)?,
+            disgust: row.get(10)?,
+            surprise: row.get(11)?,
+            curiosity: row.get(12)?,
+            respect: row.get(13)?,
+            suspicion: row.get(14)?,
+            gratitude: row.get(15)?,
+            jealousy: row.get(16)?,
+            empathy: row.get(17)?,
+            lust: row.get(18)?,
+            love: row.get(19)?,
+            anxiety: row.get(20)?,
+            butterflies: row.get(21)?,
+            submissiveness: row.get(22)?,
+            dominance: row.get(23)?,
+            relationship_score: row.get(24)?,
+            last_updated: row.get(25)?,
+            created_at: row.get(26)?,
+        })
+    })
+    .optional()
 }
 
 pub struct Database {}
@@ -1288,50 +1344,7 @@ impl Database {
         target_type: &str,
     ) -> Result<Option<CompanionAttitude>> {
         let con = Connection::open("companion_database.db")?;
-        let mut stmt = con.prepare(
-            "SELECT id, companion_id, target_id, target_type, attraction, trust, fear, anger,
-                    joy, sorrow, disgust, surprise, curiosity, respect, suspicion,
-                    gratitude, jealousy, empathy, lust, love, anxiety, butterflies,
-                    submissiveness, dominance, relationship_score, last_updated, created_at
-             FROM companion_attitudes
-             WHERE companion_id = ? AND target_id = ? AND target_type = ?",
-        )?;
-
-        let attitude = stmt
-            .query_row(params![companion_id, target_id, target_type], |row| {
-                Ok(CompanionAttitude {
-                    id: Some(row.get(0)?),
-                    companion_id: row.get(1)?,
-                    target_id: row.get(2)?,
-                    target_type: row.get(3)?,
-                    attraction: row.get(4)?,
-                    trust: row.get(5)?,
-                    fear: row.get(6)?,
-                    anger: row.get(7)?,
-                    joy: row.get(8)?,
-                    sorrow: row.get(9)?,
-                    disgust: row.get(10)?,
-                    surprise: row.get(11)?,
-                    curiosity: row.get(12)?,
-                    respect: row.get(13)?,
-                    suspicion: row.get(14)?,
-                    gratitude: row.get(15)?,
-                    jealousy: row.get(16)?,
-                    empathy: row.get(17)?,
-                    lust: row.get(18)?,
-                    love: row.get(19)?,
-                    anxiety: row.get(20)?,
-                    butterflies: row.get(21)?,
-                    submissiveness: row.get(22)?,
-                    dominance: row.get(23)?,
-                    relationship_score: row.get(24)?,
-                    last_updated: row.get(25)?,
-                    created_at: row.get(26)?,
-                })
-            })
-            .ok();
-
-        Ok(attitude)
+        read_attitude_row(&con, companion_id, target_id, target_type)
     }
 
     pub fn update_attitude_dimension(
@@ -1396,7 +1409,17 @@ impl Database {
         target_type: &str,
         deltas: &[crate::attitude_engine::DimensionDelta],
     ) -> Result<Option<(CompanionAttitude, CompanionAttitude)>> {
-        let previous = match Database::get_attitude(companion_id, target_id, target_type)? {
+        let mut con = Connection::open("companion_database.db")?;
+        let current_time = get_current_date();
+
+        // Immediate acquires the write lock before the first read below, so
+        // the previous/current snapshots and the writes between them are one
+        // continuous critical section: no concurrent writer's changes can
+        // land between "previous" and "current" and be misattributed to this
+        // turn's diff.
+        let tx = con.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let previous = match read_attitude_row(&tx, companion_id, target_id, target_type)? {
             Some(attitude) => attitude,
             None => return Ok(None),
         };
@@ -1405,9 +1428,6 @@ impl Database {
             return Ok(Some((previous.clone(), previous)));
         }
 
-        let mut con = Connection::open("companion_database.db")?;
-        let current_time = get_current_date();
-        let tx = con.transaction()?;
         for delta in deltas {
             let column = delta.dimension.column();
             let query = format!(
@@ -1427,10 +1447,11 @@ impl Database {
                 ],
             )?;
         }
-        tx.commit()?;
 
-        let current = Database::get_attitude(companion_id, target_id, target_type)?
+        let current = read_attitude_row(&tx, companion_id, target_id, target_type)?
             .unwrap_or_else(|| previous.clone());
+
+        tx.commit()?;
 
         Ok(Some((previous, current)))
     }
@@ -1571,6 +1592,63 @@ impl Database {
         let adjusted_attitude =
             Database::adjust_attitude_for_persona(&base_attitude, companion_persona);
         Database::create_or_update_attitude(companion_id, user_id, "user", &adjusted_attitude)
+    }
+
+    /// Inserts a persona-adjusted default attitude row for a user target only
+    /// if one does not already exist, relying on the table's
+    /// `UNIQUE(companion_id, target_id, target_type)` constraint to no-op
+    /// instead of overwriting.
+    ///
+    /// This is the seed path `finish_turn` uses when `get_attitude` reports no
+    /// row: unlike `create_initial_user_attitude` (still used by the
+    /// `/api/attitude/clear` REST handler, which legitimately wants to reset
+    /// an existing row via `create_or_update_attitude`'s UPDATE fallback), this
+    /// never falls back to an UPDATE, so a wrongly inferred "row absent"
+    /// premise can never wipe accumulated attitude state.
+    pub fn seed_missing_user_attitude(
+        companion_id: i32,
+        user_id: i32,
+        companion_persona: &str,
+    ) -> Result<()> {
+        let base_attitude = Database::default_user_attitude(companion_id, user_id);
+        let attitude = Database::adjust_attitude_for_persona(&base_attitude, companion_persona);
+        let con = Connection::open("companion_database.db")?;
+        con.execute(
+            "INSERT OR IGNORE INTO companion_attitudes (
+                companion_id, target_id, target_type, attraction, trust, fear, anger,
+                joy, sorrow, disgust, surprise, curiosity, respect, suspicion,
+                gratitude, jealousy, empathy, lust, love, anxiety, butterflies,
+                submissiveness, dominance, last_updated, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                companion_id,
+                user_id,
+                "user",
+                attitude.attraction,
+                attitude.trust,
+                attitude.fear,
+                attitude.anger,
+                attitude.joy,
+                attitude.sorrow,
+                attitude.disgust,
+                attitude.surprise,
+                attitude.curiosity,
+                attitude.respect,
+                attitude.suspicion,
+                attitude.gratitude,
+                attitude.jealousy,
+                attitude.empathy,
+                attitude.lust,
+                attitude.love,
+                attitude.anxiety,
+                attitude.butterflies,
+                attitude.submissiveness,
+                attitude.dominance,
+                attitude.last_updated,
+                attitude.created_at,
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn adjust_attitude_for_persona(
