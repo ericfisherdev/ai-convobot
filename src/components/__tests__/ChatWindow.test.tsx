@@ -291,6 +291,7 @@ describe('ChatWindow Component', () => {
     // alone (which an empty textarea would also produce).
     await waitFor(() => {
       expect(textarea).not.toBeDisabled()
+      expect(textarea).toHaveFocus()
     })
     await user.type(textarea, 'again')
     expect(sendButton).not.toBeDisabled()
