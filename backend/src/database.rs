@@ -628,11 +628,11 @@ impl Database {
     /// lose only the last transactions on power loss) and must be set on
     /// every connection since it is not persisted like `journal_mode` is.
     ///
-    /// `PRAGMA foreign_keys` is intentionally left at its default (off):
-    /// `attitude_memories` declares a foreign key to a `companions` table
-    /// that does not exist (the table is named `companion`), so turning
-    /// enforcement on would break every attitude-memory insert. Fixing that
-    /// typo and validating existing databases is tracked separately (#110).
+    /// `PRAGMA foreign_keys` is on: `attitude_memories` used to declare a
+    /// foreign key to a `companions` table that did not exist (the table is
+    /// named `companion`), which would have broken every attitude-memory
+    /// insert with enforcement on. That typo is fixed and `init()` runs a
+    /// rebuild migration for databases created before the fix (#110).
     pub fn open() -> Result<Connection> {
         Self::open_at(DATABASE_PATH)
     }
@@ -642,6 +642,7 @@ impl Database {
         con.busy_timeout(Duration::from_secs(5))?;
         con.pragma_update(None, "journal_mode", "WAL")?;
         con.pragma_update(None, "synchronous", "NORMAL")?;
+        con.pragma_update(None, "foreign_keys", true)?;
         Ok(con)
     }
 
@@ -650,6 +651,29 @@ impl Database {
             cache.clear();
         }
     }
+}
+
+/// The `attitude_memories` DDL, shared by the table creation path and the
+/// rebuild migration below so the column list only exists once. `target_id`
+/// stays unconstrained: it is polymorphic on `target_type` (a `user` or
+/// `third_party_individuals` row id) and cannot be a single foreign key.
+fn attitude_memories_ddl(table_name: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {table_name} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            companion_id INTEGER NOT NULL,
+            target_id INTEGER NOT NULL,
+            target_type TEXT NOT NULL,
+            memory_type TEXT NOT NULL,
+            description TEXT NOT NULL,
+            priority_score REAL NOT NULL,
+            attitude_delta_json TEXT NOT NULL,
+            impact_score REAL NOT NULL,
+            message_context TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(companion_id) REFERENCES companion(id) ON DELETE CASCADE
+        )"
+    )
 }
 
 impl Database {
@@ -941,7 +965,12 @@ impl Database {
         }
 
         // Initialize attitude memories table
-        Database::create_attitude_memories_table()?;
+        Database::create_attitude_memories_table(&con)?;
+
+        // Rebuild attitude_memories if it still targets the nonexistent
+        // `companions` table (#110), before foreign key enforcement runs
+        // against it.
+        Database::migrate_attitude_memories_foreign_key(&con)?;
 
         // Migrate config table to add new context window fields if they don't exist
         Database::migrate_config_table(&con)?;
@@ -2223,25 +2252,8 @@ impl Database {
 
     // Attitude Change Detection System
 
-    pub fn create_attitude_memories_table() -> Result<()> {
-        let con = Self::open()?;
-        con.execute(
-            "CREATE TABLE IF NOT EXISTS attitude_memories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                companion_id INTEGER NOT NULL,
-                target_id INTEGER NOT NULL,
-                target_type TEXT NOT NULL,
-                memory_type TEXT NOT NULL,
-                description TEXT NOT NULL,
-                priority_score REAL NOT NULL,
-                attitude_delta_json TEXT NOT NULL,
-                impact_score REAL NOT NULL,
-                message_context TEXT,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(companion_id) REFERENCES companions(id)
-            )",
-            [],
-        )?;
+    pub fn create_attitude_memories_table(con: &Connection) -> Result<()> {
+        con.execute(&attitude_memories_ddl("attitude_memories"), [])?;
 
         // Create index for priority queries
         con.execute(
@@ -2249,6 +2261,74 @@ impl Database {
              ON attitude_memories(companion_id, priority_score DESC)",
             [],
         )?;
+
+        Ok(())
+    }
+
+    /// Rebuilds `attitude_memories` if it still carries the old `companions`
+    /// (nonexistent) foreign key target, so `PRAGMA foreign_keys=ON` does not
+    /// break inserts against databases created before that typo was fixed.
+    /// Fresh and already-migrated databases detect a match on `companion` and
+    /// return immediately.
+    ///
+    /// Precondition: no transaction may be open on `con`. `PRAGMA
+    /// foreign_keys` is silently ignored while a transaction is open, so this
+    /// must run right after the connection is opened.
+    pub fn migrate_attitude_memories_foreign_key(con: &Connection) -> Result<()> {
+        debug_assert!(con.is_autocommit());
+
+        let mut stmt = con.prepare("PRAGMA foreign_key_list(attitude_memories)")?;
+        let targets = stmt
+            .query_map([], |row| row.get::<_, String>(2))?
+            .collect::<Result<Vec<_>>>()?;
+        drop(stmt);
+
+        if targets.iter().all(|table| table == "companion") {
+            return Ok(());
+        }
+
+        // Must precede BEGIN: SQLite ignores PRAGMA foreign_keys inside a
+        // transaction, and turning it off first stops DROP TABLE below from
+        // running an implicit FK-checked DELETE.
+        con.pragma_update(None, "foreign_keys", false)?;
+
+        let tx = con.unchecked_transaction()?;
+        tx.execute(&attitude_memories_ddl("attitude_memories_new"), [])?;
+        tx.execute(
+            "INSERT INTO attitude_memories_new (
+                id, companion_id, target_id, target_type, memory_type, description,
+                priority_score, attitude_delta_json, impact_score, message_context, created_at
+            )
+            SELECT id, companion_id, target_id, target_type, memory_type, description,
+                   priority_score, attitude_delta_json, impact_score, message_context, created_at
+            FROM attitude_memories",
+            [],
+        )?;
+        tx.execute("DROP TABLE attitude_memories", [])?;
+        tx.execute(
+            "ALTER TABLE attitude_memories_new RENAME TO attitude_memories",
+            [],
+        )?;
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_attitude_memories_priority
+             ON attitude_memories(companion_id, priority_score DESC)",
+            [],
+        )?;
+
+        let orphan_count = {
+            let mut check_stmt = tx.prepare("PRAGMA foreign_key_check(attitude_memories)")?;
+            let rows = check_stmt.query_map([], |_| Ok(()))?;
+            rows.count()
+        };
+        if orphan_count > 0 {
+            println!(
+                "warning: attitude_memories has {orphan_count} row(s) whose \
+                 companion_id no longer matches a companion; keeping them as-is"
+            );
+        }
+
+        tx.commit()?;
+        con.pragma_update(None, "foreign_keys", true)?;
 
         Ok(())
     }
@@ -4576,5 +4656,212 @@ mod tests {
         assert_eq!(Database::capitalize_name("mary-jane"), "Mary-Jane");
         assert_eq!(Database::capitalize_name("o'connor"), "O'Connor");
         assert_eq!(Database::capitalize_name("jean-luc"), "Jean-Luc");
+    }
+
+    /// Minimal `companion` table with one row, since `init()` is hard-wired
+    /// to `DATABASE_PATH` and these tests run against a `TempDir` instead.
+    fn create_companion_row(con: &Connection) {
+        con.execute(
+            "CREATE TABLE companion (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT
+            )",
+            [],
+        )
+        .unwrap();
+        con.execute("INSERT INTO companion (id, name) VALUES (1, 'Test')", [])
+            .unwrap();
+    }
+
+    /// The pre-#110 `attitude_memories` DDL, literal `REFERENCES
+    /// companions(id)` typo included, so the migration is exercised against
+    /// what real databases actually contain.
+    fn create_legacy_attitude_memories_table(con: &Connection) {
+        con.execute(
+            "CREATE TABLE attitude_memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                companion_id INTEGER NOT NULL,
+                target_id INTEGER NOT NULL,
+                target_type TEXT NOT NULL,
+                memory_type TEXT NOT NULL,
+                description TEXT NOT NULL,
+                priority_score REAL NOT NULL,
+                attitude_delta_json TEXT NOT NULL,
+                impact_score REAL NOT NULL,
+                message_context TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(companion_id) REFERENCES companions(id)
+            )",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_attitude_memories_priority
+             ON attitude_memories(companion_id, priority_score DESC)",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn insert_attitude_memory_row(con: &Connection, id: i32, companion_id: i32, description: &str) {
+        con.execute(
+            "INSERT INTO attitude_memories (
+                id, companion_id, target_id, target_type, memory_type, description,
+                priority_score, attitude_delta_json, impact_score, message_context, created_at
+            ) VALUES (?, ?, 1, 'user', 'shift', ?, 0.5, '{}', 0.5, NULL, '2024-01-01')",
+            params![id, companion_id, description],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn open_at_enables_foreign_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+
+        let enabled: i64 = con
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert_eq!(enabled, 1);
+    }
+
+    #[test]
+    fn legacy_attitude_memories_foreign_key_is_rebuilt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+
+        // Setting up the legacy schema needs foreign keys off: the old FK
+        // target table (`companions`) never existed.
+        con.pragma_update(None, "foreign_keys", false).unwrap();
+        create_companion_row(&con);
+        create_legacy_attitude_memories_table(&con);
+        insert_attitude_memory_row(&con, 1, 1, "first");
+        insert_attitude_memory_row(&con, 2, 1, "second");
+        con.pragma_update(None, "foreign_keys", true).unwrap();
+
+        Database::migrate_attitude_memories_foreign_key(&con).unwrap();
+
+        let mut fk_stmt = con
+            .prepare("PRAGMA foreign_key_list(attitude_memories)")
+            .unwrap();
+        let fks: Vec<(String, String)> = fk_stmt
+            .query_map([], |row| Ok((row.get(2)?, row.get(6)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        drop(fk_stmt);
+        assert_eq!(fks, vec![("companion".to_string(), "CASCADE".to_string())]);
+
+        let mut select_stmt = con
+            .prepare("SELECT id, description FROM attitude_memories ORDER BY id")
+            .unwrap();
+        let rows: Vec<(i32, String)> = select_stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        drop(select_stmt);
+        assert_eq!(
+            rows,
+            vec![(1, "first".to_string()), (2, "second".to_string())]
+        );
+
+        let index_count: i64 = con
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_attitude_memories_priority'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1);
+
+        let fk_enabled: i64 = con
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert_eq!(fk_enabled, 1);
+    }
+
+    #[test]
+    fn migration_keeps_orphan_rows() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+
+        con.pragma_update(None, "foreign_keys", false).unwrap();
+        create_companion_row(&con);
+        create_legacy_attitude_memories_table(&con);
+        insert_attitude_memory_row(&con, 1, 99, "orphan");
+        con.pragma_update(None, "foreign_keys", true).unwrap();
+
+        Database::migrate_attitude_memories_foreign_key(&con).unwrap();
+
+        let count: i64 = con
+            .query_row(
+                "SELECT COUNT(*) FROM attitude_memories WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "existing rows must survive the migration");
+    }
+
+    #[test]
+    fn corrected_attitude_memories_table_is_left_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_companion_row(&con);
+        Database::create_attitude_memories_table(&con).unwrap();
+
+        Database::migrate_attitude_memories_foreign_key(&con).unwrap();
+
+        let mut stmt = con
+            .prepare("PRAGMA foreign_key_list(attitude_memories)")
+            .unwrap();
+        let targets: Vec<String> = stmt
+            .query_map([], |row| row.get(2))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(targets, vec!["companion".to_string()]);
+    }
+
+    #[test]
+    fn attitude_memory_insert_succeeds_with_foreign_keys_on() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_companion_row(&con);
+        Database::create_attitude_memories_table(&con).unwrap();
+
+        let result = con.execute(
+            "INSERT INTO attitude_memories (
+                companion_id, target_id, target_type, memory_type, description,
+                priority_score, attitude_delta_json, impact_score, message_context, created_at
+            ) VALUES (1, 1, 'user', 'shift', 'test', 0.5, '{}', 0.5, NULL, '2024-01-01')",
+            [],
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn orphan_attitude_memory_insert_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_companion_row(&con);
+        Database::create_attitude_memories_table(&con).unwrap();
+
+        let result = con.execute(
+            "INSERT INTO attitude_memories (
+                companion_id, target_id, target_type, memory_type, description,
+                priority_score, attitude_delta_json, impact_score, message_context, created_at
+            ) VALUES (42, 1, 'user', 'shift', 'test', 0.5, '{}', 0.5, NULL, '2024-01-01')",
+            [],
+        );
+
+        match result {
+            Err(Error::SqliteFailure(e, _)) => {
+                assert_eq!(e.code, rusqlite::ErrorCode::ConstraintViolation);
+            }
+            other => panic!("expected a foreign key constraint violation, got {other:?}"),
+        }
     }
 }
