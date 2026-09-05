@@ -4348,6 +4348,8 @@ mod tests {
 
         let barrier = Arc::new(Barrier::new(2));
         let writer_barrier = Arc::clone(&barrier);
+        let commit_gate = Arc::new(Barrier::new(2));
+        let writer_commit_gate = Arc::clone(&commit_gate);
         let writer_path = db_path.clone();
 
         let writer = thread::spawn(move || {
@@ -4359,7 +4361,9 @@ mod tests {
             // so the reader's snapshot must not include it.
             tx.execute("INSERT INTO t (id) VALUES (2)", []).unwrap();
             writer_barrier.wait();
-            thread::sleep(Duration::from_millis(100));
+            // Commit only after the reader has taken and asserted its
+            // snapshot, so the test cannot race the scheduler.
+            writer_commit_gate.wait();
             tx.commit().unwrap();
         });
 
@@ -4371,6 +4375,7 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+        commit_gate.wait();
 
         writer.join().unwrap();
     }
