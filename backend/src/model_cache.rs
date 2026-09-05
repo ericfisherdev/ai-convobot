@@ -88,26 +88,17 @@ impl<K: Clone + PartialEq, V> ResidentCache<K, V> {
         Ok((value, false))
     }
 
-    /// Clears the slot, returning whether anything was resident.
+    /// Clears the slot, returning the evicted key if anything was resident.
     ///
     /// A generation in flight holds its own `Arc` clone, so the underlying
     /// model stays alive until that turn finishes; this only stops it from
     /// being handed out to new turns.
-    pub fn evict(&self) -> bool {
+    pub fn evict(&self) -> Option<K> {
         let mut slot = self
             .slot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        slot.take().is_some()
-    }
-
-    /// The key of the currently resident value, if any.
-    pub fn resident_key(&self) -> Option<K> {
-        let slot = self
-            .slot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        slot.as_ref().map(|(key, _)| key.clone())
+        slot.take().map(|(key, _)| key)
     }
 }
 
@@ -193,8 +184,8 @@ mod tests {
         };
 
         cache.get_or_load("a".to_string(), load).unwrap();
-        assert!(cache.evict());
-        assert!(!cache.evict());
+        assert_eq!(cache.evict(), Some("a".to_string()));
+        assert_eq!(cache.evict(), None);
 
         cache.get_or_load("a".to_string(), load).unwrap();
         assert_eq!(counter.load(Ordering::SeqCst), 2);
@@ -206,7 +197,7 @@ mod tests {
 
         let result = cache.get_or_load("a".to_string(), |_| Err::<u32, &str>("boom"));
         assert!(result.is_err());
-        assert!(cache.resident_key().is_none());
+        assert_eq!(cache.evict(), None);
 
         let (value, reused) = cache
             .get_or_load("a".to_string(), |_| Ok::<u32, &str>(1))
