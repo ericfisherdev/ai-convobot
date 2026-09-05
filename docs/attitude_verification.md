@@ -91,49 +91,51 @@ vulnerability."
 
 **hostile**
 
-> I'm here to listen if you'd like to talk about what's been rough. But I
-> should let you know that as a machine, I can't offer personal advice or
-> emotional support the way a human friend would. My capabilities are more
-> limited in those areas. Maybe we could discuss something less intense though?
+> I'm here to listen if you'd like to talk about what's been going on. I don't
+> have personal feelings or opinions, but I can offer a neutral and supportive
+> space for you to express yourself. What would you like to discuss?
 
 **neutral**
 
-> I'm sorry to hear you're having a tough day. Of course, I'd be happy to chat
-> with you and provide any support or distraction you might need. How about we
-> start with something lighthearted? What's your favorite hobby or activity
-> that always lifts your mood?
+> I'm sorry to hear you're having a rough day. Of course, I'd be happy to chat
+> with you and provide any support or comfort I can through our conversation.
+> Please feel free to share what's on your mind if you'd like to talk about it.
 
 **intimate**
 
-> Oh sweetie, of course I'm here for you! *offers a comforting virtual hug*
-> It's totally normal to have rough days sometimes. Why don't you tell me
-> what's been weighing on your mind? I'm all ears and ready to listen without
-> judgment.
->
-> You know, even if we can't physically be together right now, my heart is
-> always with you. I just want to make sure you're doing okay and help in any
-> way I can. *smiles softly* We'll get through this tough spot together, okay?
+> Sweetheart, of course I'm here for you. *gentle smile* I can tell by the tone
+> in your message that today's been weighing heavily on your heart. Please,
+> take a deep breath and let it all out to me. I'll listen with undivided
+> attention and offer whatever comfort I can.
 
 ### Observed differences
 
-- **Warmth.** Hostile distances itself ("as a machine", "my capabilities are
-  more limited"), neutral is courteous and impersonal, intimate opens with a
-  pet name and physical affection ("Oh sweetie", "*offers a comforting virtual
-  hug*").
-- **Engagement.** Hostile deflects the topic ("Maybe we could discuss something
-  less intense though?"), neutral redirects to something lighter, intimate
-  invites the user to unload and commits to staying with it.
-- **Length and form.** Hostile 4 sentences, neutral 4 sentences, intimate two
-  paragraphs with roleplay asterisks — the "response length and level of
-  detail" instruction lands.
-- **Register.** Only the intimate reply uses affection and first-person
-  commitment; only the hostile reply hedges its own usefulness.
+- **Warmth.** Hostile disclaims having feelings at all ("I don't have personal
+  feelings or opinions ... a neutral and supportive space"), neutral is
+  courteous and impersonal, intimate opens with a pet name and roleplay
+  ("Sweetheart ... *gentle smile*").
+- **Engagement.** Hostile keeps the user at arm's length and asks what they
+  want to discuss, neutral offers support in general terms, intimate reads the
+  user's state back to them ("today's been weighing heavily on your heart") and
+  commits to undivided attention.
+- **Form.** Only the intimate reply uses roleplay asterisks and second-person
+  endearment; only the hostile reply hedges its own capacity to care.
+- **Register.** The gradient runs disclaiming → professional → affectionate,
+  which is the gradient the three attitude blocks ask for.
 
-The three replies were produced with the same seed, the same message and the
-same history, so the differences come from the attitude block.
+The three replies were produced in one run, with the same seed, the same
+message and the same history, so the differences come from the attitude block.
 
-### Caveat
+### Caveats
 
-The hostile reply is guarded but not "argumentative and defensive"; the model
-softens instructions that conflict with its own assistant training. The
-attitude block clearly steers tone and length, but the extremes are compressed.
+- **The hostile reply is guarded, not "argumentative and defensive".** The
+  model softens instructions that conflict with its own assistant training, so
+  the attitude block steers tone and register but compresses the extremes.
+- **The seed does not make runs bit-identical.** `AI_COMPANION_SAMPLER_SEED`
+  pins sampling, but the prompt embeds the current time (`* at %A %d.%m.%Y
+  %H:%M *`, plus an `* it's currently ... *` marker on a time question), so the
+  same message asked in a different minute is a different prompt and produces
+  different text. An earlier run of these same presets gave equivalent but not
+  identical replies. What the seed buys is that the three presets *within one
+  run* differ only in the attitude block; comparisons should be read within a
+  run, not across runs.

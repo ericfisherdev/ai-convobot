@@ -263,10 +263,21 @@ fn attitude_debug_enabled() -> bool {
 /// comparable (the rest of the sampler chain is deterministic given the same
 /// logits); unset, each generation is seeded randomly as before.
 fn sampler_seed() -> u32 {
-    std::env::var("AI_COMPANION_SAMPLER_SEED")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or_else(rand::random::<u32>)
+    match std::env::var("AI_COMPANION_SAMPLER_SEED") {
+        Ok(value) => match value.trim().parse::<u32>() {
+            Ok(seed) => seed,
+            Err(e) => {
+                // Falling back silently would defeat the whole point of the
+                // variable, so say so rather than quietly randomising.
+                eprintln!(
+                    "AI_COMPANION_SAMPLER_SEED is not a u32 ({:?}: {}); using a random seed",
+                    value, e
+                );
+                rand::random::<u32>()
+            }
+        },
+        Err(_) => rand::random::<u32>(),
+    }
 }
 
 /// Everything a prompt is made of, before the model is involved.
@@ -293,21 +304,19 @@ pub struct AssembledPrompt {
 /// be sent. `user_message` is what the turn's long-term memory recall is keyed
 /// on, so an inspection with an empty message simply recalls nothing.
 ///
+/// The caller passes the `ConfigView` it is using for the rest of the turn:
+/// `PUT /api/config` does not take `GENERATION_LOCK`, so a second read here
+/// could see a different template or token budget than the one the reply is
+/// rendered with.
+///
 /// # Errors
-/// Propagates config, user and companion load failures as
-/// `std::io::ErrorKind::Other`.
+/// Propagates user and companion load failures as `std::io::ErrorKind::Other`.
 pub fn assemble_prompt(
     user_message: &str,
     companion_id: i32,
     long_term_memory: &LongTermMem,
+    config: &ConfigView,
 ) -> Result<AssembledPrompt, std::io::Error> {
-    let config: ConfigView = match Database::get_config() {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("Error while getting config: {}", e);
-            return Err(std::io::Error::other("Error while getting config"));
-        }
-    };
     let user: UserView = match Database::get_user_data() {
         Ok(user) => user,
         Err(e) => {
@@ -663,14 +672,14 @@ fn generate(
         .unwrap_or(4); // Fallback to 4 cores if detection fails
 
     println!("🚀 Generating AI response with optimized session...");
-    let assembled = assemble_prompt(prompt, companion_id, &long_term_memory)?;
+    let assembled = assemble_prompt(prompt, companion_id, &long_term_memory, &config)?;
     let AssembledPrompt {
         system_prompt: base_prompt,
         chat_history,
         attitude_context,
         managed_messages,
     } = assembled;
-    // Rebuilt from the same config `assemble_prompt` read, so the budgets below
+    // Built from the config passed into `assemble_prompt`, so the budgets below
     // match the ones the assembly was trimmed against.
     let context_manager = ContextManager::new(config.clone());
 
