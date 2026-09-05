@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useCallback, ReactNode } from 'react';
 import { AttitudeData, AttitudeDimensionUpdate } from '../interfaces/AttitudeData';
 
 interface AttitudeContextType {
@@ -29,7 +29,7 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
     const [error, setError] = useState<string | null>(null);
     const [selectedAttitude, setSelectedAttitude] = useState<AttitudeData | null>(null);
 
-    const fetchAttitudes = async (companionId: number): Promise<void> => {
+    const fetchAttitudes = useCallback(async (companionId: number): Promise<void> => {
         setLoading(true);
         setError(null);
 
@@ -48,9 +48,9 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
         } finally {
             setLoading(false);
         }
-    };
+    }, []);
 
-    const getAttitude = async (companionId: number, targetId: number, targetType: string): Promise<AttitudeData | null> => {
+    const getAttitude = useCallback(async (companionId: number, targetId: number, targetType: string): Promise<AttitudeData | null> => {
         setLoading(true);
         setError(null);
 
@@ -73,9 +73,9 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
         } finally {
             setLoading(false);
         }
-    };
+    }, []);
 
-    const createOrUpdateAttitude = async (attitude: Partial<AttitudeData>): Promise<boolean> => {
+    const createOrUpdateAttitude = useCallback(async (attitude: Partial<AttitudeData>): Promise<boolean> => {
         setLoading(true);
         setError(null);
 
@@ -110,9 +110,9 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
         } finally {
             setLoading(false);
         }
-    };
+    }, [fetchAttitudes]);
 
-    const updateAttitudeDimension = async (update: AttitudeDimensionUpdate): Promise<boolean> => {
+    const updateAttitudeDimension = useCallback(async (update: AttitudeDimensionUpdate): Promise<boolean> => {
         setLoading(true);
         setError(null);
 
@@ -133,14 +133,15 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
             await fetchAttitudes(update.companion_id);
 
             // Update selected attitude if it matches
-            if (selectedAttitude &&
-                selectedAttitude.companion_id === update.companion_id &&
-                selectedAttitude.target_id === update.target_id &&
-                selectedAttitude.target_type === update.target_type) {
-
-                const updatedAttitude = await getAttitude(update.companion_id, update.target_id, update.target_type);
-                setSelectedAttitude(updatedAttitude);
-            }
+            setSelectedAttitude(prev => {
+                if (prev &&
+                    prev.companion_id === update.companion_id &&
+                    prev.target_id === update.target_id &&
+                    prev.target_type === update.target_type) {
+                    getAttitude(update.companion_id, update.target_id, update.target_type).then(setSelectedAttitude);
+                }
+                return prev;
+            });
 
             return true;
         } catch (err) {
@@ -151,7 +152,7 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
         } finally {
             setLoading(false);
         }
-    };
+    }, [fetchAttitudes, getAttitude]);
 
     const contextValue: AttitudeContextType = {
         attitudes,
