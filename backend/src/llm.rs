@@ -377,6 +377,11 @@ fn generate(
             );
         };
     }
+    // Initialize context manager for intelligent memory management. Built
+    // before the attitude block because the memory block below is trimmed
+    // against its attitude token budget.
+    let context_manager = ContextManager::new(config.clone());
+
     // Load and integrate attitude context. This must happen before
     // base_components is built, so the attitude block lands inside the
     // system portion of the prompt rather than after the conversation
@@ -410,6 +415,34 @@ fn generate(
     } else {
         String::new()
     };
+
+    // Append the moments that shaped those feelings, so the companion can say
+    // why it feels the way it does and not only how strongly. Appending to
+    // `attitude_context` keeps the block inside the same system portion and
+    // counted by the same `attitude_tokens` figure below.
+    let mut attitude_context = attitude_context;
+    match Database::get_priority_attitude_memories(companion_id, 5) {
+        Ok(mut memories) => {
+            // Trim from the tail (lowest priority first) until the whole
+            // attitude block fits its budget, so memories can never starve
+            // message history.
+            while !memories.is_empty() {
+                let block = attitude_formatter.format_attitude_memories(&memories);
+                if block.is_empty() {
+                    break;
+                }
+                let candidate = format!("{}{}\n", attitude_context, block);
+                if ContextManager::estimate_tokens(&candidate)
+                    <= context_manager.attitude_token_budget
+                {
+                    attitude_context = candidate;
+                    break;
+                }
+                memories.pop();
+            }
+        }
+        Err(e) => eprintln!("Warning: Could not load attitude memories: {}", e),
+    }
 
     if !attitude_context.is_empty() {
         println!(
@@ -468,9 +501,6 @@ fn generate(
             }
         }
     }
-    // Initialize context manager for intelligent memory management
-    let context_manager = ContextManager::new(config.clone());
-
     let short_term_memory_entries: Vec<Message> = match Database::get_x_messages(
         if companion.short_term_mem > 0 {
             companion.short_term_mem

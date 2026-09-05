@@ -315,22 +315,64 @@ pub struct AttitudeMemory {
     pub created_at: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+/// Per-dimension movement between two `CompanionAttitude` snapshots, persisted
+/// as `attitude_memories.attitude_delta_json`.
+///
+/// Every field defaults, so rows written before a dimension existed still
+/// deserialize (the six trailing dimensions were added after the first rows
+/// could have been written).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct AttitudeDelta {
+    #[serde(default)]
     pub attraction: f32,
+    #[serde(default)]
     pub trust: f32,
+    #[serde(default)]
     pub fear: f32,
+    #[serde(default)]
     pub anger: f32,
+    #[serde(default)]
     pub joy: f32,
+    #[serde(default)]
     pub sorrow: f32,
+    #[serde(default)]
     pub disgust: f32,
+    #[serde(default)]
     pub surprise: f32,
+    #[serde(default)]
     pub curiosity: f32,
+    #[serde(default)]
     pub respect: f32,
+    #[serde(default)]
     pub suspicion: f32,
+    #[serde(default)]
     pub gratitude: f32,
+    #[serde(default)]
     pub jealousy: f32,
+    #[serde(default)]
     pub empathy: f32,
+    #[serde(default)]
+    pub lust: f32,
+    #[serde(default)]
+    pub love: f32,
+    #[serde(default)]
+    pub anxiety: f32,
+    #[serde(default)]
+    pub butterflies: f32,
+    #[serde(default)]
+    pub submissiveness: f32,
+    #[serde(default)]
+    pub dominance: f32,
+}
+
+/// One attitude shift judged worth remembering, before it becomes a row.
+#[derive(Debug, Clone)]
+pub struct AttitudeMemoryDraft {
+    pub memory_type: String,
+    pub description: String,
+    pub priority_score: f32,
+    pub impact_score: f32,
+    pub delta: AttitudeDelta,
 }
 
 fn calculate_attitude_delta(
@@ -352,6 +394,12 @@ fn calculate_attitude_delta(
         gratitude: new.gratitude - previous.gratitude,
         jealousy: new.jealousy - previous.jealousy,
         empathy: new.empathy - previous.empathy,
+        lust: new.lust - previous.lust,
+        love: new.love - previous.love,
+        anxiety: new.anxiety - previous.anxiety,
+        butterflies: new.butterflies - previous.butterflies,
+        submissiveness: new.submissiveness - previous.submissiveness,
+        dominance: new.dominance - previous.dominance,
     }
 }
 
@@ -372,6 +420,12 @@ fn calculate_impact_score(delta: &AttitudeDelta) -> f32 {
         ("gratitude", delta.gratitude, 1.1),
         ("jealousy", delta.jealousy, 1.3),
         ("empathy", delta.empathy, 1.2),
+        ("lust", delta.lust, 1.1),
+        ("love", delta.love, 1.5), // Relationship-defining, weighted like trust
+        ("anxiety", delta.anxiety, 1.1),
+        ("butterflies", delta.butterflies, 0.9),
+        ("submissiveness", delta.submissiveness, 1.0),
+        ("dominance", delta.dominance, 1.0),
     ];
 
     let mut weighted_sum = 0.0;
@@ -436,6 +490,41 @@ fn calculate_priority_score(delta: &AttitudeDelta, impact_score: f32, memory_typ
         + impact_normalized * impact_weight
         + type_score * type_weight
         + relevance_score * relevance_weight
+}
+
+/// Impact score a turn has to clear before it is worth remembering.
+pub const SIGNIFICANT_IMPACT_THRESHOLD: f32 = 10.0;
+
+/// Largest number of `attitude_memories` rows kept per companion.
+pub const MAX_ATTITUDE_MEMORIES_PER_COMPANION: usize = 100;
+
+/// Judges whether one attitude shift is worth remembering.
+///
+/// Pure and database-free, so the threshold and the classification can be
+/// tested without SQLite. Returns `None` when the movement is below
+/// `SIGNIFICANT_IMPACT_THRESHOLD`.
+pub fn evaluate_attitude_shift(
+    previous: &CompanionAttitude,
+    new: &CompanionAttitude,
+) -> Option<AttitudeMemoryDraft> {
+    let delta = calculate_attitude_delta(previous, new);
+    let impact_score = calculate_impact_score(&delta);
+
+    if impact_score <= SIGNIFICANT_IMPACT_THRESHOLD {
+        return None;
+    }
+
+    let memory_type = classify_memory_type(&delta, impact_score);
+    let priority_score = calculate_priority_score(&delta, impact_score, &memory_type);
+    let description = generate_memory_description(&memory_type, &delta, impact_score);
+
+    Some(AttitudeMemoryDraft {
+        memory_type,
+        description,
+        priority_score,
+        impact_score,
+        delta,
+    })
 }
 
 fn generate_memory_description(
@@ -1354,9 +1443,10 @@ impl Database {
         dimension: &str,
         delta: f32,
     ) -> Result<()> {
-        // Get the attitude before the change for comparison
-        let previous_attitude = Database::get_attitude(companion_id, target_id, target_type)?;
-
+        // No attitude memory is recorded here: a manual edit through
+        // `PUT /api/attitude/dimension` is not something the companion lived
+        // through. Memories are recorded per conversation turn, from
+        // `finish_turn` in `main.rs`.
         let con = Connection::open("companion_database.db")?;
         let current_time = get_current_date();
 
@@ -1371,23 +1461,6 @@ impl Database {
             &query,
             params![delta, current_time, companion_id, target_id, target_type],
         )?;
-
-        // Get the attitude after the change and check for significant changes
-        if let Some(previous) = previous_attitude {
-            if let Some(new_attitude) =
-                Database::get_attitude(companion_id, target_id, target_type)?
-            {
-                // Trigger change detection - pass None for message context since we don't have it here
-                Database::detect_attitude_change(
-                    companion_id,
-                    target_id,
-                    target_type,
-                    &previous,
-                    &new_attitude,
-                    None,
-                )?;
-            }
-        }
 
         Ok(())
     }
@@ -2148,6 +2221,12 @@ impl Database {
         Ok(())
     }
 
+    /// Persists an attitude shift as a memory when it is significant enough.
+    ///
+    /// Detection itself lives in `evaluate_attitude_shift`; this only writes.
+    /// Callers pass the whole turn's before/after pair, so one turn produces at
+    /// most one memory. `message_context` should be an excerpt of what the user
+    /// said, so the memory records why the feelings moved.
     pub fn detect_attitude_change(
         companion_id: i32,
         target_id: i32,
@@ -2156,41 +2235,56 @@ impl Database {
         new_attitude: &CompanionAttitude,
         message_context: Option<&str>,
     ) -> Result<()> {
-        let delta = calculate_attitude_delta(previous_attitude, new_attitude);
-        let impact_score = calculate_impact_score(&delta);
+        let Some(draft) = evaluate_attitude_shift(previous_attitude, new_attitude) else {
+            return Ok(());
+        };
 
-        if impact_score > 10.0 {
-            // Threshold for significant changes
-            let memory_type = classify_memory_type(&delta, impact_score);
-            let priority_score = calculate_priority_score(&delta, impact_score, &memory_type);
+        let attitude_delta_json = serde_json::to_string(&draft.delta).unwrap_or_default();
+        let con = Connection::open("companion_database.db")?;
+        let current_time = get_current_date();
 
-            let description = generate_memory_description(&memory_type, &delta, impact_score);
-            let attitude_delta_json = serde_json::to_string(&delta).unwrap_or_default();
+        con.execute(
+            "INSERT INTO attitude_memories (
+                companion_id, target_id, target_type, memory_type, description,
+                priority_score, attitude_delta_json, impact_score, message_context, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                companion_id,
+                target_id,
+                target_type,
+                draft.memory_type,
+                draft.description,
+                draft.priority_score,
+                attitude_delta_json,
+                draft.impact_score,
+                message_context.unwrap_or(""),
+                current_time
+            ],
+        )?;
 
-            let con = Connection::open("companion_database.db")?;
-            let current_time = get_current_date();
-
-            con.execute(
-                "INSERT INTO attitude_memories (
-                    companion_id, target_id, target_type, memory_type, description,
-                    priority_score, attitude_delta_json, impact_score, message_context, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                params![
-                    companion_id,
-                    target_id,
-                    target_type,
-                    memory_type,
-                    description,
-                    priority_score,
-                    attitude_delta_json,
-                    impact_score,
-                    message_context.unwrap_or(""),
-                    current_time
-                ],
-            )?;
-        }
+        // The only writer maintains the bound, so the table cannot grow without
+        // limit however many turns are played.
+        Database::prune_attitude_memories(companion_id, MAX_ATTITUDE_MEMORIES_PER_COMPANION)?;
 
         Ok(())
+    }
+
+    /// Drops all but the `keep` highest-priority memories for one companion.
+    ///
+    /// Returns the number of rows deleted.
+    pub fn prune_attitude_memories(companion_id: i32, keep: usize) -> Result<usize> {
+        let con = Connection::open("companion_database.db")?;
+        con.execute(
+            "DELETE FROM attitude_memories
+             WHERE companion_id = ?1
+               AND id NOT IN (
+                   SELECT id FROM attitude_memories
+                   WHERE companion_id = ?1
+                   ORDER BY priority_score DESC, created_at DESC
+                   LIMIT ?2
+               )",
+            params![companion_id, keep],
+        )
     }
 
     pub fn get_priority_attitude_memories(
