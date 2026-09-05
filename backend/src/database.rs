@@ -1379,6 +1379,62 @@ impl Database {
         Ok(())
     }
 
+    /// Applies a batch of engine-derived deltas to one attitude row in a single
+    /// transaction and returns the (previous, current) pair.
+    ///
+    /// Returns `Ok(None)` when no row exists yet for `(companion_id, target_id,
+    /// target_type)` — the caller must seed one (see `default_user_attitude`
+    /// and `create_initial_user_attitude`) before deltas can land anywhere,
+    /// since an `UPDATE` against a missing row silently changes zero rows.
+    ///
+    /// Unlike `update_attitude_dimension`, this does not call
+    /// `detect_attitude_change`: turning the returned pair into an attitude
+    /// memory is the caller's responsibility (see `finish_turn` in `main.rs`).
+    pub fn apply_attitude_deltas(
+        companion_id: i32,
+        target_id: i32,
+        target_type: &str,
+        deltas: &[crate::attitude_engine::DimensionDelta],
+    ) -> Result<Option<(CompanionAttitude, CompanionAttitude)>> {
+        let previous = match Database::get_attitude(companion_id, target_id, target_type)? {
+            Some(attitude) => attitude,
+            None => return Ok(None),
+        };
+
+        if deltas.is_empty() {
+            return Ok(Some((previous.clone(), previous)));
+        }
+
+        let mut con = Connection::open("companion_database.db")?;
+        let current_time = get_current_date();
+        let tx = con.transaction()?;
+        for delta in deltas {
+            let column = delta.dimension.column();
+            let query = format!(
+                "UPDATE companion_attitudes
+                 SET {} = MAX(-100, MIN(100, {} + ?)), last_updated = ?
+                 WHERE companion_id = ? AND target_id = ? AND target_type = ?",
+                column, column
+            );
+            tx.execute(
+                &query,
+                params![
+                    delta.delta,
+                    current_time,
+                    companion_id,
+                    target_id,
+                    target_type
+                ],
+            )?;
+        }
+        tx.commit()?;
+
+        let current = Database::get_attitude(companion_id, target_id, target_type)?
+            .unwrap_or_else(|| previous.clone());
+
+        Ok(Some((previous, current)))
+    }
+
     pub fn get_all_companion_attitudes(companion_id: i32) -> Result<Vec<CompanionAttitude>> {
         let con = Connection::open("companion_database.db")?;
         let mut stmt = con.prepare(
@@ -1471,12 +1527,11 @@ impl Database {
         Ok(())
     }
 
-    pub fn create_initial_user_attitude(
-        companion_id: i32,
-        user_id: i32,
-        companion_persona: &str,
-    ) -> Result<i32> {
-        let base_attitude = CompanionAttitude {
+    /// Unadjusted starting point for a new `companion_attitudes` row, before
+    /// persona adjustment. Pure (no connection), so callers that only need a
+    /// decay baseline can use it without touching SQLite.
+    pub fn default_user_attitude(companion_id: i32, user_id: i32) -> CompanionAttitude {
+        CompanionAttitude {
             id: None,
             companion_id,
             target_id: user_id,
@@ -1504,8 +1559,15 @@ impl Database {
             relationship_score: Some(0.0),
             last_updated: get_current_date(),
             created_at: get_current_date(),
-        };
+        }
+    }
 
+    pub fn create_initial_user_attitude(
+        companion_id: i32,
+        user_id: i32,
+        companion_persona: &str,
+    ) -> Result<i32> {
+        let base_attitude = Database::default_user_attitude(companion_id, user_id);
         let adjusted_attitude =
             Database::adjust_attitude_for_persona(&base_attitude, companion_persona);
         Database::create_or_update_attitude(companion_id, user_id, "user", &adjusted_attitude)
