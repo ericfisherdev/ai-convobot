@@ -175,7 +175,11 @@ const ChatWindow = () => {
       toast.error(`Error while sending a message: ${error}`);
     } finally {
       setIsSending(false);
-      inputRef.current?.focus();
+      // The re-render that clears `disabled` on the textarea hasn't
+      // committed yet at this point in the synchronous finally block, and
+      // focus() on a still-disabled control is a no-op — defer past the
+      // commit.
+      setTimeout(() => inputRef.current?.focus(), 0);
     }
   };
 
