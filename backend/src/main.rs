@@ -77,6 +77,20 @@ async fn companion_avatar_img() -> HttpResponse {
         .body(&include_bytes!("../../dist/assets/companion_avatar-4rust.jpg")[..])
 }
 
+#[get("/manifest.json")]
+async fn manifest() -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("application/manifest+json")
+        .body(include_str!("../../dist/manifest.json"))
+}
+
+#[get("/sw.js")]
+async fn service_worker() -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("application/javascript")
+        .body(include_str!("../../dist/sw.js"))
+}
+
 #[get("/assets/avatar.png")]
 async fn companion_avatar_custom() -> actix_web::Result<actix_web::HttpResponse> {
     match File::open("assets/avatar.png") {
@@ -1355,6 +1369,10 @@ async fn end_session(
 ) -> HttpResponse {
     match session_manager.end_session(&session_id) {
         Ok(()) => HttpResponse::Ok().body("Session ended successfully"),
+        Err(e) if e.contains("not found") => {
+            println!("Failed to end session: {}", e);
+            HttpResponse::NotFound().body(format!("Error ending session: {}", e))
+        }
         Err(e) => {
             println!("Failed to end session: {}", e);
             HttpResponse::InternalServerError().body(format!("Error ending session: {}", e))
@@ -1559,6 +1577,8 @@ async fn main() -> std::io::Result<()> {
             .service(project_logo)
             .service(companion_avatar_img)
             .service(companion_avatar_custom)
+            .service(manifest)
+            .service(service_worker)
             .service(message)
             .service(clear_messages)
             .service(message_id)
