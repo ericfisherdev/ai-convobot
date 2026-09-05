@@ -21,6 +21,8 @@ use crate::inference_optimizer::{StreamChunk, INFERENCE_OPTIMIZER};
 mod session_manager;
 mod token_budget;
 use crate::session_manager::SessionManager;
+mod attitude_engine;
+use crate::attitude_engine::{LexiconScorer, ScorerConfig, TurnScorer};
 mod attitude_formatter;
 mod gpu_allocator;
 use crate::gpu_allocator::{GpuAllocator, LayerAllocation};
@@ -567,6 +569,96 @@ fn preprocess_user_message(user_message: &str, companion_id: i32) -> Option<Stri
     None
 }
 
+/// Derives attitude deltas from one conversation turn and persists them.
+///
+/// Called after generation, once both sides of the turn are known, from both
+/// `/api/prompt` and `/api/prompt/stream`. An attitude failure must never fail
+/// the chat reply, so every error path here is logged and returns `None`
+/// rather than propagating.
+///
+/// On success, returns the (previous, current) attitude pair for the user
+/// target so callers can report or persist the change (e.g. into the SSE
+/// chunk, or as an attitude memory).
+fn finish_turn(
+    companion_id: i32,
+    user_id: i32,
+    user_message: &str,
+    companion_reply: &str,
+) -> Option<(CompanionAttitude, CompanionAttitude)> {
+    let current = match Database::get_attitude(companion_id, user_id, "user") {
+        Ok(Some(attitude)) => attitude,
+        Ok(None) => {
+            // Fresh database: seed the row from the companion's persona before
+            // scoring, otherwise the UPDATE below would silently touch zero rows.
+            let persona = match Database::get_companion_data() {
+                Ok(companion_data) => companion_data.persona,
+                Err(e) => {
+                    eprintln!("Failed to load companion persona for attitude seed: {}", e);
+                    return None;
+                }
+            };
+            if let Err(e) = Database::create_initial_user_attitude(companion_id, user_id, &persona)
+            {
+                eprintln!("Failed to seed initial user attitude: {}", e);
+                return None;
+            }
+            match Database::get_attitude(companion_id, user_id, "user") {
+                Ok(Some(attitude)) => attitude,
+                Ok(None) => {
+                    eprintln!("Attitude row missing immediately after seeding");
+                    return None;
+                }
+                Err(e) => {
+                    eprintln!("Failed to reload seeded attitude: {}", e);
+                    return None;
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to load attitude before scoring turn: {}", e);
+            return None;
+        }
+    };
+
+    let persona = match Database::get_companion_data() {
+        Ok(companion_data) => companion_data.persona,
+        Err(e) => {
+            eprintln!(
+                "Failed to load companion persona for attitude baseline: {}",
+                e
+            );
+            return None;
+        }
+    };
+    let baseline = Database::adjust_attitude_for_persona(
+        &Database::default_user_attitude(companion_id, user_id),
+        &persona,
+    );
+
+    let scorer = LexiconScorer::new(ScorerConfig::new(baseline));
+    let deltas = scorer.evaluate_turn(user_message, companion_reply, &current);
+
+    match Database::apply_attitude_deltas(companion_id, user_id, "user", &deltas) {
+        Ok(Some((previous, updated))) => {
+            let formatter = crate::attitude_formatter::AttitudeFormatter::new();
+            let attitude_changes =
+                formatter.format_attitude_changes_for_console(&previous, &updated);
+            if !attitude_changes.is_empty() {
+                println!("{}", attitude_changes);
+            }
+            Some((previous, updated))
+        }
+        Ok(None) => {
+            eprintln!("Attitude row missing when applying deltas after seeding");
+            None
+        }
+        Err(e) => {
+            eprintln!("Failed to apply attitude deltas: {}", e);
+            None
+        }
+    }
+}
+
 #[post("/api/prompt")]
 async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
     let prompt_message = received.into_inner().prompt.clone();
@@ -581,18 +673,7 @@ async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
         }
     };
     let interaction_prompt = preprocess_user_message(&prompt_message, companion_id);
-
-    // Get current attitude for comparison (before processing)
     let user_id = 1; // Default user ID
-    let previous_attitude = match Database::get_all_companion_attitudes(companion_id) {
-        Ok(attitudes) => {
-            // Find the user attitude
-            attitudes
-                .into_iter()
-                .find(|a| a.target_id == user_id && a.target_type == "user")
-        }
-        _ => None,
-    };
 
     // Estimate response time based on message complexity
     let estimate = estimate_response_time_enhanced(&prompt_message);
@@ -623,7 +704,10 @@ async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
 
         // Generate response with interaction context
         match prompt(enhanced_prompt, companion_id) {
-            Ok(v) => return HttpResponse::Ok().body(v),
+            Ok(v) => {
+                finish_turn(companion_id, user_id, &prompt_message, &v);
+                return HttpResponse::Ok().body(v);
+            }
             Err(e) => {
                 println!("Failed to generate prompt with interaction context: {}", e);
             }
@@ -643,22 +727,7 @@ async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
     };
     match prompt(&prompt_message, companion_id) {
         Ok(v) => {
-            // Check for attitude changes after processing
-            if let Some(prev_attitude) = previous_attitude {
-                if let Ok(attitudes) = Database::get_all_companion_attitudes(companion_id) {
-                    if let Some(current_attitude) = attitudes
-                        .into_iter()
-                        .find(|a| a.target_id == user_id && a.target_type == "user")
-                    {
-                        let formatter = crate::attitude_formatter::AttitudeFormatter::new();
-                        let attitude_changes = formatter
-                            .format_attitude_changes_for_console(&prev_attitude, &current_attitude);
-                        if !attitude_changes.is_empty() {
-                            println!("{}", attitude_changes);
-                        }
-                    }
-                }
-            }
+            finish_turn(companion_id, user_id, &prompt_message, &v);
 
             // Display actual response time
             let elapsed = start_time.elapsed();
@@ -1211,6 +1280,7 @@ async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpR
         }
     };
     let interaction_prompt = preprocess_user_message(&user_message, companion_id);
+    let user_id = 1; // Default user ID
 
     // The generator reads recent messages back out of the database, so the
     // user's turn has to be persisted before generation starts.
@@ -1228,6 +1298,10 @@ async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpR
     // Generation is CPU-bound and blocking, so it runs on its own thread rather
     // than occupying an actix worker for the whole response.
     let worker_session = session_id.clone();
+    // Cloned before the move into `generation_prompt` below: the interaction
+    // context (if any) is what gets generated from, but the attitude engine
+    // needs to score what the user actually said.
+    let scored_message = user_message.clone();
     let generation_prompt = interaction_prompt.unwrap_or(user_message);
     std::thread::spawn(move || {
         let mut token_count = 0usize;
@@ -1251,13 +1325,18 @@ async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpR
             // The streamed pieces include stop markers that are stripped before
             // the reply is persisted, so the final chunk carries the cleaned
             // text for the client to settle on.
-            Ok(reply) => StreamChunk {
-                request_id: worker_session.clone(),
-                content: reply,
-                is_complete: true,
-                token_count: Some(token_count),
-                error: None,
-            },
+            Ok(reply) => {
+                // Persisted before the client sees `is_complete: true`, so the
+                // row is already updated by the time the caller can react to it.
+                finish_turn(companion_id, user_id, &scored_message, &reply);
+                StreamChunk {
+                    request_id: worker_session.clone(),
+                    content: reply,
+                    is_complete: true,
+                    token_count: Some(token_count),
+                    error: None,
+                }
+            }
             Err(e) => {
                 eprintln!("Failed to generate streamed prompt: {}", e);
                 StreamChunk {
