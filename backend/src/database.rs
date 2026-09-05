@@ -3,6 +3,7 @@ use rusqlite::types::{FromSql, FromSqlError, ToSqlOutput, ValueRef};
 use rusqlite::{params, Connection, Error, OptionalExtension, Result, ToSql, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -612,7 +613,38 @@ fn read_attitude_row(
 
 pub struct Database {}
 
+/// The single definition of the SQLite database file name. #107 will later
+/// swap this for `paths::db_path()`.
+pub const DATABASE_PATH: &str = "companion_database.db";
+
 impl Database {
+    /// Opens the shared companion database with the pragmas every caller
+    /// needs: a five-second busy timeout so concurrent access waits instead
+    /// of racing rusqlite's default (`sqlite3_busy_timeout(db, 5000)`, which
+    /// its own docs mark as "subject to change"), and WAL journaling so
+    /// readers (HTTP handlers) and the writer (the generation thread) stop
+    /// excluding each other the way the default rollback journal does.
+    /// `synchronous=NORMAL` is safe with WAL (durable across crashes, may
+    /// lose only the last transactions on power loss) and must be set on
+    /// every connection since it is not persisted like `journal_mode` is.
+    ///
+    /// `PRAGMA foreign_keys` is intentionally left at its default (off):
+    /// `attitude_memories` declares a foreign key to a `companions` table
+    /// that does not exist (the table is named `companion`), so turning
+    /// enforcement on would break every attitude-memory insert. Fixing that
+    /// typo and validating existing databases is tracked separately (#110).
+    pub fn open() -> Result<Connection> {
+        Self::open_at(DATABASE_PATH)
+    }
+
+    fn open_at(path: impl AsRef<Path>) -> Result<Connection> {
+        let con = Connection::open(path)?;
+        con.busy_timeout(Duration::from_secs(5))?;
+        con.pragma_update(None, "journal_mode", "WAL")?;
+        con.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(con)
+    }
+
     pub fn clear_message_cache() {
         if let Ok(mut cache) = MESSAGE_CACHE.lock() {
             cache.clear();
@@ -622,7 +654,7 @@ impl Database {
 
 impl Database {
     pub fn init() -> Result<usize> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         con.execute(
             "CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -966,7 +998,7 @@ impl Database {
     }
 
     /* pub fn get_messages() -> Result<Vec<Message>> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let mut stmt = con.prepare("SELECT id, ai, content, created_at FROM messages")?;
         let rows = stmt.query_map([], |row| {
             Ok(Message {
@@ -996,7 +1028,7 @@ impl Database {
             }
         }
 
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let mut stmt = con.prepare(
             "SELECT id, ai, content, created_at FROM messages ORDER BY id DESC LIMIT ? OFFSET ?",
         )?;
@@ -1027,13 +1059,13 @@ impl Database {
     }
 
     pub fn get_total_message_count() -> Result<usize> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let count: i64 = con.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
         Ok(count as usize)
     }
 
     pub fn get_latest_message() -> Result<Message> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let mut stmt = con
             .prepare("SELECT id, ai, content, created_at FROM messages ORDER BY id DESC LIMIT 1")?;
         let row = stmt.query_row([], |row| {
@@ -1048,7 +1080,7 @@ impl Database {
     }
 
     pub fn get_companion_data() -> Result<CompanionView> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let mut stmt = con.prepare("SELECT name, persona, example_dialogue, first_message, long_term_mem, short_term_mem, roleplay, dialogue_tuning, avatar_path FROM companion LIMIT 1")?;
         let row = stmt.query_row([], |row| {
             Ok(CompanionView {
@@ -1067,14 +1099,14 @@ impl Database {
     }
 
     pub fn get_companion_id() -> Result<i32> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let mut stmt = con.prepare("SELECT id FROM companion LIMIT 1")?;
         let row = stmt.query_row([], |row| row.get(0))?;
         Ok(row)
     }
 
     pub fn get_companion_card_data() -> Result<CharacterCard> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let mut stmt = con.prepare(
             "SELECT name, persona, first_message, example_dialogue FROM companion LIMIT 1",
         )?;
@@ -1090,7 +1122,7 @@ impl Database {
     }
 
     pub fn get_user_data() -> Result<UserView> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let mut stmt = con.prepare("SELECT name, persona FROM user LIMIT 1")?;
         let row: UserView = stmt.query_row([], |row| {
             Ok(UserView {
@@ -1102,7 +1134,7 @@ impl Database {
     }
 
     pub fn get_message(id: i32) -> Result<Message> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let mut stmt =
             con.prepare("SELECT id, ai, content, created_at FROM messages WHERE id = ?")?;
         let row = stmt.query_row([id], |row| {
@@ -1117,7 +1149,7 @@ impl Database {
     }
 
     pub fn insert_message(message: NewMessage) -> Result<(), Error> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         con.execute(
             &format!(
                 "INSERT INTO messages (ai, content, created_at) VALUES ({}, ?, ?)",
@@ -1133,7 +1165,7 @@ impl Database {
     }
 
     pub fn edit_message(id: i32, message: NewMessage) -> Result<(), Error> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         con.execute(
             &format!(
                 "UPDATE messages SET ai = {}, content = ? WHERE id = ?",
@@ -1149,7 +1181,7 @@ impl Database {
     }
 
     pub fn delete_message(id: i32) -> Result<(), Error> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         con.execute("DELETE FROM messages WHERE id = ?", [id])?;
 
         // Clear message cache when message is deleted
@@ -1159,7 +1191,7 @@ impl Database {
     }
 
     pub fn delete_latest_message() -> Result<(), rusqlite::Error> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let last_message_id: i32 = con.query_row(
             "SELECT id FROM messages ORDER BY id DESC LIMIT 1",
             [],
@@ -1170,7 +1202,7 @@ impl Database {
     }
 
     pub fn erase_messages() -> Result<(), Error> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         con.execute("DELETE FROM messages", [])?;
 
         // Clear message cache when all messages are erased
@@ -1205,7 +1237,7 @@ impl Database {
     }
 
     pub fn edit_companion(companion: CompanionView) -> Result<(), Error> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         con.execute(
             &format!("UPDATE companion SET name = ?, persona = ?, example_dialogue = ?, first_message = ?, long_term_mem = {}, short_term_mem = {}, roleplay = {}, dialogue_tuning = {}, avatar_path = ?", companion.long_term_mem, companion.short_term_mem, companion.roleplay, companion.dialogue_tuning),
             [
@@ -1220,7 +1252,7 @@ impl Database {
     }
 
     pub fn import_character_json(companion: CharacterCard) -> Result<(), Error> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         con.execute(
             "UPDATE companion SET name = ?, persona = ?, example_dialogue = ?, first_message = ?",
             [
@@ -1234,7 +1266,7 @@ impl Database {
     }
 
     pub fn import_character_card(companion: CharacterCard, image_path: &str) -> Result<(), Error> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         con.execute(
             "UPDATE companion SET name = ?, persona = ?, example_dialogue = ?, first_message = ?, avatar_path = ?",
             [
@@ -1249,13 +1281,13 @@ impl Database {
     }
 
     pub fn change_companion_avatar(avatar_path: &str) -> Result<(), Error> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         con.execute("UPDATE companion SET avatar_path = ?", [avatar_path])?;
         Ok(())
     }
 
     pub fn edit_user(user: UserView) -> Result<(), Error> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         con.execute(
             "UPDATE user SET name = ?, persona = ?",
             [&user.name, &user.persona],
@@ -1264,7 +1296,7 @@ impl Database {
     }
 
     pub fn get_config() -> Result<ConfigView> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let mut stmt = con.prepare("SELECT device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb, dynamic_gpu_allocation, gpu_safety_margin, min_free_vram_mb, enable_hybrid_context, max_system_ram_usage_gb, context_expansion_strategy, ram_safety_margin_gb FROM config LIMIT 1")?;
         let row = stmt.query_row([], |row| {
             Ok(ConfigView {
@@ -1314,7 +1346,7 @@ impl Database {
             }
         };
 
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         con.execute(
             "UPDATE config SET device = ?, llm_model_path = ?, gpu_layers = ?, prompt_template = ?, context_window_size = ?, max_response_tokens = ?, enable_dynamic_context = ?, vram_limit_gb = ?, dynamic_gpu_allocation = ?, gpu_safety_margin = ?, min_free_vram_mb = ?, enable_hybrid_context = ?, max_system_ram_usage_gb = ?, context_expansion_strategy = ?, ram_safety_margin_gb = ?",
             [
@@ -1344,7 +1376,7 @@ impl Database {
         target_type: &str,
         attitude: &CompanionAttitude,
     ) -> Result<i32> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let current_time = get_current_date();
 
         let existing_id: Option<i32> = con.query_row(
@@ -1432,7 +1464,7 @@ impl Database {
         target_id: i32,
         target_type: &str,
     ) -> Result<Option<CompanionAttitude>> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         read_attitude_row(&con, companion_id, target_id, target_type)
     }
 
@@ -1447,7 +1479,7 @@ impl Database {
         // `PUT /api/attitude/dimension` is not something the companion lived
         // through. Memories are recorded per conversation turn, from
         // `finish_turn` in `main.rs`.
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let current_time = get_current_date();
 
         let query = format!(
@@ -1482,7 +1514,7 @@ impl Database {
         target_type: &str,
         deltas: &[crate::attitude_engine::DimensionDelta],
     ) -> Result<Option<(CompanionAttitude, CompanionAttitude)>> {
-        let mut con = Connection::open("companion_database.db")?;
+        let mut con = Self::open()?;
         let current_time = get_current_date();
 
         // Immediate acquires the write lock before the first read below, so
@@ -1530,7 +1562,7 @@ impl Database {
     }
 
     pub fn get_all_companion_attitudes(companion_id: i32) -> Result<Vec<CompanionAttitude>> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let mut stmt = con.prepare(
             "SELECT id, companion_id, target_id, target_type, attraction, trust, fear, anger,
                     joy, sorrow, disgust, surprise, curiosity, respect, suspicion,
@@ -1587,7 +1619,7 @@ impl Database {
         interaction_type: &str,
         event: Option<&str>,
     ) -> Result<()> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
 
         let field = match interaction_type {
             "positive" => "positive_interactions",
@@ -1613,7 +1645,7 @@ impl Database {
     }
 
     pub fn clear_companion_attitudes(companion_id: i32) -> Result<()> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         con.execute(
             "DELETE FROM companion_attitudes WHERE companion_id = ?",
             params![companion_id],
@@ -1685,7 +1717,7 @@ impl Database {
     ) -> Result<()> {
         let base_attitude = Database::default_user_attitude(companion_id, user_id);
         let attitude = Database::adjust_attitude_for_persona(&base_attitude, companion_persona);
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         con.execute(
             "INSERT OR IGNORE INTO companion_attitudes (
                 companion_id, target_id, target_type, attraction, trust, fear, anger,
@@ -1810,7 +1842,7 @@ impl Database {
         name: &str,
         initial_data: Option<ThirdPartyIndividual>,
     ) -> Result<i32> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let current_time = get_current_date();
 
         let existing_id: Option<i32> = con
@@ -1904,7 +1936,7 @@ impl Database {
         companion_id: i32,
         memory: &ThirdPartyMemory,
     ) -> Result<i32> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let current_time = get_current_date();
 
         con.execute(
@@ -1928,7 +1960,7 @@ impl Database {
     }
 
     pub fn plan_third_party_interaction(interaction: &ThirdPartyInteraction) -> Result<i32> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let current_time = get_current_date();
 
         con.execute(
@@ -1955,7 +1987,7 @@ impl Database {
         companion_id: i32,
         limit: Option<usize>,
     ) -> Result<Vec<ThirdPartyInteraction>> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let query = if let Some(limit) = limit {
             format!(
                 "SELECT id, third_party_id, companion_id, interaction_type, description,
@@ -2003,7 +2035,7 @@ impl Database {
     }
 
     pub fn complete_interaction(interaction_id: i32, outcome: &str, impact: f32) -> Result<()> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let current_time = get_current_date();
 
         con.execute(
@@ -2024,7 +2056,7 @@ impl Database {
         companion_id: i32,
         third_party_id: i32,
     ) -> Result<Vec<ThirdPartyInteraction>> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let mut stmt = con.prepare(
             "SELECT id, third_party_id, companion_id, interaction_type, description,
                     planned_date, actual_date, outcome, impact_on_relationship,
@@ -2059,7 +2091,7 @@ impl Database {
     }
 
     pub fn get_third_party_by_name(name: &str) -> Result<Option<ThirdPartyIndividual>> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let mut stmt = con.prepare(
             "SELECT id, name, relationship_to_user, relationship_to_companion, occupation,
                     personality_traits, physical_description, first_mentioned, last_mentioned,
@@ -2091,7 +2123,7 @@ impl Database {
     }
 
     pub fn get_all_third_party_individuals() -> Result<Vec<ThirdPartyIndividual>> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let mut stmt = con.prepare(
             "SELECT id, name, relationship_to_user, relationship_to_companion, occupation,
                     personality_traits, physical_description, first_mentioned, last_mentioned,
@@ -2131,7 +2163,7 @@ impl Database {
         third_party_id: i32,
         limit: Option<usize>,
     ) -> Result<Vec<ThirdPartyMemory>> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let query = if let Some(limit) = limit {
             format!(
                 "SELECT id, third_party_id, companion_id, memory_type, content,
@@ -2176,7 +2208,7 @@ impl Database {
 
     #[allow(dead_code)]
     pub fn update_third_party_importance(third_party_id: i32, new_importance: f32) -> Result<()> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let current_time = get_current_date();
 
         con.execute(
@@ -2192,7 +2224,7 @@ impl Database {
     // Attitude Change Detection System
 
     pub fn create_attitude_memories_table() -> Result<()> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         con.execute(
             "CREATE TABLE IF NOT EXISTS attitude_memories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2240,7 +2272,7 @@ impl Database {
         };
 
         let attitude_delta_json = serde_json::to_string(&draft.delta).unwrap_or_default();
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let current_time = get_current_date();
 
         con.execute(
@@ -2278,7 +2310,7 @@ impl Database {
     ///
     /// Returns the number of rows deleted.
     pub fn prune_attitude_memories(companion_id: i32, keep: usize) -> Result<usize> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         con.execute(
             "DELETE FROM attitude_memories
              WHERE companion_id = ?1
@@ -2318,7 +2350,7 @@ impl Database {
         target_type: Option<&str>,
         limit: usize,
     ) -> Result<Vec<AttitudeMemory>> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let base = "SELECT id, companion_id, target_id, target_type, memory_type, description,
                     priority_score, attitude_delta_json, impact_score, message_context, created_at
              FROM attitude_memories
@@ -2422,7 +2454,7 @@ impl Database {
     }
 
     pub fn cleanup_duplicate_third_parties() -> Result<i32> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let mut cleaned_count = 0;
 
         // Find all duplicate names (case-insensitive)
@@ -2554,7 +2586,7 @@ impl Database {
     }
 
     pub fn cleanup_invalid_third_parties() -> Result<i32> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let mut cleaned_count = 0;
 
         // List of invalid names that should be removed
@@ -3555,7 +3587,7 @@ impl Database {
     // Companion Interaction Tracking System
 
     pub fn generate_interaction_outcome(interaction_id: i32) -> Result<String> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
 
         // Get the interaction details
         let interaction: ThirdPartyInteraction = con.query_row(
@@ -3801,7 +3833,7 @@ impl Database {
     }
 
     pub fn get_third_party_by_id(id: i32) -> Result<Option<ThirdPartyIndividual>> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let mut stmt = con.prepare(
             "SELECT id, name, relationship_to_user, relationship_to_companion, occupation,
                     personality_traits, physical_description, first_mentioned, last_mentioned,
@@ -3995,7 +4027,7 @@ impl Database {
     }
 
     pub fn get_interaction_by_id(id: i32) -> Result<Option<ThirdPartyInteraction>> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Self::open()?;
         let mut stmt = con.prepare(
             "SELECT id, third_party_id, companion_id, interaction_type, description,
                     planned_date, actual_date, outcome, impact_on_relationship,
@@ -4183,6 +4215,7 @@ impl Database {
         let third_parties = Database::get_all_third_party_individuals()?;
 
         let message_lower = message.to_lowercase();
+        let con = Self::open()?;
 
         for party in &third_parties {
             let name_lower = party.name.to_lowercase();
@@ -4190,7 +4223,6 @@ impl Database {
             // Check if this person is mentioned in the message
             if message_lower.contains(&name_lower) {
                 // Update mention count and last_mentioned
-                let con = Connection::open("companion_database.db")?;
                 let current_time = get_current_date();
 
                 con.execute(
@@ -4279,6 +4311,102 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
+    use std::thread;
+
+    #[test]
+    fn open_at_enables_wal_on_a_fresh_database() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("t.db");
+
+        let con = Database::open_at(&db_path).unwrap();
+        let mode: String = con
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        drop(con);
+
+        // WAL is persisted in the file itself, so a fresh connection to the
+        // same path reports it too, not just the connection that set it.
+        let con2 = Database::open_at(&db_path).unwrap();
+        let mode2: String = con2
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode2, "wal");
+    }
+
+    #[test]
+    fn concurrent_read_succeeds_while_a_write_transaction_is_held() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("t.db");
+
+        let setup = Database::open_at(&db_path).unwrap();
+        setup
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", [])
+            .unwrap();
+        setup.execute("INSERT INTO t (id) VALUES (1)", []).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let writer_barrier = Arc::clone(&barrier);
+        let writer_path = db_path.clone();
+
+        let writer = thread::spawn(move || {
+            let mut con = Database::open_at(&writer_path).unwrap();
+            let tx = con
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            // This second row stays uncommitted while the reader below runs,
+            // so the reader's snapshot must not include it.
+            tx.execute("INSERT INTO t (id) VALUES (2)", []).unwrap();
+            writer_barrier.wait();
+            thread::sleep(Duration::from_millis(100));
+            tx.commit().unwrap();
+        });
+
+        barrier.wait();
+        let reader = Database::open_at(&db_path).unwrap();
+        // WAL readers see a snapshot as of the start of their read: the
+        // pre-existing committed row, not the writer's uncommitted insert.
+        let count: i64 = reader
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn open_sets_a_busy_timeout_so_a_second_writer_waits_instead_of_failing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("t.db");
+
+        let setup = Database::open_at(&db_path).unwrap();
+        setup
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", [])
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let writer_barrier = Arc::clone(&barrier);
+        let writer_path = db_path.clone();
+
+        let writer = thread::spawn(move || {
+            let mut con = Database::open_at(&writer_path).unwrap();
+            let tx = con
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            writer_barrier.wait();
+            thread::sleep(Duration::from_millis(100));
+            tx.commit().unwrap();
+        });
+
+        barrier.wait();
+        let mut second = Database::open_at(&db_path).unwrap();
+        let tx2 = second.transaction_with_behavior(TransactionBehavior::Immediate);
+        assert!(tx2.is_ok(), "busy handler should wait rather than fail");
+        tx2.unwrap().commit().unwrap();
+
+        writer.join().unwrap();
+    }
 
     #[test]
     fn test_get_current_date() {
