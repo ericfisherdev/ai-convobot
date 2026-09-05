@@ -975,6 +975,16 @@ async fn inspect_prompt(query: web::Query<PromptInspectParams>) -> HttpResponse 
         }
     };
 
+    // Named to avoid the `config` handler unit struct in this module.
+    let config_view = match Database::get_config() {
+        Ok(config_view) => config_view,
+        Err(e) => {
+            println!("Failed to get config: {}", e);
+            return HttpResponse::InternalServerError()
+                .body("Error while getting config, check logs for more information");
+        }
+    };
+
     let companion_id = match query.companion_id {
         Some(id) => id,
         None => match Database::get_companion_id() {
@@ -991,6 +1001,7 @@ async fn inspect_prompt(query: web::Query<PromptInspectParams>) -> HttpResponse 
         query.prompt.as_deref().unwrap_or(""),
         companion_id,
         &long_term_memory,
+        &config_view,
     ) {
         Ok(assembled) => HttpResponse::Ok().json(assembled),
         Err(e) => {

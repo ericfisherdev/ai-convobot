@@ -121,8 +121,18 @@ run_preset() {
         -d "$(preset_body "$@")" >/dev/null
 
     # The exact block the next generation will inject, with no inference.
-    curl -sf "$BASE_URL/api/debug/prompt?companion_id=$COMPANION_ID" \
-        | jq -r '.attitude_context' > "$WORK_DIR/$name.attitude"
+    local inspected="$WORK_DIR/$name.debug_prompt.json"
+    curl -sf "$BASE_URL/api/debug/prompt?companion_id=$COMPANION_ID" -o "$inspected"
+
+    # The comparison is only meaningful if the block actually reaches the
+    # prompt, so fail loudly rather than leaving a human to notice three
+    # identical replies.
+    jq -e '.system_prompt | contains($block)' \
+        --arg block "$(jq -r '.attitude_context' "$inspected")" \
+        "$inspected" >/dev/null \
+        || { echo "attitude_context is not present in system_prompt for preset '$name'" >&2; exit 1; }
+
+    jq -r '.attitude_context' "$inspected" > "$WORK_DIR/$name.attitude"
 
     local floor
     floor="$(latest_message_id)"
