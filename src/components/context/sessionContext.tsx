@@ -120,7 +120,8 @@ export const SessionProvider: React.FC<SessionProviderProps> = ({ children }) =>
                     'Content-Type': 'application/json',
                 },
                 body: JSON.stringify({
-                    companion_id: 1, // Using default companion_id
+                    // companion_id is resolved server-side; the client has no way
+                    // to know the real companion id (CompanionView exposes no id).
                     user_id: 1, // Using default user_id
                 }),
             });

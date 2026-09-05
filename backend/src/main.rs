@@ -676,6 +676,17 @@ async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
 
 #[get("/api/prompt/regenerate")]
 async fn regenerate_prompt() -> HttpResponse {
+    // Resolved before the delete below: it is read-only, so a lookup failure
+    // here must not leave the conversation with its last message destroyed
+    // and no replacement generated.
+    let companion_id = match Database::get_companion_id() {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Failed to get companion id: {}", e);
+            return HttpResponse::InternalServerError()
+                .body("Error while getting companion data, check logs for more information");
+        }
+    };
     match Database::delete_latest_message() {
         Ok(_) => {}
         Err(e) => {
@@ -690,14 +701,6 @@ async fn regenerate_prompt() -> HttpResponse {
             println!("Failed to get latest message: {}", e);
             return HttpResponse::InternalServerError()
                 .body("Error while getting latest message, check logs for more information");
-        }
-    };
-    let companion_id = match Database::get_companion_id() {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!("Failed to get companion id: {}", e);
-            return HttpResponse::InternalServerError()
-                .body("Error while getting companion data, check logs for more information");
         }
     };
     match prompt(&prompt_msg, companion_id) {
@@ -1327,7 +1330,6 @@ async fn cleanup_cache() -> HttpResponse {
 // Session Management Endpoints
 #[derive(Deserialize)]
 struct CreateSessionRequest {
-    companion_id: i32,
     user_id: Option<i32>,
 }
 
@@ -1336,7 +1338,18 @@ async fn create_session(
     session_manager: web::Data<SessionManager>,
     req: web::Json<CreateSessionRequest>,
 ) -> HttpResponse {
-    match session_manager.create_session(req.companion_id, req.user_id) {
+    // Resolved server-side rather than trusted from the request: the client
+    // cannot know the real companion id (CompanionView exposes no id), so a
+    // client-supplied value would always be the hardcoded default.
+    let companion_id = match Database::get_companion_id() {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Failed to get companion id: {}", e);
+            return HttpResponse::InternalServerError()
+                .body("Error while getting companion data, check logs for more information");
+        }
+    };
+    match session_manager.create_session(companion_id, req.user_id) {
         Ok(session) => {
             let response_json =
                 serde_json::to_string(&session).unwrap_or_else(|_| "{}".to_string());
