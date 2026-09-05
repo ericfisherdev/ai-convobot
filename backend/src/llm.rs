@@ -13,6 +13,7 @@ use crate::gpu_allocator::GpuAllocator;
 use crate::inference_optimizer::INFERENCE_OPTIMIZER;
 use crate::inference_performance::{ModelConfig, INFERENCE_TRACKER};
 use crate::long_term_mem::LongTermMem;
+use crate::model_cache::{ModelKey, ResidentCache};
 
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -26,9 +27,16 @@ use std::sync::{Mutex, OnceLock};
 /// Maximum tokens submitted to llama.cpp in a single decode call.
 const N_BATCH: u32 = 512;
 
-/// Serialises generation. Each call loads its own copy of the model, so two
-/// concurrent requests would hold two full copies in memory at once.
+/// Serialises generation. This does not protect two copies of the model from
+/// coexisting in memory any more (the model is cached in `RESIDENT_MODEL`
+/// and shared via `Arc`); it guarantees exactly one `LlamaContext` uses that
+/// shared model at a time, and lets a config-driven key change free the old
+/// model before loading the new one without racing a generation in flight.
 static GENERATION_LOCK: Mutex<()> = Mutex::new(());
+
+/// The currently loaded model, kept resident between turns. Reloaded only
+/// when `ModelKey::from_config` changes (model path or GPU-related config).
+static RESIDENT_MODEL: ResidentCache<ModelKey, LlamaModel> = ResidentCache::new();
 
 /// llama.cpp keeps process-global state, so its backend must be initialised
 /// exactly once. Later calls reuse the handle stored here.
@@ -546,49 +554,15 @@ pub fn assemble_prompt(
     })
 }
 
-fn generate(
-    prompt: &str,
-    companion_id: i32,
-    on_token: &mut dyn FnMut(&str),
-) -> Result<String, std::io::Error> {
-    let _generation_guard = GENERATION_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let start_time = std::time::Instant::now();
-    let long_term_memory = match LongTermMem::connect() {
-        Ok(ltm) => ltm,
-        Err(e) => {
-            eprintln!("Error while connecting to tantivy: {}", e);
-            return Err(std::io::Error::other("Error while connecting to tantivy"));
-        }
-    };
-    let local: DateTime<Local> = Local::now();
-    let formatted_date = local.format("* at %A %d.%m.%Y %H:%M *\n").to_string();
-    let config: ConfigView = match Database::get_config() {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("Error while getting config: {}", e);
-            return Err(std::io::Error::other("Error while getting config"));
-        }
-    };
-    let user: UserView = match Database::get_user_data() {
-        Ok(user) => user,
-        Err(e) => {
-            eprintln!("Error while getting user data: {}", e);
-            return Err(std::io::Error::other("Error while getting user data"));
-        }
-    };
-    let companion: CompanionView = match Database::get_companion_data() {
-        Ok(companion) => companion,
-        Err(e) => {
-            eprintln!("Error while getting companion data: {}", e);
-            return Err(std::io::Error::other("Error while getting companion data"));
-        }
-    };
-
-    // llama.cpp expresses GPU offloading as a single layer count, so resolve
-    // that number before building the model parameters.
-    let gpu_layers: u32 = if config.device == Device::GPU || config.device == Device::Metal {
+/// Resolves how many layers llama.cpp should offload to the GPU.
+///
+/// llama.cpp expresses GPU offloading as a single layer count, so this runs
+/// before building the model parameters. Only called from `load_model`, i.e.
+/// only when a (re)load actually happens: running GPU detection on every
+/// turn would see less free VRAM once the model is resident and thrash the
+/// layer count down, see `ModelKey`.
+fn resolve_gpu_layers(config: &ConfigView) -> u32 {
+    if config.device == Device::GPU || config.device == Device::Metal {
         if config.dynamic_gpu_allocation {
             let allocator = GpuAllocator::new()
                 .with_safety_margin(config.gpu_safety_margin)
@@ -632,30 +606,95 @@ fn generate(
     } else {
         println!("💻 CPU-only inference mode");
         0
-    };
+    }
+}
 
+/// Loads the GGUF file named by `config.llm_model_path`. Only runs when
+/// `RESIDENT_MODEL` needs a (re)load, i.e. on the first turn and whenever
+/// `ModelKey::from_config` changes.
+fn load_model(backend: &LlamaBackend, config: &ConfigView) -> Result<LlamaModel, std::io::Error> {
+    let gpu_layers = resolve_gpu_layers(config);
     let model_params = LlamaModelParams::default()
         .with_n_gpu_layers(gpu_layers)
         .with_use_mmap(true); // Memory-mapped model loading reduces RAM usage
 
-    let backend = llama_backend()?;
-
     print!("📚 Loading model... ");
     std::io::stdout().flush().unwrap();
-    let model = match LlamaModel::load_from_file(
+    let load_start = std::time::Instant::now();
+    let model = LlamaModel::load_from_file(
         backend,
         std::path::Path::new(&config.llm_model_path),
         &model_params,
-    ) {
-        Ok(model) => model,
+    )
+    .map_err(|e| std::io::Error::other(format!("Failed to load llm model: {}", e)))?;
+    println!(
+        "✓ Model loaded in {:.2}s ({} GPU layers)",
+        load_start.elapsed().as_secs_f64(),
+        gpu_layers
+    );
+    Ok(model)
+}
+
+/// Frees the resident model, if any, returning whether one was resident and
+/// the path it was loaded from. A generation in flight keeps its own `Arc`
+/// clone, so the model stays alive until that turn finishes; this only stops
+/// it from being handed out to new turns. The next turn reloads it.
+pub fn unload_model() -> (bool, Option<String>) {
+    let model_path = RESIDENT_MODEL.resident_key().map(|key| key.model_path);
+    let unloaded = RESIDENT_MODEL.evict();
+    (unloaded, model_path)
+}
+
+fn generate(
+    prompt: &str,
+    companion_id: i32,
+    on_token: &mut dyn FnMut(&str),
+) -> Result<String, std::io::Error> {
+    let _generation_guard = GENERATION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let start_time = std::time::Instant::now();
+    let long_term_memory = match LongTermMem::connect() {
+        Ok(ltm) => ltm,
         Err(e) => {
-            return Err(std::io::Error::other(format!(
-                "Failed to load llm model: {}",
-                e
-            )))
+            eprintln!("Error while connecting to tantivy: {}", e);
+            return Err(std::io::Error::other("Error while connecting to tantivy"));
         }
     };
-    println!("✓ Model loaded");
+    let local: DateTime<Local> = Local::now();
+    let formatted_date = local.format("* at %A %d.%m.%Y %H:%M *\n").to_string();
+    let config: ConfigView = match Database::get_config() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("Error while getting config: {}", e);
+            return Err(std::io::Error::other("Error while getting config"));
+        }
+    };
+    let user: UserView = match Database::get_user_data() {
+        Ok(user) => user,
+        Err(e) => {
+            eprintln!("Error while getting user data: {}", e);
+            return Err(std::io::Error::other("Error while getting user data"));
+        }
+    };
+    let companion: CompanionView = match Database::get_companion_data() {
+        Ok(companion) => companion,
+        Err(e) => {
+            eprintln!("Error while getting companion data: {}", e);
+            return Err(std::io::Error::other("Error while getting companion data"));
+        }
+    };
+
+    let backend = llama_backend()?;
+
+    let (model, was_resident) = RESIDENT_MODEL
+        .get_or_load(ModelKey::from_config(&config), |_| {
+            load_model(backend, &config)
+        })?;
+    if was_resident {
+        println!("♻️ Reusing resident model");
+    }
+    let model_ready = start_time.elapsed();
 
     // Calculate CPU cores for optimizations
     let cpu_cores = std::thread::available_parallelism()
@@ -813,6 +852,7 @@ fn generate(
     let mut end_of_generation = String::new();
     let mut tokens_generated = 0u32;
     let mut first_token_recorded = false;
+    let mut first_token_at: Option<std::time::Duration> = None;
     let eog = format!("\n{}:", user.name);
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut n_cur = prompt_tokens.len() as i32;
@@ -842,6 +882,7 @@ fn generate(
                 tracker.record_first_token(&session_id);
             }
             first_token_recorded = true;
+            first_token_at = Some(start_time.elapsed());
         }
 
         tokens_generated += 1;
@@ -928,6 +969,17 @@ fn generate(
     };
 
     println!("⚡ Performance Metrics:");
+    println!(
+        "  • Model ready: {:.2}s ({})",
+        model_ready.as_secs_f64(),
+        if was_resident { "resident" } else { "loaded" }
+    );
+    if let Some(first_token_at) = first_token_at {
+        println!(
+            "  • Time to first token (from request): {:.2}s",
+            first_token_at.as_secs_f64()
+        );
+    }
     println!("  • Total time: {:.2}s", response_time.as_secs_f64());
     println!("  • Tokens generated: {}", tokens_generated);
     println!("  • Tokens per second: {:.1}", tokens_per_second);

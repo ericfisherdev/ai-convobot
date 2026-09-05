@@ -13,6 +13,7 @@ mod character_card;
 use character_card::CharacterCard;
 use serde::Deserialize;
 mod llm;
+mod model_cache;
 use crate::llm::{assemble_prompt, prompt, prompt_streaming};
 use uuid::Uuid;
 mod context_manager;
@@ -874,6 +875,10 @@ async fn config() -> HttpResponse {
     HttpResponse::Ok().body(config_json)
 }
 
+// Note: no eager model reload here. `llm::generate` compares the next turn's
+// `ModelKey` against the resident one and reloads only if it changed — do
+// not "optimize" this into an eager reload, it would reload on every config
+// save even when nothing model-relevant changed.
 #[put("/api/config")]
 async fn config_post(received: web::Json<ConfigModify>) -> HttpResponse {
     match Database::change_config(received.into_inner()) {
@@ -957,6 +962,14 @@ async fn remove_llm_directory(id: web::Path<i32>) -> HttpResponse {
                 .body("Error while removing directory, check logs for more information")
         }
     }
+}
+
+/// Frees the model kept resident between turns (see `llm::unload_model`).
+/// The next turn reloads it from disk.
+#[post("/api/llm/unload")]
+async fn unload_llm_model() -> HttpResponse {
+    let (unloaded, model_path) = llm::unload_model();
+    HttpResponse::Ok().json(serde_json::json!({ "unloaded": unloaded, "model_path": model_path }))
 }
 
 //              Attitude Tracking
@@ -1880,6 +1893,7 @@ async fn main() -> std::io::Result<()> {
             .service(get_llm_directories)
             .service(add_llm_directory)
             .service(remove_llm_directory)
+            .service(unload_llm_model)
             .service(inspect_prompt)
             .service(get_attitude)
             .service(create_or_update_attitude)
