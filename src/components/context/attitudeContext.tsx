@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useCallback, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useCallback, useEffect, useRef, ReactNode } from 'react';
 import { AttitudeData, AttitudeDimensionUpdate } from '../interfaces/AttitudeData';
 
 interface AttitudeContextType {
@@ -28,6 +28,10 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [selectedAttitude, setSelectedAttitude] = useState<AttitudeData | null>(null);
+    const selectedAttitudeRef = useRef(selectedAttitude);
+    useEffect(() => {
+        selectedAttitudeRef.current = selectedAttitude;
+    }, [selectedAttitude]);
 
     const fetchAttitudes = useCallback(async (companionId: number): Promise<void> => {
         setLoading(true);
@@ -133,15 +137,13 @@ export const AttitudeProvider: React.FC<AttitudeProviderProps> = ({ children }) 
             await fetchAttitudes(update.companion_id);
 
             // Update selected attitude if it matches
-            setSelectedAttitude(prev => {
-                if (prev &&
-                    prev.companion_id === update.companion_id &&
-                    prev.target_id === update.target_id &&
-                    prev.target_type === update.target_type) {
-                    getAttitude(update.companion_id, update.target_id, update.target_type).then(setSelectedAttitude);
-                }
-                return prev;
-            });
+            const selected = selectedAttitudeRef.current;
+            if (selected &&
+                selected.companion_id === update.companion_id &&
+                selected.target_id === update.target_id &&
+                selected.target_type === update.target_type) {
+                setSelectedAttitude(await getAttitude(update.companion_id, update.target_id, update.target_type));
+            }
 
             return true;
         } catch (err) {
