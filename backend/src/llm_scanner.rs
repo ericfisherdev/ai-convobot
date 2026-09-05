@@ -1,5 +1,6 @@
+use crate::database::Database;
 use chrono::Local;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{params, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
@@ -30,15 +31,11 @@ pub struct DirectoryInfo {
     pub created_at: String,
 }
 
-pub struct LlmScanner {
-    database_path: String,
-}
+pub struct LlmScanner {}
 
 impl LlmScanner {
     pub fn new() -> Self {
-        Self {
-            database_path: "companion_database.db".to_string(),
-        }
+        Self {}
     }
 
     /// Get default directories relative to the executable
@@ -118,7 +115,7 @@ impl LlmScanner {
 
     /// Get all configured directories from the database
     pub fn get_directories(&self) -> Result<Vec<DirectoryInfo>> {
-        let conn = Connection::open(&self.database_path)?;
+        let conn = Database::open()?;
         let mut stmt =
             conn.prepare("SELECT id, path, created_at FROM llm_directories ORDER BY id")?;
 
@@ -156,7 +153,7 @@ impl LlmScanner {
         // Convert to string using display() for better cross-platform compatibility
         let path_string = normalized_path.display().to_string();
 
-        let conn = Connection::open(&self.database_path)?;
+        let conn = Database::open()?;
         let created_at = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
         conn.execute(
@@ -169,7 +166,7 @@ impl LlmScanner {
 
     /// Remove a directory from the scan list
     pub fn remove_directory(&self, id: i32) -> Result<()> {
-        let conn = Connection::open(&self.database_path)?;
+        let conn = Database::open()?;
         conn.execute("DELETE FROM llm_directories WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -209,7 +206,7 @@ impl LlmScanner {
 
     /// Check if the old llm_model_path exists and migrate it to a directory
     pub fn migrate_existing_config(&self) -> Result<()> {
-        let conn = Connection::open(&self.database_path)?;
+        let conn = Database::open()?;
 
         // Get the current llm_model_path from config
         let model_path: Option<String> = conn

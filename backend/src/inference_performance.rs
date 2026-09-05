@@ -1,8 +1,8 @@
+use crate::database::Database;
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-// Database import removed - using direct connection
-use rusqlite::params;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceMetrics {
@@ -316,7 +316,7 @@ impl InferencePerformanceTracker {
         input_tokens: u32,
         output_tokens: u32,
     ) -> rusqlite::Result<()> {
-        let con = rusqlite::Connection::open("companion_database.db")?;
+        let con = Database::open()?;
 
         con.execute(
             "INSERT INTO inference_metrics (
@@ -365,7 +365,7 @@ impl InferencePerformanceTracker {
         &self,
         config: &ModelConfig,
     ) -> rusqlite::Result<Option<InferenceMetrics>> {
-        let con = rusqlite::Connection::open("companion_database.db")?;
+        let con = Database::open()?;
 
         // Get aggregated metrics for this configuration
         let mut stmt = con.prepare(

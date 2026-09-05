@@ -1,4 +1,5 @@
-use rusqlite::{Connection, Error, Result};
+use crate::database::Database;
+use rusqlite::{Error, Result};
 
 pub struct Dialogue {
     pub user_msg: String,
@@ -9,7 +10,7 @@ pub struct DialogueTuning {}
 
 impl DialogueTuning {
     pub fn create() -> Result<usize, Error> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Database::open()?;
         con.execute(
             "CREATE TABLE IF NOT EXISTS dialogue_tuning (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -21,7 +22,7 @@ impl DialogueTuning {
     }
 
     pub fn insert(user_msg: &str, ai_msg: &str) -> Result<usize, Error> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Database::open()?;
         con.execute(
             "INSERT INTO dialogue_tuning (user_msg, ai_msg) VALUES (?1, ?2)",
             [user_msg, ai_msg],
@@ -29,7 +30,7 @@ impl DialogueTuning {
     }
 
     pub fn get_random_dialogue() -> Result<Dialogue, Error> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Database::open()?;
         let mut stmt =
             con.prepare("SELECT user_msg, ai_msg FROM dialogue_tuning ORDER BY RANDOM() LIMIT 1")?;
         let mut rows = stmt.query([])?;
@@ -43,7 +44,7 @@ impl DialogueTuning {
     }
 
     pub fn clear_dialogues() -> Result<usize, Error> {
-        let con = Connection::open("companion_database.db")?;
+        let con = Database::open()?;
         con.execute("DELETE FROM dialogue_tuning", [])
     }
 }
