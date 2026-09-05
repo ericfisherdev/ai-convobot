@@ -542,6 +542,7 @@ Endpoint sections above cover the core messaging, companion, user, configuration
 | `POST` | `/api/llm/directories` |
 | `DELETE` | `/api/llm/directories/{id}` |
 | `GET` | `/api/llm/models` |
+| `POST` | `/api/llm/unload` |
 | `DELETE` | `/api/memory/dialogueTuning` |
 | `POST` | `/api/memory/dialogueTuning` |
 | `DELETE` | `/api/memory/longTerm` |
