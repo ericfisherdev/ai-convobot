@@ -22,32 +22,6 @@ mod tests {
     }
 
     #[test]
-    fn test_inference_optimizer() {
-        let optimizer = InferenceOptimizer::new();
-
-        // Test token estimation
-        let text = "This is a test";
-        let tokens = optimizer.estimate_tokens(text);
-        assert!(tokens > 0);
-        assert!(tokens <= text.len());
-
-        // Test prompt hashing
-        let prompt = "Hello, world!";
-        let hash1 = optimizer.hash_prompt(prompt);
-        let hash2 = optimizer.hash_prompt(prompt);
-        assert_eq!(hash1, hash2);
-        assert!(!hash1.is_empty());
-
-        // Test cache operations
-        assert!(optimizer.get_cached_prompt("nonexistent").is_none());
-
-        optimizer.cache_prompt("test", "base test", 10);
-        let cached = optimizer.get_cached_prompt("test");
-        assert!(cached.is_some());
-        assert_eq!(cached.unwrap().estimated_tokens, 10);
-    }
-
-    #[test]
     fn test_message_struct() {
         let message = Message {
             id: 1,
@@ -110,29 +84,11 @@ mod tests {
     }
 
     #[test]
-    fn test_prompt_optimization() {
-        let optimizer = InferenceOptimizer::new();
-        let base_components = vec![
-            "System: You are a helpful assistant.".to_string(),
-            "Human: ".to_string(),
-        ];
-        let dynamic_content = "Hello, how are you?";
-        let messages = vec![];
-
-        let (optimized_prompt, _was_cached) =
-            optimizer.optimize_prompt_construction(&base_components, dynamic_content, &messages);
-
-        assert!(optimized_prompt.contains("System: You are a helpful assistant."));
-        assert!(optimized_prompt.contains("Hello, how are you?"));
-    }
-
-    #[test]
     fn test_stats_tracking() {
         let optimizer = InferenceOptimizer::new();
 
         let initial_stats = optimizer.get_stats();
         assert_eq!(initial_stats.total_requests, 0);
-        assert_eq!(initial_stats.cache_hits, 0);
 
         // Simulate recording response time
         optimizer.record_response_time(std::time::Duration::from_millis(150));
@@ -140,23 +96,6 @@ mod tests {
         let updated_stats = optimizer.get_stats();
         assert_eq!(updated_stats.total_requests, 1);
         assert!(updated_stats.avg_response_time.as_millis() > 0);
-    }
-
-    #[test]
-    fn test_cache_statistics() {
-        let optimizer = InferenceOptimizer::new();
-
-        let (cache_size, hits, hit_rate) = optimizer.get_cache_stats();
-        assert_eq!(cache_size, 0);
-        assert_eq!(hits, 0);
-        assert_eq!(hit_rate, 0.0);
-
-        // Add some cache entries
-        optimizer.cache_prompt("test1", "base1", 10);
-        optimizer.cache_prompt("test2", "base2", 15);
-
-        let (cache_size_after, _, _) = optimizer.get_cache_stats();
-        assert_eq!(cache_size_after, 2);
     }
 
     fn attitude_fixture() -> CompanionAttitude {

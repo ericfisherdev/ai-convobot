@@ -529,7 +529,6 @@ Endpoint sections above cover the core messaging, companion, user, configuration
 | `POST` | `/api/estimate-response-time` |
 | `GET` | `/api/gpu/allocation` |
 | `GET` | `/api/gpu/memory` |
-| `POST` | `/api/inference/cache/cleanup` |
 | `GET` | `/api/inference/stats` |
 | `POST` | `/api/interactions/detect` |
 | `GET` | `/api/interactions/history/{companion_id}/{third_party_id}` |
