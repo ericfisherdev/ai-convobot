@@ -1,12 +1,9 @@
-use crate::database::Database;
+use crate::database::{CompanionAttitude, Database};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
-
-#[cfg(test)]
-use crate::database::CompanionAttitude;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -111,7 +108,7 @@ impl SessionManager {
     pub fn update_attitude(
         &self,
         session_id: &str,
-        attitude: crate::database::CompanionAttitude,
+        attitude: CompanionAttitude,
     ) -> Result<(), String> {
         let mut sessions = self.sessions.lock().map_err(|e| e.to_string())?;
 
