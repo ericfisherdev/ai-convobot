@@ -569,6 +569,24 @@ fn preprocess_user_message(user_message: &str, companion_id: i32) -> Option<Stri
     None
 }
 
+/// Longest user-turn excerpt stored on an attitude memory.
+const MEMORY_EXCERPT_CHARS: usize = 200;
+
+/// Single-line excerpt of a user turn, for `attitude_memories.message_context`.
+///
+/// Truncates on a character boundary, so a multi-byte message can never split
+/// mid-codepoint.
+fn message_excerpt(user_message: &str) -> String {
+    let single_line = user_message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    match single_line.char_indices().nth(MEMORY_EXCERPT_CHARS) {
+        Some((byte_index, _)) => format!("{}…", &single_line[..byte_index]),
+        None => single_line,
+    }
+}
+
 /// Derives attitude deltas from one conversation turn and persists them.
 ///
 /// Called after generation, once both sides of the turn are known, from both
@@ -651,6 +669,18 @@ fn finish_turn(
                 formatter.format_attitude_changes_for_console(&previous, &updated);
             if !attitude_changes.is_empty() {
                 println!("{}", attitude_changes);
+            }
+            // One memory per turn at most, carrying what the user said so the
+            // companion remembers why its feelings moved.
+            if let Err(e) = Database::detect_attitude_change(
+                companion_id,
+                user_id,
+                "user",
+                &previous,
+                &updated,
+                Some(&message_excerpt(user_message)),
+            ) {
+                eprintln!("Failed to record attitude memory: {}", e);
             }
             Some((previous, updated))
         }

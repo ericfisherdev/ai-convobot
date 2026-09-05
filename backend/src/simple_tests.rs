@@ -3,6 +3,7 @@ mod tests {
     use crate::attitude_formatter::AttitudeFormatter;
     use crate::database::*;
     use crate::inference_optimizer::*;
+    use crate::message_excerpt;
 
     #[test]
     fn test_date_functions() {
@@ -226,5 +227,119 @@ mod tests {
 
         assert!(rendered.contains("Anger -5"));
         assert!(rendered.contains("Love +2"));
+    }
+
+    fn memory_fixture(target_type: &str, attitude_delta_json: &str) -> AttitudeMemory {
+        AttitudeMemory {
+            id: Some(1),
+            companion_id: 1,
+            target_id: 1,
+            target_type: target_type.to_string(),
+            memory_type: "BondingMoment".to_string(),
+            description: "A bonding moment occurred".to_string(),
+            priority_score: 80.0,
+            attitude_delta_json: attitude_delta_json.to_string(),
+            impact_score: 20.0,
+            message_context: "thanks for listening".to_string(),
+            created_at: "2024-01-15 10:00".to_string(),
+        }
+    }
+
+    #[test]
+    fn evaluate_attitude_shift_ignores_negligible_movement() {
+        let previous = attitude_fixture();
+        let mut current = previous.clone();
+        current.trust += 1.0;
+
+        assert!(evaluate_attitude_shift(&previous, &current).is_none());
+    }
+
+    #[test]
+    fn evaluate_attitude_shift_reports_a_multi_dimension_turn() {
+        let previous = attitude_fixture();
+        let mut current = previous.clone();
+        current.trust += 5.0;
+        current.joy += 5.0;
+        current.respect += 5.0;
+        current.anger -= 5.0;
+
+        let draft = evaluate_attitude_shift(&previous, &current).expect("shift is significant");
+
+        assert!(draft.impact_score > SIGNIFICANT_IMPACT_THRESHOLD);
+        assert!(draft.priority_score > 0.0);
+        assert!(!draft.description.is_empty());
+        assert!((draft.delta.trust - 5.0).abs() < f32::EPSILON);
+        assert!((draft.delta.anger + 5.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn evaluate_attitude_shift_scores_dimensions_the_old_delta_omitted() {
+        let previous = attitude_fixture();
+        let mut current = previous.clone();
+        // Love alone used to score zero impact, so a turn like this could never
+        // become a memory.
+        current.love += 12.0;
+
+        let draft =
+            evaluate_attitude_shift(&previous, &current).expect("love shift is significant");
+
+        assert!((draft.delta.love - 12.0).abs() < f32::EPSILON);
+        assert!(draft.impact_score > SIGNIFICANT_IMPACT_THRESHOLD);
+    }
+
+    #[test]
+    fn message_excerpt_truncates_multi_byte_text_on_a_char_boundary() {
+        let long = "é".repeat(500);
+
+        let excerpt = message_excerpt(&long);
+
+        // 200 characters plus the ellipsis marker.
+        assert_eq!(excerpt.chars().count(), 201);
+        assert!(excerpt.ends_with('…'));
+    }
+
+    #[test]
+    fn message_excerpt_collapses_whitespace_and_keeps_short_text() {
+        assert_eq!(message_excerpt("hello\n  there"), "hello there");
+    }
+
+    #[test]
+    fn format_attitude_memories_is_empty_without_memories() {
+        let formatter = AttitudeFormatter::new();
+
+        assert_eq!(formatter.format_attitude_memories(&[]), "");
+    }
+
+    #[test]
+    fn format_attitude_memories_renders_context_and_movement() {
+        let formatter = AttitudeFormatter::new();
+        let delta = serde_json::json!({ "trust": 4.0, "joy": 5.0 }).to_string();
+
+        let block = formatter.format_attitude_memories(&[memory_fixture("user", &delta)]);
+
+        assert!(block.contains("A bonding moment occurred"));
+        assert!(block.contains("when you said: \"thanks for listening\""));
+        assert!(block.contains("trust +4"));
+        assert!(block.contains("joy +5"));
+    }
+
+    #[test]
+    fn format_attitude_memories_survives_malformed_delta_json() {
+        let formatter = AttitudeFormatter::new();
+
+        let block = formatter.format_attitude_memories(&[memory_fixture("user", "not json")]);
+
+        assert!(block.contains("A bonding moment occurred"));
+        assert!(!block.contains("moved:"));
+    }
+
+    #[test]
+    fn format_attitude_memories_excludes_third_party_rows() {
+        let formatter = AttitudeFormatter::new();
+        let delta = serde_json::json!({ "trust": 4.0 }).to_string();
+
+        let block = formatter.format_attitude_memories(&[memory_fixture("third_party", &delta)]);
+
+        assert_eq!(block, "");
     }
 }

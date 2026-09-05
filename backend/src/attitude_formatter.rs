@@ -1,7 +1,9 @@
 use serde::Serialize;
 
 use crate::attitude_engine::AttitudeDimension;
-use crate::database::{CompanionAttitude, ThirdPartyIndividual};
+use crate::database::{
+    AttitudeDelta as StoredAttitudeDelta, AttitudeMemory, CompanionAttitude, ThirdPartyIndividual,
+};
 
 /// One dimension that moved over a single conversation turn.
 ///
@@ -448,6 +450,60 @@ impl AttitudeFormatter {
             / 1100.0; // Normalize across 11 key emotions
 
         relationship_weight * 0.7 + emotion_intensity * 0.3
+    }
+
+    /// Renders the companion's most notable attitude memories as a prompt block.
+    ///
+    /// Third-party rows are filtered out, so only moments involving the user
+    /// reach the user-facing attitude block. A row whose
+    /// `attitude_delta_json` will not parse still renders its description,
+    /// just without the "moved:" suffix.
+    pub fn format_attitude_memories(&self, memories: &[AttitudeMemory]) -> String {
+        let lines: Vec<String> = memories
+            .iter()
+            .filter(|memory| memory.target_type == "user")
+            .map(|memory| {
+                let mut line = format!("- {}", memory.description);
+                if !memory.message_context.is_empty() {
+                    line.push_str(&format!(" (when you said: \"{}\")", memory.message_context));
+                }
+                if let Some(moved) = Self::format_memory_movement(&memory.attitude_delta_json) {
+                    line.push_str(&format!(" [moved: {}]", moved));
+                }
+                line
+            })
+            .collect();
+
+        if lines.is_empty() {
+            return String::new();
+        }
+
+        format!(
+            "Notable moments that shaped these feelings:\n{}\n",
+            lines.join("\n")
+        )
+    }
+
+    /// "trust +4, joy +5" for the dimensions a stored delta actually moved, or
+    /// `None` when the stored JSON does not parse.
+    fn format_memory_movement(attitude_delta_json: &str) -> Option<String> {
+        let delta: StoredAttitudeDelta = serde_json::from_str(attitude_delta_json).ok()?;
+        let moved: Vec<String> = AttitudeDimension::ALL
+            .iter()
+            .filter_map(|dimension| {
+                let value = dimension.value_of_delta(&delta);
+                if value.abs() < Self::CHANGE_THRESHOLD {
+                    return None;
+                }
+                Some(format!("{} {:+.0}", dimension.column(), value))
+            })
+            .collect();
+
+        if moved.is_empty() {
+            None
+        } else {
+            Some(moved.join(", "))
+        }
     }
 
     /// Signed change per dimension between two snapshots of the same attitude row.

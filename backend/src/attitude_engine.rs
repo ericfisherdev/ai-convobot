@@ -106,6 +106,35 @@ impl AttitudeDimension {
             AttitudeDimension::Dominance => attitude.dominance,
         }
     }
+
+    /// Value of this dimension on a persisted `database::AttitudeDelta`.
+    ///
+    /// Lets a caller walk a stored delta dimension by dimension without
+    /// repeating the 20-arm match.
+    pub fn value_of_delta(self, delta: &crate::database::AttitudeDelta) -> f32 {
+        match self {
+            AttitudeDimension::Attraction => delta.attraction,
+            AttitudeDimension::Trust => delta.trust,
+            AttitudeDimension::Fear => delta.fear,
+            AttitudeDimension::Anger => delta.anger,
+            AttitudeDimension::Joy => delta.joy,
+            AttitudeDimension::Sorrow => delta.sorrow,
+            AttitudeDimension::Disgust => delta.disgust,
+            AttitudeDimension::Surprise => delta.surprise,
+            AttitudeDimension::Curiosity => delta.curiosity,
+            AttitudeDimension::Respect => delta.respect,
+            AttitudeDimension::Suspicion => delta.suspicion,
+            AttitudeDimension::Gratitude => delta.gratitude,
+            AttitudeDimension::Jealousy => delta.jealousy,
+            AttitudeDimension::Empathy => delta.empathy,
+            AttitudeDimension::Lust => delta.lust,
+            AttitudeDimension::Love => delta.love,
+            AttitudeDimension::Anxiety => delta.anxiety,
+            AttitudeDimension::Butterflies => delta.butterflies,
+            AttitudeDimension::Submissiveness => delta.submissiveness,
+            AttitudeDimension::Dominance => delta.dominance,
+        }
+    }
 }
 
 /// A signed change to apply to one dimension of an attitude row.
