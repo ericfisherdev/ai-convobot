@@ -8,7 +8,6 @@ interface Session {
     user_id: number | null;
     created_at: string;
     last_activity: string;
-    attitude_state: unknown[];
     is_active: boolean;
 }
 
@@ -89,11 +88,8 @@ export const SessionProvider: React.FC<SessionProviderProps> = ({ children }) =>
             const sessionData = await response.json();
             setSession(sessionData);
 
-            // Load attitudes from session
-            // Using companion_id 1 as there's only one companion in the system
-            if (companionData && sessionData.attitude_state.length > 0) {
-                await fetchAttitudes(1);
-            }
+            // Load attitudes for the session's companion
+            await fetchAttitudes(sessionData.companion_id);
 
             console.log('✅ Session loaded:', id);
         } catch (err) {
@@ -140,10 +136,8 @@ export const SessionProvider: React.FC<SessionProviderProps> = ({ children }) =>
             // Store session ID in localStorage for persistence
             localStorage.setItem('ai_companion_session_id', sessionData.id);
 
-            // Load attitudes from session
-            if (sessionData.attitude_state.length > 0) {
-                await fetchAttitudes(1); // Using default companion_id
-            }
+            // Load attitudes for the session's companion
+            await fetchAttitudes(sessionData.companion_id);
 
             console.log('🚀 New session initialized:', sessionData.id);
         } catch (err) {

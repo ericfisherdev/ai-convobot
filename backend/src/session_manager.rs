@@ -1,9 +1,12 @@
-use crate::database::{CompanionAttitude, Database};
+use crate::database::Database;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+
+#[cfg(test)]
+use crate::database::CompanionAttitude;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -12,7 +15,6 @@ pub struct Session {
     pub user_id: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
-    pub attitude_state: Vec<CompanionAttitude>,
     pub is_active: bool,
 }
 
@@ -30,7 +32,7 @@ impl SessionManager {
         }
     }
 
-    /// Create a new session and load existing attitudes from database
+    /// Create a new session
     pub fn create_session(
         &self,
         companion_id: i32,
@@ -38,25 +40,12 @@ impl SessionManager {
     ) -> Result<Session, String> {
         let session_id = Uuid::new_v4().to_string();
 
-        // Load existing attitudes from database
-        let attitude_state = match Database::get_all_companion_attitudes(companion_id) {
-            Ok(attitudes) => attitudes,
-            Err(e) => {
-                eprintln!(
-                    "Failed to load attitudes for companion {}: {}",
-                    companion_id, e
-                );
-                Vec::new() // Start with empty attitudes if load fails
-            }
-        };
-
         let session = Session {
             id: session_id.clone(),
             companion_id,
             user_id,
             created_at: Utc::now(),
             last_activity: Utc::now(),
-            attitude_state,
             is_active: true,
         };
 
@@ -64,11 +53,7 @@ impl SessionManager {
         let mut sessions = self.sessions.lock().map_err(|e| e.to_string())?;
         sessions.insert(session_id.clone(), session.clone());
 
-        println!(
-            "📦 Session created: {} with {} attitudes loaded",
-            session_id,
-            session.attitude_state.len()
-        );
+        println!("📦 Session created: {}", session_id);
 
         Ok(session)
     }
@@ -120,26 +105,17 @@ impl SessionManager {
         }
     }
 
-    /// Update attitude state in session and persist to database
+    /// Update attitude state for a session's companion and persist to database.
+    /// The database is the single authoritative store for attitude state;
+    /// this only bumps the session's activity timestamp and writes through.
     pub fn update_attitude(
         &self,
         session_id: &str,
-        attitude: CompanionAttitude,
+        attitude: crate::database::CompanionAttitude,
     ) -> Result<(), String> {
         let mut sessions = self.sessions.lock().map_err(|e| e.to_string())?;
 
         if let Some(session) = sessions.get_mut(session_id) {
-            // Update in-memory attitude state
-            let existing_idx = session.attitude_state.iter().position(|a| {
-                a.target_id == attitude.target_id && a.target_type == attitude.target_type
-            });
-
-            if let Some(idx) = existing_idx {
-                session.attitude_state[idx] = attitude.clone();
-            } else {
-                session.attitude_state.push(attitude.clone());
-            }
-
             session.last_activity = Utc::now();
 
             // Persist to database
@@ -161,57 +137,16 @@ impl SessionManager {
         }
     }
 
-    /// Get current attitude state for a session
-    #[allow(dead_code)]
-    pub fn get_attitude_state(&self, session_id: &str) -> Result<Vec<CompanionAttitude>, String> {
-        let sessions = self.sessions.lock().map_err(|e| e.to_string())?;
-
-        sessions
-            .get(session_id)
-            .map(|s| s.attitude_state.clone())
-            .ok_or_else(|| format!("Session {} not found", session_id))
-    }
-
-    /// Save session state to database before expiration
-    pub fn persist_session(&self, session_id: &str) -> Result<(), String> {
-        let sessions = self.sessions.lock().map_err(|e| e.to_string())?;
-
-        if let Some(session) = sessions.get(session_id) {
-            // Persist all attitudes to database
-            for attitude in &session.attitude_state {
-                Database::create_or_update_attitude(
-                    attitude.companion_id,
-                    attitude.target_id,
-                    &attitude.target_type,
-                    attitude,
-                )
-                .map_err(|e| format!("Failed to persist attitude: {}", e))?;
-            }
-
-            println!(
-                "💾 Session {} persisted with {} attitudes",
-                session_id,
-                session.attitude_state.len()
-            );
-            Ok(())
-        } else {
-            Err(format!("Session {} not found", session_id))
-        }
-    }
-
-    /// End a session and persist state
+    /// End a session
     pub fn end_session(&self, session_id: &str) -> Result<(), String> {
-        // Persist session state first
-        self.persist_session(session_id)?;
-
-        // Mark session as inactive
         let mut sessions = self.sessions.lock().map_err(|e| e.to_string())?;
         if let Some(session) = sessions.get_mut(session_id) {
             session.is_active = false;
             println!("🔚 Session {} ended", session_id);
+            Ok(())
+        } else {
+            Err(format!("Session {} not found", session_id))
         }
-
-        Ok(())
     }
 
     /// Check if a session has expired
@@ -233,19 +168,7 @@ impl SessionManager {
             .map(|(id, _)| id.clone())
             .collect();
 
-        // Persist and remove expired sessions
         for session_id in &expired_ids {
-            if let Some(session) = sessions.get(&session_id.clone()) {
-                // Persist attitudes before removal
-                for attitude in &session.attitude_state {
-                    let _ = Database::create_or_update_attitude(
-                        attitude.companion_id,
-                        attitude.target_id,
-                        &attitude.target_type,
-                        attitude,
-                    );
-                }
-            }
             sessions.remove(session_id);
         }
 
@@ -262,12 +185,10 @@ impl SessionManager {
         let sessions = self.sessions.lock().map_err(|e| e.to_string())?;
 
         let active_count = sessions.values().filter(|s| s.is_active).count();
-        let total_attitudes: usize = sessions.values().map(|s| s.attitude_state.len()).sum();
 
         Ok(SessionStats {
             active_sessions: active_count,
             total_sessions: sessions.len(),
-            total_attitudes_cached: total_attitudes,
         })
     }
 }
@@ -276,7 +197,6 @@ impl SessionManager {
 pub struct SessionStats {
     pub active_sessions: usize,
     pub total_sessions: usize,
-    pub total_attitudes_cached: usize,
 }
 
 #[cfg(test)]
