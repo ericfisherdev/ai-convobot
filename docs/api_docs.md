@@ -490,6 +490,21 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   - Generation is serialised: a request that arrives while another is generating waits its turn.
   - If the client disconnects mid-stream, generation still runs to completion so the reply is persisted.
 
+### Inspect the assembled prompt
+
+- **URL:** `/debug/prompt`
+- **Method:** `GET`
+- **Description:** Returns the prompt a turn would send, without loading a model. Intended for verifying what the attitude block actually injects: `attitude_context` in the response is exactly the text `generate` folds into the system portion of the prompt.
+- **Query Parameters:**
+  - `companion_id` (integer, optional): defaults to the single companion the backend resolves server-side
+  - `prompt` (string, optional): message the long-term memory recall is keyed on. Omitted, the prompt is assembled with no recalled entries.
+- **Response:**
+  - Status: 200 OK
+  - Body: `{ "system_prompt": string, "chat_history": [[bool, string]], "attitude_context": string, "managed_messages": [Message] }`
+- **Notes:**
+  - No model is loaded, so for `PromptTemplate::Auto` the response holds the pre-template system text plus the role-tagged `chat_history` rather than the final rendered string. Every other template returns the finished prompt in `system_prompt`.
+  - `docs/attitude_verification.md` records a comparison run made with this route and `backend/scripts/attitude_comparison.sh`.
+
 ## Route index
 
 Endpoint sections above cover the core messaging, companion, user, configuration, memory and prompting routes. The table below lists every route the backend registers, including those not yet written up in full. It is generated from the handler attributes in `backend/src/main.rs`.
@@ -542,6 +557,7 @@ Endpoint sections above cover the core messaging, companion, user, configuration
 | `GET` | `/api/persons/{name}` |
 | `POST` | `/api/prompt` |
 | `GET` | `/api/prompt/regenerate` |
+| `GET` | `/api/debug/prompt` |
 | `POST` | `/api/prompt/stream` |
 | `POST` | `/api/session` |
 | `PUT` | `/api/session/attitude` |
