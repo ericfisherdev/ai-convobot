@@ -1,24 +1,11 @@
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::attitude_formatter::AttitudeDelta;
-use crate::database::{CompanionAttitude, Message};
-
-/// Cache entry for frequently used prompts
-#[derive(Debug, Clone)]
-pub struct CachedPrompt {
-    #[allow(dead_code)]
-    pub prompt_hash: String,
-    pub base_prompt: String,
-    pub timestamp: Instant,
-    pub hit_count: usize,
-    #[allow(dead_code)]
-    pub estimated_tokens: usize,
-}
+use crate::database::CompanionAttitude;
 
 /// Post-turn attitude state, carried by the stream's attitude chunk.
 #[derive(Debug, Clone, Serialize)]
@@ -62,141 +49,31 @@ pub struct StreamChunk {
 #[derive(Debug, Clone, Serialize)]
 pub struct InferenceStats {
     pub total_requests: usize,
-    pub cache_hits: usize,
-    pub cache_misses: usize,
     pub avg_response_time: Duration,
     pub batch_processed: usize,
     pub streaming_sessions: usize,
 }
 
-/// Main inference optimizer with caching and batching capabilities
+/// Main inference optimizer: tracks streaming sessions and response-time stats
 pub struct InferenceOptimizer {
-    /// Cache for frequently used prompt segments
-    prompt_cache: Arc<RwLock<HashMap<String, CachedPrompt>>>,
     /// Active streaming sessions
     streaming_sessions: Arc<RwLock<HashMap<String, mpsc::UnboundedSender<StreamChunk>>>>,
     /// Performance statistics
     stats: Arc<RwLock<InferenceStats>>,
-    /// Configuration
-    cache_max_size: usize,
-    cache_ttl: Duration,
 }
 
 impl InferenceOptimizer {
     /// Create a new inference optimizer
     pub fn new() -> Self {
         Self {
-            prompt_cache: Arc::new(RwLock::new(HashMap::new())),
             streaming_sessions: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(InferenceStats {
                 total_requests: 0,
-                cache_hits: 0,
-                cache_misses: 0,
                 avg_response_time: Duration::from_millis(0),
                 batch_processed: 0,
                 streaming_sessions: 0,
             })),
-            cache_max_size: 1000,
-            cache_ttl: Duration::from_secs(3600), // 1 hour
         }
-    }
-
-    /// Generate a hash for prompt caching
-    pub fn hash_prompt(&self, prompt: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(prompt.as_bytes());
-        format!("{:x}", hasher.finalize())
-    }
-
-    /// Check cache for existing prompt
-    pub fn get_cached_prompt(&self, prompt: &str) -> Option<CachedPrompt> {
-        let hash = self.hash_prompt(prompt);
-        let cache = self.prompt_cache.read().unwrap();
-
-        if let Some(cached) = cache.get(&hash) {
-            // Check if cache entry is still valid
-            if cached.timestamp.elapsed() < self.cache_ttl {
-                let mut stats = self.stats.write().unwrap();
-                stats.cache_hits += 1;
-
-                // Clone and update hit count
-                let mut updated_cache = cached.clone();
-                updated_cache.hit_count += 1;
-                drop(cache);
-
-                // Update cache with new hit count
-                let mut cache_write = self.prompt_cache.write().unwrap();
-                cache_write.insert(hash, updated_cache.clone());
-
-                return Some(updated_cache);
-            }
-        }
-
-        let mut stats = self.stats.write().unwrap();
-        stats.cache_misses += 1;
-        None
-    }
-
-    /// Cache a prompt for future use
-    pub fn cache_prompt(&self, prompt: &str, base_prompt: &str, estimated_tokens: usize) {
-        let hash = self.hash_prompt(prompt);
-        let cached = CachedPrompt {
-            prompt_hash: hash.clone(),
-            base_prompt: base_prompt.to_string(),
-            timestamp: Instant::now(),
-            hit_count: 1,
-            estimated_tokens,
-        };
-
-        let mut cache = self.prompt_cache.write().unwrap();
-
-        // Implement LRU eviction if cache is full
-        if cache.len() >= self.cache_max_size {
-            self.evict_lru_entries();
-        }
-
-        cache.insert(hash, cached);
-    }
-
-    /// Evict least recently used cache entries
-    fn evict_lru_entries(&self) {
-        let mut cache = self.prompt_cache.write().unwrap();
-        // Find oldest entries and remove 25% of cache
-        let mut entries: Vec<_> = cache
-            .iter()
-            .map(|(k, v)| (k.clone(), v.timestamp))
-            .collect();
-        entries.sort_by_key(|(_, timestamp)| *timestamp);
-
-        let to_remove = cache.len() / 4;
-        for (hash, _) in entries.into_iter().take(to_remove) {
-            cache.remove(&hash);
-        }
-    }
-
-    /// Optimize prompt construction with caching
-    pub fn optimize_prompt_construction(
-        &self,
-        base_components: &[String],
-        dynamic_content: &str,
-        _messages: &[Message],
-    ) -> (String, bool) {
-        let base_prompt = base_components.join("");
-        let _base_hash = self.hash_prompt(&base_prompt);
-
-        // Check if base prompt is cached
-        if let Some(cached) = self.get_cached_prompt(&base_prompt) {
-            // Construct full prompt with dynamic content
-            let full_prompt = format!("{}{}", cached.base_prompt, dynamic_content);
-            return (full_prompt, true);
-        }
-
-        // Not cached, construct normally and cache for future use
-        let estimated_tokens = self.estimate_tokens(&base_prompt);
-        self.cache_prompt(&base_prompt, &base_prompt, estimated_tokens);
-
-        let full_prompt = format!("{}{}", base_prompt, dynamic_content);
-        (full_prompt, false)
     }
 
     /// Start response streaming session
@@ -234,13 +111,6 @@ impl InferenceOptimizer {
         sessions.remove(session_id);
     }
 
-    /// Estimate token count for a text (simplified implementation)
-    pub fn estimate_tokens(&self, text: &str) -> usize {
-        // Simple estimation: ~4 characters per token on average
-        // In a real implementation, this would use proper tokenization
-        text.len().div_ceil(4)
-    }
-
     /// Get current performance statistics
     pub fn get_stats(&self) -> InferenceStats {
         self.stats.read().unwrap().clone()
@@ -260,36 +130,6 @@ impl InferenceOptimizer {
             ((current_avg_nanos * (total_requests - 1)) + new_duration_nanos) / total_requests;
         stats.avg_response_time = Duration::from_nanos(new_avg_nanos);
     }
-
-    /// Clear expired cache entries
-    pub fn cleanup_cache(&self) {
-        let mut cache = self.prompt_cache.write().unwrap();
-        let now = Instant::now();
-
-        cache.retain(|_, cached| now.duration_since(cached.timestamp) < self.cache_ttl);
-
-        println!(
-            "Cache cleanup completed. Entries remaining: {}",
-            cache.len()
-        );
-    }
-
-    /// Get cache statistics
-    pub fn get_cache_stats(&self) -> (usize, usize, f64) {
-        let cache = self.prompt_cache.read().unwrap();
-        let stats = self.stats.read().unwrap();
-
-        let cache_size = cache.len();
-        let total_hits = stats.cache_hits;
-        let total_requests = stats.cache_hits + stats.cache_misses;
-        let hit_rate = if total_requests > 0 {
-            stats.cache_hits as f64 / total_requests as f64
-        } else {
-            0.0
-        };
-
-        (cache_size, total_hits, hit_rate)
-    }
 }
 
 impl Default for InferenceOptimizer {
@@ -301,43 +141,4 @@ impl Default for InferenceOptimizer {
 lazy_static::lazy_static! {
     /// Global inference optimizer instance
     pub static ref INFERENCE_OPTIMIZER: InferenceOptimizer = InferenceOptimizer::new();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_prompt_hashing() {
-        let optimizer = InferenceOptimizer::new();
-        let prompt = "Hello, world!";
-        let hash1 = optimizer.hash_prompt(prompt);
-        let hash2 = optimizer.hash_prompt(prompt);
-        assert_eq!(hash1, hash2);
-    }
-
-    #[test]
-    fn test_cache_operations() {
-        let optimizer = InferenceOptimizer::new();
-        let prompt = "Test prompt";
-        let base_prompt = "Base: Test prompt";
-
-        // Should be cache miss initially
-        assert!(optimizer.get_cached_prompt(prompt).is_none());
-
-        // Cache the prompt
-        optimizer.cache_prompt(prompt, base_prompt, 10);
-
-        // Should be cache hit now
-        assert!(optimizer.get_cached_prompt(prompt).is_some());
-    }
-
-    #[test]
-    fn test_token_estimation() {
-        let optimizer = InferenceOptimizer::new();
-        let text = "This is a test";
-        let tokens = optimizer.estimate_tokens(text);
-        assert!(tokens > 0);
-        assert!(tokens <= text.len()); // Should be reasonable estimate
-    }
 }

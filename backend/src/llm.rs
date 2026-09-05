@@ -422,7 +422,7 @@ pub fn assemble_prompt(
         );
     }
 
-    // Build base prompt components for caching optimization
+    // Build base prompt components.
     // Auto renders through the model's own chat template, so its system content
     // must be plain prose; the Mistral branch below would embed [INST] markers.
     let base_components = build_base_components(
@@ -434,17 +434,8 @@ pub fn assemble_prompt(
         &attitude_context,
     );
 
-    // Use cache optimization for base prompt construction
-    let (optimized_base_prompt, cache_hit) =
-        INFERENCE_OPTIMIZER.optimize_prompt_construction(&base_components, "", &[]);
+    base_prompt = base_components.join("");
 
-    base_prompt = optimized_base_prompt;
-
-    if cache_hit {
-        println!("✓ Cache hit for base prompt construction");
-    } else {
-        println!("✗ Cache miss - caching base prompt for future use");
-    }
     if companion.long_term_mem > 0 {
         let long_term_memory_entries: Vec<String> =
             match long_term_memory.get_matches(user_message, companion.long_term_mem) {
@@ -943,16 +934,9 @@ fn generate(
     println!("  • CPU cores used: {}", cpu_cores);
     println!("  • Context size: {} tokens", input_tokens);
 
-    // Print cache statistics periodically
+    // Print performance stats periodically
     let stats = INFERENCE_OPTIMIZER.get_stats();
     if stats.total_requests.is_multiple_of(10) {
-        let (cache_size, cache_hits, hit_rate) = INFERENCE_OPTIMIZER.get_cache_stats();
-        println!(
-            "📊 Cache Stats: {} entries, {} hits, {:.2}% hit rate",
-            cache_size,
-            cache_hits,
-            hit_rate * 100.0
-        );
         println!(
             "📈 Performance: {} requests, avg response time: {:?}",
             stats.total_requests, stats.avg_response_time

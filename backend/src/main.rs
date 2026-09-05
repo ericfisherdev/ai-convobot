@@ -1523,7 +1523,6 @@ async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpR
 #[get("/api/inference/stats")]
 async fn get_inference_stats() -> HttpResponse {
     let stats = INFERENCE_OPTIMIZER.get_stats();
-    let (cache_size, cache_hits, hit_rate) = INFERENCE_OPTIMIZER.get_cache_stats();
 
     let response = serde_json::json!({
         "performance": {
@@ -1531,24 +1530,10 @@ async fn get_inference_stats() -> HttpResponse {
             "avg_response_time_ms": stats.avg_response_time.as_millis(),
             "batch_processed": stats.batch_processed,
             "streaming_sessions": stats.streaming_sessions
-        },
-        "cache": {
-            "size": cache_size,
-            "hits": cache_hits,
-            "misses": stats.cache_misses,
-            "hit_rate": hit_rate
         }
     });
 
     HttpResponse::Ok().json(response)
-}
-
-#[post("/api/inference/cache/cleanup")]
-async fn cleanup_cache() -> HttpResponse {
-    INFERENCE_OPTIMIZER.cleanup_cache();
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "cache_cleaned"
-    }))
 }
 
 // Session Management Endpoints
@@ -1885,7 +1870,6 @@ async fn main() -> std::io::Result<()> {
             .service(detect_interaction)
             .service(start_streaming_session)
             .service(get_inference_stats)
-            .service(cleanup_cache)
             .service(create_session)
             .service(get_session)
             .service(update_session_attitude)
