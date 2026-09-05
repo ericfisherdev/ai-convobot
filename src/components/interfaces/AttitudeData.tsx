@@ -59,6 +59,29 @@ export const ATTITUDE_DIMENSIONS = [
     { key: 'dominance', label: 'Dominance', color: '#FF4500', category: 'neutral' }
 ] as const;
 
+// One dimension that moved on the most recent turn, mirroring the backend's
+// `attitude_formatter::AttitudeDelta`.
+export interface AttitudeDelta {
+    dimension: string;
+    delta: number;
+}
+
+// Payload of the `/api/prompt/stream` attitude chunk, mirroring the backend's
+// `inference_optimizer::AttitudeStreamUpdate`.
+export interface AttitudeStreamUpdate {
+    attitude: AttitudeData;
+    summary: string;
+    deltas: AttitudeDelta[];
+}
+
+// A dimension at or below this magnitude is only shown when it is core or it
+// changed on the most recent turn.
+export const ATTITUDE_DISPLAY_THRESHOLD = 15;
+
+// Always visible in the summary bar, however small, so the bar never renders
+// empty on a fresh companion.
+export const CORE_ATTITUDE_DIMENSIONS = ['love', 'trust', 'curiosity', 'anger'] as const;
+
 export const RELATIONSHIP_STATUSES = {
     'hostile': { label: 'Hostile', color: '#F44336', range: [-100, -61] },
     'unfriendly': { label: 'Unfriendly', color: '#FF5722', range: [-60, -21] },

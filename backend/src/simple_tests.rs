@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use crate::attitude_formatter::AttitudeFormatter;
     use crate::database::*;
     use crate::inference_optimizer::*;
 
@@ -155,5 +156,75 @@ mod tests {
 
         let (cache_size_after, _, _) = optimizer.get_cache_stats();
         assert_eq!(cache_size_after, 2);
+    }
+
+    fn attitude_fixture() -> CompanionAttitude {
+        Database::default_user_attitude(1, 1)
+    }
+
+    #[test]
+    fn diff_attitudes_reports_nothing_when_unchanged() {
+        let formatter = AttitudeFormatter::new();
+        let attitude = attitude_fixture();
+
+        assert!(formatter.diff_attitudes(&attitude, &attitude).is_empty());
+    }
+
+    #[test]
+    fn diff_attitudes_reports_one_moved_dimension() {
+        let formatter = AttitudeFormatter::new();
+        let previous = attitude_fixture();
+        let mut current = previous.clone();
+        current.trust += 3.0;
+
+        let deltas = formatter.diff_attitudes(&previous, &current);
+
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].dimension, "trust");
+        assert!((deltas[0].delta - 3.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn diff_attitudes_ignores_sub_threshold_movement() {
+        let formatter = AttitudeFormatter::new();
+        let previous = attitude_fixture();
+        let mut current = previous.clone();
+        current.joy += 0.4;
+        current.anger -= 0.9;
+
+        assert!(formatter.diff_attitudes(&previous, &current).is_empty());
+    }
+
+    #[test]
+    fn diff_attitudes_covers_dimensions_the_console_list_omitted() {
+        let formatter = AttitudeFormatter::new();
+        let previous = attitude_fixture();
+        let mut current = previous.clone();
+        current.disgust += 2.0;
+        current.gratitude -= 4.0;
+        current.dominance += 5.0;
+
+        let mut dimensions: Vec<String> = formatter
+            .diff_attitudes(&previous, &current)
+            .into_iter()
+            .map(|delta| delta.dimension)
+            .collect();
+        dimensions.sort();
+
+        assert_eq!(dimensions, vec!["disgust", "dominance", "gratitude"]);
+    }
+
+    #[test]
+    fn console_changes_render_signed_labels() {
+        let formatter = AttitudeFormatter::new();
+        let previous = attitude_fixture();
+        let mut current = previous.clone();
+        current.love += 2.0;
+        current.anger -= 5.0;
+
+        let rendered = formatter.format_attitude_changes_for_console(&previous, &current);
+
+        assert!(rendered.contains("Anger -5"));
+        assert!(rendered.contains("Love +2"));
     }
 }

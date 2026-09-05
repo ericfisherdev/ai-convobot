@@ -24,6 +24,9 @@ import { toast } from "sonner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./ui/tooltip";
 import { cn } from "../lib/utils";
 import { AttitudeSummaryBar } from "./attitude/AttitudeSummaryBar";
+import { useAttitude } from "./context/attitudeContext";
+import { useSession } from "./context/sessionContext";
+import { StreamChunk } from "./interfaces/Message";
 
 const ChatWindow = () => {
   const companionDataContext = useCompanionData();
@@ -31,6 +34,8 @@ const ChatWindow = () => {
   const { isMobile, isStandalone } = useMobile();
 
   const { refreshMessages, pushMessage, updateMessage } = useMessages();
+  const { applyAttitudeStreamUpdate } = useAttitude();
+  const { session } = useSession();
 
   const [userMessage, setUserMessage] = useState('');
   const [companionMessage, setCompanionMessage] = useState('');
@@ -91,6 +96,7 @@ const ChatWindow = () => {
       let buffer = '';
       let streamed = '';
       let streamError: string | null = null;
+      let attitudeStreamed = false;
 
       // Server-Sent Events arrive as "data: {json}\n\n" records, and a single
       // read can contain a partial record, so hold the remainder in a buffer.
@@ -105,12 +111,18 @@ const ChatWindow = () => {
         for (const record of records) {
           const line = record.split('\n').find(part => part.startsWith('data: '));
           if (!line) continue;
-          let chunk;
+          let chunk: StreamChunk;
           try {
             chunk = JSON.parse(line.slice('data: '.length));
           } catch (parseError) {
             // A single malformed record should not abandon the whole stream.
             console.error('Failed to parse stream chunk:', parseError);
+            continue;
+          }
+
+          if (chunk.attitude) {
+            applyAttitudeStreamUpdate(chunk.attitude);
+            attitudeStreamed = true;
             continue;
           }
 
@@ -137,8 +149,11 @@ const ChatWindow = () => {
 
       refreshMessages();
 
-      // Trigger attitude update
-      window.dispatchEvent(new CustomEvent('attitude-update'));
+      // The stream already delivered the new attitude; only fall back to a
+      // refetch when it did not.
+      if (!attitudeStreamed) {
+        window.dispatchEvent(new CustomEvent('attitude-update'));
+      }
 
     } catch (error) {
       console.error('Error sending message:', error);
@@ -279,7 +294,9 @@ const ChatWindow = () => {
           )}
 
           {/* Attitude Summary Bar (moved to bottom as status indicator) */}
-          <AttitudeSummaryBar companionId={1} userId={1} />
+          {session && session.user_id !== null && (
+            <AttitudeSummaryBar companionId={session.companion_id} userId={session.user_id} />
+          )}
         </main>
     )
 }

@@ -23,6 +23,12 @@ interface SessionContextType {
     updateSessionActivity: () => Promise<void>;
 }
 
+// The backend is single-companion and resolves the companion server-side
+// (`CompanionView` exposes no id), and it has no user table to pick from, so
+// session creation posts these fixed ids. Every other id on the frontend comes
+// from the session the backend hands back.
+const DEFAULT_USER_ID = 1;
+
 const SessionContext = createContext<SessionContextType | undefined>(undefined);
 
 interface SessionProviderProps {
@@ -122,7 +128,7 @@ export const SessionProvider: React.FC<SessionProviderProps> = ({ children }) =>
                 body: JSON.stringify({
                     // companion_id is resolved server-side; the client has no way
                     // to know the real companion id (CompanionView exposes no id).
-                    user_id: 1, // Using default user_id
+                    user_id: DEFAULT_USER_ID,
                 }),
             });
 

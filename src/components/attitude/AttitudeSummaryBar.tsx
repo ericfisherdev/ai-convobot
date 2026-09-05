@@ -1,6 +1,11 @@
-import React, { useEffect, useState, useMemo, useCallback } from 'react';
+import React, { useEffect, useMemo, useCallback } from 'react';
 import { Progress } from "../ui/progress";
-import { AttitudeData, ATTITUDE_DIMENSIONS } from '../interfaces/AttitudeData';
+import {
+    AttitudeData,
+    ATTITUDE_DIMENSIONS,
+    ATTITUDE_DISPLAY_THRESHOLD,
+    CORE_ATTITUDE_DIMENSIONS,
+} from '../interfaces/AttitudeData';
 import { useAttitude } from '../context/attitudeContext';
 import { useCompanionData } from '../context/companionContext';
 import { useUserData } from '../context/userContext';
@@ -8,63 +13,39 @@ import { useUserData } from '../context/userContext';
 interface AttitudeSummaryBarProps {
     companionId: number;
     userId: number;
+    // Magnitude above which a non-core, unchanged dimension is still shown.
+    significanceThreshold?: number;
 }
 
-interface AttitudeSummaryResponse {
-    attitude: AttitudeData;
-    summary: string;
-}
-
-export const AttitudeSummaryBar: React.FC<AttitudeSummaryBarProps> = ({ companionId, userId }) => {
-    const { getAttitude } = useAttitude();
+export const AttitudeSummaryBar: React.FC<AttitudeSummaryBarProps> = ({
+    companionId,
+    userId,
+    significanceThreshold = ATTITUDE_DISPLAY_THRESHOLD,
+}) => {
+    const {
+        userAttitude: attitude,
+        userAttitudeSummary,
+        lastTurnDeltas,
+        userAttitudeLoaded,
+        refreshUserAttitude,
+    } = useAttitude();
     const companionDataContext = useCompanionData();
     const companionData = companionDataContext?.companionData;
     const userDataContext = useUserData();
     const userData = userDataContext?.userData;
-    const [attitude, setAttitude] = useState<AttitudeData | null>(null);
-    const [summary, setSummary] = useState<string>('');
-    const [loading, setLoading] = useState(true);
 
-    // Fetch attitude summary from backend
-    const fetchAttitudeSummary = useCallback(async () => {
-        try {
-            const response = await fetch(`/api/attitude/summary/${companionId}/${userId}`);
-            if (response.ok) {
-                const data: AttitudeSummaryResponse = await response.json();
-                setAttitude(data.attitude);
+    const companionName = companionData?.name || 'Companion';
+    const userName = userData?.name || 'User';
 
-                // Replace placeholders with actual names
-                const formattedSummary = data.summary
-                    .replace(/\{\{companion\}\}/g, companionData?.name || 'Companion')
-                    .replace(/\{\{user\}\}/g, userData?.name || 'User');
-                setSummary(formattedSummary);
-            } else {
-                // Fallback to regular attitude fetch if summary endpoint not available
-                const attitudeData = await getAttitude(companionId, userId, 'user');
-                if (attitudeData) {
-                    setAttitude(attitudeData);
-                    generateLocalSummary(attitudeData);
-                }
-            }
-        } catch (error) {
-            console.error('Error fetching attitude summary:', error);
-            // Fallback to regular attitude fetch
-            const attitudeData = await getAttitude(companionId, userId, 'user');
-            if (attitudeData) {
-                setAttitude(attitudeData);
-                generateLocalSummary(attitudeData);
-            }
-        } finally {
-            setLoading(false);
+    useEffect(() => {
+        if (companionId && userId) {
+            refreshUserAttitude(companionId, userId);
         }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [companionId, userId, companionData?.name, userData?.name, getAttitude]); // generateLocalSummary is stable
+    }, [companionId, userId, refreshUserAttitude]);
 
-    // Generate summary locally if backend endpoint not available
-    const generateLocalSummary = useCallback((attitudeData: AttitudeData) => {
-        const companionName = companionData?.name || 'Companion';
-        const userName = userData?.name || 'User';
-
+    // Used when the backend returned no summary (older builds have no summary
+    // endpoint, and the raw attitude fallback carries no prose).
+    const generateLocalSummary = useCallback((attitudeData: AttitudeData): string => {
         // Find dominant emotions
         const emotions = [
             { key: 'love', value: attitudeData.love },
@@ -80,62 +61,72 @@ export const AttitudeSummaryBar: React.FC<AttitudeSummaryBarProps> = ({ companio
         const dominant = emotions[0];
         const secondary = emotions[1];
 
-        let summaryText = '';
-
         // Generate contextual summary based on dominant emotions
         if (dominant.value > 70) {
             if (dominant.key === 'love' && secondary.key === 'trust') {
-                summaryText = `${companionName} is deeply in love with ${userName}`;
+                return `${companionName} is deeply in love with ${userName}`;
             } else if (dominant.key === 'attraction' && attitudeData.lust > 50) {
-                summaryText = `${companionName} really wants to be intimate with ${userName}`;
+                return `${companionName} really wants to be intimate with ${userName}`;
             } else if (dominant.key === 'anger') {
-                summaryText = `${companionName} is upset with ${userName}`;
+                return `${companionName} is upset with ${userName}`;
             } else if (dominant.key === 'curiosity' && attitudeData.butterflies > 50) {
-                summaryText = `${companionName} is nervously excited about ${userName}`;
+                return `${companionName} is nervously excited about ${userName}`;
             } else if (dominant.key === 'trust') {
-                summaryText = `${companionName} deeply trusts ${userName}`;
-            } else {
-                summaryText = `${companionName} feels strongly about ${userName}`;
+                return `${companionName} deeply trusts ${userName}`;
             }
-        } else if (dominant.value > 40) {
-            if (dominant.key === 'love') {
-                summaryText = `${companionName} cares about ${userName}`;
-            } else if (dominant.key === 'attraction') {
-                summaryText = `${companionName} is attracted to ${userName}`;
-            } else if (dominant.key === 'curiosity') {
-                summaryText = `${companionName} is curious about ${userName}`;
-            } else {
-                summaryText = `${companionName} has mixed feelings about ${userName}`;
-            }
-        } else if (dominant.value < -40) {
-            if (dominant.key === 'anger' || dominant.key === 'suspicion') {
-                summaryText = `${companionName} is upset and distrustful of ${userName}`;
-            } else {
-                summaryText = `${companionName} has negative feelings toward ${userName}`;
-            }
-        } else {
-            summaryText = `${companionName} feels neutral toward ${userName}`;
+            return `${companionName} feels strongly about ${userName}`;
         }
 
-        setSummary(summaryText);
-    }, [companionData?.name, userData?.name]);
+        if (dominant.value > 40) {
+            if (dominant.key === 'love') {
+                return `${companionName} cares about ${userName}`;
+            } else if (dominant.key === 'attraction') {
+                return `${companionName} is attracted to ${userName}`;
+            } else if (dominant.key === 'curiosity') {
+                return `${companionName} is curious about ${userName}`;
+            }
+            return `${companionName} has mixed feelings about ${userName}`;
+        }
 
-    // Filter for significant attitudes (> 30 or < -30)
-    const significantAttitudes = useMemo(() => {
+        if (dominant.value < -40) {
+            if (dominant.key === 'anger' || dominant.key === 'suspicion') {
+                return `${companionName} is upset and distrustful of ${userName}`;
+            }
+            return `${companionName} has negative feelings toward ${userName}`;
+        }
+
+        return `${companionName} feels neutral toward ${userName}`;
+    }, [companionName, userName]);
+
+    const summary = useMemo(() => {
+        if (userAttitudeSummary) {
+            return userAttitudeSummary
+                .replace(/\{\{companion\}\}/g, companionName)
+                .replace(/\{\{user\}\}/g, userName);
+        }
+        return attitude ? generateLocalSummary(attitude) : '';
+    }, [userAttitudeSummary, attitude, companionName, userName, generateLocalSummary]);
+
+    // Core dimensions are always shown so the bar never renders empty; anything
+    // strong enough, or moved by the last turn, joins them.
+    const visibleAttitudes = useMemo(() => {
         if (!attitude) return [];
 
         return ATTITUDE_DIMENSIONS.filter(dimension => {
-            const value = attitude[dimension.key as keyof AttitudeData] as number;
-            return Math.abs(value) > 30;
+            const value = attitude[dimension.key] as number;
+            return (CORE_ATTITUDE_DIMENSIONS as readonly string[]).includes(dimension.key)
+                || Math.abs(value) > significanceThreshold
+                || dimension.key in lastTurnDeltas;
         }).map(dimension => ({
             ...dimension,
-            value: attitude[dimension.key as keyof AttitudeData] as number
+            value: attitude[dimension.key] as number,
+            delta: lastTurnDeltas[dimension.key]
         }));
-    }, [attitude]);
+    }, [attitude, lastTurnDeltas, significanceThreshold]);
 
     // Responsive grid columns
     const getGridColumns = () => {
-        const attitudeCount = significantAttitudes.length;
+        const attitudeCount = visibleAttitudes.length;
         if (attitudeCount === 0) return '';
         if (attitudeCount === 1) return 'grid-cols-1';
         if (attitudeCount === 2) return 'grid-cols-2';
@@ -150,30 +141,17 @@ export const AttitudeSummaryBar: React.FC<AttitudeSummaryBarProps> = ({ companio
         return ((value + 100) / 200) * 100; // Convert -100 to +100 range to 0-100%
     };
 
-    useEffect(() => {
-        if (companionId && userId) {
-            fetchAttitudeSummary();
-        }
-    }, [companionId, userId, fetchAttitudeSummary]);
-
-    // Update on message send/receive
-    useEffect(() => {
-        const handleAttitudeUpdate = () => {
-            fetchAttitudeSummary();
-        };
-
-        window.addEventListener('attitude-update', handleAttitudeUpdate);
-        return () => {
-            window.removeEventListener('attitude-update', handleAttitudeUpdate);
-        };
-    }, [fetchAttitudeSummary]);
-
-    if (loading || !attitude || significantAttitudes.length === 0) {
+    // Only the very first load hides the bar; a later refetch keeps the last
+    // known values on screen instead of flashing empty.
+    if (!userAttitudeLoaded || !attitude) {
         return null;
     }
 
     return (
-        <div className="attitude-summary-container px-4 py-3 border-t bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
+        <div
+            className="attitude-summary-container px-4 py-3 border-t bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60"
+            data-testid="attitude-summary-bar"
+        >
             {/* Natural language summary */}
             <p className="text-center mb-3 text-sm text-muted-foreground italic">
                 {summary}
@@ -181,23 +159,34 @@ export const AttitudeSummaryBar: React.FC<AttitudeSummaryBarProps> = ({ companio
 
             {/* Attitude bars grid */}
             <div className={`grid ${getGridColumns()} gap-3 max-w-4xl mx-auto`}>
-                {significantAttitudes.map(attitude => (
-                    <div key={attitude.key} className="space-y-1">
+                {visibleAttitudes.map(dimension => (
+                    <div key={dimension.key} className="space-y-1">
                         <div className="flex justify-between items-center">
-                            <span className="text-xs font-medium">{attitude.label}</span>
-                            <span
-                                className="text-xs font-mono"
-                                style={{ color: attitude.color }}
-                            >
-                                {formatValue(attitude.value)}
-                            </span>
+                            <span className="text-xs font-medium">{dimension.label}</span>
+                            <div className="flex items-center gap-1">
+                                {dimension.delta !== undefined && (
+                                    <span
+                                        className={`text-xs font-mono ${dimension.delta > 0 ? 'text-emerald-500' : 'text-red-500'}`}
+                                        data-testid={`attitude-delta-${dimension.key}`}
+                                        aria-label={`${dimension.label} changed by ${formatValue(dimension.delta)}`}
+                                    >
+                                        {formatValue(dimension.delta)}
+                                    </span>
+                                )}
+                                <span
+                                    className="text-xs font-mono"
+                                    style={{ color: dimension.color }}
+                                >
+                                    {formatValue(dimension.value)}
+                                </span>
+                            </div>
                         </div>
                         <Progress
-                            value={getProgressValue(attitude.value)}
+                            value={getProgressValue(dimension.value)}
                             className="h-1.5"
                             style={{
-                                '--progress-background': attitude.color + '20',
-                                '--progress-foreground': attitude.color
+                                '--progress-background': dimension.color + '20',
+                                '--progress-foreground': dimension.color
                             } as React.CSSProperties}
                         />
                     </div>
