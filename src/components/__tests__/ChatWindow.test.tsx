@@ -9,6 +9,11 @@ import { ConfigProvider } from '../context/configContext'
 import { AttitudeProvider } from '../context/attitudeContext'
 import { SessionProvider } from '../context/sessionContext'
 import { ThemeProvider } from '../theme-provider'
+import { toast } from 'sonner'
+
+vi.mock('sonner', () => ({
+  toast: { error: vi.fn(), success: vi.fn() },
+}))
 
 // The real message list renders replies through a `lazy()` react-markdown
 // import, which suspends inside the discrete click event and blanks the tree.
@@ -217,5 +222,116 @@ describe('ChatWindow Component', () => {
         String(input).startsWith('/api/attitude/summary/')
       ).length
     ).toBe(summaryFetchesBeforeSend)
+  })
+
+  it('disables send controls while a reply streams and re-enables afterwards', async () => {
+    const user = userEvent.setup()
+    let releaseStream: (() => void) | undefined
+    const streamGate = new Promise<void>(resolve => { releaseStream = resolve })
+
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.startsWith('/api/prompt/stream')) {
+        const encoder = new TextEncoder()
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          body: new ReadableStream<Uint8Array>({
+            async start(controller) {
+              await streamGate
+              controller.enqueue(
+                encoder.encode(`data: ${JSON.stringify({ request_id: 'r1', content: 'hi', is_complete: true, token_count: 1 })}\n\n`)
+              )
+              controller.close()
+            },
+          }),
+        })
+      }
+      if (url.startsWith('/api/session')) {
+        return Promise.resolve(jsonResponse(session))
+      }
+      if (url.startsWith('/api/attitude/summary/')) {
+        return Promise.resolve(jsonResponse({ attitude, summary: 'neutral' }))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+    global.fetch = fetchMock as unknown as typeof fetch
+
+    render(
+      <MockProviders>
+        <ChatWindow />
+      </MockProviders>
+    )
+
+    const textarea = screen.getByRole('textbox')
+    const sendButton = screen.getByRole('button', { name: /^send message$/i })
+    await user.type(textarea, 'hello')
+    await user.click(sendButton)
+
+    await waitFor(() => {
+      expect(textarea).toBeDisabled()
+      expect(sendButton).toBeDisabled()
+    })
+
+    const streamCallsWhileSending = fetchMock.mock.calls.filter(([input]) =>
+      String(input).startsWith('/api/prompt/stream')
+    ).length
+
+    // Disabled controls should not let a second send slip through mid-stream.
+    await user.click(sendButton)
+    await user.keyboard('{Enter}')
+    expect(
+      fetchMock.mock.calls.filter(([input]) => String(input).startsWith('/api/prompt/stream')).length
+    ).toBe(streamCallsWhileSending)
+
+    releaseStream?.()
+
+    // The textarea empties on send, so re-enabling is checked by typing again
+    // and confirming the button responds rather than by its disabled state
+    // alone (which an empty textarea would also produce).
+    await waitFor(() => {
+      expect(textarea).not.toBeDisabled()
+    })
+    await user.type(textarea, 'again')
+    expect(sendButton).not.toBeDisabled()
+  })
+
+  it('surfaces a 409 as a still-replying toast', async () => {
+    const user = userEvent.setup()
+
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.startsWith('/api/prompt/stream')) {
+        return Promise.resolve({ ok: false, status: 409, body: null })
+      }
+      if (url.startsWith('/api/session')) {
+        return Promise.resolve(jsonResponse(session))
+      }
+      if (url.startsWith('/api/attitude/summary/')) {
+        return Promise.resolve(jsonResponse({ attitude, summary: 'neutral' }))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+    global.fetch = fetchMock as unknown as typeof fetch
+
+    render(
+      <MockProviders>
+        <ChatWindow />
+      </MockProviders>
+    )
+
+    const textarea = screen.getByRole('textbox')
+    await user.type(textarea, 'hello')
+    await user.click(screen.getByRole('button', { name: /^send message$/i }))
+
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith(expect.stringContaining('still replying'))
+    })
+    // The textarea empties on send, so re-enabling is checked by typing again
+    // and confirming the button responds rather than by its disabled state
+    // alone (which an empty textarea would also produce).
+    expect(textarea).not.toBeDisabled()
+    await user.type(textarea, 'again')
+    expect(screen.getByRole('button', { name: /^send message$/i })).not.toBeDisabled()
   })
 })

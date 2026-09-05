@@ -19,7 +19,7 @@ import {
 import { useCompanionData } from "./context/companionContext";
 import { CompanionData } from "./interfaces/CompanionData";
 import { useMessages } from "./context/messageContext";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { toast } from "sonner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./ui/tooltip";
 import { cn } from "../lib/utils";
@@ -41,6 +41,10 @@ const ChatWindow = () => {
   const [companionMessage, setCompanionMessage] = useState('');
   const [isImpersonating, setIsImpersonating] = useState(false);
   const [prevUserMessage, setPrevUserMessage] = useState('');
+  // Blocks sending while a reply streams: the backend only guards one turn at
+  // a time, so a second send before this one settles would corrupt turn order.
+  const [isSending, setIsSending] = useState(false);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   const handleMessageChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
     if (isImpersonating) {
@@ -53,17 +57,24 @@ const ChatWindow = () => {
   const handleKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
+      if (isSending || !(isImpersonating ? companionMessage : userMessage).trim()) {
+        return;
+      }
       isImpersonating ? sendMessageAsAi() : promptMessage();
     }
   };
 
   const promptMessage = async () => {
+    if (isSending || !userMessage.trim()) {
+      return;
+    }
     const sentMessage = userMessage;
     // Negative ids mark optimistic messages that refreshMessages later replaces
     // with the persisted rows. Each send needs its own id, because
     // updateMessage matches by id and a shared one would let two in-flight
     // streams write into each other's bubble.
     const streamingMessageId = -Date.now();
+    setIsSending(true);
     try {
       setUserMessage('');
       pushMessage({
@@ -88,6 +99,9 @@ const ChatWindow = () => {
       });
 
       if (!response.ok || !response.body) {
+        if (response.status === 409) {
+          throw new Error(`${companionData.name} is still replying`);
+        }
         throw new Error(`Streaming request failed with status ${response.status}`);
       }
 
@@ -159,10 +173,16 @@ const ChatWindow = () => {
       console.error('Error sending message:', error);
       refreshMessages();
       toast.error(`Error while sending a message: ${error}`);
+    } finally {
+      setIsSending(false);
+      inputRef.current?.focus();
     }
   };
 
   const sendMessageAsAi = async () => {
+    if (isSending) {
+      return;
+    }
     try {
       const sendPromise = await fetch('/api/message', {
         method: 'POST',
@@ -245,6 +265,7 @@ const ChatWindow = () => {
               isImpersonating={isImpersonating}
               placeholder={isImpersonating ? `🥸 Type your message as ${companionData?.name}` : "Type your message"}
               companionName={companionData?.name}
+              disabled={isSending}
             />
           ) : (
             /* Desktop input */
@@ -264,11 +285,13 @@ const ChatWindow = () => {
                 </DropdownMenu>
 
                 <Textarea
+                  ref={inputRef}
                   value={isImpersonating ? companionMessage : userMessage}
                   onChange={handleMessageChange}
                   cols={1}
                   placeholder={isImpersonating ? `🥸 Type your message as ${companionData?.name}` : "Type your message"}
                   onKeyDown={handleKeyDown}
+                  disabled={isSending}
                   className="min-h-[44px] max-h-[120px] resize-none"
                 />
 
@@ -278,7 +301,7 @@ const ChatWindow = () => {
                       <Button
                         size="sm"
                         onClick={() => {isImpersonating ? sendMessageAsAi() : promptMessage()}}
-                        disabled={!(isImpersonating ? companionMessage : userMessage).trim()}
+                        disabled={isSending || !(isImpersonating ? companionMessage : userMessage).trim()}
                         aria-label={isImpersonating ? `Send message as ${companionData.name || "AI Companion"}` : "Send message"}
                       >
                         <SendHorizontal className="h-4 w-4" />

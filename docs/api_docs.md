@@ -427,6 +427,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 - **Response:**
   - Status: 200 OK
   - Body: generated text
+  - Status: 409 Conflict — a turn (from `/prompt`, `/prompt/stream`, or `/prompt/regenerate`) is already in flight; wait for it to finish before sending another message
 - **Example Request:**
   ```http
   POST /prompt
@@ -445,6 +446,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 - **Response:**
   - Status: 200 OK
   - Body: generated text
+  - Status: 409 Conflict — a turn is already in flight; wait for it to finish before regenerating
 - **Example Request:**
   ```http
   GET /prompt/regenerate
@@ -466,6 +468,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
     - the attitude chunk: `is_complete: false`, empty `content`, and an `attitude` object. Sent once after generation, only when the turn moved at least one attitude dimension. `attitude.attitude` is the companion's full post-turn `CompanionAttitude` toward the user, `attitude.summary` is its natural language rendering (with `{{companion}}` and `{{user}}` placeholders), and `attitude.deltas` lists `{ dimension, delta }` for the dimensions that moved;
     - the final chunk: `is_complete: true`, carrying the sanitized reply in `content`, or an `error` string when generation failed.
     `attitude` and `error` are omitted when absent, so token and final chunks keep the shape older clients expect.
+  - Status: 409 Conflict — a turn is already in flight; wait for it to finish before sending another message
 - **Example Request:**
   ```http
   POST /prompt/stream
@@ -487,7 +490,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   data: {"request_id":"abc123","content":"It's 10:04.","is_complete":true,"token_count":41}
   ```
 - **Notes:**
-  - Generation is serialised: a request that arrives while another is generating waits its turn.
+  - A turn is claimed for the whole request, from the moment the user message is persisted until the reply (and its attitude update) is persisted. A second `/prompt`, `/prompt/stream`, or `/prompt/regenerate` call that arrives while a turn is in flight gets 409 immediately rather than queuing, so a burst of sends cannot interleave one turn's user message into another's.
   - If the client disconnects mid-stream, generation still runs to completion so the reply is persisted.
 
 ### Inspect the assembled prompt

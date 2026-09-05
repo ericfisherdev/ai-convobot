@@ -32,6 +32,8 @@ mod inference_performance;
 use crate::inference_performance::{ModelConfig, ResponseEstimate, INFERENCE_TRACKER};
 mod llm_scanner;
 use crate::llm_scanner::LlmScanner;
+mod turn_slot;
+use crate::turn_slot::ACTIVE_TURN;
 #[cfg(test)]
 mod simple_tests;
 
@@ -731,6 +733,14 @@ async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
                 .body("Error while getting companion data, check logs for more information");
         }
     };
+    // Claimed before the user-turn insert below and held for the whole
+    // function, so an overlapping call cannot insert its own user message
+    // between this one and the reply it is about to generate.
+    let Some(_turn_guard) = ACTIVE_TURN.try_claim() else {
+        return HttpResponse::Conflict()
+            .body("A reply is still being generated; wait for it to finish before sending another message");
+    };
+
     let interaction_prompt = preprocess_user_message(&prompt_message, companion_id);
     let user_id = 1; // Default user ID
 
@@ -814,6 +824,12 @@ async fn regenerate_prompt() -> HttpResponse {
             return HttpResponse::InternalServerError()
                 .body("Error while getting companion data, check logs for more information");
         }
+    };
+    // Claimed before the delete below: without it, a regenerate racing a live
+    // stream could delete the user message a worker thread is about to answer.
+    let Some(_turn_guard) = ACTIVE_TURN.try_claim() else {
+        return HttpResponse::Conflict()
+            .body("A reply is still being generated; wait for it to finish before sending another message");
     };
     match Database::delete_latest_message() {
         Ok(_) => {}
@@ -1405,11 +1421,23 @@ async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpR
                 .body("Error while getting companion data, check logs for more information");
         }
     };
+    // Claimed before the user-turn insert below: without it, a second
+    // request's insert could land between this one and the worker thread
+    // reading history, and the worker would answer both messages at once.
+    // Moved into the spawned closure and dropped only after the reply (and
+    // its attitude update) is persisted, so the slot covers the whole turn.
+    let Some(turn_guard) = ACTIVE_TURN.try_claim() else {
+        return HttpResponse::Conflict()
+            .body("A reply is still being generated; wait for it to finish before sending another message");
+    };
+
     let interaction_prompt = preprocess_user_message(&user_message, companion_id);
     let user_id = 1; // Default user ID
 
     // The generator reads recent messages back out of the database, so the
-    // user's turn has to be persisted before generation starts.
+    // user's turn has to be persisted before generation starts. The turn
+    // slot claimed above is what actually prevents another turn's insert
+    // from landing in between; this insert alone is not enough.
     if let Err(e) = Database::insert_message(NewMessage {
         ai: false,
         content: user_message.clone(),
@@ -1430,6 +1458,9 @@ async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpR
     let scored_message = user_message.clone();
     let generation_prompt = interaction_prompt.unwrap_or(user_message);
     std::thread::spawn(move || {
+        // Held for the whole worker thread; dropped below only after the
+        // reply and its attitude update are persisted.
+        let _turn_guard = turn_guard;
         let mut token_count = 0usize;
         let result = prompt_streaming(&generation_prompt, companion_id, &mut |token| {
             token_count += 1;
