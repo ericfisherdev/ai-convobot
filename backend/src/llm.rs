@@ -640,9 +640,10 @@ fn load_model(backend: &LlamaBackend, config: &ConfigView) -> Result<LlamaModel,
 /// clone, so the model stays alive until that turn finishes; this only stops
 /// it from being handed out to new turns. The next turn reloads it.
 pub fn unload_model() -> (bool, Option<String>) {
-    let model_path = RESIDENT_MODEL.resident_key().map(|key| key.model_path);
-    let unloaded = RESIDENT_MODEL.evict();
-    (unloaded, model_path)
+    match RESIDENT_MODEL.evict() {
+        Some(key) => (true, Some(key.model_path)),
+        None => (false, None),
+    }
 }
 
 fn generate(
