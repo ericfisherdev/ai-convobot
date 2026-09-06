@@ -564,7 +564,13 @@ pub fn assemble_prompt(
 /// layer count down, see `ModelKey`. `facts` is the real GGUF metadata read
 /// by `load_model`, not the config inputs, so it must never be folded into
 /// `ModelKey`.
-fn resolve_gpu_layers(config: &ConfigView, facts: &ModelFacts) -> u32 {
+///
+/// `layer_count_known` is `false` when `facts.layer_count` is `load_model`'s
+/// 32-layer fallback guess rather than a real header read. The static-layer
+/// clamp below only fires when the count is known: clamping a user's
+/// configured layer count down to a guess could silently under-offload a
+/// model that actually has far more layers than the guess.
+fn resolve_gpu_layers(config: &ConfigView, facts: &ModelFacts, layer_count_known: bool) -> u32 {
     if config.device == Device::GPU || config.device == Device::Metal {
         if config.dynamic_gpu_allocation {
             let allocator = GpuAllocator::new()
@@ -586,7 +592,7 @@ fn resolve_gpu_layers(config: &ConfigView, facts: &ModelFacts) -> u32 {
                     config.gpu_layers as u32
                 }
             }
-        } else if config.gpu_layers as u32 > facts.layer_count {
+        } else if layer_count_known && config.gpu_layers as u32 > facts.layer_count {
             println!(
                 "📌 Static Allocation: clamping configured {} GPU layers to the model's {} layers",
                 config.gpu_layers, facts.layer_count
@@ -613,7 +619,7 @@ fn resolve_gpu_layers(config: &ConfigView, facts: &ModelFacts) -> u32 {
 /// no-thrash doc comment in `model_cache.rs`).
 fn load_model(backend: &LlamaBackend, config: &ConfigView) -> Result<LlamaModel, std::io::Error> {
     let model_path = std::path::Path::new(&config.llm_model_path);
-    let facts = match model_metadata::read_model_facts(model_path) {
+    let (facts, layer_count_known) = match model_metadata::read_model_facts(model_path) {
         Ok(facts) => {
             println!(
                 "📐 Model: {}, {} layers, {} MB",
@@ -621,7 +627,7 @@ fn load_model(backend: &LlamaBackend, config: &ConfigView) -> Result<LlamaModel,
                 facts.layer_count,
                 facts.size_mb()
             );
-            facts
+            (facts, true)
         }
         Err(e) => {
             eprintln!(
@@ -629,16 +635,17 @@ fn load_model(backend: &LlamaBackend, config: &ConfigView) -> Result<LlamaModel,
                 e
             );
             let file_size_bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
-            ModelFacts {
+            let facts = ModelFacts {
                 path: config.llm_model_path.clone(),
                 architecture: "unknown".to_string(),
                 layer_count: 32,
                 file_size_bytes,
-            }
+            };
+            (facts, false)
         }
     };
 
-    let gpu_layers = resolve_gpu_layers(config, &facts);
+    let gpu_layers = resolve_gpu_layers(config, &facts, layer_count_known);
     let model_params = LlamaModelParams::default()
         .with_n_gpu_layers(gpu_layers)
         .with_use_mmap(true); // Memory-mapped model loading reduces RAM usage
@@ -654,8 +661,10 @@ fn load_model(backend: &LlamaBackend, config: &ConfigView) -> Result<LlamaModel,
         gpu_layers
     );
     // Post-load truth check: the header read above should always agree
-    // with what llama.cpp itself resolves. This should never fire.
-    if model.n_layer() != facts.layer_count {
+    // with what llama.cpp itself resolves. This should never fire. Skipped
+    // when the header read failed, since `facts.layer_count` is then a
+    // guess rather than a fact, and disagreeing with it is expected.
+    if layer_count_known && model.n_layer() != facts.layer_count {
         eprintln!(
             "⚠️ Layer count mismatch: GGUF header reported {} but loaded model has {}",
             facts.layer_count,

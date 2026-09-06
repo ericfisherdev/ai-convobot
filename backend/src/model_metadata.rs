@@ -25,7 +25,7 @@ impl ModelFacts {
     /// On-disk size in MB, rounded up, with a floor of 1 so it is never
     /// used as a zero divisor.
     pub fn size_mb(&self) -> u64 {
-        (self.file_size_bytes / (1024 * 1024)).max(1)
+        self.file_size_bytes.div_ceil(1024 * 1024).max(1)
     }
 }
 

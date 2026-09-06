@@ -1882,13 +1882,23 @@ async fn get_gpu_allocation() -> HttpResponse {
         let total_layers = facts.layer_count as usize;
         let gpu_layers = std::cmp::min(config_data.gpu_layers, total_layers);
         let cpu_layers = total_layers.saturating_sub(gpu_layers);
+        // gpu_layers is clamped above and can land below total_layers (or at
+        // zero), so the reported strategy has to reflect that instead of
+        // always claiming a full GPU offload.
+        let allocation_strategy = if gpu_layers == 0 {
+            crate::gpu_allocator::AllocationStrategy::CpuFallback
+        } else if gpu_layers >= total_layers {
+            crate::gpu_allocator::AllocationStrategy::MaxGpu
+        } else {
+            crate::gpu_allocator::AllocationStrategy::Balanced
+        };
         let report = GpuAllocationReport {
             allocation: LayerAllocation {
                 gpu_layers,
                 cpu_layers,
                 total_layers,
                 estimated_vram_usage_mb: 0,
-                allocation_strategy: crate::gpu_allocator::AllocationStrategy::MaxGpu,
+                allocation_strategy,
             },
             model: facts,
         };
