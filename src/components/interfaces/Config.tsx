@@ -54,5 +54,11 @@ export interface LayerAllocation {
     cpu_layers: number;
     total_layers: number;
     estimated_vram_usage_mb: number;
-    allocation_strategy: "MaxGpu" | "Balanced" | "Conservative" | "CpuFallback";
+    allocation_strategy: "MaxGpu" | "Balanced" | "Conservative" | "CpuFallback" | "Aggressive";
+    model?: {
+        path: string;
+        architecture: string;
+        layer_count: number;
+        file_size_bytes: number;
+    };
 }

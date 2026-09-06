@@ -14,6 +14,7 @@ use character_card::CharacterCard;
 use serde::Deserialize;
 mod llm;
 mod model_cache;
+mod model_metadata;
 use crate::llm::{assemble_prompt, prompt, prompt_streaming};
 use uuid::Uuid;
 mod context_manager;
@@ -27,6 +28,7 @@ use crate::attitude_engine::{LexiconScorer, ScorerConfig, TurnScorer};
 mod attitude_formatter;
 mod gpu_allocator;
 use crate::gpu_allocator::{GpuAllocator, LayerAllocation};
+use crate::model_metadata::ModelFacts;
 mod system_memory;
 // Removed unused system_memory imports
 mod inference_performance;
@@ -1843,6 +1845,17 @@ async fn get_gpu_memory() -> HttpResponse {
     }
 }
 
+/// `GET /api/gpu/allocation` response body. Flattens `LayerAllocation` so
+/// existing consumers keep seeing `gpu_layers`/`cpu_layers`/`total_layers`/
+/// `estimated_vram_usage_mb`/`allocation_strategy` at the top level, with
+/// the real model facts added under `model`.
+#[derive(serde::Serialize)]
+struct GpuAllocationReport {
+    #[serde(flatten)]
+    allocation: LayerAllocation,
+    model: ModelFacts,
+}
+
 #[get("/api/gpu/allocation")]
 async fn get_gpu_allocation() -> HttpResponse {
     let config_data = match Database::get_config() {
@@ -1853,21 +1866,37 @@ async fn get_gpu_allocation() -> HttpResponse {
         }
     };
 
-    if !config_data.dynamic_gpu_allocation {
-        let static_allocation = LayerAllocation {
-            gpu_layers: config_data.gpu_layers,
-            cpu_layers: 0, // We don't know total layers without loading the model
-            total_layers: config_data.gpu_layers,
-            estimated_vram_usage_mb: 0,
-            allocation_strategy: crate::gpu_allocator::AllocationStrategy::MaxGpu,
+    let facts =
+        match model_metadata::read_model_facts(std::path::Path::new(&config_data.llm_model_path)) {
+            Ok(facts) => facts,
+            Err(e) => {
+                println!("Failed to read model metadata: {}", e);
+                return HttpResponse::UnprocessableEntity()
+                    .body(format!("Failed to read model metadata: {}", e));
+            }
         };
-        match serde_json::to_string(&static_allocation) {
-            Ok(json) => return HttpResponse::Ok().body(json),
+
+    if !config_data.dynamic_gpu_allocation {
+        let total_layers = facts.layer_count as usize;
+        let gpu_layers = std::cmp::min(config_data.gpu_layers, total_layers);
+        let cpu_layers = total_layers.saturating_sub(gpu_layers);
+        let report = GpuAllocationReport {
+            allocation: LayerAllocation {
+                gpu_layers,
+                cpu_layers,
+                total_layers,
+                estimated_vram_usage_mb: 0,
+                allocation_strategy: crate::gpu_allocator::AllocationStrategy::MaxGpu,
+            },
+            model: facts,
+        };
+        return match serde_json::to_string(&report) {
+            Ok(json) => HttpResponse::Ok().body(json),
             Err(e) => {
                 println!("Failed to serialize allocation: {}", e);
-                return HttpResponse::InternalServerError().body("Failed to serialize allocation");
+                HttpResponse::InternalServerError().body("Failed to serialize allocation")
             }
-        }
+        };
     }
 
     let allocator = GpuAllocator::new()
@@ -1876,24 +1905,16 @@ async fn get_gpu_allocation() -> HttpResponse {
 
     match allocator.detect_gpu_memory(&config_data.device) {
         Ok(gpu_info) => {
-            let vram_limit = if config_data.vram_limit_gb > 0 {
-                Some(config_data.vram_limit_gb as f32)
-            } else {
-                None
+            let vram_limit = GpuAllocator::vram_limit_from_config(config_data.vram_limit_gb);
+            // Same `plan_for_model` entry point `load_model` uses, so this
+            // report shows what generation will actually do.
+            let allocation = allocator.plan_for_model(&gpu_info, &facts, vram_limit);
+            let report = GpuAllocationReport {
+                allocation,
+                model: facts,
             };
 
-            // Estimate model size (this would ideally come from model metadata)
-            let estimated_model_size_mb = 4096; // 4GB default estimate
-            let estimated_total_layers = 32; // Default layer count
-
-            let allocation = allocator.calculate_optimal_layers(
-                &gpu_info,
-                estimated_model_size_mb,
-                estimated_total_layers,
-                vram_limit,
-            );
-
-            match serde_json::to_string(&allocation) {
+            match serde_json::to_string(&report) {
                 Ok(json) => HttpResponse::Ok().body(json),
                 Err(e) => {
                     println!("Failed to serialize allocation: {}", e);

@@ -232,6 +232,7 @@ dependencies = [
  "futures-util",
  "lazy_static",
  "llama-cpp-2",
+ "llama-cpp-sys-2",
  "png",
  "rand 0.8.5",
  "regex",
