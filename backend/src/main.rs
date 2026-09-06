@@ -1866,15 +1866,17 @@ async fn get_gpu_allocation() -> HttpResponse {
         }
     };
 
-    let facts =
-        match model_metadata::read_model_facts(std::path::Path::new(&config_data.llm_model_path)) {
-            Ok(facts) => facts,
-            Err(e) => {
-                println!("Failed to read model metadata: {}", e);
-                return HttpResponse::UnprocessableEntity()
-                    .body(format!("Failed to read model metadata: {}", e));
-            }
-        };
+    // GGUF header reads are a small blocking file read; keep them off the
+    // actix worker thread like every other handler here (see `off_worker`).
+    let model_path = config_data.llm_model_path.clone();
+    let facts = match off_worker("Failed to read model metadata", move || {
+        model_metadata::read_model_facts(std::path::Path::new(&model_path))
+    })
+    .await
+    {
+        Ok(facts) => facts,
+        Err(response) => return response,
+    };
 
     if !config_data.dynamic_gpu_allocation {
         let total_layers = facts.layer_count as usize;
