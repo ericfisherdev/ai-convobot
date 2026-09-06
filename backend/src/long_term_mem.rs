@@ -115,11 +115,21 @@ impl LongTermMem {
         writer.commit()?;
         self.reader.reload()?;
 
+        // Bump the generation before clearing the cache, not after: if it
+        // bumped afterwards, a `get_matches` call already past its own
+        // cache check could see the cleared (empty) cache, load the
+        // still-old generation, search against a pre-commit searcher
+        // snapshot, and have its stale result pass the generation check
+        // and get cached. Bumping first closes that window — any query
+        // that read the old generation is guaranteed to be rejected by
+        // `cache_insert_if_fresh` regardless of when its insert lands
+        // relative to the clear below.
+        self.generation.fetch_add(1, Ordering::SeqCst);
+
         // Clear cache when new entries are added to ensure fresh results
         if let Ok(mut cache) = self.query_cache.lock() {
             cache.clear();
         }
-        self.generation.fetch_add(1, Ordering::SeqCst);
 
         Ok(())
     }
@@ -217,11 +227,15 @@ impl LongTermMem {
         writer.commit()?;
         self.reader.reload()?;
 
+        // See add_entry: bump the generation before clearing the cache so
+        // an in-flight get_matches reading the old generation cannot slip
+        // a stale insert past cache_insert_if_fresh after this clear.
+        self.generation.fetch_add(1, Ordering::SeqCst);
+
         // Clear cache when memory is erased
         if let Ok(mut cache) = self.query_cache.lock() {
             cache.clear();
         }
-        self.generation.fetch_add(1, Ordering::SeqCst);
 
         Ok(())
     }
