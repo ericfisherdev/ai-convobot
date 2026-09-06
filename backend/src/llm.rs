@@ -655,7 +655,7 @@ fn generate(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let start_time = std::time::Instant::now();
-    let long_term_memory = match LongTermMem::connect() {
+    let long_term_memory = match LongTermMem::shared() {
         Ok(ltm) => ltm,
         Err(e) => {
             eprintln!("Error while connecting to tantivy: {}", e);
@@ -703,7 +703,7 @@ fn generate(
         .unwrap_or(4); // Fallback to 4 cores if detection fails
 
     println!("🚀 Generating AI response with optimized session...");
-    let assembled = assemble_prompt(prompt, companion_id, &long_term_memory, &config)?;
+    let assembled = assemble_prompt(prompt, companion_id, long_term_memory, &config)?;
     let AssembledPrompt {
         system_prompt: base_prompt,
         chat_history,

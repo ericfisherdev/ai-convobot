@@ -1,54 +1,111 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 use tantivy::collector::TopDocs;
 use tantivy::error::TantivyError;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
-use tantivy::{Index, IndexReader};
+use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy};
 
-type QueryCache = Arc<Mutex<HashMap<String, (Vec<String>, Instant)>>>;
+type QueryCache = Mutex<HashMap<String, (Vec<String>, Instant)>>;
+
+/// Directory tantivy stores the long-term-memory index in.
+const INDEX_DIR: &str = "longterm_memory";
+
+/// Heap budget handed to the writer's single indexing thread.
+///
+/// This is tantivy's undocumented per-thread minimum
+/// (`MEMORY_BUDGET_NUM_BYTES_MIN`, not re-exported from `tantivy::indexer`),
+/// not an up-front allocation: the underlying arena grows lazily in 1 MB
+/// pages, and a one-document-per-commit workload never comes close to
+/// exhausting it. `Index::writer_with_num_threads(1, ..)` is used instead of
+/// `Index::writer(..)` so the process holds exactly one indexing thread for
+/// its lifetime rather than the 3 threads `writer(50_000_000)` would pick.
+const WRITER_HEAP_BYTES: usize = 15_000_000;
 
 pub struct LongTermMem {
     index: Index,
     chat_field: Field,
-    reader: Arc<IndexReader>,
+    writer: Mutex<IndexWriter>,
+    reader: IndexReader,
     query_cache: QueryCache,
 }
 
+/// Process-wide singleton, mirroring the `RESIDENT_MODEL`/`LLAMA_BACKEND`
+/// pattern in `llm.rs`. tantivy allows exactly one `IndexWriter` per index
+/// directory (enforced with an fs2 exclusive lock on `.tantivy-writer.lock`),
+/// so every caller sharing one writer for the process lifetime is what makes
+/// concurrent `add_entry` calls queue on `writer` instead of failing with
+/// `TantivyError::LockFailure(LockBusy, ..)`.
+static LONG_TERM_MEM: OnceLock<LongTermMem> = OnceLock::new();
+static INIT_LOCK: Mutex<()> = Mutex::new(());
+
 impl LongTermMem {
-    pub fn connect() -> tantivy::Result<Self> {
+    /// Returns the process-wide long-term memory index, opening it on first
+    /// use. A failed open is not cached, so a transient startup failure (e.g.
+    /// the directory not yet being writable) can succeed on a later call.
+    pub fn shared() -> tantivy::Result<&'static LongTermMem> {
+        if let Some(ltm) = LONG_TERM_MEM.get() {
+            return Ok(ltm);
+        }
+        // Serialise first initialisation so two threads racing in here
+        // cannot both call `open_at` and have the loser fail with
+        // `LockBusy` while the winner succeeds.
+        let _guard = INIT_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(ltm) = LONG_TERM_MEM.get() {
+            return Ok(ltm);
+        }
+        let ltm = Self::open_at(Path::new(INDEX_DIR))?;
+        Ok(LONG_TERM_MEM.get_or_init(|| ltm))
+    }
+
+    /// Opens (or creates) the index at `dir`, building the single long-lived
+    /// writer and a `Manual`-reload reader. Split out from `shared()` so
+    /// tests can point it at a `tempfile::TempDir` instead of the process's
+    /// `longterm_memory` directory.
+    fn open_at(dir: &Path) -> tantivy::Result<Self> {
         let mut schema_builder = SchemaBuilder::default();
         let chat_field = schema_builder.add_text_field("chat", TEXT | STORED);
         let schema = schema_builder.build();
-        if !Path::new("longterm_memory").exists() {
-            fs::create_dir("longterm_memory")?;
+        if !dir.exists() {
+            fs::create_dir_all(dir)?;
         }
-        let companion_vector = match Index::open_in_dir("longterm_memory") {
+        let index = match Index::open_in_dir(dir) {
             Ok(index) => index,
-            Err(_) => Index::create_in_dir("longterm_memory", schema)?,
+            Err(_) => Index::create_in_dir(dir, schema)?,
         };
 
-        // Create shared reader for better performance
-        let reader = Arc::new(companion_vector.reader()?);
-        let query_cache = Arc::new(Mutex::new(HashMap::new()));
+        let writer = index.writer_with_num_threads(1, WRITER_HEAP_BYTES)?;
+
+        // `Manual` instead of the default `OnCommit`: this process is the
+        // only writer, so we reload deterministically right after our own
+        // commit (see `add_entry`/`erase_memory`) rather than relying on
+        // `OnCommit`'s async `meta.json` file-watcher thread, which can
+        // still miss a just-committed document on an immediate re-query.
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+        let query_cache = Mutex::new(HashMap::new());
 
         Ok(LongTermMem {
-            index: companion_vector,
+            index,
             chat_field,
+            writer: Mutex::new(writer),
             reader,
             query_cache,
         })
     }
 
     pub fn add_entry(&self, text: &str) -> Result<(), TantivyError> {
-        let mut writer = self.index.writer(50_000_000)?;
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         writer.add_document(tantivy::doc!(
             self.chat_field => text
         ))?;
         writer.commit()?;
+        self.reader.reload()?;
 
         // Clear cache when new entries are added to ensure fresh results
         if let Ok(mut cache) = self.query_cache.lock() {
@@ -58,6 +115,9 @@ impl LongTermMem {
         Ok(())
     }
 
+    /// Searches the index. The query cache is process-wide (backed by the
+    /// same singleton every caller shares via `shared()`), which is what its
+    /// 5-minute TTL was written for.
     pub fn get_matches(
         &self,
         query_string: &str,
@@ -121,9 +181,10 @@ impl LongTermMem {
     }
 
     pub fn erase_memory(&self) -> Result<(), TantivyError> {
-        let mut writer = self.index.writer(50_000_000)?;
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         writer.delete_all_documents()?;
         writer.commit()?;
+        self.reader.reload()?;
 
         // Clear cache when memory is erased
         if let Ok(mut cache) = self.query_cache.lock() {
@@ -132,25 +193,76 @@ impl LongTermMem {
 
         Ok(())
     }
+}
 
-    #[allow(dead_code)]
-    pub fn refresh_reader(&self) -> Result<(), TantivyError> {
-        // Force refresh the reader to see latest changes
-        self.reader.reload()?;
-        Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    #[test]
+    fn add_entry_is_searchable_immediately_on_same_instance() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ltm = LongTermMem::open_at(dir.path()).unwrap();
+
+        ltm.add_entry("the cat sat").unwrap();
+
+        let matches = ltm.get_matches("cat", 5).unwrap();
+        assert_eq!(matches, vec!["the cat sat".to_string()]);
     }
 
-    #[allow(dead_code)]
-    pub fn get_cache_stats(&self) -> (usize, usize) {
-        if let Ok(cache) = self.query_cache.lock() {
-            let total_entries = cache.len();
-            let expired_entries = cache
-                .iter()
-                .filter(|(_, (_, timestamp))| timestamp.elapsed() >= Duration::from_secs(300))
-                .count();
-            (total_entries, expired_entries)
-        } else {
-            (0, 0)
-        }
+    #[test]
+    fn two_add_entries_back_to_back_do_not_hit_lock_busy() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ltm = LongTermMem::open_at(dir.path()).unwrap();
+
+        ltm.add_entry("first entry").unwrap();
+        ltm.add_entry("second entry").unwrap();
+
+        let matches = ltm.get_matches("entry", 5).unwrap();
+        assert_eq!(matches.len(), 2);
+    }
+
+    #[test]
+    fn concurrent_add_entries_all_succeed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ltm = LongTermMem::open_at(dir.path()).unwrap();
+
+        thread::scope(|scope| {
+            for i in 0..4 {
+                let ltm = &ltm;
+                scope.spawn(move || {
+                    ltm.add_entry(&format!("concurrent entry {i}")).unwrap();
+                });
+            }
+        });
+
+        let matches = ltm.get_matches("concurrent", 10).unwrap();
+        assert_eq!(matches.len(), 4);
+    }
+
+    #[test]
+    fn erase_memory_leaves_no_matches() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ltm = LongTermMem::open_at(dir.path()).unwrap();
+
+        ltm.add_entry("something memorable").unwrap();
+        ltm.erase_memory().unwrap();
+
+        let matches = ltm.get_matches("memorable", 5).unwrap();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn add_entry_invalidates_query_cache() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ltm = LongTermMem::open_at(dir.path()).unwrap();
+
+        assert!(ltm.get_matches("dog", 5).unwrap().is_empty());
+
+        ltm.add_entry("the dog barked").unwrap();
+
+        let matches = ltm.get_matches("dog", 5).unwrap();
+        assert_eq!(matches, vec!["the dog barked".to_string()]);
     }
 }
