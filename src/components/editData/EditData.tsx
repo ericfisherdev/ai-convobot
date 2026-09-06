@@ -114,6 +114,10 @@ export function EditData() {
       if (allocationResponse.ok) {
         const allocationData = await allocationResponse.json();
         setLayerAllocation(allocationData);
+      } else {
+        const errorText = await allocationResponse.text().catch(() => 'Unknown error');
+        setLayerAllocation(null);
+        toast.error(`Failed to fetch GPU allocation: ${errorText}`);
       }
     } catch (error) {
       console.error('Failed to fetch GPU info:', error);
