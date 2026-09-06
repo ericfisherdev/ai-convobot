@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 use tantivy::collector::TopDocs;
@@ -31,6 +32,12 @@ pub struct LongTermMem {
     writer: Mutex<IndexWriter>,
     reader: IndexReader,
     query_cache: QueryCache,
+    /// Bumped by every commit (`add_entry`/`erase_memory`), after the cache
+    /// is cleared. `get_matches` snapshots this before searching and only
+    /// caches its result if it is still current at insert time, so a search
+    /// that was already in flight when a commit landed cannot resurrect
+    /// pre-commit results into the cache after the commit's own clear.
+    generation: AtomicU64,
 }
 
 /// Process-wide singleton, mirroring the `RESIDENT_MODEL`/`LLAMA_BACKEND`
@@ -96,6 +103,7 @@ impl LongTermMem {
             writer: Mutex::new(writer),
             reader,
             query_cache,
+            generation: AtomicU64::new(0),
         })
     }
 
@@ -111,6 +119,7 @@ impl LongTermMem {
         if let Ok(mut cache) = self.query_cache.lock() {
             cache.clear();
         }
+        self.generation.fetch_add(1, Ordering::SeqCst);
 
         Ok(())
     }
@@ -147,6 +156,12 @@ impl LongTermMem {
             }
         }
 
+        // Snapshot the generation before searching: if a commit lands (and
+        // clears the cache) while this search is still running, the
+        // generation will have moved by the time we reach the insert below,
+        // and `cache_insert_if_fresh` skips caching this now-stale result.
+        let generation_before = self.generation.load(Ordering::SeqCst);
+
         // Use the shared reader instead of creating a new one
         let searcher = self.reader.searcher();
         let qp = QueryParser::for_index(&self.index, vec![self.chat_field]);
@@ -168,16 +183,32 @@ impl LongTermMem {
             result.push(r.to_string());
         }
 
-        // Cache the results
+        self.cache_insert_if_fresh(cache_key, generation_before, result.clone());
+
+        Ok(result)
+    }
+
+    /// Inserts `result` into the query cache unless a commit landed after
+    /// `generation_before` was captured, in which case the result was
+    /// computed against pre-commit data and inserting it now would resurrect
+    /// stale results for up to the cache's 5-minute TTL right after the
+    /// commit's own clear.
+    fn cache_insert_if_fresh(
+        &self,
+        cache_key: String,
+        generation_before: u64,
+        result: Vec<String>,
+    ) {
         if let Ok(mut cache) = self.query_cache.lock() {
+            if self.generation.load(Ordering::SeqCst) != generation_before {
+                return;
+            }
             // Limit cache size to prevent memory issues
             if cache.len() > 100 {
                 cache.clear();
             }
-            cache.insert(cache_key, (result.clone(), Instant::now()));
+            cache.insert(cache_key, (result, Instant::now()));
         }
-
-        Ok(result)
     }
 
     pub fn erase_memory(&self) -> Result<(), TantivyError> {
@@ -190,6 +221,7 @@ impl LongTermMem {
         if let Ok(mut cache) = self.query_cache.lock() {
             cache.clear();
         }
+        self.generation.fetch_add(1, Ordering::SeqCst);
 
         Ok(())
     }
@@ -198,6 +230,7 @@ impl LongTermMem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
     use std::thread;
 
     #[test]
@@ -264,5 +297,88 @@ mod tests {
 
         let matches = ltm.get_matches("dog", 5).unwrap();
         assert_eq!(matches, vec!["the dog barked".to_string()]);
+    }
+
+    /// Regression test for a race CodeRabbit flagged on PR #116:
+    /// `get_matches` captures `generation_before`, searches, then inserts
+    /// into the cache. If `add_entry` commits and clears the cache in
+    /// between, the late insert must not resurrect the pre-commit result.
+    /// The barrier forces the commit to finish before the simulated late
+    /// insert runs, without any timing-dependent sleep.
+    #[test]
+    fn add_entry_racing_a_search_does_not_poison_the_cache_with_stale_results() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ltm = LongTermMem::open_at(dir.path()).unwrap();
+        ltm.add_entry("original entry").unwrap();
+
+        // What get_matches would have captured before starting its search.
+        let generation_before = ltm.generation.load(Ordering::SeqCst);
+
+        let barrier = Barrier::new(2);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                ltm.add_entry("second entry added mid search").unwrap();
+                barrier.wait();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                // Runs only after add_entry's commit and cache clear above
+                // have completed, simulating the in-flight search's insert
+                // landing right after them.
+                ltm.cache_insert_if_fresh(
+                    "original:5".to_string(),
+                    generation_before,
+                    vec!["stale result computed before the commit".to_string()],
+                );
+            });
+        });
+
+        assert!(ltm.query_cache.lock().unwrap().get("original:5").is_none());
+    }
+
+    /// Same race, on the `erase_memory` mutation path.
+    #[test]
+    fn erase_memory_racing_a_search_does_not_poison_the_cache_with_stale_results() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ltm = LongTermMem::open_at(dir.path()).unwrap();
+        ltm.add_entry("original entry").unwrap();
+
+        let generation_before = ltm.generation.load(Ordering::SeqCst);
+
+        let barrier = Barrier::new(2);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                ltm.erase_memory().unwrap();
+                barrier.wait();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                ltm.cache_insert_if_fresh(
+                    "original:5".to_string(),
+                    generation_before,
+                    vec!["stale result computed before the erase".to_string()],
+                );
+            });
+        });
+
+        assert!(ltm.query_cache.lock().unwrap().get("original:5").is_none());
+    }
+
+    #[test]
+    fn cache_insert_if_fresh_inserts_when_generation_is_unchanged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ltm = LongTermMem::open_at(dir.path()).unwrap();
+
+        let generation_before = ltm.generation.load(Ordering::SeqCst);
+        ltm.cache_insert_if_fresh(
+            "fresh:5".to_string(),
+            generation_before,
+            vec!["fresh result".to_string()],
+        );
+
+        assert_eq!(
+            ltm.query_cache.lock().unwrap().get("fresh:5").unwrap().0,
+            vec!["fresh result".to_string()]
+        );
     }
 }
