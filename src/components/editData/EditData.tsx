@@ -121,6 +121,7 @@ export function EditData() {
       }
     } catch (error) {
       console.error('Failed to fetch GPU info:', error);
+      setLayerAllocation(null);
       toast.error('Failed to fetch GPU information');
     } finally {
       setIsLoadingGpuInfo(false);
