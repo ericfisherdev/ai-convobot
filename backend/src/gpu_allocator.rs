@@ -1,4 +1,5 @@
 use crate::database::Device;
+use crate::model_metadata::ModelFacts;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 
@@ -28,51 +29,6 @@ pub enum AllocationStrategy {
     Conservative,
     CpuFallback,
     Aggressive, // New strategy for systems with 3.5GB+ VRAM
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(non_camel_case_types)]
-pub enum ModelQuantization {
-    F16,    // 16 bits per parameter
-    Q8_0,   // 8 bits per parameter
-    Q5_K_M, // ~5.1 bits per parameter
-    Q4_K_M, // ~4.83 bits per parameter
-    Q4_0,   // 4 bits per parameter
-    Q3_K_M, // ~3.3 bits per parameter
-    Q2_K,   // ~2.6 bits per parameter
-}
-
-impl ModelQuantization {
-    pub fn bytes_per_param(&self) -> f32 {
-        match self {
-            ModelQuantization::F16 => 2.0,
-            ModelQuantization::Q8_0 => 1.0,
-            ModelQuantization::Q5_K_M => 0.64,
-            ModelQuantization::Q4_K_M => 0.60,
-            ModelQuantization::Q4_0 => 0.5,
-            ModelQuantization::Q3_K_M => 0.41,
-            ModelQuantization::Q2_K => 0.33,
-        }
-    }
-
-    pub fn from_model_name(model_path: &str) -> Self {
-        let path_lower = model_path.to_lowercase();
-        if path_lower.contains("q2_k") {
-            ModelQuantization::Q2_K
-        } else if path_lower.contains("q3_k_m") {
-            ModelQuantization::Q3_K_M
-        } else if path_lower.contains("q4_0") {
-            ModelQuantization::Q4_0
-        } else if path_lower.contains("q4_k_m") {
-            ModelQuantization::Q4_K_M
-        } else if path_lower.contains("q5_k_m") {
-            ModelQuantization::Q5_K_M
-        } else if path_lower.contains("q8_0") {
-            ModelQuantization::Q8_0
-        } else {
-            ModelQuantization::Q4_K_M // Default assumption for unknown models
-        }
-    }
 }
 
 pub struct GpuAllocator {
@@ -213,7 +169,12 @@ impl GpuAllocator {
         })
     }
 
-    /// Calculate optimal GPU layer allocation with quantization awareness
+    /// Calculate optimal GPU layer allocation.
+    ///
+    /// The per-layer VRAM estimate below is derived from `model_size_mb`
+    /// and `total_layers` directly — the file size on disk already
+    /// reflects whatever quantization produced it, so no separate
+    /// quantization guess is needed. `model_path` is kept for the log line.
     pub fn calculate_optimal_layers_v2(
         &self,
         gpu_info: &GpuMemoryInfo,
@@ -222,7 +183,10 @@ impl GpuAllocator {
         total_layers: usize,
         vram_limit_gb: Option<f32>,
     ) -> LayerAllocation {
-        let quantization = ModelQuantization::from_model_name(model_path);
+        println!(
+            "📦 Sizing '{}': {} MB across {} layers",
+            model_path, model_size_mb, total_layers
+        );
 
         // Apply VRAM limit if specified
         let effective_available_vram = if let Some(limit_gb) = vram_limit_gb {
@@ -245,15 +209,13 @@ impl GpuAllocator {
         let safe_vram_mb = ((effective_available_vram as f32) * safety_margin) as u64;
         let usable_vram_mb = safe_vram_mb.saturating_sub(min_free_mb);
 
-        // More accurate VRAM estimation per layer based on quantization
-        // Account for model architecture overhead and KV cache
-        let base_model_params = model_size_mb as f32 / quantization.bytes_per_param();
-        let params_per_layer = base_model_params / total_layers as f32;
+        // VRAM estimation per layer: the model's on-disk size spread evenly
+        // across its layers, plus a reservation for KV cache and
+        // architecture overhead.
         let kv_cache_overhead_mb = 200; // Reserve for KV cache and context
         let arch_overhead_mb = 100; // Reserve for model architecture overhead
 
-        let vram_per_layer_mb =
-            ((params_per_layer * quantization.bytes_per_param()) / 1024.0 / 1024.0).ceil() as u64;
+        let vram_per_layer_mb = (model_size_mb as f32 / total_layers.max(1) as f32).ceil() as u64;
         let reserved_vram = kv_cache_overhead_mb + arch_overhead_mb;
         let layers_vram_budget = usable_vram_mb.saturating_sub(reserved_vram);
 
@@ -295,7 +257,39 @@ impl GpuAllocator {
         }
     }
 
+    /// Single entry point for planning an allocation from real model facts.
+    ///
+    /// Both `load_model` (`llm.rs`) and `GET /api/gpu/allocation`
+    /// (`main.rs`) call this instead of `calculate_optimal_layers_v2`
+    /// directly, so the layer count and per-layer VRAM estimate the
+    /// allocation report shows are exactly what generation will use.
+    pub fn plan_for_model(
+        &self,
+        gpu_info: &GpuMemoryInfo,
+        facts: &ModelFacts,
+        vram_limit_gb: Option<f32>,
+    ) -> LayerAllocation {
+        self.calculate_optimal_layers_v2(
+            gpu_info,
+            &facts.path,
+            facts.size_mb(),
+            facts.layer_count as usize,
+            vram_limit_gb,
+        )
+    }
+
+    /// Converts the config's `vram_limit_gb` (0 means "no limit") into the
+    /// `Option<f32>` the allocation methods take.
+    pub fn vram_limit_from_config(vram_limit_gb: usize) -> Option<f32> {
+        if vram_limit_gb > 0 {
+            Some(vram_limit_gb as f32)
+        } else {
+            None
+        }
+    }
+
     /// Calculate optimal GPU layer allocation (legacy method for backward compatibility)
+    #[allow(dead_code)]
     pub fn calculate_optimal_layers(
         &self,
         gpu_info: &GpuMemoryInfo,
@@ -469,6 +463,17 @@ impl std::fmt::Display for GpuMemoryInfo {
 mod tests {
     use super::*;
 
+    fn gpu_info(total_vram_mb: u64, available_vram_mb: u64) -> GpuMemoryInfo {
+        GpuMemoryInfo {
+            total_vram_mb,
+            available_vram_mb,
+            used_vram_mb: total_vram_mb.saturating_sub(available_vram_mb),
+            utilization_percent: 25.0,
+            device_name: "Test GPU".to_string(),
+            driver_version: "1.0".to_string(),
+        }
+    }
+
     #[test]
     fn test_calculate_optimal_layers() {
         let allocator = GpuAllocator::new();
@@ -486,6 +491,115 @@ mod tests {
         assert!(allocation.gpu_layers > 0);
         assert!(allocation.gpu_layers <= 32);
         assert_eq!(allocation.gpu_layers + allocation.cpu_layers, 32);
+    }
+
+    /// Regression test for the unit bug where `vram_per_layer_mb` was
+    /// divided by `1024.0 * 1024.0` twice (once via `bytes_per_param`
+    /// cancelling out, once explicitly), making it 1 MB for every model
+    /// and forcing `MaxGpu` regardless of how large the model actually is.
+    #[test]
+    fn vram_per_layer_reflects_real_model_size() {
+        let allocator = GpuAllocator::new();
+        let info = gpu_info(8192, 8192);
+
+        let allocation = allocator.calculate_optimal_layers_v2(&info, "model.gguf", 4096, 32, None);
+
+        // 4096 MB / 32 layers = 128 MB/layer, comfortably fits, so this
+        // should resolve to MaxGpu with all 32 layers on GPU.
+        assert!(matches!(
+            allocation.allocation_strategy,
+            AllocationStrategy::MaxGpu
+        ));
+        assert_eq!(allocation.gpu_layers, 32);
+        // estimated_vram_usage_mb = gpu_layers * ceil(size/layers) + 300;
+        // 32 * 128 + 300 = 4396. Under the old bug this would have been
+        // 32 * 1 + 300 = 332.
+        assert_eq!(allocation.estimated_vram_usage_mb, 4396);
+    }
+
+    #[test]
+    fn partial_offload_for_model_that_barely_fits() {
+        let allocator = GpuAllocator::new();
+        // ~4.9GB model, 32 layers, only 5GB free out of 6GB total.
+        let info = gpu_info(6144, 5000);
+
+        let allocation = allocator.calculate_optimal_layers_v2(&info, "model.gguf", 4915, 32, None);
+
+        assert!(!matches!(
+            allocation.allocation_strategy,
+            AllocationStrategy::MaxGpu
+        ));
+        assert!(allocation.gpu_layers > 0 && allocation.gpu_layers < 32);
+    }
+
+    #[test]
+    fn thirteen_b_model_offloads_fewer_than_all_layers_on_6gb() {
+        let allocator = GpuAllocator::new();
+        // ~8GB (13B Q4) model, 80 layers, 6GB free.
+        let info = gpu_info(6144, 6144);
+
+        let allocation = allocator.calculate_optimal_layers_v2(&info, "model.gguf", 8192, 80, None);
+
+        assert!(allocation.gpu_layers < 80);
+    }
+
+    #[test]
+    fn one_b_model_fully_offloads_on_6gb() {
+        let allocator = GpuAllocator::new();
+        // ~1GB model, 16 layers, 6GB free: should fit entirely.
+        let info = gpu_info(6144, 6144);
+
+        let allocation = allocator.calculate_optimal_layers_v2(&info, "model.gguf", 1024, 16, None);
+
+        assert!(matches!(
+            allocation.allocation_strategy,
+            AllocationStrategy::MaxGpu
+        ));
+        assert_eq!(allocation.gpu_layers, 16);
+    }
+
+    #[test]
+    fn seventy_b_model_falls_back_toward_cpu_on_6gb() {
+        let allocator = GpuAllocator::new();
+        // ~40GB (70B) model, 80 layers, only 6GB free.
+        let info = gpu_info(6144, 6144);
+
+        let allocation =
+            allocator.calculate_optimal_layers_v2(&info, "model.gguf", 40960, 80, None);
+
+        assert!(allocation.gpu_layers < 40); // well under half the layers
+        assert!(matches!(
+            allocation.allocation_strategy,
+            AllocationStrategy::Conservative | AllocationStrategy::CpuFallback
+        ));
+    }
+
+    #[test]
+    fn plan_for_model_matches_calculate_optimal_layers_v2() {
+        let allocator = GpuAllocator::new();
+        let info = gpu_info(8192, 8192);
+        let facts = ModelFacts {
+            path: "model.gguf".to_string(),
+            architecture: "llama".to_string(),
+            layer_count: 32,
+            file_size_bytes: 4096 * 1024 * 1024,
+        };
+
+        let via_facts = allocator.plan_for_model(&info, &facts, None);
+        let direct =
+            allocator.calculate_optimal_layers_v2(&info, &facts.path, facts.size_mb(), 32, None);
+
+        assert_eq!(via_facts.gpu_layers, direct.gpu_layers);
+        assert_eq!(
+            via_facts.estimated_vram_usage_mb,
+            direct.estimated_vram_usage_mb
+        );
+    }
+
+    #[test]
+    fn vram_limit_from_config_zero_means_unlimited() {
+        assert_eq!(GpuAllocator::vram_limit_from_config(0), None);
+        assert_eq!(GpuAllocator::vram_limit_from_config(8), Some(8.0));
     }
 
     #[test]

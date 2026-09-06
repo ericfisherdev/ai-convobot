@@ -14,6 +14,7 @@ use crate::inference_optimizer::INFERENCE_OPTIMIZER;
 use crate::inference_performance::{ModelConfig, INFERENCE_TRACKER};
 use crate::long_term_mem::LongTermMem;
 use crate::model_cache::{ModelKey, ResidentCache};
+use crate::model_metadata::{self, ModelFacts};
 
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -560,8 +561,10 @@ pub fn assemble_prompt(
 /// before building the model parameters. Only called from `load_model`, i.e.
 /// only when a (re)load actually happens: running GPU detection on every
 /// turn would see less free VRAM once the model is resident and thrash the
-/// layer count down, see `ModelKey`.
-fn resolve_gpu_layers(config: &ConfigView) -> u32 {
+/// layer count down, see `ModelKey`. `facts` is the real GGUF metadata read
+/// by `load_model`, not the config inputs, so it must never be folded into
+/// `ModelKey`.
+fn resolve_gpu_layers(config: &ConfigView, facts: &ModelFacts) -> u32 {
     if config.device == Device::GPU || config.device == Device::Metal {
         if config.dynamic_gpu_allocation {
             let allocator = GpuAllocator::new()
@@ -572,24 +575,8 @@ fn resolve_gpu_layers(config: &ConfigView) -> u32 {
                 Ok(gpu_info) => {
                     println!("🔍 GPU Detection: {}", gpu_info);
 
-                    let vram_limit = if config.vram_limit_gb > 0 {
-                        Some(config.vram_limit_gb as f32)
-                    } else {
-                        None
-                    };
-
-                    // Estimate model size (this would ideally come from model metadata)
-                    let estimated_model_size_mb = 4096;
-                    let estimated_total_layers = 32;
-
-                    // Use the new optimized allocation method
-                    let allocation = allocator.calculate_optimal_layers_v2(
-                        &gpu_info,
-                        &config.llm_model_path,
-                        estimated_model_size_mb,
-                        estimated_total_layers,
-                        vram_limit,
-                    );
+                    let vram_limit = GpuAllocator::vram_limit_from_config(config.vram_limit_gb);
+                    let allocation = allocator.plan_for_model(&gpu_info, facts, vram_limit);
 
                     println!("🎯 Dynamic Allocation: {}", allocation);
                     allocation.gpu_layers as u32
@@ -599,6 +586,12 @@ fn resolve_gpu_layers(config: &ConfigView) -> u32 {
                     config.gpu_layers as u32
                 }
             }
+        } else if config.gpu_layers as u32 > facts.layer_count {
+            println!(
+                "📌 Static Allocation: clamping configured {} GPU layers to the model's {} layers",
+                config.gpu_layers, facts.layer_count
+            );
+            facts.layer_count
         } else {
             println!("📌 Static Allocation: {} GPU layers", config.gpu_layers);
             config.gpu_layers as u32
@@ -612,8 +605,40 @@ fn resolve_gpu_layers(config: &ConfigView) -> u32 {
 /// Loads the GGUF file named by `config.llm_model_path`. Only runs when
 /// `RESIDENT_MODEL` needs a (re)load, i.e. on the first turn and whenever
 /// `ModelKey::from_config` changes.
+///
+/// Reads the model's real architecture, layer count, and size from its GGUF
+/// header before resolving GPU layers. That read is a pure function of
+/// `config.llm_model_path`, which is already part of `ModelKey`, so it
+/// cannot cause the resident model to reload on its own (see `ModelKey`'s
+/// no-thrash doc comment in `model_cache.rs`).
 fn load_model(backend: &LlamaBackend, config: &ConfigView) -> Result<LlamaModel, std::io::Error> {
-    let gpu_layers = resolve_gpu_layers(config);
+    let model_path = std::path::Path::new(&config.llm_model_path);
+    let facts = match model_metadata::read_model_facts(model_path) {
+        Ok(facts) => {
+            println!(
+                "📐 Model: {}, {} layers, {} MB",
+                facts.architecture,
+                facts.layer_count,
+                facts.size_mb()
+            );
+            facts
+        }
+        Err(e) => {
+            eprintln!(
+                "⚠️ Failed to read model metadata ({}), falling back to a 32-layer estimate",
+                e
+            );
+            let file_size_bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
+            ModelFacts {
+                path: config.llm_model_path.clone(),
+                architecture: "unknown".to_string(),
+                layer_count: 32,
+                file_size_bytes,
+            }
+        }
+    };
+
+    let gpu_layers = resolve_gpu_layers(config, &facts);
     let model_params = LlamaModelParams::default()
         .with_n_gpu_layers(gpu_layers)
         .with_use_mmap(true); // Memory-mapped model loading reduces RAM usage
@@ -621,17 +646,22 @@ fn load_model(backend: &LlamaBackend, config: &ConfigView) -> Result<LlamaModel,
     print!("📚 Loading model... ");
     std::io::stdout().flush().unwrap();
     let load_start = std::time::Instant::now();
-    let model = LlamaModel::load_from_file(
-        backend,
-        std::path::Path::new(&config.llm_model_path),
-        &model_params,
-    )
-    .map_err(|e| std::io::Error::other(format!("Failed to load llm model: {}", e)))?;
+    let model = LlamaModel::load_from_file(backend, model_path, &model_params)
+        .map_err(|e| std::io::Error::other(format!("Failed to load llm model: {}", e)))?;
     println!(
         "✓ Model loaded in {:.2}s ({} GPU layers)",
         load_start.elapsed().as_secs_f64(),
         gpu_layers
     );
+    // Post-load truth check: the header read above should always agree
+    // with what llama.cpp itself resolves. This should never fire.
+    if model.n_layer() != facts.layer_count {
+        eprintln!(
+            "⚠️ Layer count mismatch: GGUF header reported {} but loaded model has {}",
+            facts.layer_count,
+            model.n_layer()
+        );
+    }
     Ok(model)
 }
 

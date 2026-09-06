@@ -25,6 +25,7 @@ lazy_static = "1.4.0"
 uuid = { version = "1.6", features = ["v4", "serde"] }
 walkdir = "2.4"
 llama-cpp-2 = "0.1.156"
+llama-cpp-sys-2 = "0.1.156"
 encoding_rs = "0.8"
 
 [features]
