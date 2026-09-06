@@ -567,7 +567,7 @@ struct LongTermMemMessage {
 async fn add_memory_long_term_message(received: web::Json<LongTermMemMessage>) -> HttpResponse {
     let entry = received.into_inner().entry;
     match off_worker("Error while adding long term memory entry", move || {
-        LongTermMem::connect()?.add_entry(&entry)
+        LongTermMem::shared()?.add_entry(&entry)
     })
     .await
     {
@@ -579,7 +579,7 @@ async fn add_memory_long_term_message(received: web::Json<LongTermMemMessage>) -
 #[delete("/api/memory/longTerm")]
 async fn erase_long_term() -> HttpResponse {
     match off_worker("Error while clearing long term memory", || {
-        LongTermMem::connect()?.erase_memory()
+        LongTermMem::shared()?.erase_memory()
     })
     .await
     {
@@ -1118,7 +1118,7 @@ struct PromptInspectParams {
 /// final rendered string. Every other template returns the finished prompt.
 #[get("/api/debug/prompt")]
 async fn inspect_prompt(query: web::Query<PromptInspectParams>) -> HttpResponse {
-    let long_term_memory = match LongTermMem::connect() {
+    let long_term_memory = match LongTermMem::shared() {
         Ok(ltm) => ltm,
         Err(e) => {
             println!("Failed to connect to long term memory: {}", e);
@@ -1153,7 +1153,7 @@ async fn inspect_prompt(query: web::Query<PromptInspectParams>) -> HttpResponse 
     match assemble_prompt(
         query.prompt.as_deref().unwrap_or(""),
         companion_id,
-        &long_term_memory,
+        long_term_memory,
         &config_view,
     ) {
         Ok(assembled) => HttpResponse::Ok().json(assembled),
@@ -1963,7 +1963,7 @@ async fn main() -> std::io::Result<()> {
         Err(e) => eprintln!("⚠️ Failed to connect to sqlite database: {}\n", e),
     }
 
-    match LongTermMem::connect() {
+    match LongTermMem::shared() {
         Ok(_) => {}
         Err(e) => eprintln!("⚠️ Failed to connect to tantivy: {}\n", e),
     }
