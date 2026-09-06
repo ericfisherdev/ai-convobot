@@ -2,7 +2,7 @@ use actix_web::{delete, get, post, put, web, App, HttpResponse, HttpServer};
 use futures_util::StreamExt as _;
 mod database;
 use database::{
-    CompanionAttitude, CompanionView, ConfigModify, Database, Message, NewMessage,
+    CompanionAttitude, CompanionView, ConfigModify, Database, Device, Message, NewMessage,
     ThirdPartyInteraction, UserView,
 };
 mod long_term_mem;
@@ -1867,31 +1867,61 @@ async fn get_gpu_allocation() -> HttpResponse {
     };
 
     // GGUF header reads are a small blocking file read; keep them off the
-    // actix worker thread like every other handler here (see `off_worker`).
+    // actix worker thread, same as `off_worker`, but handled directly here
+    // so invalid metadata (a bad/foreign file) can be told apart from an
+    // operational failure (unreadable file, panicking blocking task): the
+    // former is a 422 the caller can act on, the latter is a 500.
     let model_path = config_data.llm_model_path.clone();
-    let facts = match off_worker("Failed to read model metadata", move || {
+    let facts = match web::block(move || {
         model_metadata::read_model_facts(std::path::Path::new(&model_path))
     })
     .await
     {
-        Ok(facts) => facts,
-        Err(response) => return response,
+        Ok(Ok(facts)) => facts,
+        Ok(Err(
+            e @ (model_metadata::ModelFactsError::NotGguf(_)
+            | model_metadata::ModelFactsError::MissingKey(_)
+            | model_metadata::ModelFactsError::UnexpectedType { .. }),
+        )) => {
+            println!("Invalid model metadata: {}", e);
+            return HttpResponse::UnprocessableEntity()
+                .body(format!("Invalid model metadata: {}", e));
+        }
+        Ok(Err(e)) => {
+            println!("Failed to read model metadata: {}", e);
+            return HttpResponse::InternalServerError()
+                .body("Failed to read model metadata, check logs for more information");
+        }
+        Err(e) => {
+            println!("Failed to read model metadata: blocking task failed: {}", e);
+            return HttpResponse::InternalServerError()
+                .body("Failed to read model metadata, check logs for more information");
+        }
     };
 
     if !config_data.dynamic_gpu_allocation {
         let total_layers = facts.layer_count as usize;
-        let gpu_layers = std::cmp::min(config_data.gpu_layers, total_layers);
-        let cpu_layers = total_layers.saturating_sub(gpu_layers);
-        // gpu_layers is clamped above and can land below total_layers (or at
-        // zero), so the reported strategy has to reflect that instead of
-        // always claiming a full GPU offload.
-        let allocation_strategy = if gpu_layers == 0 {
-            crate::gpu_allocator::AllocationStrategy::CpuFallback
-        } else if gpu_layers >= total_layers {
-            crate::gpu_allocator::AllocationStrategy::MaxGpu
+        // A CPU-only device always loads zero GPU layers (see
+        // `llm::resolve_gpu_layers`'s device check), regardless of the
+        // configured `gpu_layers` value, so report that instead of
+        // pretending a static GPU plan applies.
+        let (gpu_layers, allocation_strategy) = if config_data.device == Device::CPU {
+            (0, crate::gpu_allocator::AllocationStrategy::CpuFallback)
         } else {
-            crate::gpu_allocator::AllocationStrategy::Balanced
+            let gpu_layers = std::cmp::min(config_data.gpu_layers, total_layers);
+            // gpu_layers is clamped above and can land below total_layers
+            // (or at zero), so the reported strategy has to reflect that
+            // instead of always claiming a full GPU offload.
+            let allocation_strategy = if gpu_layers == 0 {
+                crate::gpu_allocator::AllocationStrategy::CpuFallback
+            } else if gpu_layers >= total_layers {
+                crate::gpu_allocator::AllocationStrategy::MaxGpu
+            } else {
+                crate::gpu_allocator::AllocationStrategy::Balanced
+            };
+            (gpu_layers, allocation_strategy)
         };
+        let cpu_layers = total_layers.saturating_sub(gpu_layers);
         let report = GpuAllocationReport {
             allocation: LayerAllocation {
                 gpu_layers,
