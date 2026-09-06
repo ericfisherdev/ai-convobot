@@ -42,6 +42,125 @@ use std::fs;
 use std::fs::File;
 use std::io::{Read, Write};
 
+/// Runs synchronous work (rusqlite, tantivy) on actix's blocking pool so the
+/// worker thread stays free to serve other requests while it runs.
+///
+/// `failure` is the user-facing prefix already used by the handlers ("Error
+/// while getting config"); it is logged with the cause and returned as the
+/// 500 body with the usual ", check logs for more information" tail.
+async fn off_worker<T, E>(
+    failure: &'static str,
+    task: impl FnOnce() -> Result<T, E> + Send + 'static,
+) -> Result<T, HttpResponse>
+where
+    T: Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    match web::block(task).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => {
+            eprintln!("{}: {}", failure, e);
+            Err(HttpResponse::InternalServerError()
+                .body(format!("{}, check logs for more information", failure)))
+        }
+        Err(blocking) => {
+            eprintln!("{}: blocking task failed: {}", failure, blocking);
+            Err(HttpResponse::InternalServerError()
+                .body(format!("{}, check logs for more information", failure)))
+        }
+    }
+}
+
+/// Reads `AI_COMPANION_WORKERS` to override actix's default worker count
+/// (`available_parallelism`). Follows the same convention as
+/// `AI_COMPANION_SAMPLER_SEED` / `AI_COMPANION_ATTITUDE_DEBUG` in `llm.rs`.
+///
+/// Returns `None` when unset (default worker count) or when the value fails
+/// to parse as a `usize >= 1` (logged, default worker count kept — falling
+/// back silently would defeat the point of the variable).
+fn configured_workers() -> Option<usize> {
+    match std::env::var("AI_COMPANION_WORKERS") {
+        Ok(value) => match value.trim().parse::<usize>() {
+            Ok(0) => {
+                eprintln!("AI_COMPANION_WORKERS must be at least 1 (got 0); using the default worker count");
+                None
+            }
+            Ok(workers) => Some(workers),
+            Err(e) => {
+                eprintln!(
+                    "AI_COMPANION_WORKERS is not a usize ({:?}: {}); using the default worker count",
+                    value, e
+                );
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod off_worker_tests {
+    use super::*;
+    use actix_web::body::to_bytes;
+    use actix_web::http::StatusCode;
+
+    #[actix_web::test]
+    async fn off_worker_returns_the_task_value() {
+        let result = off_worker("x", || Ok::<_, rusqlite::Error>(7)).await;
+        assert_eq!(result.ok(), Some(7));
+    }
+
+    #[actix_web::test]
+    async fn off_worker_maps_a_task_error_to_a_500_with_the_existing_body() {
+        let response = off_worker("x", || Err::<(), _>(rusqlite::Error::QueryReturnedNoRows))
+            .await
+            .expect_err("task returned an error");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body()).await.unwrap();
+        assert_eq!(body, "x, check logs for more information");
+    }
+
+    #[actix_web::test]
+    async fn off_worker_maps_a_panicking_task_to_a_500() {
+        let response = off_worker("x", || -> Result<(), rusqlite::Error> { panic!("boom") })
+            .await
+            .expect_err("a panicking task should map to an error response");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[actix_web::test]
+    async fn off_worker_does_not_stall_other_requests_on_the_same_runtime() {
+        let slow = off_worker("slow", || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            Ok::<_, rusqlite::Error>(())
+        });
+        let fast = std::future::ready(());
+        tokio::select! {
+            _ = slow => panic!("the blocking task should not win the race against an already-ready future"),
+            _ = fast => {}
+        }
+    }
+
+    // Sets and clears the env var within one test rather than one assertion
+    // per test fn, so parallel test threads never race each other over it.
+    #[test]
+    fn configured_workers_reads_the_env_var() {
+        std::env::remove_var("AI_COMPANION_WORKERS");
+        assert_eq!(configured_workers(), None);
+
+        std::env::set_var("AI_COMPANION_WORKERS", "3");
+        assert_eq!(configured_workers(), Some(3));
+
+        std::env::set_var("AI_COMPANION_WORKERS", "0");
+        assert_eq!(configured_workers(), None);
+
+        std::env::set_var("AI_COMPANION_WORKERS", "not-a-number");
+        assert_eq!(configured_workers(), None);
+
+        std::env::remove_var("AI_COMPANION_WORKERS");
+    }
+}
+
 #[get("/")]
 async fn index() -> HttpResponse {
     HttpResponse::Ok().body(include_str!("../../dist/index.html"))
@@ -136,25 +255,26 @@ async fn message(query_params: web::Query<MessageQuery>) -> HttpResponse {
     let limit: usize = query_params.limit.unwrap_or(15).min(50);
 
     // Get total message count for pagination metadata
-    let total_count = match Database::get_total_message_count() {
+    let total_count = match off_worker(
+        "Error while getting message count",
+        Database::get_total_message_count,
+    )
+    .await
+    {
         Ok(count) => count,
-        Err(e) => {
-            println!("Failed to get total message count: {}", e);
-            return HttpResponse::InternalServerError()
-                .body("Error while getting message count, check logs for more information");
-        }
+        Err(response) => return response,
     };
 
     // Query to database, and return messages
-    let messages: Vec<Message> = match Database::get_x_messages(limit, start_index) {
-        Ok(v) => v,
-        Err(e) => {
-            println!("Failed to get messages from database: {}", e);
-            return HttpResponse::InternalServerError().body(
-                "Error while getting messages from database, check logs for more information",
-            );
-        }
-    };
+    let messages: Vec<Message> =
+        match off_worker("Error while getting messages from database", move || {
+            Database::get_x_messages(limit, start_index)
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
 
     let has_more = start_index + messages.len() < total_count;
     let message_page = MessagePage {
@@ -241,13 +361,14 @@ async fn message_delete(id: web::Path<i32>) -> HttpResponse {
 
 #[get("/api/companion")]
 async fn companion() -> HttpResponse {
-    let companion_data: CompanionView = match Database::get_companion_data() {
+    let companion_data: CompanionView = match off_worker(
+        "Error while getting companion data",
+        Database::get_companion_data,
+    )
+    .await
+    {
         Ok(v) => v,
-        Err(e) => {
-            println!("Failed to get companion data: {}", e);
-            return HttpResponse::InternalServerError()
-                .body("Error while getting companion data, check logs for more information");
-        }
+        Err(response) => return response,
     };
     let companion_json: String = serde_json::to_string(&companion_data)
         .unwrap_or(String::from("Error serializing companion data as JSON"));
@@ -413,13 +534,11 @@ async fn companion_avatar(mut received: actix_web::web::Payload) -> HttpResponse
 
 #[get("/api/user")]
 async fn user() -> HttpResponse {
-    let user_data: UserView = match Database::get_user_data() {
-        Ok(v) => v,
-        Err(e) => {
-            println!("Failed to get user data: {}", e);
-            return HttpResponse::InternalServerError().finish();
-        }
-    };
+    let user_data: UserView =
+        match off_worker("Error while getting user data", Database::get_user_data).await {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
     let user_json: String = serde_json::to_string(&user_data)
         .unwrap_or(String::from("Error serializing user data as JSON"));
     HttpResponse::Ok().body(user_json)
@@ -446,43 +565,26 @@ struct LongTermMemMessage {
 
 #[post("/api/memory/longTerm")]
 async fn add_memory_long_term_message(received: web::Json<LongTermMemMessage>) -> HttpResponse {
-    let ltm = match LongTermMem::connect() {
-        Ok(v) => v,
-        Err(e) => {
-            println!("Failed to connect to long term memory: {}", e);
-            return HttpResponse::InternalServerError().body(
-                "Error while connecting to long term memory, check logs for more information",
-            );
-        }
-    };
-    match ltm.add_entry(&received.into_inner().entry) {
+    let entry = received.into_inner().entry;
+    match off_worker("Error while adding long term memory entry", move || {
+        LongTermMem::connect()?.add_entry(&entry)
+    })
+    .await
+    {
         Ok(_) => HttpResponse::Ok().body("Long term memory entry added!"),
-        Err(e) => {
-            println!("Failed to add long term memory entry: {}", e);
-            HttpResponse::InternalServerError()
-                .body("Error while adding long term memory entry, check logs for more information")
-        }
+        Err(response) => response,
     }
 }
 
 #[delete("/api/memory/longTerm")]
 async fn erase_long_term() -> HttpResponse {
-    let ltm = match LongTermMem::connect() {
-        Ok(v) => v,
-        Err(e) => {
-            println!("Failed to connect to long term memory: {}", e);
-            return HttpResponse::InternalServerError().body(
-                "Error while connecting to long term memory, check logs for more information",
-            );
-        }
-    };
-    match ltm.erase_memory() {
+    match off_worker("Error while clearing long term memory", || {
+        LongTermMem::connect()?.erase_memory()
+    })
+    .await
+    {
         Ok(_) => HttpResponse::Ok().body("Long term memory cleared!"),
-        Err(e) => {
-            println!("Failed to clear long term memory: {}", e);
-            HttpResponse::InternalServerError()
-                .body("Error while clearing long term memory, check logs for more information")
-        }
+        Err(response) => response,
     }
 }
 
@@ -721,92 +823,109 @@ fn attitude_update_after_turn(
     })
 }
 
+/// Why a non-streaming turn failed, carried out of the blocking closure so the
+/// handler can build the response on the async side (`HttpResponse` is not
+/// `Send`, so it cannot be built inside the closure itself).
+enum TurnError {
+    Database {
+        step: &'static str,
+        source: rusqlite::Error,
+    },
+    Generate(std::io::Error),
+}
+
+impl TurnError {
+    fn into_response(self) -> HttpResponse {
+        match self {
+            TurnError::Database { step, source } => {
+                eprintln!("{}: {}", step, source);
+                HttpResponse::InternalServerError()
+                    .body(format!("{}, check logs for more information", step))
+            }
+            TurnError::Generate(e) => {
+                println!("Failed to generate prompt: {}", e);
+                HttpResponse::InternalServerError()
+                    .body("Error while generating prompt, check logs for more information")
+            }
+        }
+    }
+}
+
 #[post("/api/prompt")]
 async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
-    let prompt_message = received.into_inner().prompt.clone();
+    let prompt_message = received.into_inner().prompt;
     let start_time = std::time::Instant::now();
 
-    let companion_id = match Database::get_companion_id() {
+    let companion_id = match off_worker(
+        "Error while getting companion data",
+        Database::get_companion_id,
+    )
+    .await
+    {
         Ok(id) => id,
-        Err(e) => {
-            eprintln!("Failed to get companion id: {}", e);
-            return HttpResponse::InternalServerError()
-                .body("Error while getting companion data, check logs for more information");
-        }
+        Err(response) => return response,
     };
-    // Claimed before the user-turn insert below and held for the whole
-    // function, so an overlapping call cannot insert its own user message
-    // between this one and the reply it is about to generate.
-    let Some(_turn_guard) = ACTIVE_TURN.try_claim() else {
+    // Claimed before the user-turn insert below and moved into the blocking
+    // closure below, which holds it for the whole turn: an overlapping call
+    // cannot insert its own user message between this one and the reply it is
+    // about to generate, and a client disconnect cannot cut generation short
+    // since `spawn_blocking` tasks are not cancelled.
+    let Some(turn_guard) = ACTIVE_TURN.try_claim() else {
         return HttpResponse::Conflict()
             .body("A reply is still being generated; wait for it to finish before sending another message");
     };
-
-    let interaction_prompt = preprocess_user_message(&prompt_message, companion_id);
     let user_id = 1; // Default user ID
 
-    // Estimate response time based on message complexity
-    let estimate = estimate_response_time_enhanced(&prompt_message);
-    println!(
-        "⏱️ Response ETA: {}s (range: {}-{}s, confidence: {:.1}%)",
-        estimate.expected_seconds,
-        estimate.min_seconds,
-        estimate.max_seconds,
-        estimate.confidence * 100.0
-    );
-    if !estimate.factors.is_empty() {
-        println!("   Factors: {}", estimate.factors.join(", "));
-    }
+    let result = web::block(move || -> Result<String, TurnError> {
+        let _turn_guard = turn_guard;
 
-    if let Some(enhanced_prompt) = interaction_prompt.as_ref() {
-        match Database::insert_message(NewMessage {
+        let interaction_prompt = preprocess_user_message(&prompt_message, companion_id);
+
+        // Estimate response time based on message complexity
+        let estimate = estimate_response_time_enhanced(&prompt_message);
+        println!(
+            "⏱️ Response ETA: {}s (range: {}-{}s, confidence: {:.1}%)",
+            estimate.expected_seconds,
+            estimate.min_seconds,
+            estimate.max_seconds,
+            estimate.confidence * 100.0
+        );
+        if !estimate.factors.is_empty() {
+            println!("   Factors: {}", estimate.factors.join(", "));
+        }
+
+        Database::insert_message(NewMessage {
             ai: false,
-            content: prompt_message.to_string(),
-        }) {
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("Failed to add message to database: {}", e);
-                return HttpResponse::InternalServerError().body(
-                    "Error while adding message to database, check logs for more information",
-                );
-            }
-        };
+            content: prompt_message.clone(),
+        })
+        .map_err(|source| TurnError::Database {
+            step: "Error while adding message to database",
+            source,
+        })?;
 
-        // Generate response with interaction context
-        match prompt(enhanced_prompt, companion_id) {
-            Ok(v) => {
-                finish_turn(companion_id, user_id, &prompt_message, &v);
-                return HttpResponse::Ok().body(v);
-            }
-            Err(e) => {
-                println!("Failed to generate prompt with interaction context: {}", e);
-            }
-        }
-    }
+        // Generate with the interaction context when one matched, otherwise
+        // from the raw user message; either way the turn is scored against
+        // what the user actually said.
+        let generation_prompt = interaction_prompt.as_deref().unwrap_or(&prompt_message);
+        let reply = prompt(generation_prompt, companion_id).map_err(TurnError::Generate)?;
+        finish_turn(companion_id, user_id, &prompt_message, &reply);
 
-    match Database::insert_message(NewMessage {
-        ai: false,
-        content: prompt_message.to_string(),
-    }) {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("Failed to add message to database: {}", e);
-            return HttpResponse::InternalServerError()
-                .body("Error while adding message to database, check logs for more information");
-        }
-    };
-    match prompt(&prompt_message, companion_id) {
-        Ok(v) => {
-            finish_turn(companion_id, user_id, &prompt_message, &v);
+        // Display actual response time
+        let elapsed = start_time.elapsed();
+        println!("✓ Response completed in {:.1}s", elapsed.as_secs_f32());
 
-            // Display actual response time
-            let elapsed = start_time.elapsed();
-            println!("✓ Response completed in {:.1}s", elapsed.as_secs_f32());
+        Ok(reply)
+    })
+    .await;
 
-            HttpResponse::Ok().body(v)
-        }
-        Err(e) => {
-            println!("Failed to generate prompt: {}", e);
+    match result {
+        Ok(Ok(reply)) => HttpResponse::Ok().body(reply),
+        Ok(Err(turn_error)) => turn_error.into_response(),
+        Err(blocking) => {
+            println!(
+                "Failed to generate prompt: blocking task failed: {}",
+                blocking
+            );
             HttpResponse::InternalServerError()
                 .body("Error while generating prompt, check logs for more information")
         }
@@ -818,40 +937,49 @@ async fn regenerate_prompt() -> HttpResponse {
     // Resolved before the delete below: it is read-only, so a lookup failure
     // here must not leave the conversation with its last message destroyed
     // and no replacement generated.
-    let companion_id = match Database::get_companion_id() {
+    let companion_id = match off_worker(
+        "Error while getting companion data",
+        Database::get_companion_id,
+    )
+    .await
+    {
         Ok(id) => id,
-        Err(e) => {
-            eprintln!("Failed to get companion id: {}", e);
-            return HttpResponse::InternalServerError()
-                .body("Error while getting companion data, check logs for more information");
-        }
+        Err(response) => return response,
     };
-    // Claimed before the delete below: without it, a regenerate racing a live
-    // stream could delete the user message a worker thread is about to answer.
-    let Some(_turn_guard) = ACTIVE_TURN.try_claim() else {
+    // Claimed before the delete below and moved into the blocking closure,
+    // which holds it for the whole turn: without it, a regenerate racing a
+    // live stream could delete the user message a worker thread is about to
+    // answer.
+    let Some(turn_guard) = ACTIVE_TURN.try_claim() else {
         return HttpResponse::Conflict()
             .body("A reply is still being generated; wait for it to finish before sending another message");
     };
-    match Database::delete_latest_message() {
-        Ok(_) => {}
-        Err(e) => {
-            println!("Failed to delete latest message: {}", e);
-            return HttpResponse::InternalServerError()
-                .body("Error while deleting latest message, check logs for more information");
-        }
-    }
-    let prompt_msg: String = match Database::get_latest_message() {
-        Ok(v) => v.content,
-        Err(e) => {
-            println!("Failed to get latest message: {}", e);
-            return HttpResponse::InternalServerError()
-                .body("Error while getting latest message, check logs for more information");
-        }
-    };
-    match prompt(&prompt_msg, companion_id) {
-        Ok(v) => HttpResponse::Ok().body(v),
-        Err(e) => {
-            println!("Failed to re-generate prompt: {}", e);
+
+    let result = web::block(move || -> Result<String, TurnError> {
+        let _turn_guard = turn_guard;
+
+        Database::delete_latest_message().map_err(|source| TurnError::Database {
+            step: "Error while deleting latest message",
+            source,
+        })?;
+        let prompt_msg = Database::get_latest_message()
+            .map_err(|source| TurnError::Database {
+                step: "Error while getting latest message",
+                source,
+            })?
+            .content;
+        prompt(&prompt_msg, companion_id).map_err(TurnError::Generate)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(reply)) => HttpResponse::Ok().body(reply),
+        Ok(Err(turn_error)) => turn_error.into_response(),
+        Err(blocking) => {
+            println!(
+                "Failed to generate prompt: blocking task failed: {}",
+                blocking
+            );
             HttpResponse::InternalServerError()
                 .body("Error while generating prompt, check logs for more information")
         }
@@ -862,13 +990,9 @@ async fn regenerate_prompt() -> HttpResponse {
 
 #[get("/api/config")]
 async fn config() -> HttpResponse {
-    let config = match Database::get_config() {
+    let config = match off_worker("Error while getting config", Database::get_config).await {
         Ok(v) => v,
-        Err(e) => {
-            println!("Failed to get config: {}", e);
-            return HttpResponse::InternalServerError()
-                .body("Error while getting config, check logs for more information");
-        }
+        Err(response) => return response,
     };
     let config_json =
         serde_json::to_string(&config).unwrap_or(String::from("Error serializing config as JSON"));
@@ -1085,17 +1209,18 @@ async fn create_or_update_attitude(received: web::Json<CompanionAttitude>) -> Ht
 
 #[get("/api/attitude/companion/{companion_id}")]
 async fn get_companion_attitudes(companion_id: web::Path<i32>) -> HttpResponse {
-    match Database::get_all_companion_attitudes(*companion_id) {
+    let companion_id = *companion_id;
+    match off_worker("Error while getting companion attitudes", move || {
+        Database::get_all_companion_attitudes(companion_id)
+    })
+    .await
+    {
         Ok(attitudes) => {
             let attitudes_json = serde_json::to_string(&attitudes)
                 .unwrap_or(String::from("Error serializing attitudes as JSON"));
             HttpResponse::Ok().body(attitudes_json)
         }
-        Err(e) => {
-            println!("Failed to get companion attitudes: {}", e);
-            HttpResponse::InternalServerError()
-                .body("Error while getting companion attitudes, check logs for more information")
-        }
+        Err(response) => response,
     }
 }
 
@@ -1426,13 +1551,14 @@ async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpR
     // session and cross-wire the two streams.
     let session_id = format!("stream-{}", Uuid::new_v4());
 
-    let companion_id = match Database::get_companion_id() {
+    let companion_id = match off_worker(
+        "Error while getting companion data",
+        Database::get_companion_id,
+    )
+    .await
+    {
         Ok(id) => id,
-        Err(e) => {
-            eprintln!("Failed to get companion id: {}", e);
-            return HttpResponse::InternalServerError()
-                .body("Error while getting companion data, check logs for more information");
-        }
+        Err(response) => return response,
     };
     // Claimed before the user-turn insert below: without it, a second
     // request's insert could land between this one and the worker thread
@@ -1444,21 +1570,27 @@ async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpR
             .body("A reply is still being generated; wait for it to finish before sending another message");
     };
 
-    let interaction_prompt = preprocess_user_message(&user_message, companion_id);
     let user_id = 1; // Default user ID
 
     // The generator reads recent messages back out of the database, so the
     // user's turn has to be persisted before generation starts. The turn
     // slot claimed above is what actually prevents another turn's insert
-    // from landing in between; this insert alone is not enough.
-    if let Err(e) = Database::insert_message(NewMessage {
-        ai: false,
-        content: user_message.clone(),
-    }) {
-        eprintln!("Failed to add message to database: {}", e);
-        return HttpResponse::InternalServerError()
-            .body("Error while adding message to database, check logs for more information");
-    }
+    // from landing in between; this insert alone is not enough. Runs off the
+    // worker thread like the rest of the chat path.
+    let pre_work_message = user_message.clone();
+    let interaction_prompt = match off_worker("Error while adding message to database", move || {
+        let interaction_prompt = preprocess_user_message(&pre_work_message, companion_id);
+        Database::insert_message(NewMessage {
+            ai: false,
+            content: pre_work_message.clone(),
+        })?;
+        Ok::<_, rusqlite::Error>(interaction_prompt)
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
 
     let rx = INFERENCE_OPTIMIZER.start_streaming_session(session_id.clone());
 
@@ -1855,7 +1987,7 @@ async fn main() -> std::io::Result<()> {
     // Initialize session manager with 30 minute timeout
     let session_manager = web::Data::new(SessionManager::new(30));
 
-    HttpServer::new(move || {
+    let mut server = HttpServer::new(move || {
         App::new()
             .app_data(session_manager.clone())
             .service(index)
@@ -1922,8 +2054,9 @@ async fn main() -> std::io::Result<()> {
             .service(get_session_stats)
             .service(get_gpu_memory)
             .service(get_gpu_allocation)
-    })
-    .bind((hostname, port))?
-    .run()
-    .await
+    });
+    if let Some(workers) = configured_workers() {
+        server = server.workers(workers);
+    }
+    server.bind((hostname, port))?.run().await
 }
