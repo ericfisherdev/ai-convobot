@@ -19,12 +19,13 @@ use crate::llm::{assemble_prompt, prompt, prompt_streaming};
 use uuid::Uuid;
 mod context_manager;
 mod inference_optimizer;
-use crate::inference_optimizer::{AttitudeStreamUpdate, StreamChunk, INFERENCE_OPTIMIZER};
+use crate::inference_optimizer::{
+    AttitudeStreamUpdate, StreamChunk, StreamSession, INFERENCE_OPTIMIZER,
+};
 mod session_manager;
 mod token_budget;
 use crate::session_manager::SessionManager;
 mod attitude_engine;
-use crate::attitude_engine::{LexiconScorer, ScorerConfig, TurnScorer};
 mod attitude_formatter;
 mod gpu_allocator;
 use crate::gpu_allocator::{GpuAllocator, LayerAllocation};
@@ -36,11 +37,13 @@ use crate::inference_performance::{ModelConfig, ResponseEstimate, INFERENCE_TRAC
 mod llm_scanner;
 use crate::llm_scanner::LlmScanner;
 mod turn_slot;
-use crate::turn_slot::ACTIVE_TURN;
+use crate::turn_slot::{TurnGuard, ACTIVE_TURN};
+mod chat_turn;
+use crate::chat_turn::{PendingTurn, SqliteTurnStore, TurnStore};
 mod paths;
 mod settings;
 #[cfg(test)]
-mod simple_tests;
+pub(crate) mod simple_tests;
 
 use std::fs;
 use std::fs::File;
@@ -655,192 +658,26 @@ struct StreamingRequest {
     prompt: String,
 }
 
-/// Pre-processing shared by `/api/prompt` and `/api/prompt/stream`: third-party
-/// mention tracking, new-person detection and interaction detection.
+/// Renders a completed turn's attitude change into the stream's attitude
+/// chunk payload.
 ///
-/// Returns the prompt to generate from when an interaction with a recorded
-/// outcome matched, so the caller can generate with that added context.
-fn preprocess_user_message(user_message: &str, companion_id: i32) -> Option<String> {
-    // Track third-party mentions and display console output
-    match Database::track_third_party_mentions(user_message) {
-        Ok(mention_output) => {
-            if !mention_output.is_empty() {
-                println!("{}", mention_output);
-            }
-        }
-        Err(e) => eprintln!("Failed to track third-party mentions: {}", e),
-    }
-
-    // Automatically detect new persons in the message
-    if let Err(e) = Database::detect_new_persons_in_message(user_message, companion_id) {
-        eprintln!("Failed to detect persons in message: {}", e);
-        // Continue processing even if person detection fails
-    }
-
-    // Detect and handle interaction requests
-    if let Ok(Some(interaction)) = Database::detect_interaction_request(user_message, companion_id)
-    {
-        if let Some(outcome) = interaction.outcome.as_ref() {
-            let third_party_name = Database::get_third_party_by_id(interaction.third_party_id)
-                .ok()
-                .flatten()
-                .map(|p| p.name)
-                .unwrap_or_else(|| "unknown".to_string());
-            return Some(format!(
-                "{}\n[Context: Interaction with {} - {}]",
-                user_message, third_party_name, outcome
-            ));
-        }
-    }
-
-    None
-}
-
-/// Longest user-turn excerpt stored on an attitude memory.
-const MEMORY_EXCERPT_CHARS: usize = 200;
-
-/// Single-line excerpt of a user turn, for `attitude_memories.message_context`.
-///
-/// Truncates on a character boundary, so a multi-byte message can never split
-/// mid-codepoint.
-fn message_excerpt(user_message: &str) -> String {
-    let single_line = user_message
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    match single_line.char_indices().nth(MEMORY_EXCERPT_CHARS) {
-        Some((byte_index, _)) => format!("{}…", &single_line[..byte_index]),
-        None => single_line,
-    }
-}
-
-/// Derives attitude deltas from one conversation turn and persists them.
-///
-/// Called after generation, once both sides of the turn are known, from both
-/// `/api/prompt` and `/api/prompt/stream`. An attitude failure must never fail
-/// the chat reply, so every error path here is logged and returns `None`
-/// rather than propagating.
-///
-/// On success, returns the (previous, current) attitude pair for the user
-/// target so callers can report or persist the change (e.g. into the SSE
-/// chunk, or as an attitude memory).
-fn finish_turn(
-    companion_id: i32,
-    user_id: i32,
-    user_message: &str,
-    companion_reply: &str,
-) -> Option<(CompanionAttitude, CompanionAttitude)> {
-    // `get_attitude` propagates real SQL failures (e.g. a busy write lock) as
-    // `Err` rather than collapsing them into `Ok(None)`, so `Ok(None)` here
-    // reliably means the row is absent, never "the read failed".
-    let current = match Database::get_attitude(companion_id, user_id, "user") {
-        Ok(Some(attitude)) => attitude,
-        Ok(None) => {
-            // Fresh database: seed the row from the companion's persona before
-            // scoring, otherwise the UPDATE below would silently touch zero rows.
-            // `seed_missing_user_attitude` is insert-only (never falls back to
-            // an UPDATE), so if this "row absent" read raced a concurrent
-            // writer that has since inserted the real row, the seed silently
-            // no-ops instead of wiping accumulated state.
-            let persona = match Database::get_companion_data() {
-                Ok(companion_data) => companion_data.persona,
-                Err(e) => {
-                    eprintln!("Failed to load companion persona for attitude seed: {}", e);
-                    return None;
-                }
-            };
-            if let Err(e) = Database::seed_missing_user_attitude(companion_id, user_id, &persona) {
-                eprintln!("Failed to seed initial user attitude: {}", e);
-                return None;
-            }
-            match Database::get_attitude(companion_id, user_id, "user") {
-                Ok(Some(attitude)) => attitude,
-                Ok(None) => {
-                    eprintln!("Attitude row missing immediately after seeding");
-                    return None;
-                }
-                Err(e) => {
-                    eprintln!("Failed to reload seeded attitude: {}", e);
-                    return None;
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("Failed to load attitude before scoring turn: {}", e);
-            return None;
-        }
-    };
-
-    let persona = match Database::get_companion_data() {
-        Ok(companion_data) => companion_data.persona,
-        Err(e) => {
-            eprintln!(
-                "Failed to load companion persona for attitude baseline: {}",
-                e
-            );
-            return None;
-        }
-    };
-    let baseline = Database::adjust_attitude_for_persona(
-        &Database::default_user_attitude(companion_id, user_id),
-        &persona,
-    );
-
-    let scorer = LexiconScorer::new(ScorerConfig::new(baseline));
-    let deltas = scorer.evaluate_turn(user_message, companion_reply, &current);
-
-    match Database::apply_attitude_deltas(companion_id, user_id, "user", &deltas) {
-        Ok(Some((previous, updated))) => {
-            let formatter = crate::attitude_formatter::AttitudeFormatter::new();
-            let attitude_changes =
-                formatter.format_attitude_changes_for_console(&previous, &updated);
-            if !attitude_changes.is_empty() {
-                println!("{}", attitude_changes);
-            }
-            // One memory per turn at most, carrying what the user said so the
-            // companion remembers why its feelings moved.
-            if let Err(e) = Database::detect_attitude_change(
-                companion_id,
-                user_id,
-                "user",
-                &previous,
-                &updated,
-                Some(&message_excerpt(user_message)),
-            ) {
-                eprintln!("Failed to record attitude memory: {}", e);
-            }
-            Some((previous, updated))
-        }
-        Ok(None) => {
-            eprintln!("Attitude row missing when applying deltas after seeding");
-            None
-        }
-        Err(e) => {
-            eprintln!("Failed to apply attitude deltas: {}", e);
-            None
-        }
-    }
-}
-
-/// Scores the turn and renders the result as the stream's attitude payload.
-///
-/// Returns `None` when the turn moved nothing, so the streaming worker only
-/// spends an extra SSE event when there is something to report.
-fn attitude_update_after_turn(
-    companion_id: i32,
-    user_id: i32,
-    user_message: &str,
-    companion_reply: &str,
+/// The turn itself is scored and persisted by `chat_turn::finish_turn`
+/// (via `PendingTurn::complete`); this only shapes the result for the SSE
+/// attitude chunk. Returns `None` when the turn moved nothing, so the
+/// streaming worker only spends an extra SSE event when there is something
+/// to report.
+fn attitude_stream_update(
+    previous: &CompanionAttitude,
+    current: &CompanionAttitude,
 ) -> Option<AttitudeStreamUpdate> {
-    let (previous, current) = finish_turn(companion_id, user_id, user_message, companion_reply)?;
     let formatter = crate::attitude_formatter::AttitudeFormatter::new();
-    let deltas = formatter.diff_attitudes(&previous, &current);
+    let deltas = formatter.diff_attitudes(previous, current);
     if deltas.is_empty() {
         return None;
     }
     Some(AttitudeStreamUpdate {
-        summary: formatter.generate_natural_language_summary(&current),
-        attitude: current,
+        summary: formatter.generate_natural_language_summary(current),
+        attitude: current.clone(),
         deltas,
     })
 }
@@ -897,6 +734,114 @@ mod turn_error_tests {
     }
 }
 
+#[cfg(test)]
+mod stream_turn_tests {
+    use super::*;
+    use crate::chat_turn::RecordingStore;
+    use crate::turn_slot::TurnSlot;
+    use std::sync::Arc;
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    #[test]
+    fn failed_generation_sends_one_user_turn_an_error_chunk_and_releases_the_slot() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = Arc::new(RecordingStore::new(None));
+        let pending = PendingTurn::begin(&guard, store.as_ref(), 1, 1, "hello".to_string())
+            .expect("insert should succeed");
+
+        let session_id = format!("test-{}", Uuid::new_v4());
+        let (stream, mut rx) = INFERENCE_OPTIMIZER.start_streaming_session(session_id);
+
+        let thread_store = store.clone();
+        let handle = std::thread::spawn(move || {
+            stream_turn(
+                guard,
+                pending,
+                stream,
+                thread_store.as_ref(),
+                |_prompt, _on_token| Err(std::io::Error::other("no model")),
+            );
+        });
+        handle.join().expect("worker thread should not panic");
+
+        assert_eq!(store.inserted.lock().unwrap().len(), 1);
+        assert!(store.finished.lock().unwrap().is_empty());
+
+        let chunk = rx
+            .try_recv()
+            .expect("a failed generation should still send a terminal chunk");
+        assert!(chunk.is_complete);
+        assert!(chunk.error.is_some());
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Disconnected)));
+
+        assert!(
+            SLOT.try_claim().is_some(),
+            "turn slot should be released once stream_turn returns"
+        );
+    }
+
+    #[test]
+    fn successful_generation_forwards_tokens_then_the_cleaned_reply() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = Arc::new(RecordingStore::new(None));
+        let pending = PendingTurn::begin(&guard, store.as_ref(), 1, 1, "hello".to_string())
+            .expect("insert should succeed");
+
+        let session_id = format!("test-{}", Uuid::new_v4());
+        let (stream, mut rx) = INFERENCE_OPTIMIZER.start_streaming_session(session_id);
+
+        let thread_store = store.clone();
+        let handle = std::thread::spawn(move || {
+            stream_turn(
+                guard,
+                pending,
+                stream,
+                thread_store.as_ref(),
+                |_prompt, on_token| {
+                    on_token("Hel");
+                    on_token("lo");
+                    Ok("Hello".to_string())
+                },
+            );
+        });
+        handle.join().expect("worker thread should not panic");
+
+        let first = rx.try_recv().expect("first token chunk");
+        assert_eq!(first.content, "Hel");
+        assert_eq!(first.token_count, Some(1));
+        assert!(!first.is_complete);
+
+        let second = rx.try_recv().expect("second token chunk");
+        assert_eq!(second.content, "lo");
+        assert_eq!(second.token_count, Some(2));
+        assert!(!second.is_complete);
+
+        // No attitude chunk: `RecordingStore::finish_turn` always returns
+        // `None`, so `stream_turn` has nothing to report before the reply
+        // settles.
+        let final_chunk = rx.try_recv().expect("final chunk");
+        assert!(final_chunk.is_complete);
+        assert_eq!(final_chunk.content, "Hello");
+        assert!(final_chunk.attitude.is_none());
+
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Disconnected)));
+
+        assert_eq!(
+            *store.finished.lock().unwrap(),
+            vec![("hello".to_string(), "Hello".to_string())]
+        );
+    }
+
+    #[test]
+    fn attitude_stream_update_is_none_when_nothing_moved() {
+        let attitude = crate::simple_tests::tests::attitude_fixture();
+
+        assert!(attitude_stream_update(&attitude, &attitude).is_none());
+    }
+}
+
 #[post("/api/prompt")]
 async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
     let prompt_message = received.into_inner().prompt;
@@ -924,10 +869,23 @@ async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
 
     let result = web::block(move || -> Result<String, TurnError> {
         let _turn_guard = turn_guard;
+        let store = SqliteTurnStore;
 
-        let interaction_prompt = preprocess_user_message(&prompt_message, companion_id);
+        let pending = PendingTurn::begin(
+            &_turn_guard,
+            &store,
+            companion_id,
+            user_id,
+            prompt_message.clone(),
+        )
+        .map_err(|source| TurnError::Database {
+            step: "Error while adding message to database",
+            source,
+        })?;
 
-        // Estimate response time based on message complexity
+        // Estimate response time based on message complexity. Console-only,
+        // so moving it after the insert (it used to run first) has no
+        // observable effect on the response.
         let estimate = estimate_response_time_enhanced(&prompt_message);
         println!(
             "⏱️ Response ETA: {}s (range: {}-{}s, confidence: {:.1}%)",
@@ -940,27 +898,17 @@ async fn prompt_message(received: web::Json<Prompt>) -> HttpResponse {
             println!("   Factors: {}", estimate.factors.join(", "));
         }
 
-        Database::insert_message(NewMessage {
-            ai: false,
-            content: prompt_message.clone(),
-        })
-        .map_err(|source| TurnError::Database {
-            step: "Error while adding message to database",
-            source,
-        })?;
-
-        // Generate with the interaction context when one matched, otherwise
-        // from the raw user message; either way the turn is scored against
-        // what the user actually said.
-        let generation_prompt = interaction_prompt.as_deref().unwrap_or(&prompt_message);
-        let reply = prompt(generation_prompt, companion_id).map_err(TurnError::Generate)?;
-        finish_turn(companion_id, user_id, &prompt_message, &reply);
+        let completed = pending
+            .complete(&store, |generation_prompt| {
+                prompt(generation_prompt, companion_id)
+            })
+            .map_err(TurnError::Generate)?;
 
         // Display actual response time
         let elapsed = start_time.elapsed();
         println!("✓ Response completed in {:.1}s", elapsed.as_secs_f32());
 
-        Ok(reply)
+        Ok(completed.reply)
     })
     .await;
 
@@ -1583,6 +1531,89 @@ async fn estimate_response_time_endpoint(req: web::Json<EstimateRequest>) -> Htt
     HttpResponse::Ok().json(response)
 }
 
+/// Runs the generation half of a streamed turn on the calling thread and ends
+/// the SSE session on every path.
+///
+/// Holds `turn_guard` until after the terminal chunk has gone out; `stream`
+/// is declared right after it so the two drop in reverse order (`stream`
+/// first, then `turn_guard`), meaning the turn slot reopens only once the
+/// client has already seen the reply settle or fail. A failed `generate`
+/// still ends the session (with an error chunk) and releases the slot: this
+/// function always calls `stream.finish`.
+fn stream_turn(
+    turn_guard: TurnGuard,
+    pending: PendingTurn,
+    stream: StreamSession,
+    store: &impl TurnStore,
+    generate: impl FnOnce(&str, &mut dyn FnMut(&str)) -> std::io::Result<String>,
+) {
+    let _turn_guard = turn_guard;
+    let stream = stream;
+    let request_id = stream.id().to_string();
+    let mut token_count = 0usize;
+
+    let result = pending.complete(store, |generation_prompt| {
+        generate(generation_prompt, &mut |token| {
+            token_count += 1;
+            // A send failure means the client hung up; generation still runs
+            // to completion so the reply is persisted.
+            let _ = stream.send(StreamChunk {
+                request_id: request_id.clone(),
+                content: token.to_string(),
+                is_complete: false,
+                token_count: Some(token_count),
+                error: None,
+                attitude: None,
+            });
+        })
+    });
+
+    let final_chunk = match result {
+        // The streamed pieces include stop markers that are stripped before
+        // the reply is persisted, so the final chunk carries the cleaned
+        // text for the client to settle on.
+        Ok(completed) => {
+            // Persisted before the client sees `is_complete: true`, so the
+            // row is already updated by the time the caller can react to it.
+            if let Some((previous, current)) = completed.attitude.as_ref() {
+                if let Some(update) = attitude_stream_update(previous, current) {
+                    // Sent ahead of the final chunk so the client has the new
+                    // attitude before it settles the reply bubble.
+                    let _ = stream.send(StreamChunk {
+                        request_id: request_id.clone(),
+                        content: String::new(),
+                        is_complete: false,
+                        token_count: Some(token_count),
+                        error: None,
+                        attitude: Some(update),
+                    });
+                }
+            }
+            StreamChunk {
+                request_id: request_id.clone(),
+                content: completed.reply,
+                is_complete: true,
+                token_count: Some(token_count),
+                error: None,
+                attitude: None,
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to generate streamed prompt: {}", e);
+            StreamChunk {
+                request_id: request_id.clone(),
+                content: String::new(),
+                is_complete: true,
+                token_count: Some(token_count),
+                error: Some(e.to_string()),
+                attitude: None,
+            }
+        }
+    };
+
+    stream.finish(final_chunk);
+}
+
 /// Streams a reply token by token as Server-Sent Events.
 ///
 /// Each event carries a `StreamChunk` as JSON. The final event has
@@ -1607,8 +1638,9 @@ async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpR
     // Claimed before the user-turn insert below: without it, a second
     // request's insert could land between this one and the worker thread
     // reading history, and the worker would answer both messages at once.
-    // Moved into the spawned closure and dropped only after the reply (and
-    // its attitude update) is persisted, so the slot covers the whole turn.
+    // Travels with the pending turn through the pre-work closure below, then
+    // into the spawned closure, and is dropped only after the reply (and its
+    // attitude update) is persisted, so the slot covers the whole turn.
     let Some(turn_guard) = ACTIVE_TURN.try_claim() else {
         return HttpResponse::Conflict()
             .body("A reply is still being generated; wait for it to finish before sending another message");
@@ -1620,104 +1652,47 @@ async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpR
     // user's turn has to be persisted before generation starts. The turn
     // slot claimed above is what actually prevents another turn's insert
     // from landing in between; this insert alone is not enough. Runs off the
-    // worker thread like the rest of the chat path.
-    let pre_work_message = user_message.clone();
-    let interaction_prompt = match off_worker("Error while adding message to database", move || {
-        let interaction_prompt = preprocess_user_message(&pre_work_message, companion_id);
-        Database::insert_message(NewMessage {
-            ai: false,
-            content: pre_work_message.clone(),
-        })?;
-        Ok::<_, rusqlite::Error>(interaction_prompt)
-    })
-    .await
-    {
-        Ok(v) => v,
-        Err(response) => return response,
-    };
+    // worker thread like the rest of the chat path. If `begin` fails the
+    // guard drops right here inside the closure, releasing the slot exactly
+    // as before generation ever starts.
+    let (pending, turn_guard) =
+        match off_worker("Error while adding message to database", move || {
+            let pending = PendingTurn::begin(
+                &turn_guard,
+                &SqliteTurnStore,
+                companion_id,
+                user_id,
+                user_message,
+            )?;
+            Ok::<_, rusqlite::Error>((pending, turn_guard))
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
 
     let (stream, rx) = INFERENCE_OPTIMIZER.start_streaming_session(session_id.clone());
 
     // Generation is CPU-bound and blocking, so it runs on its own thread rather
     // than occupying an actix worker for the whole response.
-    let request_id = stream.id().to_string();
-    // Cloned before the move into `generation_prompt` below: the interaction
-    // context (if any) is what gets generated from, but the attitude engine
-    // needs to score what the user actually said.
-    let scored_message = user_message.clone();
-    let generation_prompt = interaction_prompt.unwrap_or(user_message);
     let spawn_result = std::thread::Builder::new()
         .name("stream-generation".into())
         .spawn(move || {
-            // Held for the whole worker thread; dropped below (after `stream`,
-            // since locals drop in reverse declaration order) only once the
-            // terminal SSE event has gone out, so the turn slot reopens after
-            // the client has already seen the reply settle or fail.
-            let _turn_guard = turn_guard;
-            let stream = stream;
-            let mut token_count = 0usize;
-            let result = prompt_streaming(&generation_prompt, companion_id, &mut |token| {
-                token_count += 1;
-                // A send failure means the client hung up; generation still runs to
-                // completion so the reply is persisted.
-                let _ = stream.send(StreamChunk {
-                    request_id: request_id.clone(),
-                    content: token.to_string(),
-                    is_complete: false,
-                    token_count: Some(token_count),
-                    error: None,
-                    attitude: None,
-                });
-            });
-
-            let final_chunk = match result {
-                // The streamed pieces include stop markers that are stripped before
-                // the reply is persisted, so the final chunk carries the cleaned
-                // text for the client to settle on.
-                Ok(reply) => {
-                    // Persisted before the client sees `is_complete: true`, so the
-                    // row is already updated by the time the caller can react to it.
-                    if let Some(update) =
-                        attitude_update_after_turn(companion_id, user_id, &scored_message, &reply)
-                    {
-                        // Sent ahead of the final chunk so the client has the new
-                        // attitude before it settles the reply bubble.
-                        let _ = stream.send(StreamChunk {
-                            request_id: request_id.clone(),
-                            content: String::new(),
-                            is_complete: false,
-                            token_count: Some(token_count),
-                            error: None,
-                            attitude: Some(update),
-                        });
-                    }
-                    StreamChunk {
-                        request_id: request_id.clone(),
-                        content: reply,
-                        is_complete: true,
-                        token_count: Some(token_count),
-                        error: None,
-                        attitude: None,
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Failed to generate streamed prompt: {}", e);
-                    StreamChunk {
-                        request_id: request_id.clone(),
-                        content: String::new(),
-                        is_complete: true,
-                        token_count: Some(token_count),
-                        error: Some(e.to_string()),
-                        attitude: None,
-                    }
-                }
-            };
-
-            stream.finish(final_chunk);
+            stream_turn(
+                turn_guard,
+                pending,
+                stream,
+                &SqliteTurnStore,
+                |generation_prompt, on_token| {
+                    prompt_streaming(generation_prompt, companion_id, on_token)
+                },
+            );
         });
     // A failed spawn drops the closure immediately, which drops `stream` and
     // `turn_guard` right here: the session still ends with a terminal error
-    // chunk and the turn slot is still released.
+    // chunk (via `StreamSession`'s `Drop`) and the turn slot is still
+    // released.
     if let Err(e) = spawn_result {
         eprintln!("Failed to spawn streaming generation thread: {}", e);
     }
