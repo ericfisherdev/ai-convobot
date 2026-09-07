@@ -1,9 +1,9 @@
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::attitude_formatter::AttitudeFormatter;
+    use crate::chat_turn::message_excerpt;
     use crate::database::*;
     use crate::inference_optimizer::*;
-    use crate::message_excerpt;
 
     #[test]
     fn test_date_functions() {
@@ -98,7 +98,7 @@ mod tests {
         assert!(updated_stats.avg_response_time.as_millis() > 0);
     }
 
-    fn attitude_fixture() -> CompanionAttitude {
+    pub(crate) fn attitude_fixture() -> CompanionAttitude {
         Database::default_user_attitude(1, 1)
     }
 
