@@ -71,6 +71,16 @@ pub struct NewMessage {
     pub content: String,
 }
 
+/// Body accepted by `PUT /api/message/{id}`. Deliberately carries no role
+/// flag: an edit changes text only, never who a message is attributed to.
+/// `serde` ignores unknown fields by default, so a client still sending the
+/// old `ai` field (e.g. one built from `docs/api_docs.md` before this fix)
+/// keeps working; the flag is silently dropped instead of rejected.
+#[derive(Serialize, Deserialize)]
+pub struct MessageEdit {
+    pub content: String,
+}
+
 #[derive(Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct Companion {
@@ -1184,17 +1194,27 @@ impl Database {
         Ok(())
     }
 
-    pub fn edit_message(id: i32, message: NewMessage) -> Result<(), Error> {
+    /// Updates a message's text without ever touching its role. Deliberately
+    /// takes `MessageEdit`, not `NewMessage`: the request type has no `ai`
+    /// field, so there is nothing here that could flip a companion reply
+    /// into a user message (or vice versa) through an edit.
+    pub fn edit_message(id: i32, edit: MessageEdit) -> Result<(), Error> {
         let con = Self::open()?;
+        Self::edit_message_on(&con, id, edit)
+    }
+
+    /// Testable half of `edit_message`, taking a caller-provided connection
+    /// so tests can point it at a `TempDir`-backed database instead of the
+    /// hardwired `DATABASE_PATH`, mirroring `pop_latest_ai_reply_on`. Clears
+    /// the message cache here (rather than in the public wrapper) so the
+    /// cache-invalidation test can exercise it without touching the real
+    /// `DATABASE_PATH`.
+    fn edit_message_on(con: &Connection, id: i32, edit: MessageEdit) -> Result<(), Error> {
         con.execute(
-            &format!(
-                "UPDATE messages SET ai = {}, content = ? WHERE id = ?",
-                message.ai
-            ),
-            [&message.content, &id.to_string()],
+            "UPDATE messages SET content = ? WHERE id = ?",
+            params![edit.content, id],
         )?;
 
-        // Clear message cache when message is edited
         Database::clear_message_cache();
 
         Ok(())
@@ -4559,6 +4579,108 @@ mod tests {
         }
 
         Database::pop_latest_ai_reply_on(&mut con).unwrap();
+
+        let cache = MESSAGE_CACHE.lock().unwrap();
+        assert!(!cache.contains_key(&cache_key));
+    }
+
+    #[test]
+    fn edit_message_keeps_an_ai_reply_marked_as_ai() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        insert_message_row(&con, true, "hello");
+
+        Database::edit_message_on(
+            &con,
+            1,
+            MessageEdit {
+                content: "hello, edited".to_string(),
+            },
+        )
+        .unwrap();
+
+        let (ai, content): (bool, String) = con
+            .query_row("SELECT ai, content FROM messages WHERE id = 1", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert!(ai);
+        assert_eq!(content, "hello, edited");
+    }
+
+    #[test]
+    fn edit_message_keeps_a_user_message_marked_as_user() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        insert_message_row(&con, false, "hi");
+
+        Database::edit_message_on(
+            &con,
+            1,
+            MessageEdit {
+                content: "hi, edited".to_string(),
+            },
+        )
+        .unwrap();
+
+        let (ai, content): (bool, String) = con
+            .query_row("SELECT ai, content FROM messages WHERE id = 1", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert!(!ai);
+        assert_eq!(content, "hi, edited");
+    }
+
+    #[test]
+    fn edit_message_leaves_other_rows_untouched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        insert_message_row(&con, false, "hi");
+        insert_message_row(&con, true, "hello");
+
+        Database::edit_message_on(
+            &con,
+            1,
+            MessageEdit {
+                content: "hi, edited".to_string(),
+            },
+        )
+        .unwrap();
+
+        let (ai, content): (bool, String) = con
+            .query_row("SELECT ai, content FROM messages WHERE id = 2", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert!(ai);
+        assert_eq!(content, "hello");
+    }
+
+    #[test]
+    fn edit_message_invalidates_the_message_cache() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        insert_message_row(&con, true, "hello");
+
+        let cache_key = "messages:50:0".to_string();
+        {
+            let mut cache = MESSAGE_CACHE.lock().unwrap();
+            cache.insert(cache_key.clone(), (Vec::new(), Instant::now()));
+        }
+
+        Database::edit_message_on(
+            &con,
+            1,
+            MessageEdit {
+                content: "hello, edited".to_string(),
+            },
+        )
+        .unwrap();
 
         let cache = MESSAGE_CACHE.lock().unwrap();
         assert!(!cache.contains_key(&cache_key));
