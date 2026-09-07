@@ -43,6 +43,7 @@ mod simple_tests;
 use std::fs;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::path::Path;
 
 /// Runs synchronous work (rusqlite, tantivy) on actix's blocking pool so the
 /// worker thread stays free to serve other requests while it runs.
@@ -98,6 +99,38 @@ fn configured_workers() -> Option<usize> {
         },
         Err(_) => None,
     }
+}
+
+/// Formats a startup storage failure with the path it was trying to use, so
+/// the process's stderr names the exact thing to fix instead of a bare
+/// driver error.
+fn storage_error(what: &str, path: &Path, e: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::other(format!(
+        "cannot initialise {what} at {}: {e}",
+        path.display()
+    ))
+}
+
+/// Brings the on-disk state up to the current schema before the server
+/// binds. Returns the first failure as an `io::Error` so `main` can
+/// propagate it and exit non-zero instead of serving 500s from a
+/// half-initialised process (a corrupt or unwritable `companion_database.db`,
+/// or a `longterm_memory/` directory tantivy cannot open, previously logged
+/// a warning and kept running).
+///
+/// `data_dir` is cwd-relative today (`std::env::current_dir()` in `main()`);
+/// naming it here rather than hardcoding `"."` is what lets #107's data-dir
+/// env var change only the value it passes in, not this function's shape.
+fn init_storage(data_dir: &Path) -> std::io::Result<()> {
+    let db_path = data_dir.join(database::DATABASE_PATH);
+    Database::init().map_err(|e| storage_error("sqlite database", &db_path, e))?;
+
+    let index_path = data_dir.join(long_term_mem::INDEX_DIR);
+    LongTermMem::shared().map_err(|e| storage_error("tantivy index", &index_path, e))?;
+
+    DialogueTuning::create().map_err(|e| storage_error("dialogue tuning table", &db_path, e))?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2048,28 +2081,14 @@ async fn main() -> std::io::Result<()> {
     let port: u16 = 3000;
     let hostname: &str = "0.0.0.0";
 
-    match Database::init() {
-        Ok(_) => {}
-        Err(e) => eprintln!("⚠️ Failed to connect to sqlite database: {}\n", e),
-    }
-
-    match LongTermMem::shared() {
-        Ok(_) => {}
-        Err(e) => eprintln!("⚠️ Failed to connect to tantivy: {}\n", e),
-    }
-
-    match DialogueTuning::create() {
-        Ok(_) => {}
-        Err(e) => eprintln!(
-            "⚠️ Failed to create dialogue tuning table in sqlite database: {}\n",
-            e
-        ),
-    }
+    let data_dir = std::env::current_dir()?;
+    init_storage(&data_dir)?;
 
     println!("AI Companion v1 successfully launched! 🚀\n");
 
     println!("Listening on:\n  -> http://{}:{}/", hostname, port);
     println!("  -> http://localhost:{}/\n", port);
+    println!("Data directory: {}\n", data_dir.display());
     // Credit is retained per the MIT license; the upstream URL no longer
     // resolves, so it is not printed.
     println!("Originally by Hubert \"Hukasx0\" Kasperek\n");

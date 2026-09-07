@@ -151,6 +151,14 @@ docker run -d --name ai-companion-cuda \
   ai-companion:cuda
 ```
 
+**Startup failures fail fast:** the container now exits with a non-zero
+status if `/app` (or the mounted `data` volume) is not writable by
+`appuser`, instead of logging a warning and serving 500s indefinitely. With
+`restart: unless-stopped` this shows up as a visible restart loop rather than
+a silently broken container; `docker logs` names the exact path (e.g.
+`/app/companion_database.db` or `/app/longterm_memory`) that could not be
+opened.
+
 ### Development Deployment
 
 #### Prerequisites
