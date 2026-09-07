@@ -157,7 +157,7 @@ export function VirtualMessageList({
                   <Message
                     received={message.ai}
                     id={message.id}
-                    regenerate={messageIndex === messages.length - 1 && messageIndex !== 0}
+                    regenerate={message.ai && messageIndex === messages.length - 1 && messageIndex !== 0}
                     content={message.content}
                     created_at={message.created_at}
                   />

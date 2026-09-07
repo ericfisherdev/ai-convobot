@@ -75,4 +75,26 @@ describe('Message Component', () => {
     expect(await screen.findByText('Bold text')).toBeInTheDocument()
     expect(screen.getByText('italic text')).toBeInTheDocument()
   })
+
+  it('renders the regenerate control on a trailing AI message', async () => {
+    render(
+      <MockProviders>
+        <Message received={true} regenerate={true} id={4} content="Hello! How can I help you today?" created_at="2024-01-15 10:33" />
+      </MockProviders>
+    )
+
+    await screen.findByText('Hello! How can I help you today?')
+    expect(screen.getByRole('button', { name: 'Regenerate message' })).toBeInTheDocument()
+  })
+
+  it('never renders the regenerate control on a user message', async () => {
+    render(
+      <MockProviders>
+        <Message received={false} regenerate={true} id={5} content="Hello, this is a test message" created_at="2024-01-15 10:34" />
+      </MockProviders>
+    )
+
+    await screen.findByText('Hello, this is a test message')
+    expect(screen.queryByRole('button', { name: 'Regenerate message' })).not.toBeInTheDocument()
+  })
 })

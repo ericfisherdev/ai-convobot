@@ -17,6 +17,26 @@ pub struct Message {
     pub created_at: String,
 }
 
+/// Maps a `SELECT id, ai, content, created_at FROM messages ...` row to a
+/// `Message`. Shared by every query that reads that exact column list.
+fn message_from_row(row: &rusqlite::Row) -> Result<Message> {
+    Ok(Message {
+        id: row.get(0)?,
+        ai: row.get(1)?,
+        content: row.get(2)?,
+        created_at: row.get(3)?,
+    })
+}
+
+/// Outcome of `Database::pop_latest_ai_reply`.
+pub enum PoppedReply {
+    /// The trailing AI reply was deleted; `user_turn` is the message it answered.
+    Removed { user_turn: Message },
+    /// Nothing was deleted: the conversation is empty, its newest row is a
+    /// user message, or the AI reply has no earlier turn to regenerate from.
+    NothingToRegenerate,
+}
+
 pub fn get_current_date() -> String {
     let local: DateTime<Local> = Local::now();
     local.format("%A %d.%m.%Y %H:%M").to_string()
@@ -1061,14 +1081,7 @@ impl Database {
         let mut stmt = con.prepare(
             "SELECT id, ai, content, created_at FROM messages ORDER BY id DESC LIMIT ? OFFSET ?",
         )?;
-        let rows = stmt.query_map([x, index], |row| {
-            Ok(Message {
-                id: row.get(0)?,
-                ai: row.get(1)?,
-                content: row.get(2)?,
-                created_at: row.get(3)?,
-            })
-        })?;
+        let rows = stmt.query_map([x, index], message_from_row)?;
         let mut messages = Vec::new();
         for row in rows {
             messages.push(row?);
@@ -1091,21 +1104,6 @@ impl Database {
         let con = Self::open()?;
         let count: i64 = con.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
         Ok(count as usize)
-    }
-
-    pub fn get_latest_message() -> Result<Message> {
-        let con = Self::open()?;
-        let mut stmt = con
-            .prepare("SELECT id, ai, content, created_at FROM messages ORDER BY id DESC LIMIT 1")?;
-        let row = stmt.query_row([], |row| {
-            Ok(Message {
-                id: row.get(0)?,
-                ai: row.get(1)?,
-                content: row.get(2)?,
-                created_at: row.get(3)?,
-            })
-        })?;
-        Ok(row)
     }
 
     pub fn get_companion_data() -> Result<CompanionView> {
@@ -1166,14 +1164,7 @@ impl Database {
         let con = Self::open()?;
         let mut stmt =
             con.prepare("SELECT id, ai, content, created_at FROM messages WHERE id = ?")?;
-        let row = stmt.query_row([id], |row| {
-            Ok(Message {
-                id: row.get(0)?,
-                ai: row.get(1)?,
-                content: row.get(2)?,
-                created_at: row.get(3)?,
-            })
-        })?;
+        let row = stmt.query_row([id], message_from_row)?;
         Ok(row)
     }
 
@@ -1219,15 +1210,57 @@ impl Database {
         Ok(())
     }
 
-    pub fn delete_latest_message() -> Result<(), rusqlite::Error> {
-        let con = Self::open()?;
-        let last_message_id: i32 = con.query_row(
-            "SELECT id FROM messages ORDER BY id DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )?;
-        con.execute("DELETE FROM messages WHERE id = ?", [last_message_id])?;
-        Ok(())
+    /// Removes the trailing AI reply so a regenerate can re-prompt from the
+    /// user turn it answered, without ever deleting a user message.
+    pub fn pop_latest_ai_reply() -> Result<PoppedReply> {
+        let mut con = Self::open()?;
+        Self::pop_latest_ai_reply_on(&mut con)
+    }
+
+    /// Testable half of `pop_latest_ai_reply`, taking a caller-provided
+    /// connection so tests can point it at a `TempDir`-backed database
+    /// instead of the hardwired `DATABASE_PATH`.
+    ///
+    /// Runs the "is the newest row an AI reply with a preceding turn" check
+    /// and the delete inside one `IMMEDIATE` transaction, so a concurrent
+    /// `DELETE /api/message/{id}` or `POST /api/message` (neither of which is
+    /// covered by the turn slot) cannot interleave between the check and the
+    /// delete.
+    fn pop_latest_ai_reply_on(con: &mut Connection) -> Result<PoppedReply> {
+        let tx = con.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let latest: Option<Message> = tx
+            .query_row(
+                "SELECT id, ai, content, created_at FROM messages ORDER BY id DESC LIMIT 1",
+                [],
+                message_from_row,
+            )
+            .optional()?;
+        let reply = match latest {
+            Some(message) if message.ai => message,
+            _ => return Ok(PoppedReply::NothingToRegenerate),
+        };
+
+        let user_turn: Option<Message> = tx
+            .query_row(
+                "SELECT id, ai, content, created_at FROM messages WHERE id < ? ORDER BY id DESC LIMIT 1",
+                [reply.id],
+                message_from_row,
+            )
+            .optional()?;
+        let user_turn = match user_turn {
+            Some(message) => message,
+            None => return Ok(PoppedReply::NothingToRegenerate),
+        };
+
+        tx.execute("DELETE FROM messages WHERE id = ?", [reply.id])?;
+        tx.commit()?;
+
+        // Cleared after commit (not inside `open()`) so the invalidation is
+        // observable from a test that points this function at a TempDir.
+        Database::clear_message_cache();
+
+        Ok(PoppedReply::Removed { user_turn })
     }
 
     pub fn erase_messages() -> Result<(), Error> {
@@ -4413,6 +4446,100 @@ mod tests {
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .unwrap();
         assert_eq!(mode2, "wal");
+    }
+
+    fn create_messages_table(con: &Connection) {
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ai BOOLEAN,
+                content TEXT,
+                created_at TEXT
+            )",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn insert_message_row(con: &Connection, ai: bool, content: &str) {
+        con.execute(
+            "INSERT INTO messages (ai, content, created_at) VALUES (?, ?, ?)",
+            params![ai, content, get_current_date()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pop_latest_ai_reply_removes_the_trailing_ai_reply_and_returns_the_user_turn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        insert_message_row(&con, false, "hi");
+        insert_message_row(&con, true, "hello");
+
+        let result = Database::pop_latest_ai_reply_on(&mut con).unwrap();
+        match result {
+            PoppedReply::Removed { user_turn } => assert_eq!(user_turn.content, "hi"),
+            PoppedReply::NothingToRegenerate => panic!("expected the AI reply to be removed"),
+        }
+
+        let count: i64 = con
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn pop_latest_ai_reply_leaves_a_trailing_user_message_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        insert_message_row(&con, true, "hello");
+        insert_message_row(&con, false, "how are you?");
+
+        let result = Database::pop_latest_ai_reply_on(&mut con).unwrap();
+        assert!(matches!(result, PoppedReply::NothingToRegenerate));
+
+        let count: i64 = con
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn pop_latest_ai_reply_refuses_when_the_reply_has_no_preceding_turn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        insert_message_row(&con, true, "first message");
+
+        let result = Database::pop_latest_ai_reply_on(&mut con).unwrap();
+        assert!(matches!(result, PoppedReply::NothingToRegenerate));
+
+        let count: i64 = con
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn pop_latest_ai_reply_invalidates_the_message_cache() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        insert_message_row(&con, false, "hi");
+        insert_message_row(&con, true, "hello");
+
+        let cache_key = "messages:50:0".to_string();
+        {
+            let mut cache = MESSAGE_CACHE.lock().unwrap();
+            cache.insert(cache_key.clone(), (Vec::new(), Instant::now()));
+        }
+
+        Database::pop_latest_ai_reply_on(&mut con).unwrap();
+
+        let cache = MESSAGE_CACHE.lock().unwrap();
+        assert!(!cache.contains_key(&cache_key));
     }
 
     #[test]

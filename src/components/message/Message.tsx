@@ -486,6 +486,7 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
                     <TooltipTrigger asChild>
                       <button
                         onClick={handleRegenerate}
+                        aria-label="Regenerate message"
                         className="hover:bg-primary/10 rounded p-1 transition-colors"
                       >
                         <RotateCw className="w-4 h-4" />

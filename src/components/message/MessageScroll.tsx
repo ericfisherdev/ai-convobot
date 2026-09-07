@@ -128,7 +128,7 @@ export function MessageScroll() {
               <Message
                 received={message.ai}
                 id={message.id}
-                regenerate={index === messages.length - 1 && index !== 0}
+                regenerate={message.ai && index === messages.length - 1 && index !== 0}
                 content={message.content}
                 created_at={message.created_at}
               />
