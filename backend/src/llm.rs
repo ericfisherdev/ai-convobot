@@ -976,10 +976,7 @@ fn generate(
         .split(&format!("\n{}: ", companion.name))
         .next()
         .unwrap_or("");
-    match Database::insert_message(NewMessage {
-        ai: true,
-        content: companion_text.to_string(),
-    }) {
+    match Database::insert_message(NewMessage::from_companion(companion_text)) {
         Ok(_) => {}
         Err(e) => eprintln!(
             "Error while adding message to database/short-term memory: {}",

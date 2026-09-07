@@ -3,6 +3,7 @@ import { AttitudeStreamUpdate } from './AttitudeData';
 export interface MessageInterface {
     id: number;
     ai: boolean;
+    speaker_id: string;
     content: string;
     created_at: string;
 }

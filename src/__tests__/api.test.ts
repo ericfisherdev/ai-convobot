@@ -18,8 +18,8 @@ describe('API Integration Tests', () => {
   describe('Message API', () => {
     it('fetches messages successfully', async () => {
       const mockMessages = [
-        { id: 1, ai: false, content: 'Hello', created_at: '2024-01-15 10:00' },
-        { id: 2, ai: true, content: 'Hi there!', created_at: '2024-01-15 10:01' }
+        { id: 1, ai: false, speaker_id: 'user', content: 'Hello', created_at: '2024-01-15 10:00' },
+        { id: 2, ai: true, speaker_id: 'char', content: 'Hi there!', created_at: '2024-01-15 10:01' }
       ]
 
       mockFetch.mockResolvedValueOnce({

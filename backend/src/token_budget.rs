@@ -593,7 +593,7 @@ impl TokenUsageStatistics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::get_current_date;
+    use crate::database::{get_current_date, CHAR_SPEAKER_ID, USER_SPEAKER_ID};
 
     #[test]
     fn test_token_budget_allocation() {
@@ -867,9 +867,11 @@ mod tests {
     }
 
     fn create_test_message(id: i32, ai: bool, content: &str) -> Message {
+        let speaker_id = if ai { CHAR_SPEAKER_ID } else { USER_SPEAKER_ID };
         Message {
             id,
             ai,
+            speaker_id: speaker_id.to_string(),
             content: content.to_string(),
             created_at: get_current_date(),
         }

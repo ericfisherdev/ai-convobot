@@ -58,10 +58,7 @@ impl TurnStore for SqliteTurnStore {
     }
 
     fn insert_user_turn(&self, content: &str) -> rusqlite::Result<()> {
-        Database::insert_message(NewMessage {
-            ai: false,
-            content: content.to_string(),
-        })
+        Database::insert_message(NewMessage::from_user(content))
     }
 
     fn finish_turn(
