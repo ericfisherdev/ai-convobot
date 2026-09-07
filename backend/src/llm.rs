@@ -651,7 +651,10 @@ fn load_model(backend: &LlamaBackend, config: &ConfigView) -> Result<LlamaModel,
         .with_use_mmap(true); // Memory-mapped model loading reduces RAM usage
 
     print!("📚 Loading model... ");
-    std::io::stdout().flush().unwrap();
+    // Console output is best-effort: the stream and the persisted reply are
+    // the product, so a broken stdout pipe (e.g. `... | head`) must not panic
+    // this thread.
+    let _ = std::io::stdout().flush();
     let load_start = std::time::Instant::now();
     let model = LlamaModel::load_from_file(backend, model_path, &model_params)
         .map_err(|e| std::io::Error::other(format!("Failed to load llm model: {}", e)))?;
@@ -929,7 +932,8 @@ fn generate(
         end_of_generation.push_str(&piece);
         on_token(&piece);
         print!("{piece}");
-        std::io::stdout().flush().unwrap();
+        // Best-effort, same rationale as the flush in `load_model` above.
+        let _ = std::io::stdout().flush();
 
         // Update token count for progress tracking
         if let Ok(mut tracker) = INFERENCE_TRACKER.lock() {

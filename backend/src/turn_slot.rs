@@ -89,4 +89,24 @@ mod tests {
             "slot should be released once the worker thread drops its guard"
         );
     }
+
+    #[test]
+    fn guard_is_released_when_the_worker_thread_panics() {
+        static SLOT: TurnSlot = TurnSlot::new();
+
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let handle = std::thread::spawn(move || {
+            let _guard = guard;
+            panic!("simulated worker panic");
+        });
+
+        handle
+            .join()
+            .expect_err("worker thread should have panicked");
+
+        assert!(
+            SLOT.try_claim().is_some(),
+            "slot should be released even though the worker thread panicked"
+        );
+    }
 }
