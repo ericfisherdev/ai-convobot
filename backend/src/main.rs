@@ -1649,87 +1649,91 @@ async fn start_streaming_session(received: web::Json<StreamingRequest>) -> HttpR
         Err(response) => return response,
     };
 
-    let rx = INFERENCE_OPTIMIZER.start_streaming_session(session_id.clone());
+    let (stream, rx) = INFERENCE_OPTIMIZER.start_streaming_session(session_id.clone());
 
     // Generation is CPU-bound and blocking, so it runs on its own thread rather
     // than occupying an actix worker for the whole response.
-    let worker_session = session_id.clone();
+    let request_id = stream.id().to_string();
     // Cloned before the move into `generation_prompt` below: the interaction
     // context (if any) is what gets generated from, but the attitude engine
     // needs to score what the user actually said.
     let scored_message = user_message.clone();
     let generation_prompt = interaction_prompt.unwrap_or(user_message);
-    std::thread::spawn(move || {
-        // Held for the whole worker thread; dropped below only after the
-        // reply and its attitude update are persisted.
-        let _turn_guard = turn_guard;
-        let mut token_count = 0usize;
-        let result = prompt_streaming(&generation_prompt, companion_id, &mut |token| {
-            token_count += 1;
-            // A send failure means the client hung up; generation still runs to
-            // completion so the reply is persisted.
-            let _ = INFERENCE_OPTIMIZER.stream_chunk(
-                &worker_session,
-                StreamChunk {
-                    request_id: worker_session.clone(),
+    let spawn_result = std::thread::Builder::new()
+        .name("stream-generation".into())
+        .spawn(move || {
+            // Held for the whole worker thread; dropped below (after `stream`,
+            // since locals drop in reverse declaration order) only once the
+            // terminal SSE event has gone out, so the turn slot reopens after
+            // the client has already seen the reply settle or fail.
+            let _turn_guard = turn_guard;
+            let stream = stream;
+            let mut token_count = 0usize;
+            let result = prompt_streaming(&generation_prompt, companion_id, &mut |token| {
+                token_count += 1;
+                // A send failure means the client hung up; generation still runs to
+                // completion so the reply is persisted.
+                let _ = stream.send(StreamChunk {
+                    request_id: request_id.clone(),
                     content: token.to_string(),
                     is_complete: false,
                     token_count: Some(token_count),
                     error: None,
                     attitude: None,
-                },
-            );
-        });
+                });
+            });
 
-        let final_chunk = match result {
-            // The streamed pieces include stop markers that are stripped before
-            // the reply is persisted, so the final chunk carries the cleaned
-            // text for the client to settle on.
-            Ok(reply) => {
-                // Persisted before the client sees `is_complete: true`, so the
-                // row is already updated by the time the caller can react to it.
-                if let Some(update) =
-                    attitude_update_after_turn(companion_id, user_id, &scored_message, &reply)
-                {
-                    // Sent ahead of the final chunk so the client has the new
-                    // attitude before it settles the reply bubble.
-                    let _ = INFERENCE_OPTIMIZER.stream_chunk(
-                        &worker_session,
-                        StreamChunk {
-                            request_id: worker_session.clone(),
+            let final_chunk = match result {
+                // The streamed pieces include stop markers that are stripped before
+                // the reply is persisted, so the final chunk carries the cleaned
+                // text for the client to settle on.
+                Ok(reply) => {
+                    // Persisted before the client sees `is_complete: true`, so the
+                    // row is already updated by the time the caller can react to it.
+                    if let Some(update) =
+                        attitude_update_after_turn(companion_id, user_id, &scored_message, &reply)
+                    {
+                        // Sent ahead of the final chunk so the client has the new
+                        // attitude before it settles the reply bubble.
+                        let _ = stream.send(StreamChunk {
+                            request_id: request_id.clone(),
                             content: String::new(),
                             is_complete: false,
                             token_count: Some(token_count),
                             error: None,
                             attitude: Some(update),
-                        },
-                    );
+                        });
+                    }
+                    StreamChunk {
+                        request_id: request_id.clone(),
+                        content: reply,
+                        is_complete: true,
+                        token_count: Some(token_count),
+                        error: None,
+                        attitude: None,
+                    }
                 }
-                StreamChunk {
-                    request_id: worker_session.clone(),
-                    content: reply,
-                    is_complete: true,
-                    token_count: Some(token_count),
-                    error: None,
-                    attitude: None,
+                Err(e) => {
+                    eprintln!("Failed to generate streamed prompt: {}", e);
+                    StreamChunk {
+                        request_id: request_id.clone(),
+                        content: String::new(),
+                        is_complete: true,
+                        token_count: Some(token_count),
+                        error: Some(e.to_string()),
+                        attitude: None,
+                    }
                 }
-            }
-            Err(e) => {
-                eprintln!("Failed to generate streamed prompt: {}", e);
-                StreamChunk {
-                    request_id: worker_session.clone(),
-                    content: String::new(),
-                    is_complete: true,
-                    token_count: Some(token_count),
-                    error: Some(e.to_string()),
-                    attitude: None,
-                }
-            }
-        };
+            };
 
-        let _ = INFERENCE_OPTIMIZER.stream_chunk(&worker_session, final_chunk);
-        INFERENCE_OPTIMIZER.end_streaming_session(&worker_session);
-    });
+            stream.finish(final_chunk);
+        });
+    // A failed spawn drops the closure immediately, which drops `stream` and
+    // `turn_guard` right here: the session still ends with a terminal error
+    // chunk and the turn slot is still released.
+    if let Err(e) = spawn_result {
+        eprintln!("Failed to spawn streaming generation thread: {}", e);
+    }
 
     let event_stream = futures_util::stream::unfold(rx, |mut rx| async move {
         let chunk = rx.recv().await?;
