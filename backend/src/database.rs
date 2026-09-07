@@ -1248,9 +1248,13 @@ impl Database {
                 message_from_row,
             )
             .optional()?;
+        // Only pop when the predecessor is an actual user turn: two AI
+        // messages in a row (reachable through a direct API call, not the
+        // normal alternating flow) must not regenerate from earlier AI
+        // content mistaken for the user's message.
         let user_turn = match user_turn {
-            Some(message) => message,
-            None => return Ok(PoppedReply::NothingToRegenerate),
+            Some(message) if !message.ai => message,
+            _ => return Ok(PoppedReply::NothingToRegenerate),
         };
 
         tx.execute("DELETE FROM messages WHERE id = ?", [reply.id])?;
@@ -4520,6 +4524,24 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn pop_latest_ai_reply_refuses_when_the_predecessor_is_also_an_ai_message() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        insert_message_row(&con, false, "hi");
+        insert_message_row(&con, true, "first reply");
+        insert_message_row(&con, true, "second reply, inserted directly");
+
+        let result = Database::pop_latest_ai_reply_on(&mut con).unwrap();
+        assert!(matches!(result, PoppedReply::NothingToRegenerate));
+
+        let count: i64 = con
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
     }
 
     #[test]
