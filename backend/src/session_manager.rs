@@ -37,8 +37,14 @@ impl SessionManager {
         user_id: Option<i32>,
     ) -> Result<Session, String> {
         let session_id = Uuid::new_v4().to_string();
-        let now = Utc::now();
 
+        // Store session in memory. `now` is captured after the lock is held,
+        // not before: another holder (e.g. update_attitude's database write)
+        // can block this acquisition for a while, and a `now` captured
+        // earlier could already be stale enough to make the session we are
+        // about to insert look expired to the very next get_session call.
+        let mut sessions = self.sessions.lock().map_err(|e| e.to_string())?;
+        let now = Utc::now();
         let session = Session {
             id: session_id.clone(),
             companion_id,
@@ -47,9 +53,6 @@ impl SessionManager {
             last_activity: now,
             is_active: true,
         };
-
-        // Store session in memory
-        let mut sessions = self.sessions.lock().map_err(|e| e.to_string())?;
         self.retain_unexpired(&mut sessions, now);
         sessions.insert(session_id.clone(), session.clone());
 
