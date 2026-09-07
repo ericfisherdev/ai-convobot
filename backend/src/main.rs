@@ -37,12 +37,14 @@ mod llm_scanner;
 use crate::llm_scanner::LlmScanner;
 mod turn_slot;
 use crate::turn_slot::ACTIVE_TURN;
+mod paths;
+mod settings;
 #[cfg(test)]
 mod simple_tests;
 
 use std::fs;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 
 /// Runs synchronous work (rusqlite, tantivy) on actix's blocking pool so the
@@ -118,17 +120,23 @@ fn storage_error(what: &str, path: &Path, e: impl std::fmt::Display) -> std::io:
 /// or a `longterm_memory/` directory tantivy cannot open, previously logged
 /// a warning and kept running).
 ///
-/// `data_dir` is cwd-relative today (`std::env::current_dir()` in `main()`);
-/// naming it here rather than hardcoding `"."` is what lets #107's data-dir
-/// env var change only the value it passes in, not this function's shape.
-fn init_storage(data_dir: &Path) -> std::io::Result<()> {
-    let db_path = data_dir.join(database::DATABASE_PATH);
+/// Every path comes from `paths`, which `main()` has already pointed at
+/// `COMPANION_DATA_DIR` (default: the working directory) via `paths::init`.
+/// Also creates the `assets/` directory so the avatar handlers can write to
+/// it without a fresh checkout hitting a missing-directory error on first
+/// upload.
+fn init_storage() -> std::io::Result<()> {
+    let db_path = paths::db_path();
     Database::init().map_err(|e| storage_error("sqlite database", &db_path, e))?;
 
-    let index_path = data_dir.join(long_term_mem::INDEX_DIR);
+    let index_path = paths::ltm_dir();
     LongTermMem::shared().map_err(|e| storage_error("tantivy index", &index_path, e))?;
 
     DialogueTuning::create().map_err(|e| storage_error("dialogue tuning table", &db_path, e))?;
+
+    let assets_dir = paths::assets_dir();
+    fs::create_dir_all(&assets_dir)
+        .map_err(|e| storage_error("assets directory", &assets_dir, e))?;
 
     Ok(())
 }
@@ -250,9 +258,16 @@ async fn service_worker() -> HttpResponse {
         .body(include_str!("../../dist/sw.js"))
 }
 
+/// The URL the frontend fetches the companion avatar from. This is stored in
+/// the database by `Database::import_character_card`/`change_companion_avatar`
+/// and served by `companion_avatar_custom` below; it is a URL path, not a
+/// filesystem path, so it is never routed through `paths` the way the actual
+/// on-disk file (`paths::avatar_path()`) is.
+const AVATAR_URL_PATH: &str = "assets/avatar.png";
+
 #[get("/assets/avatar.png")]
 async fn companion_avatar_custom() -> actix_web::Result<actix_web::HttpResponse> {
-    match File::open("assets/avatar.png") {
+    match File::open(paths::avatar_path()) {
         Ok(mut file) => {
             let mut buffer = Vec::new();
             file.read_to_end(&mut buffer)?;
@@ -263,6 +278,16 @@ async fn companion_avatar_custom() -> actix_web::Result<actix_web::HttpResponse>
         }
         Err(_) => Err(actix_web::error::ErrorNotFound("File not found")),
     }
+}
+
+/// Writes the companion avatar under `paths::assets_dir()`, creating the
+/// directory if this is the first upload. Shared by `companion_card` and
+/// `companion_avatar`, which previously duplicated this create-then-write
+/// logic (and, in `companion_card`'s case, never created the directory at
+/// all, so a fresh checkout's first character-card import failed outright).
+fn write_companion_avatar(bytes: &[u8]) -> std::io::Result<()> {
+    fs::create_dir_all(paths::assets_dir())?;
+    fs::write(paths::avatar_path(), bytes)
 }
 
 //              API
@@ -439,29 +464,15 @@ async fn companion_card(mut received: actix_web::web::Payload) -> HttpResponse {
         }
     };
     let character_name = character_card.name.to_string();
-    let mut avatar_file = match File::create("assets/avatar.png") {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!(
-                "Error while creating 'avatar.png' file in a 'assets' folder: {}",
-                e
-            );
-            return HttpResponse::InternalServerError()
-                .body("Error while importing character card, check logs for more information");
-        }
-    };
-    match avatar_file.write_all(&data) {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!(
-                "Error while writing bytes to 'avatar.png' file in a 'assets' folder: {}",
-                e
-            );
-            return HttpResponse::InternalServerError()
-                .body("Error while importing character card, check logs for more information");
-        }
-    };
-    match Database::import_character_card(character_card, "assets/avatar.png") {
+    if let Err(e) = write_companion_avatar(&data) {
+        eprintln!(
+            "Error while writing 'avatar.png' file in the 'assets' folder: {}",
+            e
+        );
+        return HttpResponse::InternalServerError()
+            .body("Error while importing character card, check logs for more information");
+    }
+    match Database::import_character_card(character_card, AVATAR_URL_PATH) {
         Ok(_) => {}
         Err(e) => {
             eprintln!(
@@ -522,39 +533,15 @@ async fn companion_avatar(mut received: actix_web::web::Payload) -> HttpResponse
         let d = chunk.unwrap();
         data.extend_from_slice(&d);
     }
-    if fs::metadata("assets").is_err() {
-        match fs::create_dir("assets") {
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("Error while creating 'assets' directory: {}", e);
-                return HttpResponse::InternalServerError()
-                    .body("Error while importing character card, check logs for more information");
-            }
-        };
+    if let Err(e) = write_companion_avatar(&data) {
+        eprintln!(
+            "Error while writing 'avatar.png' file in the 'assets' folder: {}",
+            e
+        );
+        return HttpResponse::InternalServerError()
+            .body("Error while importing character card, check logs for more information");
     }
-    let mut avatar_file = match File::create("assets/avatar.png") {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!(
-                "Error while creating 'avatar.png' file in a 'assets' folder: {}",
-                e
-            );
-            return HttpResponse::InternalServerError()
-                .body("Error while importing character card, check logs for more information");
-        }
-    };
-    match avatar_file.write_all(&data) {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!(
-                "Error while writing bytes to 'avatar.png' file in a 'assets' folder: {}",
-                e
-            );
-            return HttpResponse::InternalServerError()
-                .body("Error while importing character card, check logs for more information");
-        }
-    };
-    match Database::change_companion_avatar("assets/avatar.png") {
+    match Database::change_companion_avatar(AVATAR_URL_PATH) {
         Ok(_) => {}
         Err(e) => {
             eprintln!("Error while changing companion avatar: {}", e);
@@ -2082,16 +2069,30 @@ fn estimate_response_time_enhanced(msg: &str) -> ResponseEstimate {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port: u16 = 3000;
-    let hostname: &str = "0.0.0.0";
+    // `.to_string()` first (rather than `std::io::Error::other(e)` directly):
+    // `main`'s `Result` return prints its `Err` with `Debug`, and boxing a
+    // `SettingsError` there would render its derived struct-field `Debug`
+    // instead of the message-shaped `Display` impl that names
+    // `COMPANION_PORT`.
+    let settings = settings::from_env().map_err(|e| std::io::Error::other(e.to_string()))?;
 
-    let data_dir = std::env::current_dir()?;
-    init_storage(&data_dir)?;
+    // `join` with an already-absolute `settings.data_dir` returns that path
+    // unchanged, so both a relative `COMPANION_DATA_DIR` (resolved against
+    // the working directory) and an absolute one end up absolute here.
+    let data_dir = std::env::current_dir()?.join(&settings.data_dir);
+    fs::create_dir_all(&data_dir).map_err(|e| storage_error("data directory", &data_dir, e))?;
+    paths::init(data_dir.clone())
+        .map_err(|_| std::io::Error::other("paths::init called more than once"))?;
+
+    init_storage()?;
 
     println!("AI Companion v1 successfully launched! 🚀\n");
 
-    println!("Listening on:\n  -> http://{}:{}/", hostname, port);
-    println!("  -> http://localhost:{}/\n", port);
+    println!(
+        "Listening on:\n  -> http://{}:{}/",
+        settings.host, settings.port
+    );
+    println!("  -> http://localhost:{}/\n", settings.port);
     println!("Data directory: {}\n", data_dir.display());
     // Credit is retained per the MIT license; the upstream URL no longer
     // resolves, so it is not printed.
@@ -2171,5 +2172,8 @@ async fn main() -> std::io::Result<()> {
     if let Some(workers) = configured_workers() {
         server = server.workers(workers);
     }
-    server.bind((hostname, port))?.run().await
+    server
+        .bind((settings.host.as_str(), settings.port))?
+        .run()
+        .await
 }

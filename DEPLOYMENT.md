@@ -151,15 +151,15 @@ docker run -d --name ai-companion-cuda \
   ai-companion:cuda
 ```
 
-**Startup failures fail fast:** the process opens `companion_database.db`
-and `longterm_memory/` relative to its current working directory, which is
-`/app` in this image (the `data` volume mounted above is not currently used
-for this). The container now exits with a non-zero status if `/app` is not
-writable by `appuser`, instead of logging a warning and serving 500s
-indefinitely. With `restart: unless-stopped` this shows up as a visible
-restart loop rather than a silently broken container; `docker logs` names
-the exact path (e.g. `/app/companion_database.db` or `/app/longterm_memory`)
-that could not be opened.
+**Startup failures fail fast:** the process opens `companion_database.db`,
+`longterm_memory/`, and `assets/` under `COMPANION_DATA_DIR`, which the
+images above set to `/app/data` (the mounted `data` volume). The container
+exits with a non-zero status if that directory is not writable by
+`appuser`, instead of logging a warning and serving 500s indefinitely. With
+`restart: unless-stopped` this shows up as a visible restart loop rather
+than a silently broken container; `docker logs` names the exact path (e.g.
+`/app/data/companion_database.db` or `/app/data/longterm_memory`) that
+could not be opened.
 
 ### Development Deployment
 
@@ -225,14 +225,22 @@ Set these environment variables to customize behavior:
 # Server configuration
 COMPANION_HOST=0.0.0.0          # Bind address (default: 0.0.0.0)
 COMPANION_PORT=3000             # Port (default: 3000)
+COMPANION_DATA_DIR=.            # Directory for the database, long-term memory index, and
+                                 # assets (default: the working directory)
+AI_COMPANION_WORKERS=4          # actix worker thread count (default: available_parallelism)
 RUST_LOG=info                   # Logging level (debug, info, warn, error)
-
-# Database
-DATABASE_PATH=./companion_database.db
 
 # Docker-specific
 NVIDIA_VISIBLE_DEVICES=all      # GPU visibility for CUDA
 NVIDIA_DRIVER_CAPABILITIES=compute,utility
+```
+
+**Running two instances on one machine:** point each instance at its own
+port and data directory so they do not contend for the same database or
+long-term memory index:
+
+```bash
+COMPANION_PORT=3100 COMPANION_DATA_DIR=./instance-b ./ai-companion
 ```
 
 ### Model Configuration

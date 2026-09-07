@@ -12,11 +12,6 @@ use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy};
 
 type QueryCache = Mutex<HashMap<String, (Vec<String>, Instant)>>;
 
-/// Directory tantivy stores the long-term-memory index in. `pub` so
-/// `main.rs`'s `init_storage()` can name this path in a startup-failure
-/// message rather than duplicating the literal.
-pub const INDEX_DIR: &str = "longterm_memory";
-
 /// Heap budget handed to the writer's single indexing thread.
 ///
 /// This is tantivy's undocumented per-thread minimum
@@ -66,7 +61,7 @@ impl LongTermMem {
         if let Some(ltm) = LONG_TERM_MEM.get() {
             return Ok(ltm);
         }
-        let ltm = Self::open_at(Path::new(INDEX_DIR))?;
+        let ltm = Self::open_at(&crate::paths::ltm_dir())?;
         Ok(LONG_TERM_MEM.get_or_init(|| ltm))
     }
 

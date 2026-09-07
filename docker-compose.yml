@@ -15,6 +15,7 @@ services:
       - RUST_LOG=info
       - COMPANION_HOST=0.0.0.0
       - COMPANION_PORT=3000
+      - COMPANION_DATA_DIR=/app/data
     restart: unless-stopped
     profiles:
       - cpu
@@ -33,6 +34,7 @@ services:
       - RUST_LOG=info
       - COMPANION_HOST=0.0.0.0
       - COMPANION_PORT=3000
+      - COMPANION_DATA_DIR=/app/data
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     restart: unless-stopped
@@ -58,6 +60,7 @@ services:
       - RUST_LOG=info
       - COMPANION_HOST=0.0.0.0
       - COMPANION_PORT=3000
+      - COMPANION_DATA_DIR=/app/data
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     restart: unless-stopped
@@ -83,6 +86,7 @@ services:
       - RUST_LOG=info
       - COMPANION_HOST=0.0.0.0
       - COMPANION_PORT=3000
+      - COMPANION_DATA_DIR=/app/data
     restart: unless-stopped
     profiles:
       - prebuilt-cpu
