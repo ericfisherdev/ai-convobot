@@ -40,8 +40,10 @@ mod turn_slot;
 use crate::turn_slot::{TurnGuard, ACTIVE_TURN};
 mod chat_turn;
 use crate::chat_turn::{PendingTurn, SqliteTurnStore, TurnStore};
+mod participants;
 mod paths;
 mod settings;
+use crate::participants::{avatar_from, ParticipantId, ParticipantRegistry};
 #[cfg(test)]
 pub(crate) mod simple_tests;
 
@@ -49,6 +51,7 @@ use std::fs;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::RwLock;
 
 /// Runs synchronous work (rusqlite, tantivy) on actix's blocking pool so the
 /// worker thread stays free to serve other requests while it runs.
@@ -142,6 +145,66 @@ fn init_storage() -> std::io::Result<()> {
         .map_err(|e| storage_error("assets directory", &assets_dir, e))?;
 
     Ok(())
+}
+
+/// Builds the shared participant registry from the persisted user/companion
+/// rows. Called once at startup: a host without a usable `user`/`char` pair
+/// is unusable, so a read failure here is fatal, the same as the rest of
+/// `init_storage`.
+fn seed_participants() -> std::io::Result<ParticipantRegistry> {
+    let user_data = Database::get_user_data().map_err(|e| {
+        std::io::Error::other(format!(
+            "cannot seed participant registry: failed to load user data: {e}"
+        ))
+    })?;
+    let companion_data = Database::get_companion_data().map_err(|e| {
+        std::io::Error::other(format!(
+            "cannot seed participant registry: failed to load companion data: {e}"
+        ))
+    })?;
+    Ok(ParticipantRegistry::solo(
+        &user_data.name,
+        &companion_data.name,
+        avatar_from(&companion_data.avatar_path),
+    ))
+}
+
+/// Re-reads the two reserved participants (`user`, `char`) from the database
+/// and applies them to the shared registry. Called by every handler that can
+/// change a name or avatar, on the success path only.
+///
+/// A failure here is only logged, never turned into an HTTP error: `llm.rs`
+/// re-reads `user`/`companion` from the database on every turn anyway, so a
+/// stale shared registry only affects the participant list surfaced to the
+/// frontend (#134), never the next generated reply.
+fn refresh_reserved_participants(participants: &web::Data<RwLock<ParticipantRegistry>>) {
+    let user_data = match Database::get_user_data() {
+        Ok(user_data) => user_data,
+        Err(e) => {
+            eprintln!("Failed to refresh participant registry after edit: {}", e);
+            return;
+        }
+    };
+    let companion_data = match Database::get_companion_data() {
+        Ok(companion_data) => companion_data,
+        Err(e) => {
+            eprintln!("Failed to refresh participant registry after edit: {}", e);
+            return;
+        }
+    };
+    let mut registry = participants
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Err(e) = registry.rename(&ParticipantId::USER, &user_data.name, None) {
+        eprintln!("Failed to refresh user participant: {}", e);
+    }
+    if let Err(e) = registry.rename(
+        &ParticipantId::CHAR,
+        &companion_data.name,
+        avatar_from(&companion_data.avatar_path),
+    ) {
+        eprintln!("Failed to refresh companion participant: {}", e);
+    }
 }
 
 #[cfg(test)]
@@ -443,9 +506,15 @@ async fn companion() -> HttpResponse {
 }
 
 #[put("/api/companion")]
-async fn companion_edit_data(received: web::Json<CompanionView>) -> HttpResponse {
+async fn companion_edit_data(
+    received: web::Json<CompanionView>,
+    participants: web::Data<RwLock<ParticipantRegistry>>,
+) -> HttpResponse {
     match Database::edit_companion(received.into_inner()) {
-        Ok(_) => HttpResponse::Ok().body("Companion data edited!"),
+        Ok(_) => {
+            refresh_reserved_participants(&participants);
+            HttpResponse::Ok().body("Companion data edited!")
+        }
         Err(e) => {
             println!("Failed to edit companion data: {}", e);
             HttpResponse::InternalServerError()
@@ -455,7 +524,10 @@ async fn companion_edit_data(received: web::Json<CompanionView>) -> HttpResponse
 }
 
 #[post("/api/companion/card")]
-async fn companion_card(mut received: actix_web::web::Payload) -> HttpResponse {
+async fn companion_card(
+    mut received: actix_web::web::Payload,
+    participants: web::Data<RwLock<ParticipantRegistry>>,
+) -> HttpResponse {
     // curl -X POST -H "Content-Type: image/png" -T card.png http://localhost:3000/api/companion/card
     let mut data = web::BytesMut::new();
     while let Some(chunk) = received.next().await {
@@ -490,6 +562,7 @@ async fn companion_card(mut received: actix_web::web::Payload) -> HttpResponse {
                 .body("Error while importing character card, check logs for more information");
         }
     };
+    refresh_reserved_participants(&participants);
     println!(
         "Character \"{}\" imported successfully! (from character card)",
         character_name
@@ -498,10 +571,14 @@ async fn companion_card(mut received: actix_web::web::Payload) -> HttpResponse {
 }
 
 #[post("/api/companion/characterJson")]
-async fn companion_character_json(received: web::Json<CharacterCard>) -> HttpResponse {
+async fn companion_character_json(
+    received: web::Json<CharacterCard>,
+    participants: web::Data<RwLock<ParticipantRegistry>>,
+) -> HttpResponse {
     let character_name = received.name.to_string();
     match Database::import_character_json(received.into_inner()) {
         Ok(_) => {
+            refresh_reserved_participants(&participants);
             println!(
                 "Character \"{}\" imported successfully! (from character JSON)",
                 character_name
@@ -533,7 +610,10 @@ async fn get_companion_character_json() -> HttpResponse {
 }
 
 #[post("/api/companion/avatar")]
-async fn companion_avatar(mut received: actix_web::web::Payload) -> HttpResponse {
+async fn companion_avatar(
+    mut received: actix_web::web::Payload,
+    participants: web::Data<RwLock<ParticipantRegistry>>,
+) -> HttpResponse {
     // curl -X POST -H "Content-Type: image/png" -T avatar.png http://localhost:3000/api/companion/avatar
     let mut data = web::BytesMut::new();
     while let Some(chunk) = received.next().await {
@@ -556,6 +636,7 @@ async fn companion_avatar(mut received: actix_web::web::Payload) -> HttpResponse
                 .body("Error while changing companion avatar, check logs for more information");
         }
     };
+    refresh_reserved_participants(&participants);
     HttpResponse::Ok().body("Companion avatar changed!")
 }
 
@@ -574,9 +655,15 @@ async fn user() -> HttpResponse {
 }
 
 #[put("/api/user")]
-async fn user_put(received: web::Json<UserView>) -> HttpResponse {
+async fn user_put(
+    received: web::Json<UserView>,
+    participants: web::Data<RwLock<ParticipantRegistry>>,
+) -> HttpResponse {
     match Database::edit_user(received.into_inner()) {
-        Ok(_) => HttpResponse::Ok().body("User data edited!"),
+        Ok(_) => {
+            refresh_reserved_participants(&participants);
+            HttpResponse::Ok().body("User data edited!")
+        }
         Err(e) => {
             println!("Failed to edit user data: {}", e);
             HttpResponse::InternalServerError()
@@ -2080,9 +2167,15 @@ async fn main() -> std::io::Result<()> {
     // Initialize session manager with 30 minute timeout
     let session_manager = web::Data::new(SessionManager::new(30));
 
+    // Shared across every worker via `Data`'s `Arc`. Seeded once at startup;
+    // a host without a usable `user`/`char` pair is unusable, so a failure
+    // here fails startup the same way `init_storage` does.
+    let participants = web::Data::new(RwLock::new(seed_participants()?));
+
     let mut server = HttpServer::new(move || {
         App::new()
             .app_data(session_manager.clone())
+            .app_data(participants.clone())
             .service(index)
             .service(js)
             .service(js2)
