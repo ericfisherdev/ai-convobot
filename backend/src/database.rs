@@ -4667,7 +4667,12 @@ mod tests {
         create_messages_table(&con);
         insert_message_row(&con, true, "hello");
 
-        let cache_key = "messages:50:0".to_string();
+        // Unique to this test (not "messages:50:0", which the
+        // pop_latest_ai_reply cache test also uses): MESSAGE_CACHE is
+        // process-global, so a shared key can be reinserted by a parallel
+        // test between this test's clear and its assertion, making the
+        // assertion flaky.
+        let cache_key = "edit-message-cache-invalidation".to_string();
         {
             let mut cache = MESSAGE_CACHE.lock().unwrap();
             cache.insert(cache_key.clone(), (Vec::new(), Instant::now()));
