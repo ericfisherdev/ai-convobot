@@ -79,6 +79,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 ENV RUST_LOG=info
 ENV COMPANION_HOST=0.0.0.0
 ENV COMPANION_PORT=3000
+ENV COMPANION_DATA_DIR=/app/data
 
 # Run the application
 CMD ["./ai-companion"]

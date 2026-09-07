@@ -643,10 +643,6 @@ fn read_attitude_row(
 
 pub struct Database {}
 
-/// The single definition of the SQLite database file name. #107 will later
-/// swap this for `paths::db_path()`.
-pub const DATABASE_PATH: &str = "companion_database.db";
-
 impl Database {
     /// Opens the shared companion database with the pragmas every caller
     /// needs: a five-second busy timeout so concurrent access waits instead
@@ -664,7 +660,7 @@ impl Database {
     /// insert with enforcement on. That typo is fixed and `init()` runs a
     /// rebuild migration for databases created before the fix (#110).
     pub fn open() -> Result<Connection> {
-        Self::open_at(DATABASE_PATH)
+        Self::open_at(crate::paths::db_path())
     }
 
     fn open_at(path: impl AsRef<Path>) -> Result<Connection> {
@@ -1205,10 +1201,10 @@ impl Database {
 
     /// Testable half of `edit_message`, taking a caller-provided connection
     /// so tests can point it at a `TempDir`-backed database instead of the
-    /// hardwired `DATABASE_PATH`, mirroring `pop_latest_ai_reply_on`. Clears
+    /// hardwired `paths::db_path()`, mirroring `pop_latest_ai_reply_on`. Clears
     /// the message cache here (rather than in the public wrapper) so the
     /// cache-invalidation test can exercise it without touching the real
-    /// `DATABASE_PATH`.
+    /// `paths::db_path()`.
     fn edit_message_on(con: &Connection, id: i32, edit: MessageEdit) -> Result<(), Error> {
         con.execute(
             "UPDATE messages SET content = ? WHERE id = ?",
@@ -1239,7 +1235,7 @@ impl Database {
 
     /// Testable half of `pop_latest_ai_reply`, taking a caller-provided
     /// connection so tests can point it at a `TempDir`-backed database
-    /// instead of the hardwired `DATABASE_PATH`.
+    /// instead of the hardwired `paths::db_path()`.
     ///
     /// Runs the "is the newest row an AI reply with a preceding turn" check
     /// and the delete inside one `IMMEDIATE` transaction, so a concurrent
@@ -4935,7 +4931,7 @@ mod tests {
     }
 
     /// Minimal `companion` table with one row, since `init()` is hard-wired
-    /// to `DATABASE_PATH` and these tests run against a `TempDir` instead.
+    /// to `paths::db_path()` and these tests run against a `TempDir` instead.
     fn create_companion_row(con: &Connection) {
         con.execute(
             "CREATE TABLE companion (
