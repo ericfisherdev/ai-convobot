@@ -3,7 +3,7 @@ use futures_util::StreamExt as _;
 mod database;
 use database::{
     CompanionAttitude, CompanionView, ConfigModify, Database, Device, Message, NewMessage,
-    ThirdPartyInteraction, UserView,
+    PoppedReply, ThirdPartyInteraction, UserView,
 };
 mod long_term_mem;
 use long_term_mem::LongTermMem;
@@ -834,6 +834,9 @@ enum TurnError {
         source: rusqlite::Error,
     },
     Generate(std::io::Error),
+    /// The newest message is not an AI reply with a preceding turn, so
+    /// `regenerate_prompt` has nothing to pop.
+    NothingToRegenerate,
 }
 
 impl TurnError {
@@ -849,7 +852,28 @@ impl TurnError {
                 HttpResponse::InternalServerError()
                     .body("Error while generating prompt, check logs for more information")
             }
+            TurnError::NothingToRegenerate => HttpResponse::Conflict().body(
+                "The newest message is not a companion reply, so there is nothing to regenerate",
+            ),
         }
+    }
+}
+
+#[cfg(test)]
+mod turn_error_tests {
+    use super::*;
+    use actix_web::body::to_bytes;
+    use actix_web::http::StatusCode;
+
+    #[actix_web::test]
+    async fn nothing_to_regenerate_maps_to_409_with_a_clear_body() {
+        let response = TurnError::NothingToRegenerate.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body()).await.unwrap();
+        assert_eq!(
+            body,
+            "The newest message is not a companion reply, so there is nothing to regenerate"
+        );
     }
 }
 
@@ -960,17 +984,15 @@ async fn regenerate_prompt() -> HttpResponse {
     let result = web::block(move || -> Result<String, TurnError> {
         let _turn_guard = turn_guard;
 
-        Database::delete_latest_message().map_err(|source| TurnError::Database {
-            step: "Error while deleting latest message",
-            source,
-        })?;
-        let prompt_msg = Database::get_latest_message()
-            .map_err(|source| TurnError::Database {
-                step: "Error while getting latest message",
+        let user_turn =
+            match Database::pop_latest_ai_reply().map_err(|source| TurnError::Database {
+                step: "Error while removing the latest reply",
                 source,
-            })?
-            .content;
-        prompt(&prompt_msg, companion_id).map_err(TurnError::Generate)
+            })? {
+                PoppedReply::Removed { user_turn } => user_turn,
+                PoppedReply::NothingToRegenerate => return Err(TurnError::NothingToRegenerate),
+            };
+        prompt(&user_turn.content, companion_id).map_err(TurnError::Generate)
     })
     .await;
 
