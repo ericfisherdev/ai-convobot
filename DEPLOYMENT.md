@@ -107,8 +107,15 @@ ai-companion/
 
 2. **Create required directories**:
    ```bash
-   mkdir -p models data
+   mkdir -p models
    ```
+   `docker-compose.yml` stores the database, long-term memory index, and
+   assets in a Docker-managed named volume (`data`), not a `./data` bind
+   mount: a bind mount that Docker has to create fresh is root-owned, which
+   the container's non-root `appuser` cannot write to, so the container
+   would enter a restart loop on `init_storage()`'s first write. The manual
+   `docker run` commands below still bind-mount `./data`, so create it
+   first if you use those instead of Compose: `mkdir -p data`.
 
 3. **Place your GGUF models in the models directory**:
    ```bash

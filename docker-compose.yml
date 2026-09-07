@@ -10,7 +10,7 @@ services:
       - "3000:3000"
     volumes:
       - ./models:/app/models:ro
-      - ./data:/app/data
+      - data:/app/data
     environment:
       - RUST_LOG=info
       - COMPANION_HOST=0.0.0.0
@@ -29,7 +29,7 @@ services:
       - "3000:3000"
     volumes:
       - ./models:/app/models:ro
-      - ./data:/app/data
+      - data:/app/data
     environment:
       - RUST_LOG=info
       - COMPANION_HOST=0.0.0.0
@@ -55,7 +55,7 @@ services:
       - "3000:3000"
     volumes:
       - ./models:/app/models:ro
-      - ./data:/app/data
+      - data:/app/data
     environment:
       - RUST_LOG=info
       - COMPANION_HOST=0.0.0.0
@@ -81,7 +81,7 @@ services:
       - "3000:3000"
     volumes:
       - ./models:/app/models:ro
-      - ./data:/app/data
+      - data:/app/data
     environment:
       - RUST_LOG=info
       - COMPANION_HOST=0.0.0.0
