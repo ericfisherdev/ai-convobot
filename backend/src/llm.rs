@@ -15,6 +15,9 @@ use crate::inference_performance::{ModelConfig, INFERENCE_TRACKER};
 use crate::long_term_mem::LongTermMem;
 use crate::model_cache::{ModelKey, ResidentCache};
 use crate::model_metadata::{self, ModelFacts};
+use crate::participants::{
+    avatar_from, expand_placeholders, placeholder, ParticipantId, ParticipantRegistry,
+};
 
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
@@ -130,6 +133,7 @@ fn build_base_components(
     rp: &str,
     tuned_dialogue: &str,
     attitude_context: &str,
+    participants: &ParticipantRegistry,
 ) -> Vec<String> {
     if *template == PromptTemplate::Default || *template == PromptTemplate::Auto {
         let mut components = vec![
@@ -140,9 +144,7 @@ fn build_base_components(
             format!(
                 "{}'s Persona: {}\n",
                 user.name,
-                user.persona
-                    .replace("{{char}}", &companion.name)
-                    .replace("{{user}}", &user.name)
+                expand_placeholders(&user.persona, participants)
             ),
         ];
         if !attitude_context.is_empty() {
@@ -151,17 +153,11 @@ fn build_base_components(
         components.push(format!(
             "{}'s Persona: {}\n<START>\n",
             companion.name,
-            companion
-                .persona
-                .replace("{{char}}", &companion.name)
-                .replace("{{user}}", &user.name)
+            expand_placeholders(&companion.persona, participants)
         ));
         components.push(format!(
             "{}\n<START>\n",
-            companion
-                .example_dialogue
-                .replace("{{char}}", &companion.name)
-                .replace("{{user}}", &user.name)
+            expand_placeholders(&companion.example_dialogue, participants)
         ));
         components.push(format!("{}\n<START>\n", tuned_dialogue));
         components
@@ -169,10 +165,7 @@ fn build_base_components(
         let mut components = vec![format!(
             "<<SYS>>\nYou are {}, {}\n",
             companion.name,
-            companion
-                .persona
-                .replace("{{char}}", &companion.name)
-                .replace("{{user}}", &user.name)
+            expand_placeholders(&companion.persona, participants)
         )];
         if !attitude_context.is_empty() {
             components.push(attitude_context.to_string());
@@ -181,17 +174,12 @@ fn build_base_components(
             "you are talking with {}, {} is {}\n{}\n[INST]\n",
             user.name,
             user.name,
-            user.persona
-                .replace("{{char}}", &companion.name)
-                .replace("{{user}}", &user.name),
+            expand_placeholders(&user.persona, participants),
             rp
         ));
         components.push(format!(
             "{}\n",
-            companion
-                .example_dialogue
-                .replace("{{char}}", &companion.name)
-                .replace("{{user}}", &user.name)
+            expand_placeholders(&companion.example_dialogue, participants)
         ));
         components.push(format!("{}\n[/INST]\n", tuned_dialogue));
         components
@@ -204,9 +192,7 @@ fn build_base_components(
             format!(
                 "{}'s Persona: {}\n",
                 user.name,
-                user.persona
-                    .replace("{{char}}", &companion.name)
-                    .replace("{{user}}", &user.name)
+                expand_placeholders(&user.persona, participants)
             ),
         ];
         if !attitude_context.is_empty() {
@@ -215,17 +201,11 @@ fn build_base_components(
         components.push(format!(
             "{}'s Persona: {}[/INST]\n<s>[INST]\n",
             companion.name,
-            companion
-                .persona
-                .replace("{{char}}", &companion.name)
-                .replace("{{user}}", &user.name)
+            expand_placeholders(&companion.persona, participants)
         ));
         components.push(format!(
             "{}[/INST]\n<s>[INST]\n",
-            companion
-                .example_dialogue
-                .replace("{{char}}", &companion.name)
-                .replace("{{user}}", &user.name)
+            expand_placeholders(&companion.example_dialogue, participants)
         ));
         components.push(format!("{}[/INST]\n", tuned_dialogue));
         components
@@ -340,6 +320,15 @@ pub fn assemble_prompt(
             return Err(std::io::Error::other("Error while getting companion data"));
         }
     };
+    // Built fresh from the rows just loaded above, so a name edited via the
+    // settings dialog takes effect on the next turn with nothing to
+    // invalidate. Solo chat only for now; #127 replaces this with a snapshot
+    // of the shared registry that also carries any joined bots.
+    let participants = ParticipantRegistry::solo(
+        &user.name,
+        &companion.name,
+        avatar_from(&companion.avatar_path),
+    );
     let mut base_prompt: String;
     let mut rp: &str = "";
     let mut tuned_dialogue: String = String::from("");
@@ -441,6 +430,7 @@ pub fn assemble_prompt(
         rp,
         &tuned_dialogue,
         &attitude_context,
+        &participants,
     );
 
     base_prompt = base_components.join("");
@@ -457,18 +447,13 @@ pub fn assemble_prompt(
                 }
             };
         for entry in long_term_memory_entries {
+            let entry = expand_placeholders(&entry, &participants);
             if config.prompt_template == PromptTemplate::Llama2 {
-                base_prompt += &format!("[INST]{}[/INST]\n", entry)
-                    .replace("{{char}}", &companion.name)
-                    .replace("{{user}}", &user.name);
+                base_prompt += &format!("[INST]{}[/INST]\n", entry);
             } else if config.prompt_template == PromptTemplate::Mistral {
-                base_prompt += &format!("<s>[INST]{}[/INST]\n", entry)
-                    .replace("{{char}}", &companion.name)
-                    .replace("{{user}}", &user.name);
+                base_prompt += &format!("<s>[INST]{}[/INST]\n", entry);
             } else {
-                base_prompt += &entry
-                    .replace("{{char}}", &companion.name)
-                    .replace("{{user}}", &user.name);
+                base_prompt += &entry;
             }
         }
     }
@@ -985,7 +970,11 @@ fn generate(
     };
     match long_term_memory.add_entry(&format!(
         "{}{}: {}\n{}: {}\n",
-        formatted_date, "{{user}}", prompt, "{{char}}", companion_text
+        formatted_date,
+        placeholder(&ParticipantId::USER),
+        prompt,
+        placeholder(&ParticipantId::CHAR),
+        companion_text
     )) {
         Ok(_) => {}
         Err(e) => eprintln!("Error while adding message to long-term memory: {}", e),
@@ -1066,6 +1055,10 @@ mod tests {
         }
     }
 
+    fn participants() -> ParticipantRegistry {
+        ParticipantRegistry::solo(&user().name, &companion().name, None)
+    }
+
     fn marker_index(joined: &str) -> usize {
         joined
             .find(ATTITUDE_MARKER)
@@ -1081,6 +1074,7 @@ mod tests {
             "",
             "",
             ATTITUDE_MARKER,
+            &participants(),
         );
         let joined = components.join("");
         let start_index = joined
@@ -1098,6 +1092,7 @@ mod tests {
             "",
             "",
             ATTITUDE_MARKER,
+            &participants(),
         );
         let joined = components.join("");
         let start_index = joined
@@ -1115,6 +1110,7 @@ mod tests {
             "",
             "",
             ATTITUDE_MARKER,
+            &participants(),
         );
         let joined = components.join("");
         let inst_index = joined
@@ -1132,6 +1128,7 @@ mod tests {
             "",
             "",
             ATTITUDE_MARKER,
+            &participants(),
         );
         let joined = components.join("");
         let inst_index = joined
@@ -1149,9 +1146,17 @@ mod tests {
             "",
             "",
             ATTITUDE_MARKER,
+            &participants(),
         );
-        let without_attitude =
-            build_base_components(&PromptTemplate::Default, &user(), &companion(), "", "", "");
+        let without_attitude = build_base_components(
+            &PromptTemplate::Default,
+            &user(),
+            &companion(),
+            "",
+            "",
+            "",
+            &participants(),
+        );
         assert_eq!(with_attitude.len(), without_attitude.len() + 1);
         assert!(!without_attitude.join("").contains(ATTITUDE_MARKER));
     }
