@@ -1804,6 +1804,11 @@ async fn end_session(
 
 #[get("/api/session/stats/summary")]
 async fn get_session_stats(session_manager: web::Data<SessionManager>) -> HttpResponse {
+    // Sweep expired sessions before reporting so an operator polling this
+    // endpoint also bounds the map, the same way create_session does.
+    if let Err(e) = session_manager.cleanup_expired_sessions() {
+        println!("Failed to clean up expired sessions: {}", e);
+    }
     match session_manager.get_session_stats() {
         Ok(stats) => {
             let stats_json = serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string());
