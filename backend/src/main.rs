@@ -2,8 +2,8 @@ use actix_web::{delete, get, post, put, web, App, HttpResponse, HttpServer};
 use futures_util::StreamExt as _;
 mod database;
 use database::{
-    CompanionAttitude, CompanionView, ConfigModify, Database, Device, Message, NewMessage,
-    PoppedReply, ThirdPartyInteraction, UserView,
+    CompanionAttitude, CompanionView, ConfigModify, Database, Device, Message, MessageEdit,
+    NewMessage, PoppedReply, ThirdPartyInteraction, UserView,
 };
 mod long_term_mem;
 use long_term_mem::LongTermMem;
@@ -365,7 +365,7 @@ async fn message_id(id: web::Path<i32>) -> HttpResponse {
 }
 
 #[put("/api/message/{id}")]
-async fn message_put(id: web::Path<i32>, received: web::Json<NewMessage>) -> HttpResponse {
+async fn message_put(id: web::Path<i32>, received: web::Json<MessageEdit>) -> HttpResponse {
     match Database::edit_message(*id, received.into_inner()) {
         Ok(_) => HttpResponse::Ok().body(format!("Message edited at id {}!", id)),
         Err(e) => {

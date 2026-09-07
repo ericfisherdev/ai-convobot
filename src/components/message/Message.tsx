@@ -12,8 +12,21 @@ import { useMessages } from "../context/messageContext";
 import { Textarea } from "../ui/textarea";
 import { TooltipProvider, Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
 import { toast } from "sonner";
+import { MessageEdit } from "../interfaces/MessageEdit";
 
 const Markdown = lazy(() => import('react-markdown'));
+
+/// Shared by `UserMessage.handleSave` and `AiMessage.handleSave`: an edit
+/// only ever changes text, so the request body carries no role flag and
+/// cannot flip which side a message renders on.
+const updateMessageContent = (id: number, content: string): Promise<Response> =>
+  fetch(`/api/message/${id}`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ content } satisfies MessageEdit),
+  });
 
 interface MessageScrollProps {
   received: boolean;
@@ -54,13 +67,7 @@ const UserMessage = ({ id, content, created_at }: MessageProps) => {
 
   const handleSave = async () => {
     try {
-      const response = await fetch(`/api/message/${id}`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ ai: false, content: editedContent }),
-      });
+      const response = await updateMessageContent(id, editedContent);
 
       if (response.ok) {
         setEditing(false);
@@ -111,7 +118,7 @@ const UserMessage = ({ id, content, created_at }: MessageProps) => {
         <div className="message-actions flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
           {editing ? (
             <>
-              <button onClick={handleSave} className="text-xs px-2 py-1 bg-primary text-primary-foreground rounded hover:bg-primary/90 transition-colors">Save</button>
+              <button onClick={handleSave} aria-label="Save message" className="text-xs px-2 py-1 bg-primary text-primary-foreground rounded hover:bg-primary/90 transition-colors">Save</button>
               <button onClick={handleCancel} className="text-xs px-2 py-1 bg-secondary text-secondary-foreground rounded hover:bg-secondary/90 transition-colors">Cancel</button>
             </>
           ) : (
@@ -136,6 +143,7 @@ const UserMessage = ({ id, content, created_at }: MessageProps) => {
                   <TooltipTrigger asChild>
                     <button
                       onClick={handleEdit}
+                      aria-label="Edit message"
                       className="hover:bg-secondary rounded p-1 transition-colors"
                     >
                       <Pencil className="w-4 h-4" />
@@ -274,13 +282,7 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
 
   const handleSave = async () => {
     try {
-      const response = await fetch(`/api/message/${id}`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ ai: true, content: editedContent }),
-      });
+      const response = await updateMessageContent(id, editedContent);
 
       if (response.ok) {
         setEditing(false);
@@ -386,7 +388,7 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
         <div className="message-actions flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
           {editing ? (
             <>
-              <button onClick={handleSave} className="text-xs px-2 py-1 bg-primary text-primary-foreground rounded hover:bg-primary/90 transition-colors">Save</button>
+              <button onClick={handleSave} aria-label="Save message" className="text-xs px-2 py-1 bg-primary text-primary-foreground rounded hover:bg-primary/90 transition-colors">Save</button>
               <button onClick={handleCancel} className="text-xs px-2 py-1 bg-secondary text-secondary-foreground rounded hover:bg-secondary/90 transition-colors">Cancel</button>
             </>
           ) : (
@@ -411,6 +413,7 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
                   <TooltipTrigger asChild>
                     <button
                       onClick={handleEdit}
+                      aria-label="Edit message"
                       className="hover:bg-secondary rounded p-1 transition-colors"
                     >
                       <Pencil className="w-4 h-4" />

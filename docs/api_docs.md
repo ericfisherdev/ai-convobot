@@ -108,12 +108,14 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 
 - **URL:** `/message/{id}`
 - **Method:** `PUT`
-- **Description:** Edit a message by its ID
+- **Description:** Edit a message's text by its ID. The edit is content-only:
+  it never changes which side (user or AI) the message is attributed to. Any
+  `ai` field in the request body is ignored, so older clients that still send
+  it keep working without flipping the message's role.
 - **Path Parameters:**
   - `id` (integer): The ID of the message to edit
 - **Request Body:**
-  - `ai` (boolean): Indicates whether the message is from the AI (true) or user (false).
-  - `content` (string): The content of the message.
+  - `content` (string): The new content of the message.
 - **Response:**
   - Status: 200 OK
   - Body: Message edited at id {id}
@@ -123,8 +125,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   Content-Type: application/json
 
   {
-    "ai": true,
-    "content": "Message sent by AI"
+    "content": "Edited message content"
   }
   ```
 

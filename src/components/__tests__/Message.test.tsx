@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { Message } from '../message/Message'
 import { MessagesProvider } from '../context/messageContext'
 import { UserDataProvider } from '../context/userContext'
@@ -96,5 +97,51 @@ describe('Message Component', () => {
 
     await screen.findByText('Hello, this is a test message')
     expect(screen.queryByRole('button', { name: 'Regenerate message' })).not.toBeInTheDocument()
+  })
+
+  it('editing an AI message sends only the new content', async () => {
+    const user = userEvent.setup()
+
+    render(
+      <MockProviders>
+        <Message received={true} regenerate={false} id={2} content="Hello! How can I help you today?" created_at="2024-01-15 10:31" />
+      </MockProviders>
+    )
+
+    await screen.findByText('Hello! How can I help you today?')
+    await user.click(screen.getByRole('button', { name: 'Edit message' }))
+    const textbox = screen.getByRole('textbox')
+    await user.clear(textbox)
+    await user.type(textbox, 'edited ai reply')
+    await user.click(screen.getByRole('button', { name: 'Save message' }))
+
+    const mockFetch = fetch as unknown as ReturnType<typeof vi.fn>
+    const putCalls = mockFetch.mock.calls.filter(call => call[1]?.method === 'PUT')
+    const lastPutCall = putCalls[putCalls.length - 1]
+    expect(lastPutCall[0]).toBe('/api/message/2')
+    expect(JSON.parse(lastPutCall[1].body)).toEqual({ content: 'edited ai reply' })
+  })
+
+  it('editing a user message sends only the new content', async () => {
+    const user = userEvent.setup()
+
+    render(
+      <MockProviders>
+        <Message received={false} regenerate={false} id={1} content="Hello, this is a test message" created_at="2024-01-15 10:30" />
+      </MockProviders>
+    )
+
+    await screen.findByText('Hello, this is a test message')
+    await user.click(screen.getByRole('button', { name: 'Edit message' }))
+    const textbox = screen.getByRole('textbox')
+    await user.clear(textbox)
+    await user.type(textbox, 'edited user message')
+    await user.click(screen.getByRole('button', { name: 'Save message' }))
+
+    const mockFetch = fetch as unknown as ReturnType<typeof vi.fn>
+    const putCalls = mockFetch.mock.calls.filter(call => call[1]?.method === 'PUT')
+    const lastPutCall = putCalls[putCalls.length - 1]
+    expect(lastPutCall[0]).toBe('/api/message/1')
+    expect(JSON.parse(lastPutCall[1].body)).toEqual({ content: 'edited user message' })
   })
 })
