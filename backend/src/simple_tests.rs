@@ -26,6 +26,7 @@ pub(crate) mod tests {
         let message = Message {
             id: 1,
             ai: true,
+            speaker_id: CHAR_SPEAKER_ID.to_string(),
             content: "Hello world".to_string(),
             created_at: "2024-01-15 10:00".to_string(),
         };
@@ -37,12 +38,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_new_message_struct() {
-        let new_message = NewMessage {
-            ai: false,
-            content: "User message".to_string(),
-        };
+        let new_message = NewMessage::from_user("User message");
 
-        assert!(!new_message.ai);
+        assert!(!is_ai_speaker(&new_message.speaker_id));
         assert_eq!(new_message.content, "User message");
     }
 

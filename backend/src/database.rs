@@ -9,20 +9,46 @@ use std::time::{Duration, Instant};
 
 use crate::character_card::CharacterCard;
 
+/// Reserved speaker id for the human participant. #126's `ParticipantId`
+/// reserved IDs must reuse this constant, not redefine it.
+pub const USER_SPEAKER_ID: &str = "user";
+/// Reserved speaker id for the (single, solo-mode) companion. #126's
+/// `ParticipantId` reserved IDs must reuse this constant, not redefine it.
+pub const CHAR_SPEAKER_ID: &str = "char";
+
+/// Derives the legacy `ai` flag from a `speaker_id`. The single source of
+/// truth for that derivation, used by both the row mapper and every insert,
+/// so the two can never disagree.
+///
+/// Note for #134/#135: under this rule a future `system` speaker reads as
+/// `ai: true`; if that is wrong for them, the derivation lives in exactly
+/// this one function.
+pub fn is_ai_speaker(speaker_id: &str) -> bool {
+    speaker_id != USER_SPEAKER_ID
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Message {
     pub id: i32,
     pub ai: bool,
+    pub speaker_id: String,
     pub content: String,
     pub created_at: String,
 }
 
-/// Maps a `SELECT id, ai, content, created_at FROM messages ...` row to a
-/// `Message`. Shared by every query that reads that exact column list.
+/// Column list shared by every query that reads a full message row, kept
+/// alongside `message_from_row` so the two can never drift apart.
+const MESSAGE_COLUMNS: &str = "id, speaker_id, content, created_at";
+
+/// Maps a `SELECT {MESSAGE_COLUMNS} FROM messages ...` row to a `Message`.
+/// Shared by every query that reads that exact column list. `ai` is always
+/// derived from `speaker_id`, never read from its own column.
 fn message_from_row(row: &rusqlite::Row) -> Result<Message> {
+    let speaker_id: String = row.get(1)?;
     Ok(Message {
         id: row.get(0)?,
-        ai: row.get(1)?,
+        ai: is_ai_speaker(&speaker_id),
+        speaker_id,
         content: row.get(2)?,
         created_at: row.get(3)?,
     })
@@ -65,10 +91,105 @@ pub fn contains_time_question(text: &str) -> bool {
     false
 }
 
+/// The domain type every internal caller inserts. `speaker_id` is the only
+/// source of truth; `ai` is never carried here (it is derived at read time
+/// by `message_from_row`/`is_ai_speaker`).
 #[derive(Serialize, Deserialize)]
 pub struct NewMessage {
-    pub ai: bool,
+    pub speaker_id: String,
     pub content: String,
+}
+
+impl NewMessage {
+    pub fn new(speaker_id: impl Into<String>, content: impl Into<String>) -> Self {
+        NewMessage {
+            speaker_id: speaker_id.into(),
+            content: content.into(),
+        }
+    }
+
+    pub fn from_user(content: impl Into<String>) -> Self {
+        NewMessage::new(USER_SPEAKER_ID, content)
+    }
+
+    // `char` is a Rust keyword, so this cannot be named `char`.
+    pub fn from_companion(content: impl Into<String>) -> Self {
+        NewMessage::new(CHAR_SPEAKER_ID, content)
+    }
+}
+
+/// Error returned by `resolve_speaker` when a `POST /api/message` body's
+/// `ai`/`speaker_id` fields cannot be resolved to a single speaker.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SpeakerResolveError {
+    /// Both `ai` and `speaker_id` were given, and they disagree.
+    Conflict,
+    /// Neither field was given, or `speaker_id` was empty.
+    Missing,
+}
+
+impl std::fmt::Display for SpeakerResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpeakerResolveError::Conflict => {
+                write!(f, "`ai` and `speaker_id` disagree on who sent this message")
+            }
+            SpeakerResolveError::Missing => {
+                write!(f, "either `speaker_id` or `ai` must be given")
+            }
+        }
+    }
+}
+
+/// Resolves the legacy `ai` flag and the new `speaker_id` field into a
+/// single speaker id.
+///
+/// - `speaker_id` present and non-empty wins; if `ai` is also present it
+///   must agree with `is_ai_speaker`, otherwise `Err(Conflict)`.
+/// - only `ai` present: `true` becomes `CHAR_SPEAKER_ID`, `false` becomes
+///   `USER_SPEAKER_ID`.
+/// - neither, or an empty `speaker_id`: `Err(Missing)`.
+fn resolve_speaker(
+    ai: Option<bool>,
+    speaker_id: Option<String>,
+) -> std::result::Result<String, SpeakerResolveError> {
+    match (ai, speaker_id) {
+        (ai, Some(speaker_id)) if !speaker_id.is_empty() => {
+            if let Some(ai) = ai {
+                if ai != is_ai_speaker(&speaker_id) {
+                    return Err(SpeakerResolveError::Conflict);
+                }
+            }
+            Ok(speaker_id)
+        }
+        (Some(ai), _) => Ok(if ai {
+            CHAR_SPEAKER_ID.to_string()
+        } else {
+            USER_SPEAKER_ID.to_string()
+        }),
+        (None, _) => Err(SpeakerResolveError::Missing),
+    }
+}
+
+/// Body accepted by `POST /api/message`. Kept separate from `NewMessage` so
+/// the `ai`/`speaker_id` compatibility shim does not leak into internal
+/// callers, which always build a `NewMessage` directly.
+#[derive(Deserialize)]
+pub struct NewMessageRequest {
+    #[serde(default)]
+    pub ai: Option<bool>,
+    #[serde(default)]
+    pub speaker_id: Option<String>,
+    pub content: String,
+}
+
+impl TryFrom<NewMessageRequest> for NewMessage {
+    type Error = SpeakerResolveError;
+
+    fn try_from(value: NewMessageRequest) -> std::result::Result<Self, Self::Error> {
+        let speaker_id = resolve_speaker(value.ai, value.speaker_id)?;
+        Ok(NewMessage::new(speaker_id, value.content))
+    }
 }
 
 /// Body accepted by `PUT /api/message/{id}`. Deliberately carries no role
@@ -679,6 +800,50 @@ impl Database {
     }
 }
 
+/// The `messages` DDL, shared by `init` and the test fixtures so the column
+/// list only exists once. `speaker_id` defaults to `''`: `migrate_messages_speaker_id`
+/// backfills it from `ai` on databases created before this column existed.
+fn messages_ddl() -> &'static str {
+    "CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ai BOOLEAN,
+        speaker_id TEXT NOT NULL DEFAULT '',
+        content TEXT,
+        created_at TEXT
+    )"
+}
+
+/// Inserts the companion's opening greeting, with `{{char}}`/`{{user}}`
+/// resolved to the current companion and user names. Shared by `init`'s
+/// first-run seed and `erase_messages`, which both build this exact row.
+fn insert_companion_greeting(con: &Connection) -> Result<()> {
+    struct CompanionReturn {
+        name: String,
+        first_message: String,
+    }
+    let companion_data = con.query_row("SELECT name, first_message FROM companion", [], |row| {
+        Ok(CompanionReturn {
+            name: row.get(0)?,
+            first_message: row.get(1)?,
+        })
+    })?;
+    let user_name: String = con.query_row("SELECT name, persona FROM user LIMIT 1", [], |row| {
+        row.get(0)
+    })?;
+    con.execute(
+        "INSERT INTO messages (ai, speaker_id, content, created_at) VALUES (1, ?, ?, ?)",
+        [
+            CHAR_SPEAKER_ID,
+            &companion_data
+                .first_message
+                .replace("{{char}}", &companion_data.name)
+                .replace("{{user}}", &user_name),
+            &get_current_date(),
+        ],
+    )?;
+    Ok(())
+}
+
 /// The `attitude_memories` DDL, shared by the table creation path and the
 /// rebuild migration below so the column list only exists once. `target_id`
 /// stays unconstrained: it is polymorphic on `target_type` (a `user` or
@@ -705,15 +870,11 @@ fn attitude_memories_ddl(table_name: &str) -> String {
 impl Database {
     pub fn init() -> Result<usize> {
         let con = Self::open()?;
-        con.execute(
-            "CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ai BOOLEAN,
-                content TEXT,
-                created_at TEXT
-            )",
-            [],
-        )?;
+        con.execute(messages_ddl(), [])?;
+        // Must run before the greeting seed below, which names the
+        // speaker_id column: a database created before this column existed
+        // needs it backfilled first.
+        Database::migrate_messages_speaker_id(&con)?;
         con.execute(
             "CREATE TABLE IF NOT EXISTS companion (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -952,32 +1113,7 @@ impl Database {
             )?;
         }
         if Database::is_table_empty("messages", &con)? {
-            struct CompanionReturn {
-                name: String,
-                first_message: String,
-            }
-            let companion_data =
-                con.query_row("SELECT name, first_message FROM companion", [], |row| {
-                    Ok(CompanionReturn {
-                        name: row.get(0)?,
-                        first_message: row.get(1)?,
-                    })
-                })?;
-            let user_name: String =
-                con.query_row("SELECT name, persona FROM user LIMIT 1", [], |row| {
-                    row.get(0)
-                })?;
-            con.execute(
-                "INSERT INTO messages (ai, content, created_at) VALUES (?, ?, ?)",
-                [
-                    "1",
-                    &companion_data
-                        .first_message
-                        .replace("{{char}}", &companion_data.name)
-                        .replace("{{user}}", &user_name),
-                    &get_current_date(),
-                ],
-            )?;
+            insert_companion_greeting(&con)?;
         }
         if Database::is_table_empty("config", &con)? {
             con.execute(
@@ -1052,24 +1188,6 @@ impl Database {
         Ok(count == 0)
     }
 
-    /* pub fn get_messages() -> Result<Vec<Message>> {
-        let con = Self::open()?;
-        let mut stmt = con.prepare("SELECT id, ai, content, created_at FROM messages")?;
-        let rows = stmt.query_map([], |row| {
-            Ok(Message {
-                id: row.get(0)?,
-                ai: row.get(1)?,
-                content: row.get(2)?,
-                created_at: row.get(3)?,
-            })
-        })?;
-        let mut messages = Vec::new();
-        for row in rows {
-            messages.push(row?);
-        }
-        Ok(messages)
-    } */
-
     pub fn get_x_messages(x: usize, index: usize) -> Result<Vec<Message>> {
         let cache_key = format!("messages:{}:{}", x, index);
 
@@ -1084,9 +1202,9 @@ impl Database {
         }
 
         let con = Self::open()?;
-        let mut stmt = con.prepare(
-            "SELECT id, ai, content, created_at FROM messages ORDER BY id DESC LIMIT ? OFFSET ?",
-        )?;
+        let mut stmt = con.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages ORDER BY id DESC LIMIT ? OFFSET ?"
+        ))?;
         let rows = stmt.query_map([x, index], message_from_row)?;
         let mut messages = Vec::new();
         for row in rows {
@@ -1168,20 +1286,30 @@ impl Database {
 
     pub fn get_message(id: i32) -> Result<Message> {
         let con = Self::open()?;
-        let mut stmt =
-            con.prepare("SELECT id, ai, content, created_at FROM messages WHERE id = ?")?;
+        let mut stmt = con.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE id = ?"
+        ))?;
         let row = stmt.query_row([id], message_from_row)?;
         Ok(row)
     }
 
     pub fn insert_message(message: NewMessage) -> Result<(), Error> {
         let con = Self::open()?;
+        Self::insert_message_on(&con, message)
+    }
+
+    /// Testable half of `insert_message`, taking a caller-provided connection
+    /// so tests can point it at a `TempDir`-backed database instead of the
+    /// hardwired `paths::db_path()`, mirroring `pop_latest_ai_reply_on`.
+    fn insert_message_on(con: &Connection, message: NewMessage) -> Result<(), Error> {
         con.execute(
-            &format!(
-                "INSERT INTO messages (ai, content, created_at) VALUES ({}, ?, ?)",
-                message.ai
-            ),
-            [&message.content, &get_current_date()],
+            "INSERT INTO messages (ai, speaker_id, content, created_at) VALUES (?, ?, ?, ?)",
+            params![
+                is_ai_speaker(&message.speaker_id),
+                message.speaker_id,
+                message.content,
+                get_current_date()
+            ],
         )?;
 
         // Clear message cache when new message is inserted
@@ -1247,7 +1375,7 @@ impl Database {
 
         let latest: Option<Message> = tx
             .query_row(
-                "SELECT id, ai, content, created_at FROM messages ORDER BY id DESC LIMIT 1",
+                &format!("SELECT {MESSAGE_COLUMNS} FROM messages ORDER BY id DESC LIMIT 1"),
                 [],
                 message_from_row,
             )
@@ -1259,7 +1387,9 @@ impl Database {
 
         let user_turn: Option<Message> = tx
             .query_row(
-                "SELECT id, ai, content, created_at FROM messages WHERE id < ? ORDER BY id DESC LIMIT 1",
+                &format!(
+                    "SELECT {MESSAGE_COLUMNS} FROM messages WHERE id < ? ORDER BY id DESC LIMIT 1"
+                ),
                 [reply.id],
                 message_from_row,
             )
@@ -1289,32 +1419,7 @@ impl Database {
 
         // Clear message cache when all messages are erased
         Database::clear_message_cache();
-        struct CompanionReturn {
-            name: String,
-            first_message: String,
-        }
-        let companion_data =
-            con.query_row("SELECT name, first_message FROM companion", [], |row| {
-                Ok(CompanionReturn {
-                    name: row.get(0)?,
-                    first_message: row.get(1)?,
-                })
-            })?;
-        let user_name: String =
-            con.query_row("SELECT name, persona FROM user LIMIT 1", [], |row| {
-                row.get(0)
-            })?;
-        con.execute(
-            "INSERT INTO messages (ai, content, created_at) VALUES (?, ?, ?)",
-            [
-                "1",
-                &companion_data
-                    .first_message
-                    .replace("{{char}}", &companion_data.name)
-                    .replace("{{user}}", &user_name),
-                &get_current_date(),
-            ],
-        )?;
+        insert_companion_greeting(&con)?;
         Ok(())
     }
 
@@ -4189,6 +4294,44 @@ impl Database {
         Ok(interaction)
     }
 
+    /// Backfills `messages.speaker_id` on a database created before that
+    /// column existed. `speaker_id TEXT NOT NULL DEFAULT ''` (SQLite serves
+    /// that default to every pre-existing row at read time, per the
+    /// `ALTER TABLE ADD COLUMN` docs) is what makes the follow-up `UPDATE`
+    /// necessary; the transaction guarantees no row can be left at `''` if
+    /// the process crashes between the two statements. Idempotent: the
+    /// `PRAGMA table_info` check short-circuits on an already-migrated
+    /// database, and the `UPDATE`'s `WHERE speaker_id = ''` would no-op even
+    /// if it ran again.
+    pub fn migrate_messages_speaker_id(con: &Connection) -> Result<()> {
+        let mut stmt = con.prepare("PRAGMA table_info(messages)")?;
+        let has_speaker_id = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>>>()?
+            .iter()
+            .any(|name| name == "speaker_id");
+        drop(stmt);
+
+        if has_speaker_id {
+            return Ok(());
+        }
+
+        let tx = con.unchecked_transaction()?;
+        tx.execute(
+            "ALTER TABLE messages ADD COLUMN speaker_id TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+        tx.execute(
+            &format!(
+                "UPDATE messages SET speaker_id = CASE WHEN ai = 1 THEN '{CHAR_SPEAKER_ID}' ELSE '{USER_SPEAKER_ID}' END WHERE speaker_id = ''"
+            ),
+            [],
+        )?;
+        tx.commit()?;
+
+        Ok(())
+    }
+
     pub fn migrate_config_table(con: &Connection) -> Result<()> {
         // Check if new columns exist and add them if they don't
         let mut has_context_window = false;
@@ -4468,7 +4611,10 @@ mod tests {
         assert_eq!(mode2, "wal");
     }
 
-    fn create_messages_table(con: &Connection) {
+    /// Old (pre-#125) `messages` shape, with no `speaker_id` column. Used
+    /// only by the migration tests, which need to start from what a
+    /// database created before this issue actually looks like.
+    fn create_legacy_messages_table(con: &Connection) {
         con.execute(
             "CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4481,10 +4627,15 @@ mod tests {
         .unwrap();
     }
 
+    fn create_messages_table(con: &Connection) {
+        con.execute(messages_ddl(), []).unwrap();
+    }
+
     fn insert_message_row(con: &Connection, ai: bool, content: &str) {
+        let speaker_id = if ai { CHAR_SPEAKER_ID } else { USER_SPEAKER_ID };
         con.execute(
-            "INSERT INTO messages (ai, content, created_at) VALUES (?, ?, ?)",
-            params![ai, content, get_current_date()],
+            "INSERT INTO messages (ai, speaker_id, content, created_at) VALUES (?, ?, ?, ?)",
+            params![ai, speaker_id, content, get_current_date()],
         )
         .unwrap();
     }
@@ -4786,6 +4937,7 @@ mod tests {
         let message = Message {
             id: 1,
             ai: true,
+            speaker_id: CHAR_SPEAKER_ID.to_string(),
             content: "Hello world".to_string(),
             created_at: "2024-01-15 10:00".to_string(),
         };
@@ -4797,12 +4949,9 @@ mod tests {
 
     #[test]
     fn test_new_message_struct() {
-        let new_message = NewMessage {
-            ai: false,
-            content: "User message".to_string(),
-        };
+        let new_message = NewMessage::from_user("User message");
 
-        assert!(!new_message.ai);
+        assert!(!is_ai_speaker(&new_message.speaker_id));
         assert_eq!(new_message.content, "User message");
     }
 
@@ -5135,5 +5284,159 @@ mod tests {
             }
             other => panic!("expected a foreign key constraint violation, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn migrate_messages_speaker_id_backfills_legacy_rows() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_legacy_messages_table(&con);
+        con.execute(
+            "INSERT INTO messages (ai, content, created_at) VALUES (1, 'hi from char', ?)",
+            [get_current_date()],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO messages (ai, content, created_at) VALUES (0, 'hi from user', ?)",
+            [get_current_date()],
+        )
+        .unwrap();
+
+        Database::migrate_messages_speaker_id(&con).unwrap();
+
+        let mut stmt = con
+            .prepare("SELECT ai, speaker_id FROM messages ORDER BY id")
+            .unwrap();
+        let rows: Vec<(bool, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (true, CHAR_SPEAKER_ID.to_string()),
+                (false, USER_SPEAKER_ID.to_string()),
+            ]
+        );
+        assert!(rows.iter().all(|(_, speaker_id)| !speaker_id.is_empty()));
+    }
+
+    #[test]
+    fn migrate_messages_speaker_id_is_idempotent_on_a_migrated_table() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_legacy_messages_table(&con);
+        con.execute(
+            "INSERT INTO messages (ai, content, created_at) VALUES (1, 'hi', ?)",
+            [get_current_date()],
+        )
+        .unwrap();
+
+        Database::migrate_messages_speaker_id(&con).unwrap();
+        Database::migrate_messages_speaker_id(&con).unwrap();
+
+        let speaker_id: String = con
+            .query_row("SELECT speaker_id FROM messages WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(speaker_id, CHAR_SPEAKER_ID);
+    }
+
+    #[test]
+    fn insert_message_on_writes_ai_in_sync_with_speaker_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+
+        Database::insert_message_on(&con, NewMessage::from_user("hi")).unwrap();
+        Database::insert_message_on(&con, NewMessage::new("bot1", "hello")).unwrap();
+
+        let mut stmt = con
+            .prepare("SELECT ai, speaker_id FROM messages ORDER BY id")
+            .unwrap();
+        let rows: Vec<(bool, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(false, "user".to_string()), (true, "bot1".to_string())]
+        );
+    }
+
+    #[test]
+    fn resolve_speaker_only_ai_true_gives_char() {
+        assert_eq!(
+            resolve_speaker(Some(true), None),
+            Ok(CHAR_SPEAKER_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_speaker_only_ai_false_gives_user() {
+        assert_eq!(
+            resolve_speaker(Some(false), None),
+            Ok(USER_SPEAKER_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_speaker_speaker_id_alone_is_kept_verbatim() {
+        assert_eq!(
+            resolve_speaker(None, Some("bot1".to_string())),
+            Ok("bot1".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_speaker_agreeing_pair_is_fine() {
+        assert_eq!(
+            resolve_speaker(Some(true), Some(CHAR_SPEAKER_ID.to_string())),
+            Ok(CHAR_SPEAKER_ID.to_string())
+        );
+        assert_eq!(
+            resolve_speaker(Some(false), Some(USER_SPEAKER_ID.to_string())),
+            Ok(USER_SPEAKER_ID.to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_speaker_disagreeing_pair_errors() {
+        assert_eq!(
+            resolve_speaker(Some(false), Some(CHAR_SPEAKER_ID.to_string())),
+            Err(SpeakerResolveError::Conflict)
+        );
+        assert_eq!(
+            resolve_speaker(Some(true), Some(USER_SPEAKER_ID.to_string())),
+            Err(SpeakerResolveError::Conflict)
+        );
+    }
+
+    #[test]
+    fn resolve_speaker_neither_field_errors() {
+        assert_eq!(
+            resolve_speaker(None, None),
+            Err(SpeakerResolveError::Missing)
+        );
+    }
+
+    #[test]
+    fn resolve_speaker_empty_speaker_id_errors() {
+        assert_eq!(
+            resolve_speaker(None, Some(String::new())),
+            Err(SpeakerResolveError::Missing)
+        );
+    }
+
+    #[test]
+    fn new_message_request_with_only_ai_deserializes() {
+        let request: NewMessageRequest =
+            serde_json::from_str(r#"{"ai": true, "content": "hi"}"#).unwrap();
+        let message = NewMessage::try_from(request).unwrap();
+        assert_eq!(message.speaker_id, CHAR_SPEAKER_ID);
+        assert_eq!(message.content, "hi");
     }
 }

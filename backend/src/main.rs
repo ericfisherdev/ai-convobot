@@ -3,7 +3,7 @@ use futures_util::StreamExt as _;
 mod database;
 use database::{
     CompanionAttitude, CompanionView, ConfigModify, Database, Device, Message, MessageEdit,
-    NewMessage, PoppedReply, ThirdPartyInteraction, UserView,
+    NewMessage, NewMessageRequest, PoppedReply, ThirdPartyInteraction, UserView,
 };
 mod long_term_mem;
 use long_term_mem::LongTermMem;
@@ -352,8 +352,12 @@ async fn message(query_params: web::Query<MessageQuery>) -> HttpResponse {
 }
 
 #[post("/api/message")]
-async fn message_post(received: web::Json<NewMessage>) -> HttpResponse {
-    match Database::insert_message(received.into_inner()) {
+async fn message_post(received: web::Json<NewMessageRequest>) -> HttpResponse {
+    let new_message: NewMessage = match received.into_inner().try_into() {
+        Ok(new_message) => new_message,
+        Err(e) => return HttpResponse::BadRequest().body(e.to_string()),
+    };
+    match Database::insert_message(new_message) {
         Ok(_) => HttpResponse::Ok().body("Message added!"),
         Err(e) => {
             println!("Failed to add message: {}", e);

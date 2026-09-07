@@ -80,12 +80,14 @@ const ChatWindow = () => {
       pushMessage({
         id: -1,
         ai: false,
+        speaker_id: 'user',
         content: sentMessage,
         created_at: new Date().toISOString(),
       });
       pushMessage({
         id: streamingMessageId,
         ai: true,
+        speaker_id: 'char',
         content: `${companionData.name} is typing...`,
         created_at: new Date().toISOString(),
       });

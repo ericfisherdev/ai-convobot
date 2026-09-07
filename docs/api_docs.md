@@ -33,17 +33,22 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
     {
       "id": 1,
       "ai": true,
+      "speaker_id": "char",
       "content": "Hello there!",
       "created_at": "Saturday 20.04.2024 17:49"
     },
     {
       "id": 2,
       "ai": false,
+      "speaker_id": "user",
       "content": "Hi, can you help me with something?",
       "created_at": "Saturday 20.04.2024 19:02"
     }
   ]
   ```
+  `speaker_id` is the source of truth for who sent the message; `ai` is
+  always derived from it (`speaker_id != "user"`) and kept for backward
+  compatibility.
 
 #### 1.2 Erase messages
 - **URL:** `/message`
@@ -64,12 +69,26 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 - **Method:** `POST`
 - **Description:** Add a message to the database (without prompting the AI).
 - **Request Body:**
-  - `ai` (boolean): Indicates whether the message is from the AI (true) or user (false).
+  - `speaker_id` (string, preferred): Who sent the message (e.g. `"user"` or `"char"`).
+  - `ai` (boolean, legacy): Indicates whether the message is from the AI (true) or user (false). Still accepted; `true` resolves to `speaker_id: "char"` and `false` to `speaker_id: "user"`.
   - `content` (string): The content of the message.
+  - Either `speaker_id` or `ai` must be given. If both are given they must agree, or the request is rejected.
 - **Response:**
   - Status: 200 OK
   - Body: Message added!
+  - Status: 400 Bad Request
+  - Body: error text, if neither `speaker_id` nor `ai` is given, or the two disagree.
 - **Example Request:**
+  ```http
+  POST /message
+  Content-Type: application/json
+
+  {
+    "speaker_id": "char",
+    "content": "Message sent by AI"
+  }
+  ```
+  The legacy form still works:
   ```http
   POST /message
   Content-Type: application/json
@@ -99,6 +118,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
     {
       "id": 2,
       "ai": false,
+      "speaker_id": "user",
       "content": "Hi, can you help me with something?",
       "created_at": "Saturday 20.04.2024 19:02"
     }
