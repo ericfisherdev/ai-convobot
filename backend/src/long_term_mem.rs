@@ -12,8 +12,10 @@ use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy};
 
 type QueryCache = Mutex<HashMap<String, (Vec<String>, Instant)>>;
 
-/// Directory tantivy stores the long-term-memory index in.
-const INDEX_DIR: &str = "longterm_memory";
+/// Directory tantivy stores the long-term-memory index in. `pub` so
+/// `main.rs`'s `init_storage()` can name this path in a startup-failure
+/// message rather than duplicating the literal.
+pub const INDEX_DIR: &str = "longterm_memory";
 
 /// Heap budget handed to the writer's single indexing thread.
 ///
