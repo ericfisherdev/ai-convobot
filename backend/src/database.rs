@@ -1,6 +1,8 @@
 use chrono::{DateTime, Local};
 use rusqlite::types::{FromSql, FromSqlError, ToSqlOutput, ValueRef};
-use rusqlite::{params, Connection, Error, OptionalExtension, Result, ToSql, TransactionBehavior};
+use rusqlite::{
+    params, Connection, Error, OptionalExtension, Result, ToSql, Transaction, TransactionBehavior,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -154,7 +156,8 @@ fn resolve_speaker(
     speaker_id: Option<String>,
 ) -> std::result::Result<String, SpeakerResolveError> {
     match (ai, speaker_id) {
-        (ai, Some(speaker_id)) if !speaker_id.is_empty() => {
+        (_, Some(speaker_id)) if speaker_id.is_empty() => Err(SpeakerResolveError::Missing),
+        (ai, Some(speaker_id)) => {
             if let Some(ai) = ai {
                 if ai != is_ai_speaker(&speaker_id) {
                     return Err(SpeakerResolveError::Conflict);
@@ -162,12 +165,12 @@ fn resolve_speaker(
             }
             Ok(speaker_id)
         }
-        (Some(ai), _) => Ok(if ai {
+        (Some(ai), None) => Ok(if ai {
             CHAR_SPEAKER_ID.to_string()
         } else {
             USER_SPEAKER_ID.to_string()
         }),
-        (None, _) => Err(SpeakerResolveError::Missing),
+        (None, None) => Err(SpeakerResolveError::Missing),
     }
 }
 
@@ -4298,13 +4301,22 @@ impl Database {
     /// column existed. `speaker_id TEXT NOT NULL DEFAULT ''` (SQLite serves
     /// that default to every pre-existing row at read time, per the
     /// `ALTER TABLE ADD COLUMN` docs) is what makes the follow-up `UPDATE`
-    /// necessary; the transaction guarantees no row can be left at `''` if
-    /// the process crashes between the two statements. Idempotent: the
-    /// `PRAGMA table_info` check short-circuits on an already-migrated
-    /// database, and the `UPDATE`'s `WHERE speaker_id = ''` would no-op even
-    /// if it ran again.
+    /// necessary.
+    ///
+    /// The existence check, the `ALTER TABLE` and the backfill all run
+    /// inside one `IMMEDIATE` transaction (started before the check, not
+    /// after it) so two `init()` calls racing on the same database file
+    /// cannot both observe "column missing" and both try to add it: the
+    /// second to acquire the write lock sees the first's committed column
+    /// and returns early instead of erroring on a duplicate `ALTER TABLE`.
+    /// That transaction also guarantees no row can be left at `''` if the
+    /// process crashes mid-migration. Idempotent: the `PRAGMA table_info`
+    /// check short-circuits on an already-migrated database, and the
+    /// `UPDATE`'s `WHERE speaker_id = ''` would no-op even if it ran again.
     pub fn migrate_messages_speaker_id(con: &Connection) -> Result<()> {
-        let mut stmt = con.prepare("PRAGMA table_info(messages)")?;
+        let tx = Transaction::new_unchecked(con, TransactionBehavior::Immediate)?;
+
+        let mut stmt = tx.prepare("PRAGMA table_info(messages)")?;
         let has_speaker_id = stmt
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<Result<Vec<_>>>()?
@@ -4313,10 +4325,9 @@ impl Database {
         drop(stmt);
 
         if has_speaker_id {
-            return Ok(());
+            return tx.commit();
         }
 
-        let tx = con.unchecked_transaction()?;
         tx.execute(
             "ALTER TABLE messages ADD COLUMN speaker_id TEXT NOT NULL DEFAULT ''",
             [],
@@ -5345,6 +5356,53 @@ mod tests {
     }
 
     #[test]
+    fn migrate_messages_speaker_id_run_concurrently_by_two_connections_does_not_error() {
+        // Both connections open the column-missing table before either
+        // starts migrating. Without the fix, the second to reach `ALTER
+        // TABLE` fails with a duplicate-column error instead of blocking
+        // on the first (via the busy timeout) and then seeing the column
+        // already there.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("t.db");
+        let setup = Database::open_at(&db_path).unwrap();
+        create_legacy_messages_table(&setup);
+        setup
+            .execute(
+                "INSERT INTO messages (ai, content, created_at) VALUES (1, 'hi', ?)",
+                [get_current_date()],
+            )
+            .unwrap();
+        drop(setup);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let other_barrier = Arc::clone(&barrier);
+        let other_path = db_path.clone();
+
+        let other = thread::spawn(move || {
+            let con = Database::open_at(&other_path).unwrap();
+            other_barrier.wait();
+            Database::migrate_messages_speaker_id(&con)
+        });
+
+        let con = Database::open_at(&db_path).unwrap();
+        barrier.wait();
+        let result = Database::migrate_messages_speaker_id(&con);
+
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(
+            other.join().unwrap().is_ok(),
+            "the concurrent migration call should also succeed, not hit a duplicate column error"
+        );
+
+        let speaker_id: String = con
+            .query_row("SELECT speaker_id FROM messages WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(speaker_id, CHAR_SPEAKER_ID);
+    }
+
+    #[test]
     fn insert_message_on_writes_ai_in_sync_with_speaker_id() {
         let dir = tempfile::TempDir::new().unwrap();
         let con = Database::open_at(dir.path().join("t.db")).unwrap();
@@ -5427,6 +5485,20 @@ mod tests {
     fn resolve_speaker_empty_speaker_id_errors() {
         assert_eq!(
             resolve_speaker(None, Some(String::new())),
+            Err(SpeakerResolveError::Missing)
+        );
+    }
+
+    #[test]
+    fn resolve_speaker_empty_speaker_id_errors_even_with_a_legacy_ai_fallback() {
+        // An explicitly empty `speaker_id` must not fall through to the
+        // legacy `ai`-only branch, for either value of `ai`.
+        assert_eq!(
+            resolve_speaker(Some(true), Some(String::new())),
+            Err(SpeakerResolveError::Missing)
+        );
+        assert_eq!(
+            resolve_speaker(Some(false), Some(String::new())),
             Err(SpeakerResolveError::Missing)
         );
     }

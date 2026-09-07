@@ -1,5 +1,5 @@
 export interface NewMessage {
-    ai: boolean;
+    ai?: boolean;
     speaker_id?: string;
     content: string;
 }
