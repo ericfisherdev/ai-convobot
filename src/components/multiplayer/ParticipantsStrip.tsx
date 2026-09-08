@@ -5,7 +5,19 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "../ui/
 import { useParticipants } from "../context/participantsContext";
 import { useMobile } from "../../hooks/useMobile";
 import { cn } from "../../lib/utils";
+import { Participant } from "../interfaces/Participant";
 import companionAvatarDefault from "../../assets/companion_avatar.jpg";
+
+// `ParticipantsProvider` always gives the local `user` entry `avatar_url:
+// null` (there is no user-avatar feature), so it must not fall back to the
+// companion's picture -- only a bot without its own avatar should. Falling
+// through to `undefined` lets Radix's `AvatarFallback` show initials.
+function avatarSrc(participant: Participant): string | undefined {
+  if (participant.kind === 'Human') {
+    return participant.avatar_url ?? undefined;
+  }
+  return participant.avatar_url || companionAvatarDefault;
+}
 
 // One row of every connected participant, rendered by `ChatWindow.tsx` under
 // the header whenever `status.mode !== 'solo'`. Each chip is an avatar (with
@@ -37,7 +49,7 @@ export function ParticipantsStrip() {
                   <span className="relative inline-flex">
                     <Avatar className="w-5 h-5">
                       <AvatarImage
-                        src={participant.avatar_url || companionAvatarDefault}
+                        src={avatarSrc(participant)}
                         alt={`${participant.display_name} avatar`}
                       />
                       <AvatarFallback className="text-[9px]">
