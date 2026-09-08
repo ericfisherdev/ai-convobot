@@ -19,22 +19,38 @@ impl RemoteTranscript {
         RemoteTranscript::default()
     }
 
-    /// Replaces the whole mirror, e.g. with the seed transcript a `Joined`
-    /// frame carries. `messages` is expected oldest-first, the same order
-    /// `Joined.transcript` and `Database::get_x_messages` (reversed) use.
-    pub fn replace(&mut self, messages: Vec<Message>) {
-        self.messages = messages;
+    /// Merges a host transcript snapshot into the mirror, e.g. the seed
+    /// transcript a `Joined` frame carries. `snapshot` is expected
+    /// oldest-first, the same order `Joined.transcript` and
+    /// `Database::get_x_messages` (reversed) use.
+    ///
+    /// Deliberately a merge, not an overwrite: `Joined.transcript` is only
+    /// ever the host's *last 50* messages (`host.rs::admit`), so a joiner
+    /// reconnecting after already having mirrored more history than that
+    /// would lose the older rows — and shrink `total_count` — if this
+    /// replaced `self.messages` outright. Each message in `snapshot` goes
+    /// through the same dedup-and-sorted-insert [`RemoteTranscript::push`]
+    /// uses, so calling this on a fresh mirror (the common case: the first
+    /// `Joined` of a run) is equivalent to a plain assignment.
+    pub fn replace(&mut self, snapshot: Vec<Message>) {
+        for message in snapshot {
+            self.push(message);
+        }
     }
 
-    /// Appends one message from a [`crate::multiplayer::protocol::ServerFrame::Message`]
-    /// frame. A no-op if `message.id` is already present, so a reconnect
-    /// that replays the tail of the host's transcript (the last 50 rows in
-    /// a fresh `Joined`) never duplicates a row this mirror already has.
+    /// Inserts one message from a [`crate::multiplayer::protocol::ServerFrame::Message`]
+    /// frame, or one row of a [`RemoteTranscript::replace`] snapshot, at its
+    /// sorted position by `id`. A no-op if `message.id` is already present,
+    /// so a reconnect that replays the tail of the host's transcript never
+    /// duplicates a row this mirror already has. Inserting by position
+    /// (rather than always appending) keeps the mirror correctly ordered
+    /// even if `replace` ever merges a snapshot whose new ids interleave
+    /// with an existing gap, not just the common case of new ids landing
+    /// after the current maximum.
     pub fn push(&mut self, message: Message) {
-        if self.messages.iter().any(|m| m.id == message.id) {
-            return;
+        if let Err(pos) = self.messages.binary_search_by_key(&message.id, |m| m.id) {
+            self.messages.insert(pos, message);
         }
-        self.messages.push(message);
     }
 
     /// The same windowing `GET /api/message` returns from
@@ -98,6 +114,32 @@ mod tests {
         transcript.replace(messages(1..=3));
         transcript.push(message(2));
         assert_eq!(transcript.snapshot(), messages(1..=3));
+    }
+
+    #[test]
+    fn push_inserts_an_out_of_order_id_at_its_sorted_position() {
+        let mut transcript = RemoteTranscript::new();
+        transcript.replace(messages([1, 2, 5]));
+        transcript.push(message(3));
+        assert_eq!(
+            transcript.snapshot(),
+            vec![message(1), message(2), message(3), message(5)]
+        );
+    }
+
+    #[test]
+    fn replace_merges_a_later_snapshot_without_losing_earlier_history() {
+        let mut transcript = RemoteTranscript::new();
+        // First `Joined`, early in the run: only 5 messages exist yet.
+        transcript.replace(messages(1..=5));
+        // The connection drops; more messages arrive on the host while this
+        // joiner is disconnected. A reconnect's `Joined.transcript` is only
+        // ever the host's last 50 (here: 4..=8), overlapping rather than
+        // starting exactly where this mirror left off.
+        transcript.replace(messages(4..=8));
+        assert_eq!(transcript.snapshot(), messages(1..=8));
+        let (_, total_count, _) = transcript.page(0, 50);
+        assert_eq!(total_count, 8);
     }
 
     #[test]
