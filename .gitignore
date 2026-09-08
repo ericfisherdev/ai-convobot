@@ -52,6 +52,13 @@ backend/release-package/
 longterm_memory/
 backend/longterm_memory/
 
+# Multiplayer state (transferred participant avatars); the default data
+# directory is the working directory, same as longterm_memory/ above.
+# Anchored (leading slash) so this never matches backend/src/multiplayer/,
+# the source module directory.
+/multiplayer/
+/backend/multiplayer/
+
 # Local model weights
 *.gguf
 *.bin

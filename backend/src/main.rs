@@ -44,7 +44,14 @@ mod multiplayer;
 mod participants;
 mod paths;
 mod settings;
+use crate::multiplayer::avatar as multiplayer_avatar;
+use crate::multiplayer::host::{
+    require_host_mode, HostConfigSource, HostSettings, SqliteHostConfig,
+};
+use crate::multiplayer::join_throttle::JoinThrottle;
+use crate::multiplayer::remote_bots::RemoteBots;
 use crate::participants::{avatar_from, ParticipantId, ParticipantRegistry};
+use std::sync::Arc;
 #[cfg(test)]
 pub(crate) mod simple_tests;
 
@@ -131,7 +138,8 @@ fn storage_error(what: &str, path: &Path, e: impl std::fmt::Display) -> std::io:
 /// `COMPANION_DATA_DIR` (default: the working directory) via `paths::init`.
 /// Also creates the `assets/` directory so the avatar handlers can write to
 /// it without a fresh checkout hitting a missing-directory error on first
-/// upload.
+/// upload, and the `multiplayer/avatars/` directory so a joiner's avatar
+/// upload never hits the same error on a host's first join.
 fn init_storage() -> std::io::Result<()> {
     let db_path = paths::db_path();
     Database::init().map_err(|e| storage_error("sqlite database", &db_path, e))?;
@@ -144,6 +152,10 @@ fn init_storage() -> std::io::Result<()> {
     let assets_dir = paths::assets_dir();
     fs::create_dir_all(&assets_dir)
         .map_err(|e| storage_error("assets directory", &assets_dir, e))?;
+
+    let participant_avatars_dir = paths::participant_avatars_dir();
+    fs::create_dir_all(&participant_avatars_dir)
+        .map_err(|e| storage_error("participant avatar directory", &participant_avatars_dir, e))?;
 
     Ok(())
 }
@@ -2159,6 +2171,98 @@ async fn get_gpu_allocation() -> HttpResponse {
     }
 }
 
+//              Multiplayer
+
+/// The current participant list, gated to `Host` mode like every other
+/// `/api/multiplayer/*` route (`require_host_mode`, #129's
+/// `host::host_password_or_404`).
+#[get("/api/multiplayer/participants")]
+async fn multiplayer_participants(
+    host_config: web::Data<Arc<dyn HostConfigSource>>,
+    participants: web::Data<RwLock<ParticipantRegistry>>,
+    remote_bots: web::Data<RemoteBots>,
+) -> HttpResponse {
+    if let Err(response) = require_host_mode(host_config.get_ref()).await {
+        return response;
+    }
+    let summaries: Vec<_> = {
+        let registry = participants.read().unwrap_or_else(|p| p.into_inner());
+        registry
+            .iter()
+            .map(|p| crate::multiplayer::host::participant_summary(p, &remote_bots))
+            .collect()
+    };
+    HttpResponse::Ok().json(summaries)
+}
+
+/// Serves a transferred remote bot's avatar, the counterpart to
+/// `companion_avatar_custom` for multiplayer participants. 404s for an
+/// unknown id, a reserved (`user`/`char`) id, or a `RemoteBot` that has not
+/// uploaded an avatar this run.
+#[get("/api/multiplayer/participants/{id}/avatar")]
+async fn multiplayer_participant_avatar(
+    host_config: web::Data<Arc<dyn HostConfigSource>>,
+    participants: web::Data<RwLock<ParticipantRegistry>>,
+    path: web::Path<String>,
+) -> actix_web::Result<HttpResponse> {
+    if let Err(response) = require_host_mode(host_config.get_ref()).await {
+        return Ok(response);
+    }
+
+    let id = match ParticipantId::parse(&path.into_inner()) {
+        Ok(id) => id,
+        Err(_) => {
+            return Ok(HttpResponse::BadRequest()
+                .json(serde_json::json!({ "error": "invalid participant id" })))
+        }
+    };
+
+    let is_remote_bot = {
+        let registry = participants.read().unwrap_or_else(|p| p.into_inner());
+        matches!(
+            registry.get(&id).map(|p| &p.kind),
+            Some(crate::participants::ParticipantKind::RemoteBot)
+        )
+    };
+    if !is_remote_bot {
+        return Ok(
+            HttpResponse::NotFound().json(serde_json::json!({ "error": "participant not found" }))
+        );
+    }
+
+    let Some((format, file_path)) = multiplayer_avatar::find_stored_avatar(&id) else {
+        return Ok(HttpResponse::NotFound()
+            .json(serde_json::json!({ "error": "no avatar stored for this participant" })));
+    };
+
+    let id_for_log = id.clone();
+    let bytes = match web::block(move || fs::read(&file_path)).await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => {
+            eprintln!(
+                "multiplayer: failed to read avatar for {}: {}",
+                id_for_log, e
+            );
+            return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "failed to read avatar, check logs for more information"
+            })));
+        }
+        Err(e) => {
+            eprintln!(
+                "multiplayer: blocking task failed reading avatar for {}: {}",
+                id_for_log, e
+            );
+            return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "failed to read avatar, check logs for more information"
+            })));
+        }
+    };
+
+    Ok(HttpResponse::Ok()
+        .content_type(format.content_type())
+        .body(bytes))
+}
+
 //
 
 /// Estimate response time based on message complexity
@@ -2243,10 +2347,24 @@ async fn main() -> std::io::Result<()> {
     // here fails startup the same way `init_storage` does.
     let participants = web::Data::new(RwLock::new(seed_participants()?));
 
+    // Multiplayer host state (#129). Registered unconditionally, same as
+    // `participants`: the mode is a runtime-toggleable `PUT /api/config`
+    // field, not a startup-time constant, so every route gates itself per
+    // request instead of the routes being registered conditionally.
+    let host_config: web::Data<Arc<dyn HostConfigSource>> =
+        web::Data::new(Arc::new(SqliteHostConfig) as Arc<dyn HostConfigSource>);
+    let join_throttle = web::Data::new(JoinThrottle::new(5, std::time::Duration::from_secs(600)));
+    let host_settings = web::Data::new(HostSettings::default());
+    let remote_bots = web::Data::new(RemoteBots::new());
+
     let mut server = HttpServer::new(move || {
         App::new()
             .app_data(session_manager.clone())
             .app_data(participants.clone())
+            .app_data(host_config.clone())
+            .app_data(join_throttle.clone())
+            .app_data(host_settings.clone())
+            .app_data(remote_bots.clone())
             .service(index)
             .service(js)
             .service(js2)
@@ -2311,6 +2429,9 @@ async fn main() -> std::io::Result<()> {
             .service(get_session_stats)
             .service(get_gpu_memory)
             .service(get_gpu_allocation)
+            .service(crate::multiplayer::host::multiplayer_ws)
+            .service(multiplayer_participants)
+            .service(multiplayer_participant_avatar)
     });
     if let Some(workers) = configured_workers() {
         server = server.workers(workers);
