@@ -44,8 +44,12 @@ fn respawn_instance(port: u16, addr: SocketAddr, data_dir: &Path) -> ChildGuard 
     let child = instance_command(port, data_dir)
         .spawn()
         .expect("failed to spawn the ai-companion binary");
+    // Guarded before the wait, not after: `wait_until_listening` panics on
+    // a timeout, and a bare `Child` dropped by that unwind is never killed,
+    // leaking a still-listening `ai-companion` process behind a failed test.
+    let guard = ChildGuard(child);
     wait_until_listening(addr, Duration::from_secs(10));
-    ChildGuard(child)
+    guard
 }
 
 fn get_json(agent: &ureq::Agent, url: &str) -> Value {
