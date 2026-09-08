@@ -83,20 +83,22 @@ export function EditData() {
     }
   };
 
-  const handleConfigSave = async () => {
-    if (configFormData) {
-      const saved = await updateConfigData(configFormData);
-      if (saved) {
-        // A stale password should never be resent on the next save; the
-        // backend already reports whether one is stored via
-        // multiplayer_password_set.
-        setConfigFormData((prev) => ({ ...prev, multiplayer_password: "" }));
-      }
-      // Refresh GPU info after config save if dynamic allocation is enabled
-      if (configFormData.dynamic_gpu_allocation) {
-        fetchGpuInfo();
-      }
+  const handleConfigSave = async (): Promise<boolean> => {
+    if (!configFormData) {
+      return false;
     }
+    const saved = await updateConfigData(configFormData);
+    if (saved) {
+      // A stale password should never be resent on the next save; the
+      // backend already reports whether one is stored via
+      // multiplayer_password_set.
+      setConfigFormData((prev) => ({ ...prev, multiplayer_password: "" }));
+    }
+    // Refresh GPU info after config save if dynamic allocation is enabled
+    if (configFormData.dynamic_gpu_allocation) {
+      fetchGpuInfo();
+    }
+    return saved;
   };
 
   const fetchGpuInfo = async () => {
@@ -1007,9 +1009,11 @@ export function EditData() {
             </div>
           </CardContent>
           <CardFooter className="flex justify-center">
-            <Button onClick={() => {
-                handleConfigSave();
-                configContext?.refreshConfigData();
+            <Button onClick={async () => {
+                const saved = await handleConfigSave();
+                if (saved) {
+                  configContext?.refreshConfigData();
+                }
               }}>Save changes</Button>
           </CardFooter>
         </Card>
@@ -1023,9 +1027,11 @@ export function EditData() {
             <MultiplayerSettings config={configFormData} onChange={setConfigFormData} />
           </CardContent>
           <CardFooter className="flex justify-center">
-            <Button onClick={() => {
-                handleConfigSave();
-                configContext?.refreshConfigData();
+            <Button onClick={async () => {
+                const saved = await handleConfigSave();
+                if (saved) {
+                  configContext?.refreshConfigData();
+                }
               }}>Save changes</Button>
           </CardFooter>
         </Card>

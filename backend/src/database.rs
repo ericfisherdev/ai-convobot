@@ -4505,7 +4505,11 @@ impl Database {
     /// per column (that grew unwieldy past #128's six new multiplayer
     /// columns): reads the existing column set once via `PRAGMA
     /// table_info`, then runs each `ALTER TABLE` whose column is absent.
-    /// Idempotent, like the per-bool version it replaces.
+    /// Idempotent, like the per-bool version it replaces. Includes
+    /// `dynamic_gpu_allocation`, `gpu_safety_margin`, and `min_free_vram_mb`,
+    /// which the previous per-bool version omitted entirely (a database
+    /// missing those three columns could migrate "successfully" and then
+    /// fail `read_config`/`write_config` with a "no such column" error).
     pub fn migrate_config_table(con: &Connection) -> Result<()> {
         const COLUMNS: &[(&str, &str)] = &[
             (
@@ -4523,6 +4527,18 @@ impl Database {
             (
                 "vram_limit_gb",
                 "ALTER TABLE config ADD COLUMN vram_limit_gb INTEGER DEFAULT 4",
+            ),
+            (
+                "dynamic_gpu_allocation",
+                "ALTER TABLE config ADD COLUMN dynamic_gpu_allocation BOOLEAN DEFAULT true",
+            ),
+            (
+                "gpu_safety_margin",
+                "ALTER TABLE config ADD COLUMN gpu_safety_margin REAL DEFAULT 0.8",
+            ),
+            (
+                "min_free_vram_mb",
+                "ALTER TABLE config ADD COLUMN min_free_vram_mb INTEGER DEFAULT 512",
             ),
             (
                 "enable_hybrid_context",
@@ -5853,6 +5869,9 @@ mod tests {
             "max_response_tokens",
             "enable_dynamic_context",
             "vram_limit_gb",
+            "dynamic_gpu_allocation",
+            "gpu_safety_margin",
+            "min_free_vram_mb",
             "enable_hybrid_context",
             "max_system_ram_usage_gb",
             "context_expansion_strategy",
