@@ -15,6 +15,12 @@
 //! a host, drives the handshake, and mirrors the transcript into
 //! `remote_transcript.rs`'s pure `RemoteTranscript`, reconnecting with
 //! `backoff.rs`'s `ReconnectBackoff` when the connection drops.
+//!
+//! `round.rs` (#131) is the round orchestrator: `run_round` turns one user
+//! message into the host companion's reply followed by each connected
+//! joiner's, in join order, all under one held turn slot. Its
+//! `RemoteGenerator` trait is the seam a joiner's reply is generated
+//! through; #154 implements it over `remote_bots.rs`.
 
 pub mod avatar;
 pub mod backoff;
@@ -26,3 +32,4 @@ pub mod joiner;
 pub mod protocol;
 pub mod remote_bots;
 pub mod remote_transcript;
+pub mod round;

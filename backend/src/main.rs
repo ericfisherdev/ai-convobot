@@ -39,7 +39,7 @@ use crate::llm_scanner::LlmScanner;
 mod turn_slot;
 use crate::turn_slot::{TurnGuard, ACTIVE_TURN};
 mod chat_turn;
-use crate::chat_turn::{PendingTurn, SqliteTurnStore, TurnStore};
+use crate::chat_turn::{PendingTurn, PersistedReply, SqliteTurnStore, TurnStore};
 mod multiplayer;
 mod participants;
 mod paths;
@@ -54,6 +54,9 @@ use crate::multiplayer::joiner::{
     JoinerHandle, JoinerIdentity, JoinerShared, UnimplementedGeneration,
 };
 use crate::multiplayer::remote_bots::RemoteBots;
+use crate::multiplayer::round::{
+    plan_round, run_round, NoRemotes, NoopSink, RemoteGenerator, RoundPlan, RoundSink,
+};
 use crate::participants::{avatar_from, ParticipantId, ParticipantRegistry};
 use std::sync::Arc;
 #[cfg(test)]
@@ -933,7 +936,14 @@ mod stream_turn_tests {
     use crate::chat_turn::RecordingStore;
     use crate::turn_slot::TurnSlot;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::mpsc::error::TryRecvError;
+
+    fn solo_plan() -> RoundPlan {
+        RoundPlan {
+            speakers: vec![ParticipantId::CHAR],
+        }
+    }
 
     #[test]
     fn failed_generation_sends_one_user_turn_an_error_chunk_and_releases_the_slot() {
@@ -948,12 +958,15 @@ mod stream_turn_tests {
 
         let thread_store = store.clone();
         let handle = std::thread::spawn(move || {
-            stream_turn(
+            stream_round(
                 guard,
                 pending,
                 stream,
                 thread_store.as_ref(),
+                solo_plan(),
                 |_prompt, _on_token| Err(std::io::Error::other("no model")),
+                &NoRemotes,
+                Duration::from_secs(30),
             );
         });
         handle.join().expect("worker thread should not panic");
@@ -970,7 +983,7 @@ mod stream_turn_tests {
 
         assert!(
             SLOT.try_claim().is_some(),
-            "turn slot should be released once stream_turn returns"
+            "turn slot should be released once stream_round returns"
         );
     }
 
@@ -987,16 +1000,19 @@ mod stream_turn_tests {
 
         let thread_store = store.clone();
         let handle = std::thread::spawn(move || {
-            stream_turn(
+            stream_round(
                 guard,
                 pending,
                 stream,
                 thread_store.as_ref(),
+                solo_plan(),
                 |_prompt, on_token| {
                     on_token("Hel");
                     on_token("lo");
                     Ok("Hello".to_string())
                 },
+                &NoRemotes,
+                Duration::from_secs(30),
             );
         });
         handle.join().expect("worker thread should not panic");
@@ -1012,7 +1028,7 @@ mod stream_turn_tests {
         assert!(!second.is_complete);
 
         // No attitude chunk: `RecordingStore::finish_turn` always returns
-        // `None`, so `stream_turn` has nothing to report before the reply
+        // `None`, so `stream_round` has nothing to report before the reply
         // settles.
         let final_chunk = rx.try_recv().expect("final chunk");
         assert!(final_chunk.is_complete);
@@ -1069,11 +1085,20 @@ async fn prompt_message(
         Ok(id) => id,
         Err(response) => return response,
     };
+    // The round's remote timeout budget: read once here rather than inside
+    // `run_round` (#131's round orchestrator, `multiplayer::round`, is
+    // `Database`-free), so it stays testable against a fake `TurnStore`.
+    let timeout = match off_worker("Error while getting config", Database::get_config).await {
+        Ok(loaded_config) => {
+            std::time::Duration::from_secs(loaded_config.remote_generation_timeout_secs)
+        }
+        Err(response) => return response,
+    };
     // Claimed before the user-turn insert below and moved into the blocking
-    // closure below, which holds it for the whole turn: an overlapping call
-    // cannot insert its own user message between this one and the reply it is
-    // about to generate, and a client disconnect cannot cut generation short
-    // since `spawn_blocking` tasks are not cancelled.
+    // closure below, which holds it for the whole round: an overlapping call
+    // cannot insert its own user message between this one and the replies it
+    // is about to generate, and a client disconnect cannot cut generation
+    // short since `spawn_blocking` tasks are not cancelled.
     let Some(turn_guard) = ACTIVE_TURN.try_claim() else {
         return HttpResponse::Conflict()
             .body("A reply is still being generated; wait for it to finish before sending another message");
@@ -1082,8 +1107,9 @@ async fn prompt_message(
 
     let speakers = snapshot_speakers(&registry);
     let participant_names = participant_display_names(&speakers);
+    let plan = plan_round(&prompt_message, &speakers.registry);
 
-    let result = web::block(move || -> Result<String, TurnError> {
+    let result = web::block(move || -> Result<Option<String>, TurnError> {
         let _turn_guard = turn_guard;
         let store = SqliteTurnStore::new(participant_names);
 
@@ -1114,27 +1140,38 @@ async fn prompt_message(
             println!("   Factors: {}", estimate.factors.join(", "));
         }
 
-        let completed = pending
-            .complete(&store, |generation_prompt| {
+        let outcome = run_round(
+            _turn_guard,
+            pending,
+            plan,
+            &store,
+            &mut |generation_prompt, _on_token| {
                 prompt(
                     generation_prompt,
                     companion_id,
                     &SqliteTranscript,
                     &speakers,
                 )
-            })
-            .map_err(TurnError::Generate)?;
+            },
+            &NoRemotes,
+            timeout,
+            &mut NoopSink,
+        )
+        .map_err(TurnError::Generate)?;
 
         // Display actual response time
         let elapsed = start_time.elapsed();
         println!("✓ Response completed in {:.1}s", elapsed.as_secs_f32());
 
-        Ok(completed.reply)
+        Ok(outcome.host_reply.map(|reply| reply.text))
     })
     .await;
 
     match result {
-        Ok(Ok(reply)) => HttpResponse::Ok().body(reply),
+        Ok(Ok(Some(reply))) => HttpResponse::Ok().body(reply),
+        // Unreachable until #132 can filter the host bot out of a round's
+        // plan; `plan_round` always puts `char` first today.
+        Ok(Ok(None)) => HttpResponse::NoContent().finish(),
         Ok(Err(turn_error)) => turn_error.into_response(),
         Err(blocking) => {
             println!(
@@ -1178,9 +1215,11 @@ async fn regenerate_prompt(
     };
 
     let speakers = snapshot_speakers(&registry);
+    let participant_names = participant_display_names(&speakers);
 
     let result = web::block(move || -> Result<String, TurnError> {
         let _turn_guard = turn_guard;
+        let store = SqliteTurnStore::new(participant_names);
 
         let user_turn =
             match Database::pop_latest_ai_reply().map_err(|source| TurnError::Database {
@@ -1190,13 +1229,22 @@ async fn regenerate_prompt(
                 PoppedReply::Removed { user_turn } => user_turn,
                 PoppedReply::NothingToRegenerate => return Err(TurnError::NothingToRegenerate),
             };
-        prompt(
+        let reply = prompt(
             &user_turn.content,
             companion_id,
             &SqliteTranscript,
             &speakers,
         )
-        .map_err(TurnError::Generate)
+        .map_err(TurnError::Generate)?;
+        // `llm::generate` no longer persists the reply itself (#131); this
+        // handler is the one caller that relied on that implicit insert.
+        store
+            .insert_reply(&ParticipantId::CHAR, &reply)
+            .map_err(|source| TurnError::Database {
+                step: "Error while adding message to database",
+                source,
+            })?;
+        Ok(reply)
     })
     .await;
 
@@ -1804,87 +1852,151 @@ async fn estimate_response_time_endpoint(req: web::Json<EstimateRequest>) -> Htt
     HttpResponse::Ok().json(response)
 }
 
-/// Runs the generation half of a streamed turn on the calling thread and ends
-/// the SSE session on every path.
+/// The [`RoundSink`] that drives `/api/prompt/stream`'s SSE session.
 ///
-/// Holds `turn_guard` until after the terminal chunk has gone out; `stream`
-/// is declared right after it so the two drop in reverse order (`stream`
-/// first, then `turn_guard`), meaning the turn slot reopens only once the
-/// client has already seen the reply settle or fail. A failed `generate`
-/// still ends the session (with an error chunk) and releases the slot: this
-/// function always calls `stream.finish`.
-fn stream_turn(
+/// Keeps today's chunk shape: `token` forwards only the host companion's
+/// tokens (other speakers' tokens are dropped; their persisted replies reach
+/// the UI through the `refreshMessages` call the frontend already makes
+/// after the final chunk); `round_complete` sends the attitude chunk when
+/// there is one, then the final `is_complete: true` chunk carrying the host
+/// bot's reply text. #133 extends this with speaker-tagged chunks; nothing
+/// else in the SSE path should need to move.
+///
+/// `stream` is `Option` so `round_complete` (which only gets `&mut self`)
+/// can take it and call [`StreamSession::finish`], which needs to consume
+/// it. If a round ends in `Err` before `round_complete` ever runs,
+/// [`SseRoundSink::finish_with_error`] takes it instead.
+struct SseRoundSink {
+    stream: Option<StreamSession>,
+    request_id: String,
+    token_count: usize,
+    host_reply_text: Option<String>,
+}
+
+impl SseRoundSink {
+    fn new(stream: StreamSession) -> Self {
+        let request_id = stream.id().to_string();
+        SseRoundSink {
+            stream: Some(stream),
+            request_id,
+            token_count: 0,
+            host_reply_text: None,
+        }
+    }
+
+    /// Ends the session with a terminal error chunk. Called by
+    /// [`stream_round`] when `run_round` returns `Err` before
+    /// `round_complete` ran, so `self.stream` is still held.
+    fn finish_with_error(mut self, error_message: String) {
+        if let Some(stream) = self.stream.take() {
+            stream.finish(StreamChunk {
+                request_id: self.request_id,
+                content: String::new(),
+                is_complete: true,
+                token_count: Some(self.token_count),
+                error: Some(error_message),
+                attitude: None,
+            });
+        }
+    }
+}
+
+impl RoundSink for SseRoundSink {
+    fn reply_started(&mut self, _speaker: &ParticipantId) {}
+
+    fn token(&mut self, speaker: &ParticipantId, text: &str) {
+        if *speaker != ParticipantId::CHAR {
+            return;
+        }
+        self.token_count += 1;
+        if let Some(stream) = &self.stream {
+            // A send failure means the client hung up; generation still runs
+            // to completion so the reply is persisted.
+            let _ = stream.send(StreamChunk {
+                request_id: self.request_id.clone(),
+                content: text.to_string(),
+                is_complete: false,
+                token_count: Some(self.token_count),
+                error: None,
+                attitude: None,
+            });
+        }
+    }
+
+    fn reply_complete(&mut self, reply: &PersistedReply) {
+        if reply.speaker_id == ParticipantId::CHAR {
+            self.host_reply_text = Some(reply.text.clone());
+        }
+    }
+
+    fn speaker_skipped(&mut self, _speaker: &ParticipantId, _notice: &PersistedReply) {}
+
+    fn round_complete(&mut self, attitude: Option<&(CompanionAttitude, CompanionAttitude)>) {
+        let Some(stream) = self.stream.take() else {
+            return;
+        };
+        // Persisted before the client sees `is_complete: true`, so the row
+        // is already updated by the time the caller can react to it.
+        if let Some((previous, current)) = attitude {
+            if let Some(update) = attitude_stream_update(previous, current) {
+                // Sent ahead of the final chunk so the client has the new
+                // attitude before it settles the reply bubble.
+                let _ = stream.send(StreamChunk {
+                    request_id: self.request_id.clone(),
+                    content: String::new(),
+                    is_complete: false,
+                    token_count: Some(self.token_count),
+                    error: None,
+                    attitude: Some(update),
+                });
+            }
+        }
+        stream.finish(StreamChunk {
+            request_id: self.request_id.clone(),
+            content: self.host_reply_text.clone().unwrap_or_default(),
+            is_complete: true,
+            token_count: Some(self.token_count),
+            error: None,
+            attitude: None,
+        });
+    }
+}
+
+/// Runs one streamed round on the calling thread and ends the SSE session on
+/// every path: a thin wrapper over [`run_round`] that owns the
+/// `StreamSession` through [`SseRoundSink`].
+///
+/// Holds `turn_guard` until after the terminal chunk has gone out (`run_round`
+/// binds it first and drops it on return), meaning the turn slot reopens
+/// only once the client has already seen the reply settle or fail. A failed
+/// `host_generate` still ends the session (with an error chunk) and releases
+/// the slot.
+#[allow(clippy::too_many_arguments)] // see `run_round`'s identical allow
+fn stream_round(
     turn_guard: TurnGuard,
     pending: PendingTurn,
     stream: StreamSession,
     store: &impl TurnStore,
-    generate: impl FnOnce(&str, &mut dyn FnMut(&str)) -> std::io::Result<String>,
+    plan: RoundPlan,
+    mut host_generate: impl FnMut(&str, &mut dyn FnMut(&str)) -> std::io::Result<String>,
+    remotes: &dyn RemoteGenerator,
+    timeout: std::time::Duration,
 ) {
-    let _turn_guard = turn_guard;
-    let stream = stream;
-    let request_id = stream.id().to_string();
-    let mut token_count = 0usize;
-
-    let result = pending.complete(store, |generation_prompt| {
-        generate(generation_prompt, &mut |token| {
-            token_count += 1;
-            // A send failure means the client hung up; generation still runs
-            // to completion so the reply is persisted.
-            let _ = stream.send(StreamChunk {
-                request_id: request_id.clone(),
-                content: token.to_string(),
-                is_complete: false,
-                token_count: Some(token_count),
-                error: None,
-                attitude: None,
-            });
-        })
-    });
-
-    let final_chunk = match result {
-        // The streamed pieces include stop markers that are stripped before
-        // the reply is persisted, so the final chunk carries the cleaned
-        // text for the client to settle on.
-        Ok(completed) => {
-            // Persisted before the client sees `is_complete: true`, so the
-            // row is already updated by the time the caller can react to it.
-            if let Some((previous, current)) = completed.attitude.as_ref() {
-                if let Some(update) = attitude_stream_update(previous, current) {
-                    // Sent ahead of the final chunk so the client has the new
-                    // attitude before it settles the reply bubble.
-                    let _ = stream.send(StreamChunk {
-                        request_id: request_id.clone(),
-                        content: String::new(),
-                        is_complete: false,
-                        token_count: Some(token_count),
-                        error: None,
-                        attitude: Some(update),
-                    });
-                }
-            }
-            StreamChunk {
-                request_id: request_id.clone(),
-                content: completed.reply,
-                is_complete: true,
-                token_count: Some(token_count),
-                error: None,
-                attitude: None,
-            }
-        }
-        Err(e) => {
-            eprintln!("Failed to generate streamed prompt: {}", e);
-            StreamChunk {
-                request_id: request_id.clone(),
-                content: String::new(),
-                is_complete: true,
-                token_count: Some(token_count),
-                error: Some(e.to_string()),
-                attitude: None,
-            }
-        }
-    };
-
-    stream.finish(final_chunk);
+    let mut sink = SseRoundSink::new(stream);
+    let result = run_round(
+        turn_guard,
+        pending,
+        plan,
+        store,
+        &mut host_generate,
+        remotes,
+        timeout,
+        &mut sink,
+    );
+    if let Err(e) = result {
+        eprintln!("Failed to generate streamed prompt: {}", e);
+        sink.finish_with_error(e.to_string());
+    }
 }
 
 /// Streams a reply token by token as Server-Sent Events.
@@ -1916,12 +2028,20 @@ async fn start_streaming_session(
         Ok(id) => id,
         Err(response) => return response,
     };
+    // See `prompt_message`'s identical fetch: the round's remote timeout
+    // budget, read once here since `multiplayer::round` is `Database`-free.
+    let timeout = match off_worker("Error while getting config", Database::get_config).await {
+        Ok(loaded_config) => {
+            std::time::Duration::from_secs(loaded_config.remote_generation_timeout_secs)
+        }
+        Err(response) => return response,
+    };
     // Claimed before the user-turn insert below: without it, a second
     // request's insert could land between this one and the worker thread
     // reading history, and the worker would answer both messages at once.
     // Travels with the pending turn through the pre-work closure below, then
     // into the spawned closure, and is dropped only after the reply (and its
-    // attitude update) is persisted, so the slot covers the whole turn.
+    // attitude update) is persisted, so the slot covers the whole round.
     let Some(turn_guard) = ACTIVE_TURN.try_claim() else {
         return HttpResponse::Conflict()
             .body("A reply is still being generated; wait for it to finish before sending another message");
@@ -1932,6 +2052,8 @@ async fn start_streaming_session(
     let speakers = snapshot_speakers(&registry);
     let participant_names = participant_display_names(&speakers);
     let stream_participant_names = participant_names.clone();
+    // With no registered joiners the plan is always `[char]`.
+    let plan = plan_round(&user_message, &speakers.registry);
 
     // The generator reads recent messages back out of the database, so the
     // user's turn has to be persisted before generation starts. The turn
@@ -1961,11 +2083,12 @@ async fn start_streaming_session(
         .name("stream-generation".into())
         .spawn(move || {
             let store = SqliteTurnStore::new(stream_participant_names);
-            stream_turn(
+            stream_round(
                 turn_guard,
                 pending,
                 stream,
                 &store,
+                plan,
                 |generation_prompt, on_token| {
                     prompt_streaming(
                         generation_prompt,
@@ -1975,6 +2098,8 @@ async fn start_streaming_session(
                         &speakers,
                     )
                 },
+                &NoRemotes,
+                timeout,
             );
         });
     // A failed spawn drops the closure immediately, which drops `stream` and
