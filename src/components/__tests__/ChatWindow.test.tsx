@@ -389,6 +389,75 @@ describe('ChatWindow Component', () => {
     })
   })
 
+  it('settles a skipped speaker\'s bubble under the system speaker, not the speaker that was skipped', async () => {
+    const user = userEvent.setup()
+    // bot1 gets its own `reply_started` before the round learns it will not
+    // respond, so the notice must settle that bubble as `system` rather
+    // than leaving it tagged `bot1`. `round_complete` is gated so the
+    // assertion runs before `refreshMessages()` replaces the optimistic
+    // bubbles with the (unmocked) persisted rows.
+    let releaseRoundComplete: (() => void) | undefined
+    const roundCompleteGate = new Promise<void>(resolve => { releaseRoundComplete = resolve })
+
+    const repliesChunks = [
+      { request_id: 'r1', event: 'reply_started', content: '', is_complete: false, speaker_id: 'char' },
+      { request_id: 'r1', event: 'reply_complete', content: 'hi from char', is_complete: false, speaker_id: 'char', message_id: 1 },
+      { request_id: 'r1', event: 'reply_started', content: '', is_complete: false, speaker_id: 'bot1' },
+      { request_id: 'r1', event: 'reply_complete', content: 'bot1 did not respond', is_complete: false, speaker_id: 'system', message_id: 2 },
+    ]
+    const roundCompleteChunk = { request_id: 'r1', event: 'round_complete', content: '', is_complete: true, speaker_id: '' }
+
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.startsWith('/api/prompt/stream')) {
+        const encoder = new TextEncoder()
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          body: new ReadableStream<Uint8Array>({
+            async start(controller) {
+              for (const chunk of repliesChunks) {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+              }
+              await roundCompleteGate
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(roundCompleteChunk)}\n\n`))
+              controller.close()
+            },
+          }),
+        })
+      }
+      if (url.startsWith('/api/session')) {
+        return Promise.resolve(jsonResponse(session))
+      }
+      if (url.startsWith('/api/attitude/summary/')) {
+        return Promise.resolve(jsonResponse({ attitude, summary: 'neutral' }))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+    global.fetch = fetchMock as unknown as typeof fetch
+
+    render(
+      <MockProviders>
+        <ChatWindow />
+        <MessageSpy />
+      </MockProviders>
+    )
+
+    const textarea = screen.getByRole('textbox')
+    await user.type(textarea, 'hello')
+    await user.click(screen.getByRole('button', { name: /^send message$/i }))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('message-system')).toHaveTextContent('bot1 did not respond')
+    })
+    expect(screen.queryByTestId('message-bot1')).not.toBeInTheDocument()
+
+    releaseRoundComplete?.()
+    await waitFor(() => {
+      expect(textarea).not.toBeDisabled()
+    })
+  })
+
   it('surfaces a mid-round error as a toast and re-enables input', async () => {
     const user = userEvent.setup()
     const streamChunks = [

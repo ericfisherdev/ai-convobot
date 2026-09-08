@@ -136,6 +136,7 @@ const ChatWindow = () => {
               settleMessage(effect.tempId, {
                 id: effect.messageId ?? effect.tempId,
                 content: effect.content,
+                speaker_id: effect.speakerId,
               });
               break;
             case 'apply_attitude':
