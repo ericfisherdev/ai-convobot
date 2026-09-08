@@ -35,8 +35,11 @@ pub trait TurnStore {
     /// matched, so the caller can generate with that added context.
     fn preprocess(&self, user_message: &str, companion_id: i32) -> Option<String>;
 
-    /// Persists the user's half of the turn.
-    fn insert_user_turn(&self, content: &str) -> rusqlite::Result<()>;
+    /// Persists the user's half of the turn and returns the new message's
+    /// id, for [`PendingTurn::user_message_id`] — #154's round orchestrator
+    /// reads it back through [`TurnStore::get_message`] to broadcast the
+    /// user's turn to every joiner.
+    fn insert_user_turn(&self, content: &str) -> rusqlite::Result<i32>;
 
     /// Persists one speaker's reply and returns the new message's id, for
     /// [`PersistedReply::message_id`].
@@ -46,6 +49,13 @@ pub trait TurnStore {
     /// remote speaker as its view of the conversation so far (including any
     /// replies earlier in the same round).
     fn transcript_tail(&self, limit: usize) -> rusqlite::Result<Vec<Message>>;
+
+    /// The full persisted row for a message id `insert_user_turn` or
+    /// `insert_reply` just returned — #154's round orchestrator uses this to
+    /// fetch the row it broadcasts to every joiner as `ServerFrame::Message`,
+    /// so a joiner's mirror carries the exact same id and `created_at` the
+    /// host database recorded.
+    fn get_message(&self, id: i32) -> rusqlite::Result<Message>;
 
     /// Scores the turn and persists the resulting attitude change.
     ///
@@ -83,12 +93,16 @@ impl TurnStore for SqliteTurnStore {
         preprocess_user_message(user_message, companion_id, &self.participant_names)
     }
 
-    fn insert_user_turn(&self, content: &str) -> rusqlite::Result<()> {
-        Database::insert_message(NewMessage::from_user(content)).map(|_id| ())
+    fn insert_user_turn(&self, content: &str) -> rusqlite::Result<i32> {
+        Database::insert_message(NewMessage::from_user(content))
     }
 
     fn insert_reply(&self, speaker_id: &ParticipantId, content: &str) -> rusqlite::Result<i32> {
         Database::insert_message(NewMessage::new(speaker_id.to_string(), content))
+    }
+
+    fn get_message(&self, id: i32) -> rusqlite::Result<Message> {
+        Database::get_message(id)
     }
 
     fn transcript_tail(&self, limit: usize) -> rusqlite::Result<Vec<Message>> {
@@ -303,6 +317,11 @@ pub struct PendingTurn {
     /// `@id` form before it persists them, regardless of which model
     /// produced the text.
     registry: ParticipantRegistry,
+    /// The id `store.insert_user_turn` gave the user's turn — what
+    /// [`PendingTurn::user_message_id`] exposes so #154's round orchestrator
+    /// can look the row back up (`TurnStore::get_message`) and broadcast it
+    /// to every joiner before the round's first speaker generates.
+    user_message_id: i32,
 }
 
 /// One speaker's reply, once generated and persisted: the new message's id,
@@ -338,7 +357,7 @@ impl PendingTurn {
     ) -> rusqlite::Result<PendingTurn> {
         let user_message = normalise_mentions(&user_message, &registry);
         let interaction_prompt = store.preprocess(&user_message, companion_id);
-        store.insert_user_turn(&user_message)?;
+        let user_message_id = store.insert_user_turn(&user_message)?;
         let generation_prompt = interaction_prompt.unwrap_or_else(|| user_message.clone());
         Ok(PendingTurn {
             companion_id,
@@ -346,7 +365,16 @@ impl PendingTurn {
             user_message,
             generation_prompt,
             registry,
+            user_message_id,
         })
+    }
+
+    /// The id `store.insert_user_turn` gave the user's turn during
+    /// [`PendingTurn::begin`] — #154's round orchestrator reads it back
+    /// through [`TurnStore::get_message`] to broadcast the row to every
+    /// joiner.
+    pub fn user_message_id(&self) -> i32 {
+        self.user_message_id
     }
 
     /// Generates one speaker's reply and persists it.
@@ -450,10 +478,9 @@ impl TurnStore for RecordingStore {
         self.interaction_prompt.clone()
     }
 
-    fn insert_user_turn(&self, content: &str) -> rusqlite::Result<()> {
+    fn insert_user_turn(&self, content: &str) -> rusqlite::Result<i32> {
         self.inserted.lock().unwrap().push(content.to_string());
-        self.log_message(&ParticipantId::USER, content);
-        Ok(())
+        Ok(self.log_message(&ParticipantId::USER, content))
     }
 
     fn insert_reply(&self, speaker_id: &ParticipantId, content: &str) -> rusqlite::Result<i32> {
@@ -462,6 +489,16 @@ impl TurnStore for RecordingStore {
             .unwrap()
             .push((speaker_id.clone(), content.to_string()));
         Ok(self.log_message(speaker_id, content))
+    }
+
+    fn get_message(&self, id: i32) -> rusqlite::Result<Message> {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m.id == id)
+            .cloned()
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)
     }
 
     fn transcript_tail(&self, limit: usize) -> rusqlite::Result<Vec<Message>> {
