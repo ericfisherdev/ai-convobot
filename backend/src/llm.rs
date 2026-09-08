@@ -463,6 +463,20 @@ struct RenderedHistory {
     chat_history: Vec<(bool, String)>,
 }
 
+/// Whether `Auto`-template `chat_history` entries need an inlined `"Name: "`
+/// prefix on non-self turns: true when there is more than one non-self
+/// participant, since the chat template's own role framing can no longer
+/// say who spoke. The single source of truth for that decision — both
+/// `render_history` (which decides whether to inline the prefix) and
+/// `generate`'s `Auto` fallback (which decides whether content already
+/// carries one) call this instead of each re-deriving it, so the two can
+/// never fall out of agreement. Not carried on `AssembledPrompt` itself:
+/// that struct is serialised verbatim by `GET /api/debug/prompt`, whose
+/// solo-mode JSON shape must stay unchanged.
+fn auto_prefixes_names(speakers: &PromptSpeakers) -> bool {
+    speakers.others().count() > 1
+}
+
 /// Renders `managed` (already trimmed by `ContextManager`) into both the
 /// plain-text splice used by every template but `Auto`, and the role-tagged
 /// `chat_history` `Auto` renders through the model's own chat template.
@@ -482,7 +496,7 @@ fn render_history(
     template: &PromptTemplate,
 ) -> RenderedHistory {
     let len = managed.len();
-    let auto_show_names = speakers.others().count() > 1;
+    let auto_show_names = auto_prefixes_names(speakers);
     let mut spliced = String::new();
     let mut chat_history: Vec<(bool, String)> = Vec::with_capacity(len);
 
@@ -942,6 +956,18 @@ impl ReplyTrimmer {
     /// the leading whitespace generation tends to start with.
     fn clean(&self, generated: &str) -> String {
         let mut cleaned = generated.to_string();
+        // Cut first: a `line_markers` removal below deletes the newline a
+        // `cut_markers` entry needs to match, which would otherwise let a
+        // spurious extra turn survive with only its name stripped whenever
+        // it was followed by more text (see the #127 review discussion).
+        if let Some(cut_at) = self
+            .cut_markers
+            .iter()
+            .filter_map(|marker| cleaned.find(marker.as_str()))
+            .min()
+        {
+            cleaned.truncate(cut_at);
+        }
         for marker in &self.line_markers {
             cleaned = cleaned.replace(marker.as_str(), "");
         }
@@ -952,14 +978,6 @@ impl ReplyTrimmer {
             .replace("<s>", "")
             .replace("</s>", "")
             .replace("<|user|>", "");
-        if let Some(cut_at) = self
-            .cut_markers
-            .iter()
-            .filter_map(|marker| cleaned.find(marker.as_str()))
-            .min()
-        {
-            cleaned.truncate(cut_at);
-        }
         cleaned.trim_start().to_string()
     }
 }
@@ -1117,7 +1135,7 @@ fn generate(
                 // participant to tell apart; here that content is used as
                 // is, and only the two bare cases (self, and the sole other
                 // participant in solo chat) need a prefix added.
-                let auto_show_names = speakers.others().count() > 1;
+                let auto_show_names = auto_prefixes_names(speakers);
                 let mut fallback = base_prompt.clone();
                 for (is_self, content) in &chat_history {
                     if *is_self {
@@ -1592,6 +1610,16 @@ mod tests {
         let speakers = three_speaker_speakers(ParticipantId::parse("bot1").unwrap());
         let trimmer = ReplyTrimmer::new(&speakers);
         assert_eq!(trimmer.clean("sure!\nBob: hi"), "sure!");
+    }
+
+    /// Regression guard for the #127 review finding: a non-self speaker's
+    /// impersonated line followed by more text must be cut entirely, not
+    /// merely have its name stripped by the `line_markers` removal.
+    #[test]
+    fn reply_trimmer_clean_cuts_a_non_self_extra_turn_followed_by_text() {
+        let speakers = three_speaker_speakers(ParticipantId::CHAR);
+        let trimmer = ReplyTrimmer::new(&speakers);
+        assert_eq!(trimmer.clean("sure!\nAlice: hi"), "sure!");
     }
 
     #[test]
