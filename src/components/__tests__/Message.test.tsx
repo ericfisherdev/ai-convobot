@@ -240,6 +240,29 @@ describe('Message Component', () => {
     )
   })
 
+  it('does not render the regenerate control before config has finished loading', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.startsWith('/api/config')) {
+        // Never resolves, so `config` stays `null` for the life of the test
+        // — the same state `ConfigProvider` starts in before its fetch
+        // settles. A joiner instance must not be treated as `host` during
+        // this window just because `multiplayer_mode` isn't known yet.
+        return new Promise(() => {})
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}), text: () => Promise.resolve('') })
+    }))
+
+    render(
+      <MockProviders>
+        <Message received={true} regenerate={true} id={12} content="hi from bot1" created_at="2024-01-15 10:41" speakerId="bot1" />
+      </MockProviders>
+    )
+
+    await screen.findByText('hi from bot1')
+    expect(screen.queryByRole('button', { name: 'Regenerate message' })).not.toBeInTheDocument()
+  })
+
   it('never renders the regenerate control on a trailing system notice, even if the caller passes regenerate true', async () => {
     render(
       <MockProviders>
