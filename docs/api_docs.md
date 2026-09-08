@@ -512,11 +512,14 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 - **Response:**
   - Status: 200 OK
   - Content-Type: `text/event-stream`
-  - Body: a sequence of `data:` events, each carrying one JSON chunk. Three kinds of chunk travel over the stream:
-    - token chunks: `is_complete: false`, one token in `content`;
-    - the attitude chunk: `is_complete: false`, empty `content`, and an `attitude` object. Sent once after generation, only when the turn moved at least one attitude dimension. `attitude.attitude` is the companion's full post-turn `CompanionAttitude` toward the user, `attitude.summary` is its natural language rendering (with `{{companion}}` and `{{user}}` placeholders), and `attitude.deltas` lists `{ dimension, delta }` for the dimensions that moved;
-    - the final chunk: `is_complete: true`, carrying the sanitized reply in `content`, or an `error` string when generation failed.
-    `attitude` and `error` are omitted when absent, so token and final chunks keep the shape older clients expect.
+  - Body: a sequence of `data:` events, each carrying one JSON chunk, one per speaker action in the round. `event` says which of five kinds a chunk is; `speaker_id` is the speaker the chunk is about (empty on the attitude chunk and on `round_complete`/`error`, which are round-wide rather than per-speaker):
+    - `reply_started`: a speaker is about to generate. Empty `content`, `is_complete: false`.
+    - `token`: one token from `speaker_id`, appended to that speaker's `content` so far, `is_complete: false`. A `token`-event chunk with empty `content` and an `attitude` object instead is the attitude chunk: sent once after generation, only when the turn moved at least one attitude dimension. `attitude.attitude` is the companion's full post-turn `CompanionAttitude` toward the user, `attitude.summary` is its natural language rendering (with `{{companion}}` and `{{user}}` placeholders), and `attitude.deltas` lists `{ dimension, delta }` for the dimensions that moved.
+    - `reply_complete`: `speaker_id`'s finished, persisted reply. `content` is the sanitized text, `message_id` is the new row's id, `is_complete: false`. A speaker skipped because it did not respond arrives as a bare `reply_complete` for `speaker_id: "system"` (no preceding `reply_started`) carrying the persisted notice.
+    - `round_complete`: the round is over. Empty `content`, `is_complete: true`.
+    - `error`: the round failed. `error` carries the failure message, empty `content`, `is_complete: true`.
+
+    A full round is `reply_started`, zero or more `token`s, then `reply_complete`, repeated once per speaker (host companion first, then each joined bot in join order), followed by the optional attitude chunk and then `round_complete`. `is_complete` is `true` only on `round_complete` and `error`, so a client that only tracks that field still terminates correctly; a client that only appends non-final `content` renders `reply_complete`'s sanitised text after the raw tokens, so a client must switch on `event` to render each speaker's reply correctly. `message_id`, `error` and `attitude` are omitted when absent.
   - Status: 409 Conflict — a turn is already in flight; wait for it to finish before sending another message
   - Status: 409 Conflict — this instance is in `joiner` multiplayer mode; send messages from the host instead
 - **Example Request:**
@@ -531,17 +534,21 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   ```
 - **Example Response:**
   ```
-  data: {"request_id":"abc123","content":"It","is_complete":false,"token_count":1}
+  data: {"request_id":"abc123","event":"reply_started","content":"","is_complete":false,"speaker_id":"char"}
 
-  data: {"request_id":"abc123","content":"'s","is_complete":false,"token_count":2}
+  data: {"request_id":"abc123","event":"token","content":"It","is_complete":false,"token_count":1,"speaker_id":"char"}
 
-  data: {"request_id":"abc123","content":"","is_complete":false,"token_count":41,"attitude":{"attitude":{"companion_id":1,"target_id":1,"target_type":"user","trust":7.0,"...":0.0},"summary":"{{companion}} trusts {{user}}","deltas":[{"dimension":"trust","delta":3.0}]}}
+  data: {"request_id":"abc123","event":"token","content":"'s","is_complete":false,"token_count":2,"speaker_id":"char"}
 
-  data: {"request_id":"abc123","content":"It's 10:04.","is_complete":true,"token_count":41}
+  data: {"request_id":"abc123","event":"reply_complete","content":"It's 10:04.","is_complete":false,"token_count":2,"speaker_id":"char","message_id":42}
+
+  data: {"request_id":"abc123","event":"token","content":"","is_complete":false,"token_count":2,"speaker_id":"","attitude":{"attitude":{"companion_id":1,"target_id":1,"target_type":"user","trust":7.0,"...":0.0},"summary":"{{companion}} trusts {{user}}","deltas":[{"dimension":"trust","delta":3.0}]}}
+
+  data: {"request_id":"abc123","event":"round_complete","content":"","is_complete":true,"token_count":2,"speaker_id":""}
   ```
 - **Notes:**
   - A turn is claimed for the whole request, from the moment the user message is persisted until the reply (and its attitude update) is persisted. A second `/prompt`, `/prompt/stream`, or `/prompt/regenerate` call that arrives while a turn is in flight gets 409 immediately rather than queuing, so a burst of sends cannot interleave one turn's user message into another's.
-  - If the client disconnects mid-stream, generation still runs to completion so the reply is persisted.
+  - If the client disconnects mid-stream, generation still runs to completion so every speaker's reply is persisted.
 
 ### Inspect the assembled prompt
 

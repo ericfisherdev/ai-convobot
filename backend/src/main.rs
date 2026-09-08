@@ -949,7 +949,11 @@ mod turn_error_tests {
 mod stream_turn_tests {
     use super::*;
     use crate::chat_turn::RecordingStore;
+    use crate::inference_optimizer::StreamEvent;
+    use crate::multiplayer::round::{RemoteFailure, RemoteRequest};
+    use crate::participants::{Participant, ParticipantKind};
     use crate::turn_slot::TurnSlot;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc::error::TryRecvError;
@@ -961,6 +965,91 @@ mod stream_turn_tests {
     fn no_followups() -> RoutingPolicy {
         RoutingPolicy {
             max_followup_depth: 0,
+        }
+    }
+
+    fn bot(id: &str) -> ParticipantId {
+        ParticipantId::parse(id).unwrap()
+    }
+
+    /// `Alice`/`Bob` (user/char) plus one joined bot, for the multi-speaker
+    /// tests below.
+    fn registry_with_bot1() -> ParticipantRegistry {
+        let mut registry = ParticipantRegistry::solo("Alice", "Bob", None);
+        registry
+            .insert(Participant {
+                id: bot("bot1"),
+                display_name: "Ada".to_string(),
+                kind: ParticipantKind::RemoteBot,
+                avatar: None,
+            })
+            .unwrap();
+        registry
+    }
+
+    /// A [`RemoteGenerator`] scripted with one outcome per speaker; any
+    /// speaker with no entry reports offline, mirroring `NoRemotes`.
+    struct ScriptedRemote {
+        outcomes: HashMap<ParticipantId, Result<String, RemoteFailure>>,
+    }
+
+    impl ScriptedRemote {
+        fn new(outcomes: Vec<(ParticipantId, Result<&str, RemoteFailure>)>) -> Self {
+            Self {
+                outcomes: outcomes
+                    .into_iter()
+                    .map(|(id, result)| (id, result.map(|text| text.to_string())))
+                    .collect(),
+            }
+        }
+    }
+
+    impl RemoteGenerator for ScriptedRemote {
+        fn generate(
+            &self,
+            request: RemoteRequest<'_>,
+            _on_token: &mut dyn FnMut(&str),
+        ) -> Result<String, RemoteFailure> {
+            match self.outcomes.get(request.speaker) {
+                Some(outcome) => outcome.clone(),
+                None => Err(RemoteFailure::Offline),
+            }
+        }
+    }
+
+    /// A [`RecordingStore`] whose `finish_turn` returns a fixed attitude
+    /// pair instead of `None`, so a test can exercise the attitude chunk
+    /// without a real scorer.
+    struct AttitudeReturningStore {
+        inner: RecordingStore,
+        attitude: (CompanionAttitude, CompanionAttitude),
+    }
+
+    impl TurnStore for AttitudeReturningStore {
+        fn preprocess(&self, user_message: &str, companion_id: i32) -> Option<String> {
+            self.inner.preprocess(user_message, companion_id)
+        }
+
+        fn insert_user_turn(&self, content: &str) -> rusqlite::Result<()> {
+            self.inner.insert_user_turn(content)
+        }
+
+        fn insert_reply(&self, speaker_id: &ParticipantId, content: &str) -> rusqlite::Result<i32> {
+            self.inner.insert_reply(speaker_id, content)
+        }
+
+        fn transcript_tail(&self, limit: usize) -> rusqlite::Result<Vec<Message>> {
+            self.inner.transcript_tail(limit)
+        }
+
+        fn finish_turn(
+            &self,
+            _companion_id: i32,
+            _user_id: i32,
+            _user_message: &str,
+            _companion_reply: &str,
+        ) -> Option<(CompanionAttitude, CompanionAttitude)> {
+            Some(self.attitude.clone())
         }
     }
 
@@ -1003,9 +1092,13 @@ mod stream_turn_tests {
         assert_eq!(store.inserted.lock().unwrap().len(), 1);
         assert!(store.finished.lock().unwrap().is_empty());
 
+        let started = rx.try_recv().expect("reply_started chunk");
+        assert_eq!(started.event, StreamEvent::ReplyStarted);
+
         let chunk = rx
             .try_recv()
             .expect("a failed generation should still send a terminal chunk");
+        assert_eq!(chunk.event, StreamEvent::Error);
         assert!(chunk.is_complete);
         assert!(chunk.error.is_some());
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Disconnected)));
@@ -1056,7 +1149,14 @@ mod stream_turn_tests {
         });
         handle.join().expect("worker thread should not panic");
 
+        let started = rx.try_recv().expect("reply_started chunk");
+        assert_eq!(started.event, StreamEvent::ReplyStarted);
+        assert_eq!(started.speaker_id, "char");
+        assert_eq!(started.content, "");
+        assert!(!started.is_complete);
+
         let first = rx.try_recv().expect("first token chunk");
+        assert_eq!(first.event, StreamEvent::Token);
         assert_eq!(first.content, "Hel");
         assert_eq!(first.token_count, Some(1));
         assert!(!first.is_complete);
@@ -1066,12 +1166,19 @@ mod stream_turn_tests {
         assert_eq!(second.token_count, Some(2));
         assert!(!second.is_complete);
 
+        let reply_complete = rx.try_recv().expect("reply_complete chunk");
+        assert_eq!(reply_complete.event, StreamEvent::ReplyComplete);
+        assert_eq!(reply_complete.content, "Hello");
+        assert!(reply_complete.message_id.is_some());
+        assert!(!reply_complete.is_complete);
+
         // No attitude chunk: `RecordingStore::finish_turn` always returns
-        // `None`, so `stream_round` has nothing to report before the reply
+        // `None`, so `stream_round` has nothing to report before the round
         // settles.
         let final_chunk = rx.try_recv().expect("final chunk");
+        assert_eq!(final_chunk.event, StreamEvent::RoundComplete);
         assert!(final_chunk.is_complete);
-        assert_eq!(final_chunk.content, "Hello");
+        assert_eq!(final_chunk.content, "");
         assert!(final_chunk.attitude.is_none());
 
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Disconnected)));
@@ -1080,6 +1187,205 @@ mod stream_turn_tests {
             *store.finished.lock().unwrap(),
             vec![("hello".to_string(), "Hello".to_string())]
         );
+    }
+
+    #[test]
+    fn a_two_speaker_round_streams_a_reply_started_reply_complete_pair_per_speaker() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = Arc::new(RecordingStore::new(None));
+        let registry = registry_with_bot1();
+        let pending = PendingTurn::begin(
+            &guard,
+            store.as_ref(),
+            1,
+            1,
+            "hello".to_string(),
+            registry.clone(),
+        )
+        .expect("insert should succeed");
+
+        let plan = RoundPlan::from_speakers([ParticipantId::CHAR, bot("bot1")]);
+        let remotes = ScriptedRemote::new(vec![(bot("bot1"), Ok("hi from bot1"))]);
+
+        let session_id = format!("test-{}", Uuid::new_v4());
+        let (stream, mut rx) = INFERENCE_OPTIMIZER.start_streaming_session(session_id);
+
+        let thread_store = store.clone();
+        let handle = std::thread::spawn(move || {
+            stream_round(
+                guard,
+                pending,
+                stream,
+                thread_store.as_ref(),
+                plan,
+                &registry,
+                &no_followups(),
+                |_prompt, _on_token| Ok("hi from char".to_string()),
+                &remotes,
+                Duration::from_secs(30),
+            );
+        });
+        handle.join().expect("worker thread should not panic");
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+
+        let tagged: Vec<(StreamEvent, String, String)> = chunks
+            .iter()
+            .map(|c| (c.event, c.speaker_id.clone(), c.content.clone()))
+            .collect();
+        assert_eq!(
+            tagged,
+            vec![
+                (
+                    StreamEvent::ReplyStarted,
+                    "char".to_string(),
+                    "".to_string()
+                ),
+                (
+                    StreamEvent::ReplyComplete,
+                    "char".to_string(),
+                    "hi from char".to_string()
+                ),
+                (
+                    StreamEvent::ReplyStarted,
+                    "bot1".to_string(),
+                    "".to_string()
+                ),
+                (
+                    StreamEvent::ReplyComplete,
+                    "bot1".to_string(),
+                    "hi from bot1".to_string()
+                ),
+                (StreamEvent::RoundComplete, "".to_string(), "".to_string()),
+            ]
+        );
+        assert!(chunks[1].message_id.is_some());
+        assert!(chunks[3].message_id.is_some());
+    }
+
+    #[test]
+    fn a_skipped_speaker_sends_a_system_reply_complete_carrying_the_notice_id() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = Arc::new(RecordingStore::new(None));
+        let registry = registry_with_bot1();
+        let pending = PendingTurn::begin(
+            &guard,
+            store.as_ref(),
+            1,
+            1,
+            "hello".to_string(),
+            registry.clone(),
+        )
+        .expect("insert should succeed");
+
+        let plan = RoundPlan::from_speakers([ParticipantId::CHAR, bot("bot1")]);
+        // bot1 has no scripted outcome, so `ScriptedRemote` reports it offline.
+        let remotes = ScriptedRemote::new(vec![]);
+
+        let session_id = format!("test-{}", Uuid::new_v4());
+        let (stream, mut rx) = INFERENCE_OPTIMIZER.start_streaming_session(session_id);
+
+        let thread_store = store.clone();
+        let handle = std::thread::spawn(move || {
+            stream_round(
+                guard,
+                pending,
+                stream,
+                thread_store.as_ref(),
+                plan,
+                &registry,
+                &no_followups(),
+                |_prompt, _on_token| Ok("hi from char".to_string()),
+                &remotes,
+                Duration::from_secs(30),
+            );
+        });
+        handle.join().expect("worker thread should not panic");
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+
+        let notice_chunk = chunks
+            .iter()
+            .find(|c| c.event == StreamEvent::ReplyComplete && c.speaker_id == "system")
+            .expect("a skipped speaker should send a system reply_complete chunk");
+        assert_eq!(notice_chunk.content, "bot1 did not respond");
+        assert!(notice_chunk.message_id.is_some());
+
+        // No `reply_started` for `system`: the notice arrives as a bare
+        // `reply_complete`, so the client opens its bubble there instead.
+        assert!(!chunks
+            .iter()
+            .any(|c| c.event == StreamEvent::ReplyStarted && c.speaker_id == "system"));
+    }
+
+    #[test]
+    fn the_attitude_chunk_arrives_after_the_last_reply_complete_and_before_round_complete() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let previous = crate::simple_tests::tests::attitude_fixture();
+        let mut current = previous.clone();
+        current.trust += 3.0;
+        let store = Arc::new(AttitudeReturningStore {
+            inner: RecordingStore::new(None),
+            attitude: (previous, current),
+        });
+        let registry = ParticipantRegistry::solo("Alice", "Bob", None);
+        let pending = PendingTurn::begin(
+            &guard,
+            store.as_ref(),
+            1,
+            1,
+            "hello".to_string(),
+            registry.clone(),
+        )
+        .expect("insert should succeed");
+
+        let session_id = format!("test-{}", Uuid::new_v4());
+        let (stream, mut rx) = INFERENCE_OPTIMIZER.start_streaming_session(session_id);
+
+        let thread_store = store.clone();
+        let handle = std::thread::spawn(move || {
+            stream_round(
+                guard,
+                pending,
+                stream,
+                thread_store.as_ref(),
+                solo_plan(),
+                &registry,
+                &no_followups(),
+                |_prompt, _on_token| Ok("hi".to_string()),
+                &NoRemotes,
+                Duration::from_secs(30),
+            );
+        });
+        handle.join().expect("worker thread should not panic");
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+
+        let events: Vec<StreamEvent> = chunks.iter().map(|c| c.event).collect();
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ReplyStarted,
+                StreamEvent::ReplyComplete,
+                StreamEvent::Token, // the attitude chunk
+                StreamEvent::RoundComplete,
+            ]
+        );
+        let attitude_chunk = &chunks[2];
+        assert!(attitude_chunk.attitude.is_some());
+        assert_eq!(attitude_chunk.content, "");
     }
 
     #[test]
@@ -1902,13 +2208,14 @@ async fn estimate_response_time_endpoint(req: web::Json<EstimateRequest>) -> Htt
 
 /// The [`RoundSink`] that drives `/api/prompt/stream`'s SSE session.
 ///
-/// Keeps today's chunk shape: `token` forwards only the host companion's
-/// tokens (other speakers' tokens are dropped; their persisted replies reach
-/// the UI through the `refreshMessages` call the frontend already makes
-/// after the final chunk); `round_complete` sends the attitude chunk when
-/// there is one, then the final `is_complete: true` chunk carrying the host
-/// bot's reply text. #133 extends this with speaker-tagged chunks; nothing
-/// else in the SSE path should need to move.
+/// Speaker-tagged (#133): `reply_started`/`token`/`reply_complete` all
+/// forward, for every speaker, not only the host companion — a round with a
+/// joiner streams every bubble live instead of relying on the
+/// `refreshMessages` call the frontend makes after `round_complete` to fill
+/// in the other speakers' replies. `round_complete` sends the attitude
+/// chunk when there is one, then the terminal `round_complete` chunk with
+/// empty `content` (the per-speaker text already went out on each
+/// `reply_complete`).
 ///
 /// `stream` is `Option` so `round_complete` (which only gets `&mut self`)
 /// can take it and call [`StreamSession::finish`], which needs to consume
@@ -1918,7 +2225,6 @@ struct SseRoundSink {
     stream: Option<StreamSession>,
     request_id: String,
     token_count: usize,
-    host_reply_text: Option<String>,
 }
 
 impl SseRoundSink {
@@ -1928,7 +2234,6 @@ impl SseRoundSink {
             stream: Some(stream),
             request_id,
             token_count: 0,
-            host_reply_text: None,
         }
     }
 
@@ -1937,47 +2242,59 @@ impl SseRoundSink {
     /// `round_complete` ran, so `self.stream` is still held.
     fn finish_with_error(mut self, error_message: String) {
         if let Some(stream) = self.stream.take() {
-            stream.finish(StreamChunk {
-                request_id: self.request_id,
-                content: String::new(),
-                is_complete: true,
-                token_count: Some(self.token_count),
-                error: Some(error_message),
-                attitude: None,
-            });
+            stream.finish(StreamChunk::error(
+                self.request_id,
+                error_message,
+                Some(self.token_count),
+            ));
+        }
+    }
+
+    /// `reply_complete`'s shared body: a skipped speaker's notice
+    /// (`speaker_skipped`) reaches the client the same way, just with a
+    /// `system` speaker id and no preceding `reply_started`.
+    fn send_reply_complete(&mut self, speaker: &ParticipantId, reply: &PersistedReply) {
+        if let Some(stream) = &self.stream {
+            let _ = stream.send(StreamChunk::reply_complete(
+                self.request_id.clone(),
+                speaker,
+                &reply.text,
+                reply.message_id,
+                self.token_count,
+            ));
         }
     }
 }
 
 impl RoundSink for SseRoundSink {
-    fn reply_started(&mut self, _speaker: &ParticipantId) {}
+    fn reply_started(&mut self, speaker: &ParticipantId) {
+        if let Some(stream) = &self.stream {
+            let _ = stream.send(StreamChunk::reply_started(self.request_id.clone(), speaker));
+        }
+    }
 
     fn token(&mut self, speaker: &ParticipantId, text: &str) {
-        if *speaker != ParticipantId::CHAR {
-            return;
-        }
         self.token_count += 1;
         if let Some(stream) = &self.stream {
             // A send failure means the client hung up; generation still runs
             // to completion so the reply is persisted.
-            let _ = stream.send(StreamChunk {
-                request_id: self.request_id.clone(),
-                content: text.to_string(),
-                is_complete: false,
-                token_count: Some(self.token_count),
-                error: None,
-                attitude: None,
-            });
+            let _ = stream.send(StreamChunk::token(
+                self.request_id.clone(),
+                speaker,
+                text,
+                self.token_count,
+            ));
         }
     }
 
     fn reply_complete(&mut self, reply: &PersistedReply) {
-        if reply.speaker_id == ParticipantId::CHAR {
-            self.host_reply_text = Some(reply.text.clone());
-        }
+        let speaker = reply.speaker_id.clone();
+        self.send_reply_complete(&speaker, reply);
     }
 
-    fn speaker_skipped(&mut self, _speaker: &ParticipantId, _notice: &PersistedReply) {}
+    fn speaker_skipped(&mut self, _speaker: &ParticipantId, notice: &PersistedReply) {
+        self.send_reply_complete(&ParticipantId::SYSTEM, notice);
+    }
 
     fn round_complete(&mut self, attitude: Option<&(CompanionAttitude, CompanionAttitude)>) {
         let Some(stream) = self.stream.take() else {
@@ -1989,24 +2306,17 @@ impl RoundSink for SseRoundSink {
             if let Some(update) = attitude_stream_update(previous, current) {
                 // Sent ahead of the final chunk so the client has the new
                 // attitude before it settles the reply bubble.
-                let _ = stream.send(StreamChunk {
-                    request_id: self.request_id.clone(),
-                    content: String::new(),
-                    is_complete: false,
-                    token_count: Some(self.token_count),
-                    error: None,
-                    attitude: Some(update),
-                });
+                let _ = stream.send(StreamChunk::attitude(
+                    self.request_id.clone(),
+                    update,
+                    self.token_count,
+                ));
             }
         }
-        stream.finish(StreamChunk {
-            request_id: self.request_id.clone(),
-            content: self.host_reply_text.clone().unwrap_or_default(),
-            is_complete: true,
-            token_count: Some(self.token_count),
-            error: None,
-            attitude: None,
-        });
+        stream.finish(StreamChunk::round_complete(
+            self.request_id.clone(),
+            Some(self.token_count),
+        ));
     }
 }
 

@@ -26,14 +26,20 @@ import { cn } from "../lib/utils";
 import { AttitudeSummaryBar } from "./attitude/AttitudeSummaryBar";
 import { useAttitude } from "./context/attitudeContext";
 import { useSession } from "./context/sessionContext";
-import { StreamChunk } from "./interfaces/Message";
+import {
+    initialRoundStreamState,
+    parseStreamChunk,
+    reduceStreamChunk,
+    splitSseRecords,
+    StreamEffect,
+} from "../lib/roundStream";
 
 const ChatWindow = () => {
   const companionDataContext = useCompanionData();
   const companionData: CompanionData = companionDataContext?.companionData ?? {} as CompanionData;
   const { isMobile, isStandalone } = useMobile();
 
-  const { refreshMessages, pushMessage, updateMessage } = useMessages();
+  const { refreshMessages, pushMessage, updateMessage, settleMessage } = useMessages();
   const { applyAttitudeStreamUpdate } = useAttitude();
   const { session } = useSession();
 
@@ -69,11 +75,6 @@ const ChatWindow = () => {
       return;
     }
     const sentMessage = userMessage;
-    // Negative ids mark optimistic messages that refreshMessages later replaces
-    // with the persisted rows. Each send needs its own id, because
-    // updateMessage matches by id and a shared one would let two in-flight
-    // streams write into each other's bubble.
-    const streamingMessageId = -Date.now();
     setIsSending(true);
     try {
       setUserMessage('');
@@ -82,13 +83,6 @@ const ChatWindow = () => {
         ai: false,
         speaker_id: 'user',
         content: sentMessage,
-        created_at: new Date().toISOString(),
-      });
-      pushMessage({
-        id: streamingMessageId,
-        ai: true,
-        speaker_id: 'char',
-        content: `${companionData.name} is typing...`,
         created_at: new Date().toISOString(),
       });
 
@@ -110,9 +104,51 @@ const ChatWindow = () => {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
-      let streamed = '';
-      let streamError: string | null = null;
-      let attitudeStreamed = false;
+      let streamState = initialRoundStreamState();
+      let streamErrorMessage: string | null = null;
+
+      // Negative ids mark optimistic messages that refreshMessages later
+      // replaces with the persisted rows. Decremented per bubble, so three
+      // speakers in one round get three distinct ids.
+      const tempIdBase = -Date.now();
+      let tempIdOffset = 0;
+      const nextTempId = () => tempIdBase - tempIdOffset++;
+
+      const applyStreamEffects = (effects: StreamEffect[]) => {
+        for (const effect of effects) {
+          switch (effect.type) {
+            case 'open_bubble': {
+              const displayName =
+                effect.speakerId === 'char' ? companionData.name : effect.speakerId;
+              pushMessage({
+                id: effect.tempId,
+                ai: effect.speakerId !== 'user',
+                speaker_id: effect.speakerId,
+                content: `${displayName} is typing...`,
+                created_at: new Date().toISOString(),
+              });
+              break;
+            }
+            case 'set_content':
+              updateMessage(effect.tempId, effect.content);
+              break;
+            case 'settle_bubble':
+              settleMessage(effect.tempId, {
+                id: effect.messageId ?? effect.tempId,
+                content: effect.content,
+              });
+              break;
+            case 'apply_attitude':
+              applyAttitudeStreamUpdate(effect.update);
+              break;
+            case 'round_complete':
+              break;
+            case 'error':
+              streamErrorMessage = effect.message;
+              break;
+          }
+        }
+      };
 
       // Server-Sent Events arrive as "data: {json}\n\n" records, and a single
       // read can contain a partial record, so hold the remainder in a buffer.
@@ -121,53 +157,33 @@ const ChatWindow = () => {
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-        const records = buffer.split('\n\n');
-        buffer = records.pop() ?? '';
+        const { records, rest } = splitSseRecords(buffer);
+        buffer = rest;
 
         for (const record of records) {
-          const line = record.split('\n').find(part => part.startsWith('data: '));
-          if (!line) continue;
-          let chunk: StreamChunk;
-          try {
-            chunk = JSON.parse(line.slice('data: '.length));
-          } catch (parseError) {
-            // A single malformed record should not abandon the whole stream.
-            console.error('Failed to parse stream chunk:', parseError);
-            continue;
-          }
+          const chunk = parseStreamChunk(record);
+          if (!chunk) continue;
 
-          if (chunk.attitude) {
-            applyAttitudeStreamUpdate(chunk.attitude);
-            attitudeStreamed = true;
-            continue;
-          }
-
-          if (chunk.is_complete) {
-            if (chunk.error) {
-              streamError = chunk.error;
-            } else if (chunk.content) {
-              // The final chunk carries the sanitized reply, which drops the
-              // stop markers the raw token stream still contains.
-              streamed = chunk.content;
-              updateMessage(streamingMessageId, streamed);
-            }
-            continue;
-          }
-
-          streamed += chunk.content;
-          updateMessage(streamingMessageId, streamed);
+          const { state: nextState, effects } = reduceStreamChunk(streamState, chunk, nextTempId);
+          streamState = nextState;
+          applyStreamEffects(effects);
         }
       }
 
-      if (streamError) {
-        throw new Error(streamError);
+      if (streamErrorMessage) {
+        throw new Error(streamErrorMessage);
+      }
+      if (!streamState.roundComplete) {
+        // The stream closed without a terminal chunk -- the client must
+        // still re-enable input rather than stay disabled silently.
+        throw new Error('round ended without completing');
       }
 
       refreshMessages();
 
       // The stream already delivered the new attitude; only fall back to a
       // refetch when it did not.
-      if (!attitudeStreamed) {
+      if (!streamState.attitudeStreamed) {
         window.dispatchEvent(new CustomEvent('attitude-update'));
       }
 

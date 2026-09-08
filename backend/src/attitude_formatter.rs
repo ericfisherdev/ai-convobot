@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::attitude_engine::AttitudeDimension;
 use crate::database::{
@@ -10,7 +10,7 @@ use crate::database::{
 /// `dimension` is the `companion_attitudes` column name, which is also the key
 /// the frontend's `ATTITUDE_DIMENSIONS` table uses, so this struct doubles as
 /// the wire format for the SSE attitude chunk.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttitudeDelta {
     pub dimension: String,
     pub delta: f32,

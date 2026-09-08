@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import ChatWindow from '../ChatWindow'
-import { MessagesProvider } from '../context/messageContext'
+import { MessagesProvider, useMessages } from '../context/messageContext'
 import { UserDataProvider } from '../context/userContext'
 import { CompanionDataProvider } from '../context/companionContext'
 import { ConfigProvider } from '../context/configContext'
@@ -78,6 +78,21 @@ const streamResponse = (chunks: unknown[]) => {
       },
     }),
   }
+}
+
+// Renders every message's speaker and content, so a test can assert on the
+// list `MessagesProvider` built without the real (mocked) `MessageScroll`.
+const MessageSpy: React.FC = () => {
+  const { messages } = useMessages()
+  return (
+    <div data-testid="message-spy">
+      {messages.map(message => (
+        <span key={message.id} data-testid={`message-${message.speaker_id}`}>
+          {message.content}
+        </span>
+      ))}
+    </div>
+  )
 }
 
 // Mock the contexts with minimal implementations
@@ -165,19 +180,23 @@ describe('ChatWindow Component', () => {
   it('applies the stream attitude chunk without refetching the summary', async () => {
     const user = userEvent.setup()
     const streamChunks = [
-      { request_id: 'r1', content: 'hi', is_complete: false, token_count: 1 },
+      { request_id: 'r1', event: 'reply_started', content: '', is_complete: false, speaker_id: 'char' },
+      { request_id: 'r1', event: 'token', content: 'hi', is_complete: false, token_count: 1, speaker_id: 'char' },
       {
         request_id: 'r1',
+        event: 'token',
         content: '',
         is_complete: false,
         token_count: 1,
+        speaker_id: '',
         attitude: {
           attitude: { ...attitude, trust: 7 },
           summary: 'warmer',
           deltas: [{ dimension: 'trust', delta: 3 }],
         },
       },
-      { request_id: 'r1', content: 'hi', is_complete: true, token_count: 1 },
+      { request_id: 'r1', event: 'reply_complete', content: 'hi', is_complete: false, speaker_id: 'char', message_id: 2 },
+      { request_id: 'r1', event: 'round_complete', content: '', is_complete: true, speaker_id: '' },
     ]
 
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
@@ -239,9 +258,14 @@ describe('ChatWindow Component', () => {
           body: new ReadableStream<Uint8Array>({
             async start(controller) {
               await streamGate
-              controller.enqueue(
-                encoder.encode(`data: ${JSON.stringify({ request_id: 'r1', content: 'hi', is_complete: true, token_count: 1 })}\n\n`)
-              )
+              const chunks = [
+                { request_id: 'r1', event: 'reply_started', content: '', is_complete: false, speaker_id: 'char' },
+                { request_id: 'r1', event: 'reply_complete', content: 'hi', is_complete: false, speaker_id: 'char', message_id: 2 },
+                { request_id: 'r1', event: 'round_complete', content: '', is_complete: true, speaker_id: '' },
+              ]
+              for (const chunk of chunks) {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+              }
               controller.close()
             },
           }),
@@ -295,6 +319,115 @@ describe('ChatWindow Component', () => {
     })
     await user.type(textarea, 'again')
     expect(sendButton).not.toBeDisabled()
+  })
+
+  it('streams speaker-tagged bubbles for a two-speaker round and gates re-enabling on round_complete', async () => {
+    const user = userEvent.setup()
+    let releaseRoundComplete: (() => void) | undefined
+    const roundCompleteGate = new Promise<void>(resolve => { releaseRoundComplete = resolve })
+
+    const repliesChunks = [
+      { request_id: 'r1', event: 'reply_started', content: '', is_complete: false, speaker_id: 'char' },
+      { request_id: 'r1', event: 'reply_complete', content: 'hi from char', is_complete: false, speaker_id: 'char', message_id: 10 },
+      { request_id: 'r1', event: 'reply_started', content: '', is_complete: false, speaker_id: 'bot1' },
+      { request_id: 'r1', event: 'reply_complete', content: 'hi from bot1', is_complete: false, speaker_id: 'bot1', message_id: 11 },
+    ]
+    const roundCompleteChunk = { request_id: 'r1', event: 'round_complete', content: '', is_complete: true, speaker_id: '' }
+
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.startsWith('/api/prompt/stream')) {
+        const encoder = new TextEncoder()
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          body: new ReadableStream<Uint8Array>({
+            async start(controller) {
+              for (const chunk of repliesChunks) {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+              }
+              await roundCompleteGate
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(roundCompleteChunk)}\n\n`))
+              controller.close()
+            },
+          }),
+        })
+      }
+      if (url.startsWith('/api/session')) {
+        return Promise.resolve(jsonResponse(session))
+      }
+      if (url.startsWith('/api/attitude/summary/')) {
+        return Promise.resolve(jsonResponse({ attitude, summary: 'neutral' }))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+    global.fetch = fetchMock as unknown as typeof fetch
+
+    render(
+      <MockProviders>
+        <ChatWindow />
+        <MessageSpy />
+      </MockProviders>
+    )
+
+    const textarea = screen.getByRole('textbox')
+    await user.type(textarea, 'hello')
+    await user.click(screen.getByRole('button', { name: /^send message$/i }))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('message-char')).toHaveTextContent('hi from char')
+      expect(screen.getByTestId('message-bot1')).toHaveTextContent('hi from bot1')
+    })
+
+    // round_complete has not arrived yet, so input is still gated.
+    expect(textarea).toBeDisabled()
+
+    releaseRoundComplete?.()
+
+    await waitFor(() => {
+      expect(textarea).not.toBeDisabled()
+    })
+  })
+
+  it('surfaces a mid-round error as a toast and re-enables input', async () => {
+    const user = userEvent.setup()
+    const streamChunks = [
+      { request_id: 'r1', event: 'reply_started', content: '', is_complete: false, speaker_id: 'char' },
+      { request_id: 'r1', event: 'reply_complete', content: 'hi', is_complete: false, speaker_id: 'char', message_id: 1 },
+      { request_id: 'r1', event: 'reply_started', content: '', is_complete: false, speaker_id: 'bot1' },
+      { request_id: 'r1', event: 'error', content: '', is_complete: true, speaker_id: '', error: 'bot1 timed out' },
+    ]
+
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.startsWith('/api/prompt/stream')) {
+        return Promise.resolve(streamResponse(streamChunks))
+      }
+      if (url.startsWith('/api/session')) {
+        return Promise.resolve(jsonResponse(session))
+      }
+      if (url.startsWith('/api/attitude/summary/')) {
+        return Promise.resolve(jsonResponse({ attitude, summary: 'neutral' }))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+    global.fetch = fetchMock as unknown as typeof fetch
+
+    render(
+      <MockProviders>
+        <ChatWindow />
+      </MockProviders>
+    )
+
+    const textarea = screen.getByRole('textbox')
+    await user.type(textarea, 'hello')
+    await user.click(screen.getByRole('button', { name: /^send message$/i }))
+
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith(expect.stringContaining('bot1 timed out'))
+    })
+    await user.type(textarea, 'again')
+    expect(screen.getByRole('button', { name: /^send message$/i })).not.toBeDisabled()
   })
 
   it('surfaces a 409 as a still-replying toast', async () => {
