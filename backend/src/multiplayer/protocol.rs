@@ -15,12 +15,11 @@
 //! targets one bot with `GenerateRequest`, and `RemoteBots::route_inbound`
 //! delivers a `ReplyFailed` back to the round that requested it.
 //!
-//! Reserved, not sent or received by this issue (listed so a future issue's
-//! variant addition is the only change needed, and so clippy's dead-code
-//! lint has nothing to fire on until then):
-//! - `ClientFrame::Token { round_id: u64, text: String }`,
-//!   `ClientFrame::ReplyComplete { round_id: u64, text: String }`: #153's
-//!   real joiner generation, streaming a reply back token by token.
+//! `ClientFrame::Token` and `ClientFrame::ReplyComplete` are added by #153:
+//! the joiner's own `LocalModelGeneration` (`multiplayer::remote_generation`)
+//! constructs and sends both, streaming a reply back token by token then the
+//! final text. `RemoteBots::route_inbound` reading them on the host side is
+//! #154's job.
 
 use serde::{Deserialize, Serialize};
 
@@ -58,21 +57,30 @@ pub enum ClientFrame {
         proof: String,
     },
     /// Sent by the joiner instead of a generated reply when it cannot
-    /// answer a [`ServerFrame::GenerateRequest`] — #130 ships only
-    /// `UnimplementedGeneration`, which sends this immediately for every
-    /// round; #153 sends it for a real generation failure instead.
+    /// answer a [`ServerFrame::GenerateRequest`]: a local turn already in
+    /// progress, a failed generation thread spawn, or the generator itself
+    /// erroring (`LocalModelGeneration`, #153).
     ReplyFailed { round_id: u64, reason: String },
+    /// One token of a reply as it is generated, sent by
+    /// `LocalModelGeneration` (#153) for every token `llm::prompt_streaming`
+    /// produces.
+    Token { round_id: u64, text: String },
+    /// The reply's full, cleaned text once generation finishes, sent by
+    /// `LocalModelGeneration` (#153) after the last `Token`.
+    ReplyComplete { round_id: u64, text: String },
 }
 
 impl ClientFrame {
     /// The round id this frame belongs to, or `None` if it is not
-    /// round-scoped. `Join` is never round-scoped; #153 adds the `Token`/
-    /// `ReplyComplete` arms when it adds those variants. This is the one
-    /// accessor `RemoteBots::route_inbound` keys on.
+    /// round-scoped. `Join` is the only variant that is not: every other
+    /// variant answers one `GenerateRequest`. This is the one accessor
+    /// `RemoteBots::route_inbound` keys on.
     pub fn round_id(&self) -> Option<u64> {
         match self {
             ClientFrame::Join { .. } => None,
             ClientFrame::ReplyFailed { round_id, .. } => Some(*round_id),
+            ClientFrame::Token { round_id, .. } => Some(*round_id),
+            ClientFrame::ReplyComplete { round_id, .. } => Some(*round_id),
         }
     }
 }
@@ -338,5 +346,29 @@ mod tests {
         };
         let json = serde_json::to_string(&frame).unwrap();
         assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
+    }
+
+    #[test]
+    fn token_round_trips_and_carries_its_round_id() {
+        let frame = ClientFrame::Token {
+            round_id: 9,
+            text: "hel".to_string(),
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        let back: ClientFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, frame);
+        assert_eq!(frame.round_id(), Some(9));
+    }
+
+    #[test]
+    fn reply_complete_round_trips_and_carries_its_round_id() {
+        let frame = ClientFrame::ReplyComplete {
+            round_id: 9,
+            text: "hello there".to_string(),
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        let back: ClientFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, frame);
+        assert_eq!(frame.round_id(), Some(9));
     }
 }

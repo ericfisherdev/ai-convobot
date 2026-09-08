@@ -147,30 +147,18 @@ fn read_avatar_upload() -> Option<AvatarUpload> {
     })
 }
 
-/// The seam #153 plugs its real generation into. Part A ships only
-/// [`UnimplementedGeneration`].
+/// The seam a joiner's reply is generated through. The production
+/// implementation, [`LocalModelGeneration`] (`multiplayer::remote_generation`,
+/// #153), runs the joiner's own model on the transcript the host supplied.
 ///
 /// Never `.await`ed from the read loop in [`connect_and_serve`], so a
 /// heartbeat is still answered while generation runs; `tx` is how an
-/// implementation replies, whether synchronously (as
-/// [`UnimplementedGeneration`] does) or from a spawned thread.
+/// implementation replies, whether synchronously or (as
+/// [`LocalModelGeneration`] does) from a spawned thread.
+///
+/// [`LocalModelGeneration`]: crate::multiplayer::remote_generation::LocalModelGeneration
 pub trait GenerateRequestHandler: Send + Sync {
     fn handle(&self, round_id: u64, transcript: Vec<Message>, tx: UnboundedSender<ClientFrame>);
-}
-
-/// The only [`GenerateRequestHandler`] Part A ships: immediately reports
-/// that generation is not implemented, so a `GenerateRequest` is never left
-/// unanswered while this joiner only has Part A. #153 replaces this with a
-/// handler that actually runs the joiner's own model.
-pub struct UnimplementedGeneration;
-
-impl GenerateRequestHandler for UnimplementedGeneration {
-    fn handle(&self, round_id: u64, _transcript: Vec<Message>, tx: UnboundedSender<ClientFrame>) {
-        let _ = tx.send(ClientFrame::ReplyFailed {
-            round_id,
-            reason: "generation not implemented on this joiner".to_string(),
-        });
-    }
 }
 
 /// Everything that can end a connection attempt before or during
@@ -742,6 +730,27 @@ mod tests {
         server.abort();
     }
 
+    /// A fixed-reply [`GenerateRequestHandler`]: unlike [`NoopGeneration`],
+    /// it actually answers, so this module's own tests can pin the wire
+    /// shape of a `GenerateRequest`'s reply without depending on
+    /// `multiplayer::remote_generation::LocalModelGeneration` (#153), which
+    /// needs a companion database and a turn slot this module's fake host
+    /// does not set up.
+    struct FixedReplyGeneration;
+    impl GenerateRequestHandler for FixedReplyGeneration {
+        fn handle(
+            &self,
+            round_id: u64,
+            _transcript: Vec<Message>,
+            tx: UnboundedSender<ClientFrame>,
+        ) {
+            let _ = tx.send(ClientFrame::ReplyFailed {
+                round_id,
+                reason: "stub failure".to_string(),
+            });
+        }
+    }
+
     #[tokio::test]
     async fn generate_request_reaches_the_injected_handler() {
         let (host_address, listener) = spawn_fake_host().await;
@@ -785,14 +794,14 @@ mod tests {
                     reply,
                     ClientFrame::ReplyFailed {
                         round_id: 42,
-                        reason: "generation not implemented on this joiner".to_string(),
+                        reason: "stub failure".to_string(),
                     }
                 );
             }
         });
 
         let mut backoff = ReconnectBackoff::new();
-        let generation: Arc<dyn GenerateRequestHandler> = Arc::new(UnimplementedGeneration);
+        let generation: Arc<dyn GenerateRequestHandler> = Arc::new(FixedReplyGeneration);
         let _ = connect_and_serve(&handle, &identity, &generation, &mut backoff).await;
         server.await.unwrap();
     }

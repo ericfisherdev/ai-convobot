@@ -50,10 +50,9 @@ use crate::multiplayer::host::{
     require_host_mode, HostConfigSource, HostSettings, SqliteHostConfig,
 };
 use crate::multiplayer::join_throttle::JoinThrottle;
-use crate::multiplayer::joiner::{
-    JoinerHandle, JoinerIdentity, JoinerShared, UnimplementedGeneration,
-};
+use crate::multiplayer::joiner::{JoinerHandle, JoinerIdentity, JoinerShared};
 use crate::multiplayer::remote_bots::RemoteBots;
+use crate::multiplayer::remote_generation::LocalModelGeneration;
 use crate::multiplayer::round::{
     plan_round, run_round, NoRemotes, NoopSink, RemoteGenerator, RoundPlan, RoundSink,
 };
@@ -1397,11 +1396,11 @@ mod stream_turn_tests {
 }
 
 /// Gates `/api/prompt`, `/api/prompt/regenerate` and `/api/prompt/stream`
-/// on non-joiner mode: a joiner has no model of its own to answer with
-/// (that is #153's job), so it must never claim [`ACTIVE_TURN`] or insert a
-/// user turn `joiner::run`'s mirror does not own. `Some(response)` is a
-/// ready-to-return `409` the three call sites return as-is; `None` means
-/// "not a joiner, proceed".
+/// on non-joiner mode: a joiner only answers a `GenerateRequest` the host
+/// sends it, through `LocalModelGeneration` (`multiplayer::remote_generation`),
+/// so it must never claim [`ACTIVE_TURN`] or insert a user turn `joiner::run`'s
+/// mirror does not own. `Some(response)` is a ready-to-return `409` the
+/// three call sites return as-is; `None` means "not a joiner, proceed".
 fn reject_if_joiner(joiner: &Option<web::Data<JoinerHandle>>) -> Option<HttpResponse> {
     joiner.as_ref().map(|_| {
         HttpResponse::Conflict().body("this instance is a joiner; send messages from the host")
@@ -3036,10 +3035,23 @@ async fn main() -> std::io::Result<()> {
             let identity = JoinerIdentity::from_config(&multiplayer_config, &companion_data)
                 .map_err(std::io::Error::other)?;
             let handle: JoinerHandle = Arc::new(RwLock::new(JoinerShared::new(&identity)));
+            // Read before `identity` moves into `joiner::run` below:
+            // `LocalModelGeneration` needs its own id to know which speaker
+            // it is generating for.
+            let self_id = identity.id.clone();
+            let companion_id = Database::get_companion_id().map_err(|e| {
+                std::io::Error::other(format!(
+                    "cannot read companion id for joiner generation: {e}"
+                ))
+            })?;
             actix_web::rt::spawn(crate::multiplayer::joiner::run(
                 handle.clone(),
                 identity,
-                Arc::new(UnimplementedGeneration),
+                Arc::new(LocalModelGeneration::with_local_model(
+                    companion_id,
+                    self_id,
+                    handle.clone(),
+                )),
             ));
             Some(web::Data::new(handle))
         } else {
