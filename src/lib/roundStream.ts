@@ -31,7 +31,11 @@ export function parseStreamChunk(record: string): StreamChunk | null {
       content: parsed.content ?? '',
       is_complete: parsed.is_complete ?? false,
       token_count: parsed.token_count,
-      speaker_id: parsed.speaker_id || 'char',
+      // `??`, not `||`: an empty string is a legitimate `speaker_id` on a
+      // round-wide chunk (`round_complete`/`error`/the attitude chunk) and
+      // must not be coerced to `char`. Only a missing field (an older
+      // backend) falls back.
+      speaker_id: parsed.speaker_id ?? 'char',
       message_id: parsed.message_id,
       error: parsed.error,
       attitude: parsed.attitude,
@@ -66,7 +70,7 @@ export function initialRoundStreamState(): RoundStreamState {
 export type StreamEffect =
   | { type: 'open_bubble'; tempId: number; speakerId: string }
   | { type: 'set_content'; tempId: number; content: string }
-  | { type: 'settle_bubble'; tempId: number; messageId: number | null; content: string }
+  | { type: 'settle_bubble'; tempId: number; speakerId: string; messageId: number | null; content: string }
   | { type: 'apply_attitude'; update: AttitudeStreamUpdate }
   | { type: 'round_complete' }
   | { type: 'error'; message: string };
@@ -154,7 +158,13 @@ export function reduceStreamChunk(
           ? { ...b, speakerId: chunk.speaker_id, content: chunk.content, messageId }
           : b
       );
-      effects.push({ type: 'settle_bubble', tempId, messageId, content: chunk.content });
+      effects.push({
+        type: 'settle_bubble',
+        tempId,
+        speakerId: chunk.speaker_id,
+        messageId,
+        content: chunk.content,
+      });
       return { state: { ...state, bubbles }, effects };
     }
 

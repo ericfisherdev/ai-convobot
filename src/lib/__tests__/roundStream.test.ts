@@ -120,4 +120,12 @@ describe('roundStream', () => {
     expect(state.bubbles[0].content).toBe('Hello')
     expect(state.roundComplete).toBe(true)
   })
+
+  it('keeps an explicit empty speaker_id on a round-wide chunk instead of defaulting it to char', () => {
+    const chunk = parseStreamChunk(
+      `data: ${JSON.stringify({ request_id: 'r1', event: 'round_complete', content: '', is_complete: true, speaker_id: '' })}`
+    )
+
+    expect(chunk?.speaker_id).toBe('')
+  })
 })
