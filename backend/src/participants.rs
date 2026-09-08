@@ -35,9 +35,11 @@ impl ParticipantId {
     /// The reserved id for the (single, solo-mode) companion.
     pub const CHAR: ParticipantId = ParticipantId(Cow::Borrowed(CHAR_SPEAKER_ID));
     /// The id #131's round orchestrator persists a skipped-speaker notice
-    /// under. Not a chat participant — it is never inserted into a
-    /// [`ParticipantRegistry`] and [`ParticipantId::is_reserved`] does not
-    /// need to guard against it for that reason.
+    /// under. Not a chat participant — [`ParticipantRegistry::insert`]
+    /// never inserts it — but [`ParticipantId::is_reserved`] still guards
+    /// it like [`ParticipantId::USER`]/[`ParticipantId::CHAR`], so a joiner
+    /// cannot claim `system` as its own id and have its replies persist
+    /// under the id skipped-speaker notices use.
     pub const SYSTEM: ParticipantId = ParticipantId(Cow::Borrowed(SYSTEM_SPEAKER_ID));
 
     /// Validates `value` against the id grammar.
@@ -59,10 +61,15 @@ impl ParticipantId {
         Ok(ParticipantId(Cow::Owned(value.to_string())))
     }
 
-    /// Whether this id is one of the two ids every registry always carries
-    /// ([`ParticipantId::USER`], [`ParticipantId::CHAR`]).
+    /// Whether this id is one a joiner may never claim: the two ids every
+    /// registry always carries ([`ParticipantId::USER`],
+    /// [`ParticipantId::CHAR`]), plus [`ParticipantId::SYSTEM`] — reserved
+    /// even though it is never a registry member, so a joiner cannot pick
+    /// `system` as its own id and collide with skipped-speaker notices.
     pub fn is_reserved(&self) -> bool {
-        *self == ParticipantId::USER || *self == ParticipantId::CHAR
+        *self == ParticipantId::USER
+            || *self == ParticipantId::CHAR
+            || *self == ParticipantId::SYSTEM
     }
 
     pub fn as_str(&self) -> &str {
@@ -568,6 +575,23 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(err, ParticipantError::Reserved(ParticipantId::USER));
+    }
+
+    #[test]
+    fn insert_rejects_a_joiner_claiming_the_system_id() {
+        // A joiner that picked `system` as its id could otherwise persist
+        // replies under the same speaker_id #131's round orchestrator uses
+        // for skipped-speaker notices.
+        let mut registry = ParticipantRegistry::solo("Alice", "Bob", None);
+        let err = registry
+            .insert(Participant {
+                id: ParticipantId::SYSTEM,
+                display_name: "Someone".to_string(),
+                kind: ParticipantKind::RemoteBot,
+                avatar: None,
+            })
+            .unwrap_err();
+        assert_eq!(err, ParticipantError::Reserved(ParticipantId::SYSTEM));
     }
 
     #[test]
