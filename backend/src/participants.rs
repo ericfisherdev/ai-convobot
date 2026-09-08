@@ -243,7 +243,6 @@ impl ParticipantRegistry {
     /// [`ParticipantError::Reserved`] if `p.id` is [`ParticipantId::USER`] or
     /// [`ParticipantId::CHAR`]; [`ParticipantError::Duplicate`] if `p.id` is
     /// already present.
-    #[allow(dead_code)] // wired up by #129, which starts inserting RemoteBot participants
     pub fn insert(&mut self, p: Participant) -> Result<(), ParticipantError> {
         if p.id.is_reserved() {
             return Err(ParticipantError::Reserved(p.id));

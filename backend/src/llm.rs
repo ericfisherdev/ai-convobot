@@ -377,8 +377,12 @@ impl TranscriptSource for SqliteTranscript {
 }
 
 /// A [`TranscriptSource`] over a fixed, in-memory list of messages: used by
-/// tests now, and by #130's joiner.
-#[allow(dead_code)] // wired up by #130's joiner; exercised directly by this module's tests today
+/// this module's own tests, and by the joiner's [`LocalModelGeneration`]
+/// (`multiplayer::remote_generation`, #153), which generates from the
+/// transcript the host sent over the wire rather than its own local
+/// `messages` table.
+///
+/// [`LocalModelGeneration`]: crate::multiplayer::remote_generation::LocalModelGeneration
 pub struct InMemoryTranscript(pub Vec<Message>);
 
 impl TranscriptSource for InMemoryTranscript {
