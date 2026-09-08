@@ -4505,13 +4505,10 @@ impl Database {
         let con = Self::open()?;
 
         for party in &third_parties {
-            let name_lower = party.name.to_lowercase();
-            if excluded_names
-                .iter()
-                .any(|excl| excl.to_lowercase() == name_lower)
-            {
+            if Database::names_same_participant(&party.name, excluded_names) {
                 continue;
             }
+            let name_lower = party.name.to_lowercase();
 
             // Check if this person is mentioned in the message
             if message_lower.contains(&name_lower) {
@@ -4605,20 +4602,31 @@ impl Database {
         names
     }
 
-    /// Drops any name in `names` that case-insensitively matches an entry in
-    /// `excluded`, so a chat participant's own display name (the user's, the
-    /// host companion's, or a joined bot's) is never treated as a third
+    /// Drops any name in `names` that names the same participant as an entry
+    /// in `excluded`, so a chat participant's own display name (the user's,
+    /// the host companion's, or a joined bot's) is never treated as a third
     /// party mentioned in the conversation.
+    ///
+    /// A name matches when it case-insensitively equals a full excluded
+    /// display name, or when it is a single word that is itself one word of
+    /// a multi-word excluded name: `extract_person_names`'s patterns capture
+    /// only the first token of "Mary Jane" as "Mary", so a bare word-level
+    /// match is needed to still exclude her.
     fn drop_excluded_names(names: Vec<String>, excluded: &[String]) -> Vec<String> {
         names
             .into_iter()
-            .filter(|name| {
-                let name_lower = name.to_lowercase();
-                !excluded
-                    .iter()
-                    .any(|excl| excl.to_lowercase() == name_lower)
-            })
+            .filter(|name| !Database::names_same_participant(name, excluded))
             .collect()
+    }
+
+    /// Whether `name` refers to the same participant as one of `excluded`'s
+    /// display names. See `drop_excluded_names` for the matching rule.
+    fn names_same_participant(name: &str, excluded: &[String]) -> bool {
+        let name_lower = name.to_lowercase();
+        excluded.iter().any(|excl| {
+            let excl_lower = excl.to_lowercase();
+            excl_lower == name_lower || excl_lower.split_whitespace().any(|word| word == name_lower)
+        })
     }
 }
 
@@ -5007,6 +5015,25 @@ mod tests {
     fn drop_excluded_names_folds_case_beyond_ascii() {
         let names = vec!["zoë".to_string(), "Carol".to_string()];
         let excluded = vec!["Zoë".to_string()];
+        assert_eq!(
+            Database::drop_excluded_names(names, &excluded),
+            vec!["Carol".to_string()]
+        );
+    }
+
+    /// `extract_person_names`'s patterns capture only the first token of a
+    /// multi-word name ("Mary" from "met Mary Jane"), so `drop_excluded_names`
+    /// must still recognise that lone "Mary" as the excluded participant
+    /// "Mary Jane" — the #127 review finding this pins down. Both callers
+    /// of `drop_excluded_names` (`detect_new_persons_in_message`,
+    /// `track_third_party_mentions`) share this logic, so a test at this
+    /// level covers both; neither caller has existing test coverage of its
+    /// own to extend (both require a live `Database` connection this file's
+    /// other name-extraction tests deliberately avoid).
+    #[test]
+    fn drop_excluded_names_matches_a_single_word_of_a_multi_word_excluded_name() {
+        let names = vec!["Mary".to_string(), "Carol".to_string()];
+        let excluded = vec!["Mary Jane".to_string()];
         assert_eq!(
             Database::drop_excluded_names(names, &excluded),
             vec!["Carol".to_string()]
