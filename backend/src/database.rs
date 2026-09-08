@@ -30,7 +30,7 @@ pub fn is_ai_speaker(speaker_id: &str) -> bool {
     speaker_id != USER_SPEAKER_ID
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Message {
     pub id: i32,
     pub ai: bool,
@@ -445,9 +445,10 @@ pub struct ConfigView {
     /// it. `#[serde(skip)]` (not `skip_serializing`, so `ConfigView` still
     /// derives `Deserialize`) keeps it out of every JSON response;
     /// `multiplayer_password_set` is what callers see instead.
+    ///
+    /// Read by `multiplayer::host::SqliteHostConfig::host_password` (#129);
+    /// #130 reads it too, for the joiner's own HMAC proof.
     #[serde(skip)]
-    #[allow(dead_code)]
-    // read by #129 (host verification) and #130 (joiner HMAC proof), not yet wired up
     pub multiplayer_password: String,
 }
 

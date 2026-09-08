@@ -12,6 +12,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use crate::participants::ParticipantId;
+
 /// SQLite database file name, moved from the old `database::DATABASE_PATH`.
 const DB_FILE_NAME: &str = "companion_database.db";
 /// Tantivy long-term-memory index directory name, moved from the old
@@ -21,6 +23,11 @@ const LTM_DIR_NAME: &str = "longterm_memory";
 const ASSETS_DIR_NAME: &str = "assets";
 /// Companion avatar file name within [`assets_dir`].
 const AVATAR_FILE_NAME: &str = "avatar.png";
+/// Directory multiplayer (#129+) state lives under.
+const MULTIPLAYER_DIR_NAME: &str = "multiplayer";
+/// Directory transferred participant avatars live under, within
+/// [`multiplayer_dir`].
+const PARTICIPANT_AVATARS_DIR_NAME: &str = "avatars";
 
 /// Installed once by `main()` after `COMPANION_DATA_DIR` has been resolved
 /// to an absolute path and created. Unit tests never call `init` (a
@@ -67,6 +74,25 @@ pub fn avatar_path() -> PathBuf {
     assets_dir().join(AVATAR_FILE_NAME)
 }
 
+/// Path to the directory multiplayer (#129+) state lives under.
+pub fn multiplayer_dir() -> PathBuf {
+    data_dir().join(MULTIPLAYER_DIR_NAME)
+}
+
+/// Path to the directory transferred participant avatars are stored in.
+pub fn participant_avatars_dir() -> PathBuf {
+    multiplayer_dir().join(PARTICIPANT_AVATARS_DIR_NAME)
+}
+
+/// Path to a participant's avatar file, e.g. `bot1.png`.
+///
+/// Takes `&ParticipantId` rather than `&str`: the id grammar
+/// (`^[a-z][a-z0-9_]{0,15}$`) rules out path traversal (`..`, `/`) by
+/// construction, so this can never escape [`participant_avatars_dir`].
+pub fn participant_avatar_path(id: &ParticipantId, extension: &str) -> PathBuf {
+    participant_avatars_dir().join(format!("{}.{}", id.as_str(), extension))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +122,23 @@ mod tests {
     fn avatar_path_ends_in_the_expected_directory_and_file_name() {
         assert_eq!(assets_dir(), Path::new("./assets"));
         assert_eq!(avatar_path(), Path::new("./assets/avatar.png"));
+    }
+
+    #[test]
+    fn participant_avatars_dir_lives_under_the_multiplayer_directory() {
+        assert_eq!(multiplayer_dir(), Path::new("./multiplayer"));
+        assert_eq!(
+            participant_avatars_dir(),
+            Path::new("./multiplayer/avatars")
+        );
+    }
+
+    #[test]
+    fn participant_avatar_path_joins_the_id_and_extension() {
+        let id = ParticipantId::parse("bot1").unwrap();
+        assert_eq!(
+            participant_avatar_path(&id, "png"),
+            Path::new("./multiplayer/avatars/bot1.png")
+        );
     }
 }

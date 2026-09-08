@@ -133,7 +133,7 @@ impl fmt::Display for ParticipantError {
 impl std::error::Error for ParticipantError {}
 
 /// What kind of participant a [`Participant`] is.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParticipantKind {
     /// The human at the keyboard.
     Human,
