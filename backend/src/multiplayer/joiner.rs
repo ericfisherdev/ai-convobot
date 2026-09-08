@@ -33,6 +33,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long, from the moment the socket is open, the handshake (`Challenge`
 /// then `Joined`/`Rejected`) has to finish.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the writer task flushes the socket when it has nothing of its
+/// own to send. `tokio-tungstenite` queues an automatic `Pong` for an
+/// incoming `Ping` inside the shared connection state, but only a
+/// `Sink::flush`/`send` on the write half actually puts it on the wire; the
+/// read half polled by `serve` cannot do that itself once the stream is
+/// split. Well under `HostSettings::default()`'s `heartbeat_interval` (15s)
+/// so a queued `Pong` is never at risk of missing the host's
+/// `missed_pongs_before_drop` window.
+const IDLE_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The joiner's connection state, as reported by `GET /api/multiplayer/status`.
 ///
@@ -284,18 +293,33 @@ async fn connect_and_serve(
 
     // Drains outbound frames into the socket. Unbounded on purpose: a
     // `GenerateRequestHandler` (#153) must be able to push `Token` frames
-    // without ever awaiting a full channel.
+    // without ever awaiting a full channel. Also flushes on
+    // `IDLE_FLUSH_INTERVAL` even with nothing queued, so an automatic `Pong`
+    // queued by a `Ping` the read half saw does not sit unsent for the rest
+    // of an idle connection (see `IDLE_FLUSH_INTERVAL`'s doc comment).
     let writer_task = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            let text = match serde_json::to_string(&frame) {
-                Ok(text) => text,
-                Err(e) => {
-                    eprintln!("joiner: failed to serialise {:?}: {}", frame, e);
-                    continue;
+        let mut idle_flush = tokio::time::interval(IDLE_FLUSH_INTERVAL);
+        idle_flush.tick().await; // the first tick fires immediately; consume it
+        loop {
+            tokio::select! {
+                frame = rx.recv() => {
+                    let Some(frame) = frame else { break; };
+                    let text = match serde_json::to_string(&frame) {
+                        Ok(text) => text,
+                        Err(e) => {
+                            eprintln!("joiner: failed to serialise {:?}: {}", frame, e);
+                            continue;
+                        }
+                    };
+                    if write.send(WsMessage::text(text)).await.is_err() {
+                        break;
+                    }
                 }
-            };
-            if write.send(WsMessage::text(text)).await.is_err() {
-                break;
+                _ = idle_flush.tick() => {
+                    if write.flush().await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     });
@@ -625,14 +649,22 @@ mod tests {
                 },
             )
             .await;
-            // A second accept here would hang forever if `run` retried;
-            // the test's own timeout catches that.
-            assert!(listener.accept().await.is_err() || true);
+            // If `run` retried after `Rejected`, it would land here; block
+            // instead of accepting so a regression makes `run` hang rather
+            // than silently succeeding on a second connection.
+            std::future::pending::<()>().await;
         });
 
         let generation: Arc<dyn GenerateRequestHandler> = Arc::new(NoopGeneration);
-        run(handle.clone(), identity, generation).await;
+        // Bounded so a retry regression fails this test (`run` never
+        // returning) instead of hanging the suite.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run(handle.clone(), identity, generation),
+        )
+        .await;
         server.abort();
+        result.expect("run kept retrying after a Rejected handshake");
 
         let shared = handle.read().unwrap();
         assert!(matches!(shared.state, JoinerState::Rejected { .. }));
