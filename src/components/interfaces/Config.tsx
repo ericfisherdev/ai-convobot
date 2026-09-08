@@ -11,6 +11,12 @@ export enum PromptTemplate {
     Mistral = "Mistral"
 }
 
+export enum MultiplayerMode {
+    Solo = "solo",
+    Host = "host",
+    Joiner = "joiner"
+}
+
 export interface ConfigInterface {
     device: Device;
     llm_model_path: string;
@@ -24,6 +30,14 @@ export interface ConfigInterface {
     dynamic_gpu_allocation: boolean;
     gpu_safety_margin: number;
     min_free_vram_mb: number;
+    multiplayer_mode: MultiplayerMode;
+    multiplayer_password_set: boolean;
+    multiplayer_host_address: string;
+    multiplayer_participant_id: string;
+    mention_followup_depth: number;
+    remote_generation_timeout_secs: number;
+    /** Write-only: only ever populated by the form and sent on PUT. */
+    multiplayer_password?: string;
 }
 
 export interface ModelInfo {

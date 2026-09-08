@@ -2,8 +2,8 @@ use actix_web::{delete, get, post, put, web, App, HttpResponse, HttpServer};
 use futures_util::StreamExt as _;
 mod database;
 use database::{
-    CompanionAttitude, CompanionView, ConfigModify, Database, Device, Message, MessageEdit,
-    NewMessage, NewMessageRequest, PoppedReply, ThirdPartyInteraction, UserView,
+    CompanionAttitude, CompanionView, ConfigChangeError, ConfigModify, Database, Device, Message,
+    MessageEdit, NewMessage, NewMessageRequest, PoppedReply, ThirdPartyInteraction, UserView,
 };
 mod long_term_mem;
 use long_term_mem::LongTermMem;
@@ -40,6 +40,7 @@ mod turn_slot;
 use crate::turn_slot::{TurnGuard, ACTIVE_TURN};
 mod chat_turn;
 use crate::chat_turn::{PendingTurn, SqliteTurnStore, TurnStore};
+mod multiplayer;
 mod participants;
 mod paths;
 mod settings;
@@ -1135,6 +1136,7 @@ async fn config() -> HttpResponse {
 async fn config_post(received: web::Json<ConfigModify>) -> HttpResponse {
     match Database::change_config(received.into_inner()) {
         Ok(_) => HttpResponse::Ok().body("Config updated!"),
+        Err(ConfigChangeError::Invalid(msg)) => HttpResponse::BadRequest().body(msg),
         Err(e) => {
             println!("Failed to update config: {}", e);
             HttpResponse::InternalServerError()

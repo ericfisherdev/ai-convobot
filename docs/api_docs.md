@@ -345,9 +345,16 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
     "device": "CPU",
     "llm_model_path": "/path/to/model.gguf",
     "gpu_layers": 20,
-    "prompt_template": "Default"
+    "prompt_template": "Default",
+    "multiplayer_mode": "solo",
+    "multiplayer_password_set": false,
+    "multiplayer_host_address": "",
+    "multiplayer_participant_id": "",
+    "mention_followup_depth": 1,
+    "remote_generation_timeout_secs": 120
   }
   ```
+  Note: `multiplayer_password` is never returned; `multiplayer_password_set` reports whether a host password is currently stored.
 
 #### 4.2 Update Configuration
 
@@ -359,9 +366,17 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   - `llm_model_path` (string): Path to the language model.
   - `gpu_layers` (integer): Number of GPU layers.
   - `prompt_template` (string) ("Auto" || "Default" || "Llama2" || "Mistral"): Prompt template used to format the prompt. `Auto` renders the prompt with the chat template stored inside the GGUF file and falls back to `Default` when the model does not carry one. It is the default for new installs.
+  - `multiplayer_mode` (string) ("solo" || "host" || "joiner"): The instance's multiplayer role. Defaults to `"solo"`.
+  - `multiplayer_host_address` (string): The host's `host:port` to connect to. Required, and validated, only in `joiner` mode.
+  - `multiplayer_participant_id` (string): This instance's participant id, `^[a-z][a-z0-9_]{0,15}$` (1-16 lowercase letters, digits or `_`, starting with a letter). Required, and validated, only in `joiner` mode.
+  - `mention_followup_depth` (integer, 0-10): How many rounds of `@mention` follow-ups a reply can trigger.
+  - `remote_generation_timeout_secs` (integer, 5-3600): How long to wait for a joiner bot's remote reply.
+  - `multiplayer_password` (string, optional, write-only): The shared host/joiner password. Omitted or empty leaves the currently stored password unchanged; it is never echoed back by `GET /config`.
 - **Response:**
   - Status: 200 OK
   - Body: Config updated!
+  - Status: 400 Bad Request
+  - Body: A message describing the invalid field, e.g. an unknown `multiplayer_mode`, an invalid `multiplayer_participant_id`, a `joiner` request missing its host address, or a `host` request with no password stored or supplied.
 - **Example Request:**
   ```http
   PUT /config
@@ -371,7 +386,12 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
     "device": "GPU",
     "llm_model_path": "/path/to/model.gguf",
     "gpu_layers": 30,
-    "prompt_template": "Mistral"
+    "prompt_template": "Mistral",
+    "multiplayer_mode": "solo",
+    "multiplayer_host_address": "",
+    "multiplayer_participant_id": "",
+    "mention_followup_depth": 1,
+    "remote_generation_timeout_secs": 120
   }
   ```
 

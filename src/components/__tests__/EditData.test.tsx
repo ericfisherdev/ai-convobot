@@ -50,7 +50,7 @@ describe('EditData Component', () => {
 
     expect(screen.getByRole('tablist')).toBeInTheDocument()
     const tabs = screen.getAllByRole('tab').map(t => t.textContent)
-    expect(tabs).toEqual(['Companion', 'User', 'Attitudes', 'Theme', 'Config'])
+    expect(tabs).toEqual(['Companion', 'User', 'Attitudes', 'Theme', 'Config', 'Multiplayer'])
   })
 
   it('shows user data tab', async () => {
