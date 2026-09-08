@@ -73,6 +73,25 @@ impl RemoteTranscript {
     pub fn snapshot(&self) -> Vec<Message> {
         self.messages.clone()
     }
+
+    /// Applies a [`crate::multiplayer::protocol::ServerFrame::MessageEdited`]
+    /// frame: replaces the row with `message.id`'s content in place, keeping
+    /// its sorted position. A no-op if the id is not mirrored (e.g. the
+    /// edited row is older than this mirror's history), since there is no
+    /// row here to update.
+    pub fn replace_message(&mut self, message: Message) {
+        if let Ok(pos) = self.messages.binary_search_by_key(&message.id, |m| m.id) {
+            self.messages[pos] = message;
+        }
+    }
+
+    /// Applies a [`crate::multiplayer::protocol::ServerFrame::MessageRemoved`]
+    /// frame: drops the row with this id. A no-op if it is not mirrored.
+    pub fn remove(&mut self, id: i32) {
+        if let Ok(pos) = self.messages.binary_search_by_key(&id, |m| m.id) {
+            self.messages.remove(pos);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -125,6 +144,48 @@ mod tests {
             transcript.snapshot(),
             vec![message(1), message(2), message(3), message(5)]
         );
+    }
+
+    #[test]
+    fn replace_message_updates_the_row_in_place() {
+        let mut transcript = RemoteTranscript::new();
+        transcript.replace(messages(1..=3));
+
+        let mut edited = message(2);
+        edited.content = "edited content".to_string();
+        transcript.replace_message(edited.clone());
+
+        assert_eq!(transcript.snapshot(), vec![message(1), edited, message(3)]);
+    }
+
+    #[test]
+    fn replace_message_is_a_no_op_for_an_id_not_in_the_mirror() {
+        let mut transcript = RemoteTranscript::new();
+        transcript.replace(messages(1..=3));
+
+        transcript.replace_message(message(99));
+
+        assert_eq!(transcript.snapshot(), messages(1..=3));
+    }
+
+    #[test]
+    fn remove_drops_the_row_with_the_given_id() {
+        let mut transcript = RemoteTranscript::new();
+        transcript.replace(messages(1..=3));
+
+        transcript.remove(2);
+
+        assert_eq!(transcript.snapshot(), vec![message(1), message(3)]);
+    }
+
+    #[test]
+    fn remove_is_a_no_op_for_an_id_not_in_the_mirror() {
+        let mut transcript = RemoteTranscript::new();
+        transcript.replace(messages(1..=3));
+
+        transcript.remove(99);
+
+        assert_eq!(transcript.snapshot(), messages(1..=3));
     }
 
     #[test]

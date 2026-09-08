@@ -62,13 +62,31 @@ fn message_from_row(row: &rusqlite::Row) -> Result<Message> {
     })
 }
 
-/// Outcome of `Database::pop_latest_ai_reply`.
+/// Outcome of `Database::pop_latest_bot_reply`.
+#[derive(Debug, PartialEq)]
 pub enum PoppedReply {
-    /// The trailing AI reply was deleted; `user_turn` is the message it answered.
-    Removed { user_turn: Message },
-    /// Nothing was deleted: the conversation is empty, its newest row is a
-    /// user message, or the AI reply has no earlier turn to regenerate from.
+    /// The trailing bot reply was deleted; `speaker_id` is who said it,
+    /// `message_id` is the deleted row's id (for
+    /// `regenerate_prompt`'s `ServerFrame::MessageRemoved` broadcast, #135
+    /// part 2), and `user_turn` is the newest user turn before it.
+    /// `user_turn` is not necessarily the reply's immediate predecessor: a
+    /// mention follow-up (#131/#132) can put another bot's reply — or this
+    /// bot's own earlier one — in between.
+    Removed {
+        speaker_id: String,
+        message_id: i32,
+        user_turn: Message,
+    },
+    /// Nothing was deleted: the conversation is empty, its newest row is not
+    /// a bot reply (a user message or a system notice), or there is no user
+    /// turn anywhere before it to regenerate from.
     NothingToRegenerate,
+    /// The trailing reply's owner (`speaker_id`) is not connected, so
+    /// nothing was deleted. Checked inside the same transaction as the
+    /// delete (`pop_latest_bot_reply_on`'s `owner_ready` predicate), so a
+    /// direct `POST /api/message` cannot land between "checked offline" and
+    /// "deleted" and make this report stale.
+    OwnerUnavailable { speaker_id: String },
 }
 
 pub fn get_current_date() -> String {
@@ -1386,7 +1404,7 @@ impl Database {
 
     /// Testable half of `insert_message`, taking a caller-provided connection
     /// so tests can point it at a `TempDir`-backed database instead of the
-    /// hardwired `paths::db_path()`, mirroring `pop_latest_ai_reply_on`.
+    /// hardwired `paths::db_path()`, mirroring `pop_latest_bot_reply_on`.
     fn insert_message_on(con: &Connection, message: NewMessage) -> Result<i32, Error> {
         con.execute(
             "INSERT INTO messages (ai, speaker_id, content, created_at) VALUES (?, ?, ?, ?)",
@@ -1416,7 +1434,7 @@ impl Database {
 
     /// Testable half of `edit_message`, taking a caller-provided connection
     /// so tests can point it at a `TempDir`-backed database instead of the
-    /// hardwired `paths::db_path()`, mirroring `pop_latest_ai_reply_on`. Clears
+    /// hardwired `paths::db_path()`, mirroring `pop_latest_bot_reply_on`. Clears
     /// the message cache here (rather than in the public wrapper) so the
     /// cache-invalidation test can exercise it without touching the real
     /// `paths::db_path()`.
@@ -1441,23 +1459,33 @@ impl Database {
         Ok(())
     }
 
-    /// Removes the trailing AI reply so a regenerate can re-prompt from the
+    /// Removes the trailing bot reply so a regenerate can re-prompt from the
     /// user turn it answered, without ever deleting a user message.
-    pub fn pop_latest_ai_reply() -> Result<PoppedReply> {
+    ///
+    /// `owner_ready(speaker_id)` decides whether the reply's owner can
+    /// actually regenerate it right now (the host companion is always
+    /// ready; a remote bot is ready only while it is connected); see
+    /// `pop_latest_bot_reply_on` for why the check has to run inside the
+    /// same transaction as the delete.
+    pub fn pop_latest_bot_reply(owner_ready: impl FnOnce(&str) -> bool) -> Result<PoppedReply> {
         let mut con = Self::open()?;
-        Self::pop_latest_ai_reply_on(&mut con)
+        Self::pop_latest_bot_reply_on(&mut con, owner_ready)
     }
 
-    /// Testable half of `pop_latest_ai_reply`, taking a caller-provided
+    /// Testable half of `pop_latest_bot_reply`, taking a caller-provided
     /// connection so tests can point it at a `TempDir`-backed database
     /// instead of the hardwired `paths::db_path()`.
     ///
-    /// Runs the "is the newest row an AI reply with a preceding turn" check
-    /// and the delete inside one `IMMEDIATE` transaction, so a concurrent
-    /// `DELETE /api/message/{id}` or `POST /api/message` (neither of which is
-    /// covered by the turn slot) cannot interleave between the check and the
-    /// delete.
-    fn pop_latest_ai_reply_on(con: &mut Connection) -> Result<PoppedReply> {
+    /// Runs the "is the newest row a bot reply with a preceding user turn"
+    /// check, `owner_ready` and the delete inside one `IMMEDIATE`
+    /// transaction, so a concurrent `DELETE /api/message/{id}` or
+    /// `POST /api/message` (neither of which is covered by the turn slot)
+    /// cannot interleave between the check and the delete, and a remote bot
+    /// cannot go offline between "checked ready" and "deleted".
+    fn pop_latest_bot_reply_on(
+        con: &mut Connection,
+        owner_ready: impl FnOnce(&str) -> bool,
+    ) -> Result<PoppedReply> {
         let tx = con.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let latest: Option<Message> = tx
@@ -1467,37 +1495,58 @@ impl Database {
                 message_from_row,
             )
             .optional()?;
+        // Poppable when the trailing row is neither the user's own message
+        // nor a system notice — i.e. some bot's reply — regardless of what
+        // row precedes it: with rounds (#131/#132) the newest reply can
+        // follow another bot's reply rather than the user's.
         let reply = match latest {
-            Some(message) if message.ai => message,
+            Some(message)
+                if message.speaker_id != USER_SPEAKER_ID
+                    && message.speaker_id != SYSTEM_SPEAKER_ID =>
+            {
+                message
+            }
             _ => return Ok(PoppedReply::NothingToRegenerate),
         };
 
+        // Anchored on the newest row with `speaker_id = 'user'` before the
+        // reply, not on its immediate predecessor: that predecessor can be
+        // another bot's reply (or this bot's own earlier one) from the same
+        // round. This keeps the original invariant in its real form — the
+        // anchor can never be bot content mistaken for the user's message —
+        // without requiring the user's turn to be immediately adjacent.
         let user_turn: Option<Message> = tx
             .query_row(
                 &format!(
-                    "SELECT {MESSAGE_COLUMNS} FROM messages WHERE id < ? ORDER BY id DESC LIMIT 1"
+                    "SELECT {MESSAGE_COLUMNS} FROM messages WHERE id < ? AND speaker_id = ? ORDER BY id DESC LIMIT 1"
                 ),
-                [reply.id],
+                params![reply.id, USER_SPEAKER_ID],
                 message_from_row,
             )
             .optional()?;
-        // Only pop when the predecessor is an actual user turn: two AI
-        // messages in a row (reachable through a direct API call, not the
-        // normal alternating flow) must not regenerate from earlier AI
-        // content mistaken for the user's message.
-        let user_turn = match user_turn {
-            Some(message) if !message.ai => message,
-            _ => return Ok(PoppedReply::NothingToRegenerate),
+        let Some(user_turn) = user_turn else {
+            return Ok(PoppedReply::NothingToRegenerate);
         };
 
-        tx.execute("DELETE FROM messages WHERE id = ?", [reply.id])?;
+        if !owner_ready(&reply.speaker_id) {
+            return Ok(PoppedReply::OwnerUnavailable {
+                speaker_id: reply.speaker_id,
+            });
+        }
+
+        let message_id = reply.id;
+        tx.execute("DELETE FROM messages WHERE id = ?", [message_id])?;
         tx.commit()?;
 
         // Cleared after commit (not inside `open()`) so the invalidation is
         // observable from a test that points this function at a TempDir.
         Database::clear_message_cache();
 
-        Ok(PoppedReply::Removed { user_turn })
+        Ok(PoppedReply::Removed {
+            speaker_id: reply.speaker_id,
+            message_id,
+            user_turn,
+        })
     }
 
     pub fn erase_messages() -> Result<(), Error> {
@@ -4854,44 +4903,92 @@ mod tests {
         con.execute(messages_ddl(), []).unwrap();
     }
 
-    fn insert_message_row(con: &Connection, ai: bool, content: &str) {
-        let speaker_id = if ai { CHAR_SPEAKER_ID } else { USER_SPEAKER_ID };
+    /// Matches the post-#125 schema (a `speaker_id` column, `ai` derived
+    /// from it): every test in this module inserts by `speaker_id` rather
+    /// than a bare `ai` flag, so a bot id like `"bot1"` can be seeded too.
+    fn insert_message_row(con: &Connection, speaker_id: &str, content: &str) {
         con.execute(
             "INSERT INTO messages (ai, speaker_id, content, created_at) VALUES (?, ?, ?, ?)",
-            params![ai, speaker_id, content, get_current_date()],
+            params![
+                is_ai_speaker(speaker_id),
+                speaker_id,
+                content,
+                get_current_date()
+            ],
         )
         .unwrap();
     }
 
+    /// `owner_ready` for a test that never exercises the offline path: every
+    /// speaker is ready.
+    fn always_ready(_speaker_id: &str) -> bool {
+        true
+    }
+
     #[test]
-    fn pop_latest_ai_reply_removes_the_trailing_ai_reply_and_returns_the_user_turn() {
+    fn pop_latest_bot_reply_removes_the_trailing_bot_reply_and_anchors_on_the_user_turn() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
-        insert_message_row(&con, false, "hi");
-        insert_message_row(&con, true, "hello");
+        insert_message_row(&con, USER_SPEAKER_ID, "hi");
+        insert_message_row(&con, CHAR_SPEAKER_ID, "hello");
+        insert_message_row(&con, "bot1", "hi from bot1");
 
-        let result = Database::pop_latest_ai_reply_on(&mut con).unwrap();
+        let result = Database::pop_latest_bot_reply_on(&mut con, always_ready).unwrap();
         match result {
-            PoppedReply::Removed { user_turn } => assert_eq!(user_turn.content, "hi"),
-            PoppedReply::NothingToRegenerate => panic!("expected the AI reply to be removed"),
+            PoppedReply::Removed {
+                speaker_id,
+                message_id,
+                user_turn,
+            } => {
+                assert_eq!(speaker_id, "bot1");
+                assert_eq!(message_id, 3);
+                assert_eq!(user_turn.content, "hi");
+            }
+            other => panic!("expected bot1's reply to be removed, got {:?}", other),
         }
 
         let count: i64 = con
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 2);
     }
 
     #[test]
-    fn pop_latest_ai_reply_leaves_a_trailing_user_message_alone() {
+    fn pop_latest_bot_reply_anchors_on_the_user_turn_two_positions_back_after_a_mention_followup() {
+        // A mention follow-up (#131/#132) puts `char`'s reply between the
+        // user's turn and `bot1`'s: the anchor must still be the user row,
+        // not `char`'s reply immediately preceding `bot1`.
         let dir = tempfile::TempDir::new().unwrap();
         let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
-        insert_message_row(&con, true, "hello");
-        insert_message_row(&con, false, "how are you?");
+        insert_message_row(&con, USER_SPEAKER_ID, "hi @bot1");
+        insert_message_row(&con, CHAR_SPEAKER_ID, "sure, @bot1 go ahead");
+        insert_message_row(&con, "bot1", "hi from bot1");
 
-        let result = Database::pop_latest_ai_reply_on(&mut con).unwrap();
+        let result = Database::pop_latest_bot_reply_on(&mut con, always_ready).unwrap();
+        match result {
+            PoppedReply::Removed {
+                speaker_id,
+                user_turn,
+                ..
+            } => {
+                assert_eq!(speaker_id, "bot1");
+                assert_eq!(user_turn.content, "hi @bot1");
+            }
+            _ => panic!("expected bot1's reply to be removed"),
+        }
+    }
+
+    #[test]
+    fn pop_latest_bot_reply_leaves_a_trailing_system_notice_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        insert_message_row(&con, USER_SPEAKER_ID, "hi");
+        insert_message_row(&con, SYSTEM_SPEAKER_ID, "bot1 did not respond");
+
+        let result = Database::pop_latest_bot_reply_on(&mut con, always_ready).unwrap();
         assert!(matches!(result, PoppedReply::NothingToRegenerate));
 
         let count: i64 = con
@@ -4901,13 +4998,30 @@ mod tests {
     }
 
     #[test]
-    fn pop_latest_ai_reply_refuses_when_the_reply_has_no_preceding_turn() {
+    fn pop_latest_bot_reply_leaves_a_trailing_user_message_alone() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
-        insert_message_row(&con, true, "first message");
+        insert_message_row(&con, CHAR_SPEAKER_ID, "hello");
+        insert_message_row(&con, USER_SPEAKER_ID, "how are you?");
 
-        let result = Database::pop_latest_ai_reply_on(&mut con).unwrap();
+        let result = Database::pop_latest_bot_reply_on(&mut con, always_ready).unwrap();
+        assert!(matches!(result, PoppedReply::NothingToRegenerate));
+
+        let count: i64 = con
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn pop_latest_bot_reply_refuses_when_the_reply_has_no_preceding_user_turn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        insert_message_row(&con, CHAR_SPEAKER_ID, "first message");
+
+        let result = Database::pop_latest_bot_reply_on(&mut con, always_ready).unwrap();
         assert!(matches!(result, PoppedReply::NothingToRegenerate));
 
         let count: i64 = con
@@ -4917,30 +5031,66 @@ mod tests {
     }
 
     #[test]
-    fn pop_latest_ai_reply_refuses_when_the_predecessor_is_also_an_ai_message() {
+    fn pop_latest_bot_reply_anchors_on_the_latest_user_turn_not_the_preceding_bot_row() {
+        // Pre-#135 this refused to pop because the *immediate predecessor*
+        // was another bot message; the real invariant is "the anchor is a
+        // user row somewhere before the reply", which this conversation
+        // still satisfies, so the pop now succeeds and anchors two rows back.
         let dir = tempfile::TempDir::new().unwrap();
         let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
-        insert_message_row(&con, false, "hi");
-        insert_message_row(&con, true, "first reply");
-        insert_message_row(&con, true, "second reply, inserted directly");
+        insert_message_row(&con, USER_SPEAKER_ID, "hi");
+        insert_message_row(&con, CHAR_SPEAKER_ID, "first reply");
+        insert_message_row(&con, CHAR_SPEAKER_ID, "second reply, inserted directly");
 
-        let result = Database::pop_latest_ai_reply_on(&mut con).unwrap();
-        assert!(matches!(result, PoppedReply::NothingToRegenerate));
+        let result = Database::pop_latest_bot_reply_on(&mut con, always_ready).unwrap();
+        match result {
+            PoppedReply::Removed {
+                speaker_id,
+                user_turn,
+                ..
+            } => {
+                assert_eq!(speaker_id, CHAR_SPEAKER_ID);
+                assert_eq!(user_turn.content, "hi");
+            }
+            _ => panic!("expected the trailing char reply to be removed"),
+        }
 
         let count: i64 = con
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(count, 2);
     }
 
     #[test]
-    fn pop_latest_ai_reply_invalidates_the_message_cache() {
+    fn pop_latest_bot_reply_reports_owner_unavailable_and_deletes_nothing() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
-        insert_message_row(&con, false, "hi");
-        insert_message_row(&con, true, "hello");
+        insert_message_row(&con, USER_SPEAKER_ID, "hi");
+        insert_message_row(&con, "bot1", "hi from bot1");
+
+        let result = Database::pop_latest_bot_reply_on(&mut con, |_speaker_id| false).unwrap();
+        assert_eq!(
+            result,
+            PoppedReply::OwnerUnavailable {
+                speaker_id: "bot1".to_string()
+            }
+        );
+
+        let count: i64 = con
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn pop_latest_bot_reply_invalidates_the_message_cache() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        insert_message_row(&con, USER_SPEAKER_ID, "hi");
+        insert_message_row(&con, CHAR_SPEAKER_ID, "hello");
 
         let cache_key = "messages:50:0".to_string();
         {
@@ -4948,7 +5098,7 @@ mod tests {
             cache.insert(cache_key.clone(), (Vec::new(), Instant::now()));
         }
 
-        Database::pop_latest_ai_reply_on(&mut con).unwrap();
+        Database::pop_latest_bot_reply_on(&mut con, always_ready).unwrap();
 
         let cache = MESSAGE_CACHE.lock().unwrap();
         assert!(!cache.contains_key(&cache_key));
@@ -4959,7 +5109,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
-        insert_message_row(&con, true, "hello");
+        insert_message_row(&con, CHAR_SPEAKER_ID, "hello");
 
         Database::edit_message_on(
             &con,
@@ -4980,11 +5130,38 @@ mod tests {
     }
 
     #[test]
+    fn edit_message_keeps_a_remote_bot_reply_attributed_to_its_speaker() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        insert_message_row(&con, "bot1", "hi from bot1");
+
+        Database::edit_message_on(
+            &con,
+            1,
+            MessageEdit {
+                content: "hi from bot1, edited".to_string(),
+            },
+        )
+        .unwrap();
+
+        let (speaker_id, content): (String, String) = con
+            .query_row(
+                "SELECT speaker_id, content FROM messages WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(speaker_id, "bot1");
+        assert_eq!(content, "hi from bot1, edited");
+    }
+
+    #[test]
     fn edit_message_keeps_a_user_message_marked_as_user() {
         let dir = tempfile::TempDir::new().unwrap();
         let con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
-        insert_message_row(&con, false, "hi");
+        insert_message_row(&con, USER_SPEAKER_ID, "hi");
 
         Database::edit_message_on(
             &con,
@@ -5009,8 +5186,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
-        insert_message_row(&con, false, "hi");
-        insert_message_row(&con, true, "hello");
+        insert_message_row(&con, USER_SPEAKER_ID, "hi");
+        insert_message_row(&con, CHAR_SPEAKER_ID, "hello");
 
         Database::edit_message_on(
             &con,
@@ -5035,10 +5212,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
-        insert_message_row(&con, true, "hello");
+        insert_message_row(&con, CHAR_SPEAKER_ID, "hello");
 
         // Unique to this test (not "messages:50:0", which the
-        // pop_latest_ai_reply cache test also uses): MESSAGE_CACHE is
+        // pop_latest_bot_reply cache test also uses): MESSAGE_CACHE is
         // process-global, so a shared key can be reinserted by a parallel
         // test between this test's clear and its assertion, making the
         // assertion flaky.

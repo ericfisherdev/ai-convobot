@@ -142,6 +142,19 @@ pub enum ServerFrame {
     /// transcript stays in sync (#131 broadcasts this; the joiner's
     /// `RemoteTranscript::push` is the counterpart).
     Message(DbMessage),
+    /// A message the host edited (`PUT /api/message/{id}`), mirrored so a
+    /// joiner's transcript carries the same content the host now has,
+    /// instead of the stale pre-edit text (#135; the joiner's
+    /// `RemoteTranscript::replace_message` is the counterpart).
+    MessageEdited { message: DbMessage },
+    /// A message the host deleted (`DELETE /api/message/{id}`) or popped for
+    /// a regenerate (`GET /api/prompt/regenerate`), mirrored so a joiner
+    /// drops the same row rather than showing a message the host no longer
+    /// has (#135; the joiner's `RemoteTranscript::remove` is the
+    /// counterpart). Sent for a regenerate's pop before the replacement
+    /// reply is generated, so a joiner never shows the old and new reply
+    /// side by side.
+    MessageRemoved { id: i32 },
     /// Sent to one remote bot when it is its turn to generate a reply.
     /// `transcript` is the context to generate from, sent by the host so
     /// the joiner never has to trust its own possibly-stale mirror for a
@@ -334,6 +347,22 @@ mod tests {
     #[test]
     fn message_round_trips_through_json() {
         let frame = ServerFrame::Message(sample_message());
+        let json = serde_json::to_string(&frame).unwrap();
+        assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
+    }
+
+    #[test]
+    fn message_edited_round_trips_through_json() {
+        let frame = ServerFrame::MessageEdited {
+            message: sample_message(),
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
+    }
+
+    #[test]
+    fn message_removed_round_trips_through_json() {
+        let frame = ServerFrame::MessageRemoved { id: 42 };
         let json = serde_json::to_string(&frame).unwrap();
         assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
     }

@@ -56,10 +56,12 @@ use crate::multiplayer::remote_bots::RemoteBots;
 use crate::multiplayer::remote_generation::LocalModelGeneration;
 use crate::multiplayer::remote_generator::SocketRemoteGenerator;
 use crate::multiplayer::round::{
-    plan_round, run_round, NoRemotes, NoopSink, RemoteGenerator, RoundPlan, RoundSink,
+    plan_round, regenerate_reply, regenerate_target, run_round, NoRemotes, NoopSink,
+    RegenerateError, RegenerateTarget, RemoteGenerator, RoundPlan, RoundSink,
 };
 use crate::multiplayer::routing::RoutingPolicy;
 use crate::participants::{avatar_from, normalise_mentions, ParticipantId, ParticipantRegistry};
+use std::collections::HashSet;
 use std::sync::Arc;
 #[cfg(test)]
 pub(crate) mod simple_tests;
@@ -527,6 +529,13 @@ async fn message_post(
     }
 }
 
+/// Known gap (#135): unlike `message_put`/`message_delete`/
+/// `regenerate_prompt`, this does not mirror the clear to a connected
+/// joiner — there is no bulk-resync `ServerFrame` yet (`Joined` is only ever
+/// sent once, at handshake), and broadcasting one `MessageRemoved` per row
+/// could be a very long burst for a large history. A joiner's mirror is
+/// left showing the pre-clear transcript until it reconnects. Documented in
+/// `docs/api_docs.md` section 1.2.
 #[delete("/api/message")]
 async fn clear_messages(joiner: Option<web::Data<JoinerHandle>>) -> HttpResponse {
     if let Some(response) = reject_if_joiner(&joiner) {
@@ -566,6 +575,7 @@ async fn message_put(
     received: web::Json<MessageEdit>,
     participants: web::Data<RwLock<ParticipantRegistry>>,
     joiner: Option<web::Data<JoinerHandle>>,
+    remote_bots: web::Data<RemoteBots>,
 ) -> HttpResponse {
     if let Some(response) = reject_if_joiner(&joiner) {
         return response;
@@ -576,7 +586,25 @@ async fn message_put(
     // same way a fresh message is.
     edit.content = normalise_mentions(&edit.content, &snapshot_speakers(&participants).registry);
     match Database::edit_message(*id, edit) {
-        Ok(_) => HttpResponse::Ok().body(format!("Message edited at id {}!", id)),
+        Ok(_) => {
+            // Mirrored so a connected joiner's transcript carries the edited
+            // content instead of stale pre-edit text; a lookup failure here
+            // only means a joiner mirror falls behind, not that the edit
+            // itself failed, so it is logged rather than turned into a 500.
+            match Database::get_message(*id) {
+                Ok(edited_message) => broadcast_mirror_update(
+                    &remote_bots,
+                    ServerFrame::MessageEdited {
+                        message: edited_message,
+                    },
+                ),
+                Err(e) => eprintln!(
+                    "multiplayer: failed to load edited message {} to mirror: {}",
+                    id, e
+                ),
+            }
+            HttpResponse::Ok().body(format!("Message edited at id {}!", id))
+        }
         Err(e) => {
             println!("Failed to edit message at id {}: {}", id, e);
             HttpResponse::InternalServerError().body(format!(
@@ -591,13 +619,17 @@ async fn message_put(
 async fn message_delete(
     id: web::Path<i32>,
     joiner: Option<web::Data<JoinerHandle>>,
+    remote_bots: web::Data<RemoteBots>,
 ) -> HttpResponse {
     if let Some(response) = reject_if_joiner(&joiner) {
         return response;
     }
 
     match Database::delete_message(*id) {
-        Ok(_) => HttpResponse::Ok().body(format!("Message deleted at id {}!", id)),
+        Ok(_) => {
+            broadcast_mirror_update(&remote_bots, ServerFrame::MessageRemoved { id: *id });
+            HttpResponse::Ok().body(format!("Message deleted at id {}!", id))
+        }
         Err(e) => {
             println!("Failed to delete message at id {}: {}", id, e);
             HttpResponse::InternalServerError().body(format!(
@@ -903,9 +935,13 @@ enum TurnError {
         source: rusqlite::Error,
     },
     Generate(std::io::Error),
-    /// The newest message is not an AI reply with a preceding turn, so
+    /// The newest message is not a bot reply with a preceding user turn, so
     /// `regenerate_prompt` has nothing to pop.
     NothingToRegenerate,
+    /// The newest message's owner (a remote bot) is not connected, so
+    /// `regenerate_prompt` popped nothing (`Database::pop_latest_bot_reply`'s
+    /// `owner_ready` check refused the delete).
+    SpeakerOffline(String),
 }
 
 impl TurnError {
@@ -924,6 +960,9 @@ impl TurnError {
             TurnError::NothingToRegenerate => HttpResponse::Conflict().body(
                 "The newest message is not a companion reply, so there is nothing to regenerate",
             ),
+            TurnError::SpeakerOffline(speaker_id) => HttpResponse::Conflict().body(format!(
+                "{speaker_id} is not connected, so its reply cannot be regenerated"
+            )),
         }
     }
 }
@@ -942,6 +981,17 @@ mod turn_error_tests {
         assert_eq!(
             body,
             "The newest message is not a companion reply, so there is nothing to regenerate"
+        );
+    }
+
+    #[actix_web::test]
+    async fn speaker_offline_maps_to_409_naming_the_disconnected_bot() {
+        let response = TurnError::SpeakerOffline("bot1".to_string()).into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body()).await.unwrap();
+        assert_eq!(
+            body,
+            "bot1 is not connected, so its reply cannot be regenerated"
         );
     }
 }
@@ -1448,6 +1498,26 @@ fn round_remotes(
     }
 }
 
+/// Mirrors a host-side edit or delete to every joiner, in `Host` mode only —
+/// the same rule `round_remotes` applies to a round's own broadcasts, so
+/// `message_put`/`message_delete`/`clear_messages` never touch `RemoteBots`
+/// outside `Host` mode either. A config read failure is logged and treated
+/// as "not hosting": the edit or delete itself already succeeded by the
+/// time this runs, so a joiner mirror falling behind must never turn into a
+/// 500 for a request that otherwise worked.
+fn broadcast_mirror_update(remote_bots: &RemoteBots, frame: ServerFrame) {
+    match Database::get_config() {
+        Ok(loaded_config) if loaded_config.multiplayer_mode == MultiplayerMode::Host => {
+            remote_bots.broadcast(frame, None);
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!(
+            "multiplayer: failed to read config before mirroring a message change: {}",
+            e
+        ),
+    }
+}
+
 #[post("/api/prompt")]
 async fn prompt_message(
     received: web::Json<Prompt>,
@@ -1586,12 +1656,13 @@ async fn prompt_message(
 async fn regenerate_prompt(
     registry: web::Data<RwLock<ParticipantRegistry>>,
     joiner: Option<web::Data<JoinerHandle>>,
+    remote_bots: web::Data<RemoteBots>,
 ) -> HttpResponse {
     if let Some(response) = reject_if_joiner(&joiner) {
         return response;
     }
 
-    // Resolved before the delete below: it is read-only, so a lookup failure
+    // Resolved before the pop below: it is read-only, so a lookup failure
     // here must not leave the conversation with its last message destroyed
     // and no replacement generated.
     let companion_id = match off_worker(
@@ -1603,7 +1674,33 @@ async fn regenerate_prompt(
         Ok(id) => id,
         Err(response) => return response,
     };
-    // Claimed before the delete below and moved into the blocking closure,
+    // The remote timeout budget and network role, read the same way
+    // `prompt_message` reads them: regenerating a remote bot's reply sends
+    // the same kind of `RemoteRequest` a live round would.
+    let (timeout, mode) = match off_worker("Error while getting config", Database::get_config).await
+    {
+        Ok(loaded_config) => (
+            std::time::Duration::from_secs(loaded_config.remote_generation_timeout_secs),
+            loaded_config.multiplayer_mode,
+        ),
+        Err(response) => return response,
+    };
+    let (remotes, broadcast) = round_remotes(mode, &remote_bots);
+    // Solo mode never touches `RemoteBots` (the same rule `round_remotes`
+    // itself follows): the snapshot stays empty, so `regenerate_target`
+    // routes `char` locally and any stray remote id offline, exactly like
+    // solo behaviour today.
+    let connected_bots: HashSet<String> = if mode == MultiplayerMode::Host {
+        remote_bots
+            .connected_ids()
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    // Claimed before the pop below and moved into the blocking closure,
     // which holds it for the whole turn: without it, a regenerate racing a
     // live stream could delete the user message a worker thread is about to
     // answer.
@@ -1619,30 +1716,64 @@ async fn regenerate_prompt(
         let _turn_guard = turn_guard;
         let store = SqliteTurnStore::new(participant_names);
 
-        let user_turn =
-            match Database::pop_latest_ai_reply().map_err(|source| TurnError::Database {
-                step: "Error while removing the latest reply",
-                source,
+        // Checked inside `pop_latest_bot_reply`'s own transaction, using the
+        // same `regenerate_target` decision this closure routes the actual
+        // generation with below, so the two can never disagree about who is
+        // connected.
+        let owner_ready = |speaker_id: &str| {
+            !matches!(
+                regenerate_target(speaker_id, &connected_bots),
+                RegenerateTarget::Offline(_)
+            )
+        };
+        let (speaker_id, popped_message_id, user_turn) =
+            match Database::pop_latest_bot_reply(owner_ready).map_err(|source| {
+                TurnError::Database {
+                    step: "Error while removing the latest reply",
+                    source,
+                }
             })? {
-                PoppedReply::Removed { user_turn } => user_turn,
+                PoppedReply::Removed {
+                    speaker_id,
+                    message_id: popped_message_id,
+                    user_turn,
+                } => (speaker_id, popped_message_id, user_turn),
                 PoppedReply::NothingToRegenerate => return Err(TurnError::NothingToRegenerate),
+                PoppedReply::OwnerUnavailable { speaker_id } => {
+                    return Err(TurnError::SpeakerOffline(speaker_id))
+                }
             };
-        let reply = prompt(
-            &user_turn.content,
-            companion_id,
-            &SqliteTranscript,
-            &speakers,
+        // Mirrored before generation starts, so a joiner never sees the old
+        // and new reply side by side (#135).
+        broadcast(ServerFrame::MessageRemoved {
+            id: popped_message_id,
+        });
+
+        let target = regenerate_target(&speaker_id, &connected_bots);
+        let persisted = regenerate_reply(
+            target,
+            &user_turn,
+            &store,
+            |text| prompt(text, companion_id, &SqliteTranscript, &speakers),
+            remotes.as_ref(),
+            timeout,
         )
-        .map_err(TurnError::Generate)?;
-        // `llm::generate` no longer persists the reply itself (#131); this
-        // handler is the one caller that relied on that implicit insert.
-        store
-            .insert_reply(&ParticipantId::CHAR, &reply)
-            .map_err(|source| TurnError::Database {
+        .map_err(|e| match e {
+            RegenerateError::Offline(speaker_id) => TurnError::SpeakerOffline(speaker_id),
+            RegenerateError::Generate(e) => TurnError::Generate(e),
+            RegenerateError::Database(source) => TurnError::Database {
                 step: "Error while adding message to database",
                 source,
-            })?;
-        Ok(reply)
+            },
+        })?;
+        match store.get_message(persisted.message_id) {
+            Ok(row) => broadcast(ServerFrame::Message(row)),
+            Err(e) => eprintln!(
+                "multiplayer: failed to load regenerated message {} to broadcast to joiners: {}",
+                persisted.message_id, e
+            ),
+        }
+        Ok(persisted.text)
     })
     .await;
 

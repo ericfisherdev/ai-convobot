@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { MessageInterface } from '../interfaces/Message';
 import { Message } from './Message';
 import { cn } from '../../lib/utils';
+import { isBotSpeaker } from '../../lib/speakers';
 import { useMobile } from '../../hooks/useMobile';
 
 interface VirtualMessageListProps {
@@ -157,7 +158,7 @@ export function VirtualMessageList({
                   <Message
                     received={message.ai}
                     id={message.id}
-                    regenerate={message.ai && messageIndex === messages.length - 1 && messageIndex !== 0}
+                    regenerate={isBotSpeaker(message) && messageIndex === messages.length - 1 && messageIndex !== 0}
                     content={message.content}
                     created_at={message.created_at}
                     speakerId={message.speaker_id}

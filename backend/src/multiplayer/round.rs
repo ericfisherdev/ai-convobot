@@ -20,6 +20,7 @@
 //! and `schedule_follow_ups` are re-exported from there so this module's own
 //! call sites and tests need no separate import.
 
+use std::collections::HashSet;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -295,6 +296,129 @@ pub fn run_round(
         replies,
         attitude,
     })
+}
+
+/// Where a regenerate request for a popped reply's `speaker_id` should be
+/// routed. `char` always regenerates locally through the host model; every
+/// other id belongs to a remote bot, routed to it only while it is
+/// connected — otherwise regenerating would either hang forever or answer
+/// with the wrong bot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegenerateTarget {
+    Local,
+    Remote(String),
+    Offline(String),
+}
+
+/// Pure routing decision for `speaker_id`, given the bot ids currently
+/// connected. `main.rs::regenerate_prompt` snapshots `RemoteBots`'
+/// connections into `connected_bots` before claiming the turn slot, so the
+/// whole regenerate stays `Send` across the `web::block` boundary; in
+/// `Solo` mode that snapshot is always empty, so a stray remote id there
+/// routes `Offline` and `char` still routes `Local`, matching solo
+/// behaviour exactly. This is also what `Database::pop_latest_bot_reply`'s
+/// `owner_ready` predicate is built from, so the "is this reply's owner
+/// available" check and the actual routing can never disagree.
+pub fn regenerate_target(speaker_id: &str, connected_bots: &HashSet<String>) -> RegenerateTarget {
+    if speaker_id == ParticipantId::CHAR.as_str() {
+        return RegenerateTarget::Local;
+    }
+    if connected_bots.contains(speaker_id) {
+        RegenerateTarget::Remote(speaker_id.to_string())
+    } else {
+        RegenerateTarget::Offline(speaker_id.to_string())
+    }
+}
+
+/// Why [`regenerate_reply`] could not produce a replacement reply. Mapped to
+/// an HTTP response by `main.rs::regenerate_prompt`'s `TurnError`, mirroring
+/// how [`run_round`]'s `io::Error` outcome is mapped by its own caller.
+#[derive(Debug)]
+pub enum RegenerateError {
+    /// The reply's owner is a remote bot that is not currently connected.
+    Offline(String),
+    /// The host, or the remote bot's own generation, failed. Carries the bot
+    /// id in the message so the log line names it, mirroring
+    /// [`SocketRemoteGenerator`](crate::multiplayer::remote_generator::SocketRemoteGenerator)'s
+    /// own failure logging.
+    Generate(io::Error),
+    Database(rusqlite::Error),
+}
+
+/// Regenerates the bot reply `Database::pop_latest_bot_reply` just removed,
+/// routed to its owner exactly as a live round would route it: `char`
+/// generates locally through `host`, any other id answers over `remotes`
+/// with the same transcript-tail request a round sends it.
+///
+/// Deliberately does not go through [`run_round`]: regenerate answers one
+/// speaker, not a whole round, and — unchanged from before #135 — never
+/// inserts a user turn, never calls `PendingTurn::finish`, and so never
+/// re-scores attitude. On the `Remote` arm, `host` is never called, so no
+/// host-side long-term-memory entry is written for a remote reply (`llm::generate`,
+/// `backend/src/llm.rs`, is the only place that happens); the joiner's own
+/// `generate` is what writes the entry on the joiner's side (#130).
+pub fn regenerate_reply(
+    target: RegenerateTarget,
+    user_turn: &Message,
+    store: &impl TurnStore,
+    host: impl FnOnce(&str) -> io::Result<String>,
+    remotes: &dyn RemoteGenerator,
+    timeout: Duration,
+) -> Result<PersistedReply, RegenerateError> {
+    match target {
+        RegenerateTarget::Offline(speaker_id) => Err(RegenerateError::Offline(speaker_id)),
+        RegenerateTarget::Local => {
+            let text = host(&user_turn.content).map_err(RegenerateError::Generate)?;
+            let message_id = store
+                .insert_reply(&ParticipantId::CHAR, &text)
+                .map_err(RegenerateError::Database)?;
+            Ok(PersistedReply {
+                message_id,
+                speaker_id: ParticipantId::CHAR,
+                text,
+            })
+        }
+        RegenerateTarget::Remote(speaker_id) => {
+            // Only ever reachable with an id `regenerate_target` already
+            // resolved to `Remote`, i.e. one this same process's registry
+            // produced as a connected bot's `ParticipantId`, so this parse
+            // cannot fail in practice; mapped to `Generate` rather than
+            // unwrapped so a future caller cannot turn a bad id into a panic.
+            let speaker = ParticipantId::parse(&speaker_id).map_err(|e| {
+                RegenerateError::Generate(io::Error::other(format!(
+                    "invalid speaker id {:?}: {}",
+                    speaker_id, e
+                )))
+            })?;
+            let tail = store
+                .transcript_tail(TRANSCRIPT_TAIL_MESSAGES)
+                .map_err(RegenerateError::Database)?;
+            let text = remotes
+                .generate(
+                    RemoteRequest {
+                        round_id: next_round_id(),
+                        speaker: &speaker,
+                        transcript: &tail,
+                        timeout,
+                    },
+                    &mut |_token| {},
+                )
+                .map_err(|failure| {
+                    RegenerateError::Generate(io::Error::other(format!(
+                        "{} failed to reply: {:?}",
+                        speaker_id, failure
+                    )))
+                })?;
+            let message_id = store
+                .insert_reply(&speaker, &text)
+                .map_err(RegenerateError::Database)?;
+            Ok(PersistedReply {
+                message_id,
+                speaker_id: speaker,
+                text,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -863,5 +987,146 @@ mod tests {
             ],
             "the user turn, then char's reply, then bot1's skip notice, then bot2's reply"
         );
+    }
+
+    fn user_message(id: i32, content: &str) -> Message {
+        Message {
+            id,
+            ai: false,
+            speaker_id: ParticipantId::USER.to_string(),
+            content: content.to_string(),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn connected(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn regenerate_target_routes_char_locally_regardless_of_who_is_connected() {
+        assert_eq!(
+            regenerate_target("char", &connected(&[])),
+            RegenerateTarget::Local
+        );
+        assert_eq!(
+            regenerate_target("char", &connected(&["bot1"])),
+            RegenerateTarget::Local
+        );
+    }
+
+    #[test]
+    fn regenerate_target_routes_a_connected_bot_remotely() {
+        assert_eq!(
+            regenerate_target("bot1", &connected(&["bot1", "bot2"])),
+            RegenerateTarget::Remote("bot1".to_string())
+        );
+    }
+
+    #[test]
+    fn regenerate_target_routes_a_disconnected_bot_offline() {
+        assert_eq!(
+            regenerate_target("bot1", &connected(&["bot2"])),
+            RegenerateTarget::Offline("bot1".to_string())
+        );
+        // Solo mode's snapshot is always empty, so a stray bot id (reachable
+        // only through a direct API call, never through the normal solo
+        // flow) still routes Offline rather than panicking or routing Local.
+        assert_eq!(
+            regenerate_target("bot1", &connected(&[])),
+            RegenerateTarget::Offline("bot1".to_string())
+        );
+    }
+
+    #[test]
+    fn regenerate_reply_local_calls_host_once_and_inserts_under_char() {
+        let store = RecordingStore::new(None);
+        let user_turn = user_message(1, "hi");
+        let remotes = FakeRemote::new(vec![]);
+
+        let persisted = regenerate_reply(
+            RegenerateTarget::Local,
+            &user_turn,
+            &store,
+            |prompt| {
+                assert_eq!(prompt, "hi");
+                Ok("hello again".to_string())
+            },
+            &remotes,
+            Duration::from_secs(30),
+        )
+        .expect("local regenerate should succeed");
+
+        assert_eq!(persisted.speaker_id, ParticipantId::CHAR);
+        assert_eq!(persisted.text, "hello again");
+        assert_eq!(
+            *store.replies.lock().unwrap(),
+            vec![(ParticipantId::CHAR, "hello again".to_string())]
+        );
+    }
+
+    #[test]
+    fn regenerate_reply_remote_never_calls_host_and_inserts_under_the_bot() {
+        let store = RecordingStore::new(None);
+        let user_turn = user_message(1, "hi @bot1");
+        let remotes = FakeRemote::new(vec![(bot("bot1"), Ok("hi again from bot1"))]);
+
+        let persisted = regenerate_reply(
+            RegenerateTarget::Remote("bot1".to_string()),
+            &user_turn,
+            &store,
+            |_prompt| panic!("the host must never be asked to speak for a remote reply"),
+            &remotes,
+            Duration::from_secs(30),
+        )
+        .expect("remote regenerate should succeed");
+
+        assert_eq!(persisted.speaker_id, bot("bot1"));
+        assert_eq!(persisted.text, "hi again from bot1");
+        assert_eq!(
+            *store.replies.lock().unwrap(),
+            vec![(bot("bot1"), "hi again from bot1".to_string())]
+        );
+    }
+
+    #[test]
+    fn regenerate_reply_remote_failure_inserts_nothing() {
+        let store = RecordingStore::new(None);
+        let user_turn = user_message(1, "hi @bot1");
+        let remotes = FakeRemote::new(vec![(bot("bot1"), Err(RemoteFailure::Timeout))]);
+
+        let result = regenerate_reply(
+            RegenerateTarget::Remote("bot1".to_string()),
+            &user_turn,
+            &store,
+            |_prompt| panic!("the host must never be asked to speak for a remote reply"),
+            &remotes,
+            Duration::from_secs(30),
+        );
+
+        assert!(matches!(result, Err(RegenerateError::Generate(_))));
+        assert!(store.replies.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn regenerate_reply_offline_target_fails_without_touching_the_store() {
+        let store = RecordingStore::new(None);
+        let user_turn = user_message(1, "hi @bot1");
+        let remotes = FakeRemote::new(vec![]);
+
+        let result = regenerate_reply(
+            RegenerateTarget::Offline("bot1".to_string()),
+            &user_turn,
+            &store,
+            |_prompt| panic!("an offline target must never generate"),
+            &remotes,
+            Duration::from_secs(30),
+        );
+
+        match result {
+            Err(RegenerateError::Offline(speaker_id)) => assert_eq!(speaker_id, "bot1"),
+            other => panic!("expected Offline, got {:?}", other),
+        }
+        assert!(store.replies.lock().unwrap().is_empty());
     }
 }

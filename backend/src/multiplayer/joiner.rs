@@ -446,6 +446,14 @@ async fn serve(
                     let mut shared = handle.write().unwrap_or_else(|p| p.into_inner());
                     shared.transcript.push(message);
                 }
+                Ok(ServerFrame::MessageEdited { message }) => {
+                    let mut shared = handle.write().unwrap_or_else(|p| p.into_inner());
+                    shared.transcript.replace_message(message);
+                }
+                Ok(ServerFrame::MessageRemoved { id }) => {
+                    let mut shared = handle.write().unwrap_or_else(|p| p.into_inner());
+                    shared.transcript.remove(id);
+                }
                 Ok(ServerFrame::ParticipantJoined(summary)) => {
                     let mut shared = handle.write().unwrap_or_else(|p| p.into_inner());
                     if !shared.participants.iter().any(|p| p.id == summary.id) {
@@ -804,6 +812,56 @@ mod tests {
         let generation: Arc<dyn GenerateRequestHandler> = Arc::new(FixedReplyGeneration);
         let _ = connect_and_serve(&handle, &identity, &generation, &mut backoff).await;
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn message_edited_and_message_removed_frames_update_the_transcript_mirror() {
+        let (host_address, listener) = spawn_fake_host().await;
+        let identity = identity(host_address);
+        let handle: JoinerHandle = Arc::new(RwLock::new(JoinerShared::new(&identity)));
+
+        let server = tokio::spawn({
+            let identity = identity.clone();
+            async move {
+                let mut ws = accept_one(&listener).await;
+                let (nonce, _) = nonce_and_proof(&identity);
+                send_frame(
+                    &mut ws,
+                    &ServerFrame::Challenge {
+                        protocol_version: PROTOCOL_VERSION,
+                        nonce: handshake::encode(&nonce),
+                    },
+                )
+                .await;
+                let _join = recv_client_frame(&mut ws).await;
+                send_frame(
+                    &mut ws,
+                    &ServerFrame::Joined {
+                        self_id: identity.id.clone(),
+                        participants: vec![],
+                        transcript: vec![sample_message(1), sample_message(2)],
+                    },
+                )
+                .await;
+
+                let mut edited = sample_message(1);
+                edited.content = "edited content".to_string();
+                send_frame(&mut ws, &ServerFrame::MessageEdited { message: edited }).await;
+                send_frame(&mut ws, &ServerFrame::MessageRemoved { id: 2 }).await;
+
+                ws.close(None).await.ok();
+            }
+        });
+
+        let mut backoff = ReconnectBackoff::new();
+        let generation: Arc<dyn GenerateRequestHandler> = Arc::new(NoopGeneration);
+        let _ = connect_and_serve(&handle, &identity, &generation, &mut backoff).await;
+        server.await.unwrap();
+
+        let shared = handle.read().unwrap();
+        let (page, total, _) = shared.transcript.page(0, 15);
+        assert_eq!(total, 1, "message 2 should have been removed");
+        assert_eq!(page[0].content, "edited content");
     }
 
     #[test]
