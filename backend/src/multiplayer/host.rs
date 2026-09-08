@@ -170,19 +170,35 @@ pub async fn multiplayer_ws(
         });
     }
 
-    if let Some(ip) = peer_ip {
-        if throttle.is_blocked(ip, Instant::now()) {
-            return Ok(HttpResponse::TooManyRequests()
-                .json(serde_json::json!({ "error": "too many failed joins" })));
-        }
-    }
-
     let password = match host_password_or_404(host_config.get_ref()).await {
         Ok(password) => password,
         Err(response) => return Ok(response),
     };
 
-    let (response, session, msg_stream) = actix_ws::handle(&req, body)?;
+    // Reserved atomically with the block check (`try_reserve`, not a
+    // separate is_blocked + record_failure pair) so a burst of concurrent
+    // connections from one address cannot all pass the check before any of
+    // them is counted — see the module doc on `join_throttle`.
+    if let Some(ip) = peer_ip {
+        if !throttle.try_reserve(ip, Instant::now()) {
+            return Ok(HttpResponse::TooManyRequests()
+                .json(serde_json::json!({ "error": "too many failed joins" })));
+        }
+    }
+
+    let (response, session, msg_stream) = match actix_ws::handle(&req, body) {
+        Ok(upgraded) => upgraded,
+        Err(e) => {
+            // The upgrade itself failed before a connection task exists to
+            // release the reservation on any of its own exit paths, so
+            // release it here instead of leaking it for the rest of the
+            // window.
+            if let Some(ip) = peer_ip {
+                throttle.release(ip, Instant::now());
+            }
+            return Err(e);
+        }
+    };
     actix_web::rt::spawn(run_connection(
         session,
         msg_stream,
@@ -208,33 +224,51 @@ enum AwaitJoinOutcome {
     GiveUp,
 }
 
-/// Waits up to `timeout` for the first frame and requires it to be a `Join`
-/// at [`PROTOCOL_VERSION`]. Everything else the plan calls "not a `Join` at
-/// protocol version 1" — malformed JSON, a future frame variant, or a
-/// version mismatch — becomes [`RejectReason::UnsupportedProtocol`]; a
-/// timed-out wait becomes [`RejectReason::JoinTimeout`].
+/// Waits up to `timeout` (one absolute deadline for the whole wait, not
+/// reset per message) for a `Join` at [`PROTOCOL_VERSION`], replying to any
+/// `Ping` received first and ignoring any `Pong` — `AggregatedMessageStream`
+/// surfaces both as plain messages and does not answer `Ping` itself, and a
+/// standards-compliant client may send one before `Join`. Everything else
+/// the plan calls "not a `Join` at protocol version 1" — malformed JSON, a
+/// future frame variant, or a version mismatch — becomes
+/// [`RejectReason::UnsupportedProtocol`]; running out the deadline becomes
+/// [`RejectReason::JoinTimeout`].
 async fn await_join(
+    session: &mut actix_ws::Session,
     stream: &mut actix_ws::AggregatedMessageStream,
     timeout: Duration,
 ) -> AwaitJoinOutcome {
-    let Ok(next) = tokio::time::timeout(timeout, stream.recv()).await else {
-        return AwaitJoinOutcome::Reject(RejectReason::JoinTimeout);
-    };
-    let Some(Ok(msg)) = next else {
-        return AwaitJoinOutcome::GiveUp;
-    };
-    match msg {
-        AggregatedMessage::Text(text) => match serde_json::from_str::<ClientFrame>(&text) {
-            Ok(ClientFrame::Join {
-                protocol_version, ..
-            }) if protocol_version != PROTOCOL_VERSION => {
-                AwaitJoinOutcome::Reject(RejectReason::UnsupportedProtocol)
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let Ok(next) = tokio::time::timeout_at(deadline, stream.recv()).await else {
+            return AwaitJoinOutcome::Reject(RejectReason::JoinTimeout);
+        };
+        let Some(Ok(msg)) = next else {
+            return AwaitJoinOutcome::GiveUp;
+        };
+        match msg {
+            AggregatedMessage::Text(text) => {
+                return match serde_json::from_str::<ClientFrame>(&text) {
+                    Ok(ClientFrame::Join {
+                        protocol_version, ..
+                    }) if protocol_version != PROTOCOL_VERSION => {
+                        AwaitJoinOutcome::Reject(RejectReason::UnsupportedProtocol)
+                    }
+                    Ok(frame @ ClientFrame::Join { .. }) => AwaitJoinOutcome::Frame(frame),
+                    Err(_) => AwaitJoinOutcome::Reject(RejectReason::UnsupportedProtocol),
+                };
             }
-            Ok(frame @ ClientFrame::Join { .. }) => AwaitJoinOutcome::Frame(frame),
-            Err(_) => AwaitJoinOutcome::Reject(RejectReason::UnsupportedProtocol),
-        },
-        AggregatedMessage::Close(_) => AwaitJoinOutcome::GiveUp,
-        _ => AwaitJoinOutcome::Reject(RejectReason::UnsupportedProtocol),
+            AggregatedMessage::Ping(bytes) => {
+                if session.pong(&bytes).await.is_err() {
+                    return AwaitJoinOutcome::GiveUp;
+                }
+            }
+            AggregatedMessage::Pong(_) => {}
+            AggregatedMessage::Close(_) => return AwaitJoinOutcome::GiveUp,
+            AggregatedMessage::Binary(_) => {
+                return AwaitJoinOutcome::Reject(RejectReason::UnsupportedProtocol);
+            }
+        }
     }
 }
 
@@ -250,17 +284,22 @@ enum AdmitOutcome {
     Rejected(RejectReason),
 }
 
-/// Validates and stores the avatar (if any), inserts the participant into
-/// the shared registry, registers it with `remote_bots`, and builds the
-/// `Joined` frame (participant snapshot plus the last 50 messages).
+/// Validates the avatar (if any), inserts the participant into the shared
+/// registry, registers it with `remote_bots`, stores the avatar, and builds
+/// the `Joined` frame (participant snapshot plus the last 50 messages).
 ///
-/// Order matters: the avatar is validated and stored *before* the registry
-/// insert, so a rejected avatar never leaves a half-admitted participant
-/// behind; the registry insert happens *before* `remote_bots.register`, so
-/// a losing race against a duplicate `remote_bots` entry (which cannot
-/// happen today since the registry's own `Duplicate` check runs first, but
-/// would if a future caller ever registered with `remote_bots` a different
-/// way) is rolled back here rather than left inconsistent.
+/// Order matters. Avatar *validation* (pure, no I/O) happens first so an
+/// invalid upload is rejected before anything is written anywhere. Avatar
+/// *storage* happens last, only after the registry insert and
+/// `remote_bots.register` both succeed: storing first would let an upload
+/// for an already-taken or reserved id overwrite that id's file on disk
+/// before the `Duplicate`/`Reserved` check ever ran. If storage then fails,
+/// the registry entry and `remote_bots` registration are rolled back and
+/// the join is rejected, so a participant is never admitted with an
+/// avatar URL for bytes that were never actually written; `Participant::avatar`
+/// is set only from *this* join's own successful store, never derived from
+/// `avatar::find_stored_avatar`, which is not scoped to this join and could
+/// still find an older file after a failed write.
 async fn admit(
     id: &ParticipantId,
     display_name: String,
@@ -268,25 +307,19 @@ async fn admit(
     participants: &RwLock<ParticipantRegistry>,
     remote_bots: &RemoteBots,
 ) -> AdmitOutcome {
-    if let Some(upload) = avatar_upload {
-        match avatar::validate_avatar(&upload) {
-            Ok(validated) => {
-                if let Err(e) = avatar::store_participant_avatar(id, &validated) {
-                    eprintln!("multiplayer: failed to store avatar for {}: {}", id, e);
-                }
-            }
+    let validated_avatar = match avatar_upload {
+        None => None,
+        Some(upload) => match avatar::validate_avatar(&upload) {
+            Ok(validated) => Some(validated),
             Err(e) => return AdmitOutcome::Rejected(RejectReason::InvalidAvatar(e.to_string())),
-        }
-    }
-
-    let avatar_ref = avatar::find_stored_avatar(id)
-        .map(|_| AvatarRef::new(format!("/api/multiplayer/participants/{}/avatar", id)));
+        },
+    };
 
     let participant = Participant {
         id: id.clone(),
-        display_name,
+        display_name: display_name.clone(),
         kind: ParticipantKind::RemoteBot,
-        avatar: avatar_ref,
+        avatar: None,
     };
 
     {
@@ -307,6 +340,27 @@ async fn admit(
             return AdmitOutcome::Rejected(RejectReason::DuplicateId);
         }
     };
+
+    if let Some(validated) = validated_avatar {
+        match avatar::store_participant_avatar(id, &validated) {
+            Ok(_) => {
+                let avatar_ref =
+                    AvatarRef::new(format!("/api/multiplayer/participants/{}/avatar", id));
+                let mut registry = participants.write().unwrap_or_else(|p| p.into_inner());
+                let _ = registry.rename(id, &display_name, Some(avatar_ref));
+            }
+            Err(e) => {
+                eprintln!("multiplayer: failed to store avatar for {}: {}", id, e);
+                avatar::remove_stored_avatar(id);
+                remote_bots.unregister(id);
+                let mut registry = participants.write().unwrap_or_else(|p| p.into_inner());
+                let _ = registry.remove(id);
+                return AdmitOutcome::Rejected(RejectReason::InvalidAvatar(
+                    "failed to store avatar, check host logs".to_string(),
+                ));
+            }
+        }
+    }
 
     let participant_summaries = {
         let registry = participants.read().unwrap_or_else(|p| p.into_inner());
@@ -495,13 +549,24 @@ async fn run_connection(
         return;
     }
 
-    let join_frame = match await_join(&mut stream, settings.join_timeout).await {
+    let join_frame = match await_join(&mut session, &mut stream, settings.join_timeout).await {
         AwaitJoinOutcome::Frame(frame) => frame,
         AwaitJoinOutcome::Reject(reason) => {
+            // Not a bad password guess (a timeout, a malformed frame, or an
+            // unsupported protocol version), so release the reservation
+            // rather than let it count toward the throttle.
+            if let Some(ip) = peer_ip {
+                throttle.release(ip, Instant::now());
+            }
             reject_and_close(&mut session, reason).await;
             return;
         }
-        AwaitJoinOutcome::GiveUp => return,
+        AwaitJoinOutcome::GiveUp => {
+            if let Some(ip) = peer_ip {
+                throttle.release(ip, Instant::now());
+            }
+            return;
+        }
     };
 
     let ClientFrame::Join {
@@ -518,16 +583,26 @@ async fn run_connection(
                 "multiplayer: refusing joins because host mode has no password set; set one in the settings dialog"
             );
         });
+        if let Some(ip) = peer_ip {
+            throttle.release(ip, Instant::now());
+        }
         reject_and_close(&mut session, RejectReason::NoHostPassword).await;
         return;
     }
 
     if !handshake::verify_join_proof(&password, &nonce, &id, &proof) {
-        if let Some(ip) = peer_ip {
-            throttle.record_failure(ip, Instant::now());
-        }
+        // Deliberately not released: a wrong password proof is exactly the
+        // kind of attempt this throttle exists to keep counted for the
+        // rest of the window.
         reject_and_close(&mut session, RejectReason::BadProof).await;
         return;
+    }
+
+    // The proof was valid, so this attempt is done consuming throttle
+    // budget regardless of what `admit` decides next (`DuplicateId`,
+    // `ReservedId`, and an invalid avatar are not password guesses).
+    if let Some(ip) = peer_ip {
+        throttle.release(ip, Instant::now());
     }
 
     let admitted = match admit(&id, display_name, avatar, &participants, &remote_bots).await {
@@ -537,10 +612,6 @@ async fn run_connection(
             return;
         }
     };
-
-    if let Some(ip) = peer_ip {
-        throttle.clear(ip);
-    }
 
     if send_frame(&mut session, &admitted.joined).await.is_err() {
         unregister(&id, session, &remote_bots, &participants).await;

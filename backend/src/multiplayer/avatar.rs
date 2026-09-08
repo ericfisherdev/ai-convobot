@@ -160,11 +160,29 @@ fn remove_other_extension(id: &ParticipantId, format: AvatarFormat) -> io::Resul
     Ok(())
 }
 
+/// Best-effort removal of any stored avatar for `id` (both extensions).
+/// Used to roll back a file `store_participant_avatar` partially wrote when
+/// admission fails after storage (`host.rs::admit`): a missing file is not
+/// an error (there may never have been one to remove), and any other I/O
+/// error is logged rather than propagated since this itself runs on an
+/// already-failing path with nothing left to report the error to.
+pub fn remove_stored_avatar(id: &ParticipantId) {
+    for format in [AvatarFormat::Png, AvatarFormat::Jpeg] {
+        let path = paths::participant_avatar_path(id, format.extension());
+        if let Err(e) = fs::remove_file(&path) {
+            if e.kind() != io::ErrorKind::NotFound {
+                eprintln!("multiplayer: failed to remove {}: {}", path.display(), e);
+            }
+        }
+    }
+}
+
 /// Looks for a previously stored avatar for `id`, trying PNG then JPEG
-/// (the two formats `store_participant_avatar` ever writes). Used both to
-/// decide whether a just-admitted participant has an avatar URL to publish
-/// (`host.rs::admit`) and by the avatar-serving HTTP handler
-/// (`main.rs::multiplayer_participant_avatar`).
+/// (the two formats `store_participant_avatar` ever writes). Used by the
+/// avatar-serving HTTP handler (`main.rs::multiplayer_participant_avatar`).
+/// Not used to decide a fresh join's `avatar_url` (`host.rs::admit` sets
+/// that only from its own successful store) since a file found here is not
+/// scoped to any particular join.
 pub fn find_stored_avatar(id: &ParticipantId) -> Option<(AvatarFormat, PathBuf)> {
     for format in [AvatarFormat::Png, AvatarFormat::Jpeg] {
         let path = paths::participant_avatar_path(id, format.extension());
