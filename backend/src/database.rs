@@ -4,12 +4,13 @@ use rusqlite::{
     params, Connection, Error, OptionalExtension, Result, ToSql, Transaction, TransactionBehavior,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::character_card::CharacterCard;
+use crate::multiplayer::config::{MultiplayerConfig, MultiplayerMode};
 
 /// Reserved speaker id for the human participant. #126's `ParticipantId`
 /// reserved IDs must reuse this constant, not redefine it.
@@ -429,6 +430,25 @@ pub struct ConfigView {
     pub max_system_ram_usage_gb: usize,
     pub context_expansion_strategy: String,
     pub ram_safety_margin_gb: usize,
+    pub multiplayer_mode: MultiplayerMode,
+    pub multiplayer_host_address: String,
+    pub multiplayer_participant_id: String,
+    pub mention_followup_depth: u8,
+    pub remote_generation_timeout_secs: u64,
+    /// Derived from `multiplayer_password`: whether a host password is
+    /// currently stored. What `GET /api/config` sends instead of the
+    /// password itself.
+    pub multiplayer_password_set: bool,
+    /// The shared HMAC secret #129/#130 use to authenticate host/joiner
+    /// connections. Stored and kept in plaintext: unlike a login password,
+    /// it must be recoverable so both sides of the connection can present
+    /// it. `#[serde(skip)]` (not `skip_serializing`, so `ConfigView` still
+    /// derives `Deserialize`) keeps it out of every JSON response;
+    /// `multiplayer_password_set` is what callers see instead.
+    #[serde(skip)]
+    #[allow(dead_code)]
+    // read by #129 (host verification) and #130 (joiner HMAC proof), not yet wired up
+    pub multiplayer_password: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -448,6 +468,60 @@ pub struct ConfigModify {
     pub max_system_ram_usage_gb: usize,
     pub context_expansion_strategy: String,
     pub ram_safety_margin_gb: usize,
+    #[serde(default = "default_multiplayer_mode")]
+    pub multiplayer_mode: String,
+    #[serde(default)]
+    pub multiplayer_host_address: String,
+    #[serde(default)]
+    pub multiplayer_participant_id: String,
+    #[serde(default = "default_mention_followup_depth")]
+    pub mention_followup_depth: u8,
+    #[serde(default = "default_remote_generation_timeout_secs")]
+    pub remote_generation_timeout_secs: u64,
+    /// Write-only: `None` or `Some("")` leaves the stored password
+    /// unchanged, so the frontend never has to resend it on every save.
+    #[serde(default)]
+    pub multiplayer_password: Option<String>,
+}
+
+fn default_multiplayer_mode() -> String {
+    "solo".to_string()
+}
+
+fn default_mention_followup_depth() -> u8 {
+    1
+}
+
+fn default_remote_generation_timeout_secs() -> u64 {
+    120
+}
+
+/// The one way `Database::write_config` (#128) can reject a `PUT
+/// /api/config` request: `Invalid` names an already-user-facing message
+/// (bad device/template/multiplayer value), surfaced by `main.rs::config_post`
+/// as a 400. `Database` wraps any lower-level `rusqlite` failure and is
+/// surfaced as the existing 500.
+#[derive(Debug)]
+pub enum ConfigChangeError {
+    Invalid(String),
+    Database(rusqlite::Error),
+}
+
+impl std::fmt::Display for ConfigChangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigChangeError::Invalid(msg) => write!(f, "{}", msg),
+            ConfigChangeError::Database(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl std::error::Error for ConfigChangeError {}
+
+impl From<rusqlite::Error> for ConfigChangeError {
+    fn from(e: rusqlite::Error) -> Self {
+        ConfigChangeError::Database(e)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -914,7 +988,13 @@ impl Database {
                 enable_hybrid_context BOOLEAN DEFAULT true,
                 max_system_ram_usage_gb INTEGER DEFAULT 8,
                 context_expansion_strategy TEXT DEFAULT 'balanced',
-                ram_safety_margin_gb INTEGER DEFAULT 2
+                ram_safety_margin_gb INTEGER DEFAULT 2,
+                multiplayer_mode TEXT DEFAULT 'solo',
+                multiplayer_password TEXT DEFAULT '',
+                multiplayer_host_address TEXT DEFAULT '',
+                multiplayer_participant_id TEXT DEFAULT '',
+                mention_followup_depth INTEGER DEFAULT 1,
+                remote_generation_timeout_secs INTEGER DEFAULT 120
             )",
             [],
         )?;
@@ -1482,8 +1562,18 @@ impl Database {
 
     pub fn get_config() -> Result<ConfigView> {
         let con = Self::open()?;
-        let mut stmt = con.prepare("SELECT device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb, dynamic_gpu_allocation, gpu_safety_margin, min_free_vram_mb, enable_hybrid_context, max_system_ram_usage_gb, context_expansion_strategy, ram_safety_margin_gb FROM config LIMIT 1")?;
+        Self::read_config(&con)
+    }
+
+    /// The `SELECT`/row-mapping half of `get_config`, split out so tests can
+    /// run it against a temp-file `Connection` instead of the real database
+    /// path (matches how `migrate_config_table` already takes a
+    /// connection).
+    fn read_config(con: &Connection) -> Result<ConfigView> {
+        let mut stmt = con.prepare("SELECT device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb, dynamic_gpu_allocation, gpu_safety_margin, min_free_vram_mb, enable_hybrid_context, max_system_ram_usage_gb, context_expansion_strategy, ram_safety_margin_gb, multiplayer_mode, multiplayer_password, multiplayer_host_address, multiplayer_participant_id, mention_followup_depth, remote_generation_timeout_secs FROM config LIMIT 1")?;
         let row = stmt.query_row([], |row| {
+            let multiplayer_password: String =
+                row.get::<_, Option<String>>(16)?.unwrap_or_default();
             Ok(ConfigView {
                 device: row.get(0)?,
                 llm_model_path: row.get(1)?,
@@ -1502,18 +1592,44 @@ impl Database {
                     .get::<_, Option<String>>(13)?
                     .unwrap_or("balanced".to_string()),
                 ram_safety_margin_gb: row.get::<_, Option<usize>>(14)?.unwrap_or(2),
+                multiplayer_mode: row
+                    .get::<_, Option<MultiplayerMode>>(15)?
+                    .unwrap_or_default(),
+                multiplayer_password_set: !multiplayer_password.is_empty(),
+                multiplayer_password,
+                multiplayer_host_address: row.get::<_, Option<String>>(17)?.unwrap_or_default(),
+                multiplayer_participant_id: row.get::<_, Option<String>>(18)?.unwrap_or_default(),
+                mention_followup_depth: row.get::<_, Option<u8>>(19)?.unwrap_or(1),
+                remote_generation_timeout_secs: row.get::<_, Option<u64>>(20)?.unwrap_or(120),
             })
         })?;
         Ok(row)
     }
 
-    pub fn change_config(config: ConfigModify) -> Result<(), Error> {
+    pub fn change_config(config: ConfigModify) -> Result<(), ConfigChangeError> {
+        let con = Self::open()?;
+        Self::write_config(&con, config)
+    }
+
+    /// The validation/`UPDATE` half of `change_config`, split out so tests
+    /// can run it against a temp-file `Connection`.
+    ///
+    /// Validation order: device, then prompt template, then the
+    /// multiplayer fields as one unit via `MultiplayerConfig::parse`, then
+    /// (only once every field parses) the host-mode-needs-a-password rule,
+    /// which needs the currently stored password. The main `UPDATE` and the
+    /// password `UPDATE` run in one transaction so a crash between the two
+    /// can never leave a password write half-applied; the password
+    /// statement only runs when the caller supplied a non-empty
+    /// `multiplayer_password`, so an empty or absent one never clears the
+    /// stored value.
+    fn write_config(con: &Connection, config: ConfigModify) -> Result<(), ConfigChangeError> {
         let device = match config.device.as_str() {
             "CPU" => Device::CPU,
             "GPU" => Device::GPU,
             "Metal" => Device::Metal,
             _ => {
-                return Err(rusqlite::Error::InvalidParameterName(
+                return Err(ConfigChangeError::Invalid(
                     "Invalid device type".to_string(),
                 ))
             }
@@ -1525,16 +1641,42 @@ impl Database {
             "Llama2" => PromptTemplate::Llama2,
             "Mistral" => PromptTemplate::Mistral,
             _ => {
-                return Err(rusqlite::Error::InvalidParameterName(
+                return Err(ConfigChangeError::Invalid(
                     "Invalid prompt template type".to_string(),
                 ))
             }
         };
 
-        let con = Self::open()?;
-        con.execute(
-            "UPDATE config SET device = ?, llm_model_path = ?, gpu_layers = ?, prompt_template = ?, context_window_size = ?, max_response_tokens = ?, enable_dynamic_context = ?, vram_limit_gb = ?, dynamic_gpu_allocation = ?, gpu_safety_margin = ?, min_free_vram_mb = ?, enable_hybrid_context = ?, max_system_ram_usage_gb = ?, context_expansion_strategy = ?, ram_safety_margin_gb = ?",
-            [
+        let multiplayer = MultiplayerConfig::parse(
+            &config.multiplayer_mode,
+            &config.multiplayer_host_address,
+            &config.multiplayer_participant_id,
+            config.mention_followup_depth,
+            config.remote_generation_timeout_secs,
+        )
+        .map_err(|e| ConfigChangeError::Invalid(e.to_string()))?;
+
+        let stored_password: String = con
+            .query_row(
+                "SELECT multiplayer_password FROM config LIMIT 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )?
+            .unwrap_or_default();
+        let incoming_password = config.multiplayer_password.clone().unwrap_or_default();
+        if multiplayer.mode == MultiplayerMode::Host
+            && stored_password.is_empty()
+            && incoming_password.is_empty()
+        {
+            return Err(ConfigChangeError::Invalid(
+                "host mode requires a password".to_string(),
+            ));
+        }
+
+        let tx = con.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE config SET device = ?, llm_model_path = ?, gpu_layers = ?, prompt_template = ?, context_window_size = ?, max_response_tokens = ?, enable_dynamic_context = ?, vram_limit_gb = ?, dynamic_gpu_allocation = ?, gpu_safety_margin = ?, min_free_vram_mb = ?, enable_hybrid_context = ?, max_system_ram_usage_gb = ?, context_expansion_strategy = ?, ram_safety_margin_gb = ?, multiplayer_mode = ?, multiplayer_host_address = ?, multiplayer_participant_id = ?, mention_followup_depth = ?, remote_generation_timeout_secs = ?",
+            params![
                 &device as &dyn ToSql,
                 &config.llm_model_path,
                 &config.gpu_layers,
@@ -1550,8 +1692,22 @@ impl Database {
                 &config.max_system_ram_usage_gb,
                 &config.context_expansion_strategy,
                 &config.ram_safety_margin_gb,
-            ]
+                &multiplayer.mode as &dyn ToSql,
+                &config.multiplayer_host_address,
+                &config.multiplayer_participant_id,
+                &config.mention_followup_depth,
+                &config.remote_generation_timeout_secs,
+            ],
         )?;
+
+        if !incoming_password.is_empty() {
+            tx.execute(
+                "UPDATE config SET multiplayer_password = ?",
+                params![&incoming_password],
+            )?;
+        }
+
+        tx.commit()?;
         Ok(())
     }
 
@@ -4343,87 +4499,83 @@ impl Database {
         Ok(())
     }
 
+    /// Adds every `config` column introduced after the original four
+    /// (`device`, `llm_model_path`, `gpu_layers`, `prompt_template`) to a
+    /// database that predates it. Table-driven rather than one `has_*` bool
+    /// per column (that grew unwieldy past #128's six new multiplayer
+    /// columns): reads the existing column set once via `PRAGMA
+    /// table_info`, then runs each `ALTER TABLE` whose column is absent.
+    /// Idempotent, like the per-bool version it replaces.
     pub fn migrate_config_table(con: &Connection) -> Result<()> {
-        // Check if new columns exist and add them if they don't
-        let mut has_context_window = false;
-        let mut has_max_response = false;
-        let mut has_dynamic_context = false;
-        let mut has_vram_limit = false;
-        let mut has_hybrid_context = false;
-        let mut has_max_system_ram = false;
-        let mut has_context_strategy = false;
-        let mut has_ram_safety_margin = false;
-
-        // Check existing columns
-        let mut stmt = con.prepare("PRAGMA table_info(config)")?;
-        let rows = stmt.query_map([], |row| {
-            let column_name: String = row.get(1)?;
-            Ok(column_name)
-        })?;
-
-        for row in rows {
-            let column_name = row?;
-            match column_name.as_str() {
-                "context_window_size" => has_context_window = true,
-                "max_response_tokens" => has_max_response = true,
-                "enable_dynamic_context" => has_dynamic_context = true,
-                "vram_limit_gb" => has_vram_limit = true,
-                "enable_hybrid_context" => has_hybrid_context = true,
-                "max_system_ram_usage_gb" => has_max_system_ram = true,
-                "context_expansion_strategy" => has_context_strategy = true,
-                "ram_safety_margin_gb" => has_ram_safety_margin = true,
-                _ => {}
-            }
-        }
-
-        // Add missing columns with default values
-        if !has_context_window {
-            con.execute(
+        const COLUMNS: &[(&str, &str)] = &[
+            (
+                "context_window_size",
                 "ALTER TABLE config ADD COLUMN context_window_size INTEGER DEFAULT 2048",
-                [],
-            )?;
-        }
-        if !has_max_response {
-            con.execute(
+            ),
+            (
+                "max_response_tokens",
                 "ALTER TABLE config ADD COLUMN max_response_tokens INTEGER DEFAULT 512",
-                [],
-            )?;
-        }
-        if !has_dynamic_context {
-            con.execute(
+            ),
+            (
+                "enable_dynamic_context",
                 "ALTER TABLE config ADD COLUMN enable_dynamic_context BOOLEAN DEFAULT true",
-                [],
-            )?;
-        }
-        if !has_vram_limit {
-            con.execute(
+            ),
+            (
+                "vram_limit_gb",
                 "ALTER TABLE config ADD COLUMN vram_limit_gb INTEGER DEFAULT 4",
-                [],
-            )?;
-        }
-        if !has_hybrid_context {
-            con.execute(
+            ),
+            (
+                "enable_hybrid_context",
                 "ALTER TABLE config ADD COLUMN enable_hybrid_context BOOLEAN DEFAULT true",
-                [],
-            )?;
-        }
-        if !has_max_system_ram {
-            con.execute(
+            ),
+            (
+                "max_system_ram_usage_gb",
                 "ALTER TABLE config ADD COLUMN max_system_ram_usage_gb INTEGER DEFAULT 8",
-                [],
-            )?;
-        }
-        if !has_context_strategy {
-            con.execute(
+            ),
+            (
+                "context_expansion_strategy",
                 "ALTER TABLE config ADD COLUMN context_expansion_strategy TEXT DEFAULT 'balanced'",
-                [],
-            )?;
-        }
-        if !has_ram_safety_margin {
-            con.execute(
+            ),
+            (
+                "ram_safety_margin_gb",
                 "ALTER TABLE config ADD COLUMN ram_safety_margin_gb INTEGER DEFAULT 2",
-                [],
-            )?;
+            ),
+            (
+                "multiplayer_mode",
+                "ALTER TABLE config ADD COLUMN multiplayer_mode TEXT DEFAULT 'solo'",
+            ),
+            (
+                "multiplayer_password",
+                "ALTER TABLE config ADD COLUMN multiplayer_password TEXT DEFAULT ''",
+            ),
+            (
+                "multiplayer_host_address",
+                "ALTER TABLE config ADD COLUMN multiplayer_host_address TEXT DEFAULT ''",
+            ),
+            (
+                "multiplayer_participant_id",
+                "ALTER TABLE config ADD COLUMN multiplayer_participant_id TEXT DEFAULT ''",
+            ),
+            (
+                "mention_followup_depth",
+                "ALTER TABLE config ADD COLUMN mention_followup_depth INTEGER DEFAULT 1",
+            ),
+            (
+                "remote_generation_timeout_secs",
+                "ALTER TABLE config ADD COLUMN remote_generation_timeout_secs INTEGER DEFAULT 120",
+            ),
+        ];
+
+        let mut stmt = con.prepare("PRAGMA table_info(config)")?;
+        let existing: HashSet<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_>>()?;
+        drop(stmt);
+
+        for (name, ddl) in COLUMNS {
+            if !existing.contains(*name) {
+                con.execute(ddl, [])?;
+            }
         }
 
         Ok(())
@@ -5584,5 +5736,204 @@ mod tests {
         let message = NewMessage::try_from(request).unwrap();
         assert_eq!(message.speaker_id, CHAR_SPEAKER_ID);
         assert_eq!(message.content, "hi");
+    }
+
+    // --- config / multiplayer (#128) ---
+
+    /// The four original `config` columns, matching what `init()` created
+    /// before #128 (and before the seven columns #94/#101/etc. added
+    /// earlier still) - what `migrate_config_table` needs to backfill on an
+    /// old database.
+    fn create_legacy_config_table(con: &Connection) {
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS config (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device TEXT,
+                llm_model_path TEXT,
+                gpu_layers INTEGER,
+                prompt_template TEXT
+            )",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO config (device, llm_model_path, gpu_layers, prompt_template) VALUES ('CPU', '', 0, 'Auto')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// The full, current `config` DDL (mirrors `init()`), plus a single
+    /// seed row, for tests that exercise `read_config`/`write_config`
+    /// directly without going through `migrate_config_table`.
+    fn create_config_table(con: &Connection) {
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS config (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device TEXT,
+                llm_model_path TEXT,
+                gpu_layers INTEGER,
+                prompt_template TEXT,
+                context_window_size INTEGER DEFAULT 2048,
+                max_response_tokens INTEGER DEFAULT 512,
+                enable_dynamic_context BOOLEAN DEFAULT true,
+                vram_limit_gb INTEGER DEFAULT 4,
+                dynamic_gpu_allocation BOOLEAN DEFAULT true,
+                gpu_safety_margin REAL DEFAULT 0.8,
+                min_free_vram_mb INTEGER DEFAULT 512,
+                enable_hybrid_context BOOLEAN DEFAULT true,
+                max_system_ram_usage_gb INTEGER DEFAULT 8,
+                context_expansion_strategy TEXT DEFAULT 'balanced',
+                ram_safety_margin_gb INTEGER DEFAULT 2,
+                multiplayer_mode TEXT DEFAULT 'solo',
+                multiplayer_password TEXT DEFAULT '',
+                multiplayer_host_address TEXT DEFAULT '',
+                multiplayer_participant_id TEXT DEFAULT '',
+                mention_followup_depth INTEGER DEFAULT 1,
+                remote_generation_timeout_secs INTEGER DEFAULT 120
+            )",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO config (device, llm_model_path, gpu_layers, prompt_template) VALUES ('CPU', '', 0, 'Auto')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// A `ConfigModify` that passes every validation rule, for tests to
+    /// mutate the one or two fields they care about.
+    fn valid_config_modify() -> ConfigModify {
+        ConfigModify {
+            device: "CPU".to_string(),
+            llm_model_path: String::new(),
+            gpu_layers: 0,
+            prompt_template: "Auto".to_string(),
+            context_window_size: 2048,
+            max_response_tokens: 512,
+            enable_dynamic_context: true,
+            vram_limit_gb: 4,
+            dynamic_gpu_allocation: true,
+            gpu_safety_margin: 0.8,
+            min_free_vram_mb: 512,
+            enable_hybrid_context: true,
+            max_system_ram_usage_gb: 8,
+            context_expansion_strategy: "balanced".to_string(),
+            ram_safety_margin_gb: 2,
+            multiplayer_mode: "solo".to_string(),
+            multiplayer_host_address: String::new(),
+            multiplayer_participant_id: String::new(),
+            mention_followup_depth: 1,
+            remote_generation_timeout_secs: 120,
+            multiplayer_password: None,
+        }
+    }
+
+    #[test]
+    fn migrate_config_table_adds_all_new_columns_and_is_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_legacy_config_table(&con);
+
+        Database::migrate_config_table(&con).unwrap();
+        // Running it again on an already-migrated table must still be Ok.
+        Database::migrate_config_table(&con).unwrap();
+
+        let mut stmt = con.prepare("PRAGMA table_info(config)").unwrap();
+        let columns: HashSet<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        drop(stmt);
+
+        for column in [
+            "context_window_size",
+            "max_response_tokens",
+            "enable_dynamic_context",
+            "vram_limit_gb",
+            "enable_hybrid_context",
+            "max_system_ram_usage_gb",
+            "context_expansion_strategy",
+            "ram_safety_margin_gb",
+            "multiplayer_mode",
+            "multiplayer_password",
+            "multiplayer_host_address",
+            "multiplayer_participant_id",
+            "mention_followup_depth",
+            "remote_generation_timeout_secs",
+        ] {
+            assert!(columns.contains(column), "missing column {column}");
+        }
+    }
+
+    #[test]
+    fn write_config_then_read_config_round_trips_multiplayer_fields() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_config_table(&con);
+
+        let mut modify = valid_config_modify();
+        modify.multiplayer_mode = "joiner".to_string();
+        modify.multiplayer_host_address = "host:3000".to_string();
+        modify.multiplayer_participant_id = "bot1".to_string();
+        modify.multiplayer_password = Some("secret".to_string());
+        Database::write_config(&con, modify).unwrap();
+
+        let view = Database::read_config(&con).unwrap();
+        assert_eq!(view.multiplayer_mode, MultiplayerMode::Joiner);
+        assert_eq!(view.multiplayer_host_address, "host:3000");
+        assert_eq!(view.multiplayer_participant_id, "bot1");
+        assert!(view.multiplayer_password_set);
+        assert_eq!(view.multiplayer_password, "secret");
+    }
+
+    #[test]
+    fn write_config_with_an_empty_password_keeps_the_stored_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_config_table(&con);
+
+        let mut first = valid_config_modify();
+        first.multiplayer_mode = "host".to_string();
+        first.multiplayer_password = Some("secret".to_string());
+        Database::write_config(&con, first).unwrap();
+
+        let mut second = valid_config_modify();
+        second.multiplayer_mode = "host".to_string();
+        second.multiplayer_password = Some(String::new());
+        Database::write_config(&con, second).unwrap();
+
+        let view = Database::read_config(&con).unwrap();
+        assert_eq!(view.multiplayer_password, "secret");
+        assert!(view.multiplayer_password_set);
+    }
+
+    #[test]
+    fn write_config_rejects_joiner_with_empty_host_address() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_config_table(&con);
+
+        let mut modify = valid_config_modify();
+        modify.multiplayer_mode = "joiner".to_string();
+        modify.multiplayer_participant_id = "bot1".to_string();
+
+        let err = Database::write_config(&con, modify).unwrap_err();
+        assert!(matches!(err, ConfigChangeError::Invalid(_)));
+    }
+
+    #[test]
+    fn write_config_rejects_host_mode_with_no_password_stored_or_supplied() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_config_table(&con);
+
+        let mut modify = valid_config_modify();
+        modify.multiplayer_mode = "host".to_string();
+
+        let err = Database::write_config(&con, modify).unwrap_err();
+        assert!(matches!(err, ConfigChangeError::Invalid(ref msg) if msg.contains("password")));
     }
 }

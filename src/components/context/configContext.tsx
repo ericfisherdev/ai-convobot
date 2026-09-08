@@ -54,7 +54,7 @@ export const useConfigData = () => {
   return useContext(ConfigContext);
 };
 
-export const updateConfigData = async (configData: ConfigInterface) => {
+export const updateConfigData = async (configData: ConfigInterface): Promise<boolean> => {
   try {
     const response = await fetch('/api/config', {
       method: 'PUT',
@@ -63,13 +63,19 @@ export const updateConfigData = async (configData: ConfigInterface) => {
       },
       body: JSON.stringify(configData),
     });
-    if (!response.ok) {
-      throw new Error('');
-    }
     const response_text = await response.text();
+    if (!response.ok) {
+      // The body carries the validation message (e.g. the 400 raised when a
+      // joiner participant id fails the id pattern) - surface it verbatim
+      // instead of a generic error.
+      toast.error(response_text);
+      return false;
+    }
     toast.info(response_text);
+    return true;
   } catch (error) {
     console.error(error);
     toast.error(`Error while sending config data to backend: ${error}`);
+    return false;
   }
 };

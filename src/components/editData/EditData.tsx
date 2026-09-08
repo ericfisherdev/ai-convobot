@@ -47,6 +47,7 @@ import { ThemeSettings } from "./ThemeSettings"
 import { DirectoryManager } from "../llm/DirectoryManager"
 import { LlmModelSelector } from "../llm/LlmModelSelector"
 import { ModelList } from "../llm/ModelList"
+import { MultiplayerSettings } from "./MultiplayerSettings"
 
 export function EditData() {
   const companionDataContext = useCompanionData();
@@ -84,7 +85,13 @@ export function EditData() {
 
   const handleConfigSave = async () => {
     if (configFormData) {
-      await updateConfigData(configFormData);
+      const saved = await updateConfigData(configFormData);
+      if (saved) {
+        // A stale password should never be resent on the next save; the
+        // backend already reports whether one is stored via
+        // multiplayer_password_set.
+        setConfigFormData((prev) => ({ ...prev, multiplayer_password: "" }));
+      }
       // Refresh GPU info after config save if dynamic allocation is enabled
       if (configFormData.dynamic_gpu_allocation) {
         fetchGpuInfo();
@@ -355,12 +362,13 @@ export function EditData() {
 
   return (
     <Tabs defaultValue="companion" className="w-full max-h-[65vh] overflow-y-auto">
-      <TabsList className="grid w-full grid-cols-5">
+      <TabsList className="grid w-full grid-cols-6">
         <TabsTrigger value="companion">Companion</TabsTrigger>
         <TabsTrigger value="user">User</TabsTrigger>
         <TabsTrigger value="attitudes">Attitudes</TabsTrigger>
         <TabsTrigger value="theme">Theme</TabsTrigger>
         <TabsTrigger value="config">Config</TabsTrigger>
+        <TabsTrigger value="multiplayer">Multiplayer</TabsTrigger>
       </TabsList>
       <TabsContent value="companion">
         <Card className="bg-background border-none shadow-none">
@@ -997,6 +1005,22 @@ export function EditData() {
                 </div>
               </div>
             </div>
+          </CardContent>
+          <CardFooter className="flex justify-center">
+            <Button onClick={() => {
+                handleConfigSave();
+                configContext?.refreshConfigData();
+              }}>Save changes</Button>
+          </CardFooter>
+        </Card>
+      </TabsContent>
+      <TabsContent value="multiplayer">
+        <Card className="bg-background border-none shadow-none">
+          <CardHeader>
+            <CardTitle>Multiplayer</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            <MultiplayerSettings config={configFormData} onChange={setConfigFormData} />
           </CardContent>
           <CardFooter className="flex justify-center">
             <Button onClick={() => {
