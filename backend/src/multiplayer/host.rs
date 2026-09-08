@@ -255,7 +255,10 @@ async fn await_join(
                         AwaitJoinOutcome::Reject(RejectReason::UnsupportedProtocol)
                     }
                     Ok(frame @ ClientFrame::Join { .. }) => AwaitJoinOutcome::Frame(frame),
-                    Err(_) => AwaitJoinOutcome::Reject(RejectReason::UnsupportedProtocol),
+                    // Any other frame before authentication (e.g. a #130
+                    // joiner's `ReplyFailed` sent out of sequence) is not a
+                    // `Join` at protocol version 1 either.
+                    Ok(_) | Err(_) => AwaitJoinOutcome::Reject(RejectReason::UnsupportedProtocol),
                 };
             }
             AggregatedMessage::Ping(bytes) => {
@@ -575,13 +578,19 @@ async fn run_connection(
         }
     };
 
+    // `await_join` only ever returns `AwaitJoinOutcome::Frame` for a `Join`
+    // (see its match arms above); every other `ClientFrame` variant becomes
+    // a `Reject` there instead, which already returned above.
     let ClientFrame::Join {
         id,
         display_name,
         avatar,
         proof,
         ..
-    } = join_frame;
+    } = join_frame
+    else {
+        unreachable!("await_join only returns AwaitJoinOutcome::Frame for a Join");
+    };
 
     if password.is_empty() {
         EMPTY_PASSWORD_WARNED.call_once(|| {

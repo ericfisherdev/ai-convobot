@@ -45,10 +45,14 @@ mod participants;
 mod paths;
 mod settings;
 use crate::multiplayer::avatar as multiplayer_avatar;
+use crate::multiplayer::config::MultiplayerMode;
 use crate::multiplayer::host::{
     require_host_mode, HostConfigSource, HostSettings, SqliteHostConfig,
 };
 use crate::multiplayer::join_throttle::JoinThrottle;
+use crate::multiplayer::joiner::{
+    JoinerHandle, JoinerIdentity, JoinerShared, UnimplementedGeneration,
+};
 use crate::multiplayer::remote_bots::RemoteBots;
 use crate::participants::{avatar_from, ParticipantId, ParticipantRegistry};
 use std::sync::Arc;
@@ -418,40 +422,67 @@ struct MessagePage {
     has_more: bool,
 }
 
+/// Whether older messages remain past this page. Shared by the SQLite path
+/// and the joiner-mirror path in [`message`] so the two can never drift
+/// into reporting `has_more` differently for the same `(start_index,
+/// page_len, total_count)` triple; [`RemoteTranscript::page`] applies the
+/// same formula on its own data.
+fn has_more_messages(start_index: usize, page_len: usize, total_count: usize) -> bool {
+    start_index + page_len < total_count
+}
+
 #[get("/api/message")]
-async fn message(query_params: web::Query<MessageQuery>) -> HttpResponse {
+async fn message(
+    query_params: web::Query<MessageQuery>,
+    joiner: Option<web::Data<JoinerHandle>>,
+) -> HttpResponse {
     let start_index: usize = query_params.start_index.unwrap_or(0);
 
     // 50 Messages is the max
     let limit: usize = query_params.limit.unwrap_or(15).min(50);
 
-    // Get total message count for pagination metadata
-    let total_count = match off_worker(
-        "Error while getting message count",
-        Database::get_total_message_count,
-    )
-    .await
-    {
-        Ok(count) => count,
-        Err(response) => return response,
-    };
-
-    // Query to database, and return messages
-    let messages: Vec<Message> =
-        match off_worker("Error while getting messages from database", move || {
-            Database::get_x_messages(limit, start_index)
-        })
+    // A joiner has no local `messages` table of its own to query: it
+    // answers from the mirror `joiner::run` keeps in sync with the host
+    // instead of ever touching SQLite here.
+    let message_page = if let Some(joiner) = joiner {
+        let (messages, total_count, has_more) = {
+            let shared = joiner.read().unwrap_or_else(|p| p.into_inner());
+            shared.transcript.page(start_index, limit)
+        };
+        MessagePage {
+            messages,
+            total_count,
+            has_more,
+        }
+    } else {
+        // Get total message count for pagination metadata
+        let total_count = match off_worker(
+            "Error while getting message count",
+            Database::get_total_message_count,
+        )
         .await
         {
-            Ok(v) => v,
+            Ok(count) => count,
             Err(response) => return response,
         };
 
-    let has_more = start_index + messages.len() < total_count;
-    let message_page = MessagePage {
-        messages,
-        total_count,
-        has_more,
+        // Query to database, and return messages
+        let messages: Vec<Message> =
+            match off_worker("Error while getting messages from database", move || {
+                Database::get_x_messages(limit, start_index)
+            })
+            .await
+            {
+                Ok(v) => v,
+                Err(response) => return response,
+            };
+
+        let has_more = has_more_messages(start_index, messages.len(), total_count);
+        MessagePage {
+            messages,
+            total_count,
+            has_more,
+        }
     };
 
     let page_json = serde_json::to_string(&message_page)
@@ -978,11 +1009,28 @@ mod stream_turn_tests {
     }
 }
 
+/// Gates `/api/prompt`, `/api/prompt/regenerate` and `/api/prompt/stream`
+/// on non-joiner mode: a joiner has no model of its own to answer with
+/// (that is #153's job), so it must never claim [`ACTIVE_TURN`] or insert a
+/// user turn `joiner::run`'s mirror does not own. `Some(response)` is a
+/// ready-to-return `409` the three call sites return as-is; `None` means
+/// "not a joiner, proceed".
+fn reject_if_joiner(joiner: &Option<web::Data<JoinerHandle>>) -> Option<HttpResponse> {
+    joiner.as_ref().map(|_| {
+        HttpResponse::Conflict().body("this instance is a joiner; send messages from the host")
+    })
+}
+
 #[post("/api/prompt")]
 async fn prompt_message(
     received: web::Json<Prompt>,
     registry: web::Data<RwLock<ParticipantRegistry>>,
+    joiner: Option<web::Data<JoinerHandle>>,
 ) -> HttpResponse {
+    if let Some(response) = reject_if_joiner(&joiner) {
+        return response;
+    }
+
     let prompt_message = received.into_inner().prompt;
     let start_time = std::time::Instant::now();
 
@@ -1074,7 +1122,14 @@ async fn prompt_message(
 }
 
 #[get("/api/prompt/regenerate")]
-async fn regenerate_prompt(registry: web::Data<RwLock<ParticipantRegistry>>) -> HttpResponse {
+async fn regenerate_prompt(
+    registry: web::Data<RwLock<ParticipantRegistry>>,
+    joiner: Option<web::Data<JoinerHandle>>,
+) -> HttpResponse {
+    if let Some(response) = reject_if_joiner(&joiner) {
+        return response;
+    }
+
     // Resolved before the delete below: it is read-only, so a lookup failure
     // here must not leave the conversation with its last message destroyed
     // and no replacement generated.
@@ -1152,7 +1207,18 @@ async fn config() -> HttpResponse {
 // save even when nothing model-relevant changed.
 #[put("/api/config")]
 async fn config_post(received: web::Json<ConfigModify>) -> HttpResponse {
+    // Read before the write so a role change can be reported: `main()`
+    // builds the joiner's identity, and registers its routes' `app_data`,
+    // once at startup (#130), so flipping `multiplayer_mode` here has no
+    // effect until the process restarts.
+    let previous_mode = Database::get_config()
+        .ok()
+        .map(|c| c.multiplayer_mode.to_string());
+    let mode_changed = previous_mode.as_deref() != Some(received.multiplayer_mode.as_str());
+
     match Database::change_config(received.into_inner()) {
+        Ok(_) if mode_changed => HttpResponse::Ok()
+            .body("Config updated! The multiplayer role change takes effect after a restart."),
         Ok(_) => HttpResponse::Ok().body("Config updated!"),
         Err(ConfigChangeError::Invalid(msg)) => HttpResponse::BadRequest().body(msg),
         Err(e) => {
@@ -1792,7 +1858,12 @@ fn stream_turn(
 async fn start_streaming_session(
     received: web::Json<StreamingRequest>,
     registry: web::Data<RwLock<ParticipantRegistry>>,
+    joiner: Option<web::Data<JoinerHandle>>,
 ) -> HttpResponse {
+    if let Some(response) = reject_if_joiner(&joiner) {
+        return response;
+    }
+
     let request = received.into_inner();
     let user_message = request.prompt.clone();
     // Generated server-side: a caller-supplied id could collide with a live
@@ -2269,6 +2340,50 @@ async fn multiplayer_participant_avatar(
         .body(bytes))
 }
 
+/// This instance's own multiplayer role and, in `joiner` mode, its
+/// connection state. `#134` is the frontend consumer of this shape.
+///
+/// `solo`/`host` mode: `{ "mode": "...", "state": null }` — participants for
+/// `host` mode live at `GET /api/multiplayer/participants` instead.
+/// `joiner` mode: `JoinerState`'s own tagged JSON (`state`, plus `reason` or
+/// `last_error` depending on which state it is) merged with `mode`,
+/// `attempts`, `host_address`, `participant_id` and `participants`.
+#[get("/api/multiplayer/status")]
+async fn multiplayer_status(joiner: Option<web::Data<JoinerHandle>>) -> HttpResponse {
+    let mode = match off_worker("Error while reading multiplayer config", || {
+        Database::get_config().map(|c| c.multiplayer_mode)
+    })
+    .await
+    {
+        Ok(mode) => mode,
+        Err(response) => return response,
+    };
+
+    let Some(joiner) = joiner else {
+        return HttpResponse::Ok().json(serde_json::json!({ "mode": mode, "state": null }));
+    };
+
+    let shared = joiner.read().unwrap_or_else(|p| p.into_inner());
+    let mut body = serde_json::to_value(&shared.state).unwrap_or_else(|_| serde_json::json!({}));
+    if let serde_json::Value::Object(fields) = &mut body {
+        fields.insert("mode".to_string(), serde_json::json!(mode));
+        fields.insert("attempts".to_string(), serde_json::json!(shared.attempts));
+        fields.insert(
+            "host_address".to_string(),
+            serde_json::json!(shared.host_address),
+        );
+        fields.insert(
+            "participant_id".to_string(),
+            serde_json::json!(shared.participant_id),
+        );
+        fields.insert(
+            "participants".to_string(),
+            serde_json::json!(shared.participants),
+        );
+    }
+    HttpResponse::Ok().json(body)
+}
+
 //
 
 /// Estimate response time based on message complexity
@@ -2363,15 +2478,48 @@ async fn main() -> std::io::Result<()> {
     let host_settings = web::Data::new(HostSettings::default());
     let remote_bots = web::Data::new(RemoteBots::new());
 
+    // Multiplayer joiner state (#130). Built once here, before the server
+    // starts accepting connections, from the config as it stood at
+    // startup: `PUT /api/config` can flip the multiplayer fields at
+    // runtime, but a joiner's identity (participant id, host address,
+    // password) only takes effect on the next restart. `joiner` stays
+    // `None` outside `Joiner` mode; every joiner-mode HTTP handler takes
+    // `Option<web::Data<JoinerHandle>>` and treats `None` as "not a
+    // joiner", the same seam `host_config`'s routes use for `Host` mode.
+    let multiplayer_config = Database::get_config()
+        .map_err(|e| std::io::Error::other(format!("cannot read multiplayer config: {e}")))?;
+    let joiner: Option<web::Data<JoinerHandle>> =
+        if multiplayer_config.multiplayer_mode == MultiplayerMode::Joiner {
+            let companion_data = Database::get_companion_data().map_err(|e| {
+                std::io::Error::other(format!(
+                    "cannot read companion data for joiner identity: {e}"
+                ))
+            })?;
+            let identity = JoinerIdentity::from_config(&multiplayer_config, &companion_data)
+                .map_err(std::io::Error::other)?;
+            let handle: JoinerHandle = Arc::new(RwLock::new(JoinerShared::new(&identity)));
+            actix_web::rt::spawn(crate::multiplayer::joiner::run(
+                handle.clone(),
+                identity,
+                Arc::new(UnimplementedGeneration),
+            ));
+            Some(web::Data::new(handle))
+        } else {
+            None
+        };
+
     let mut server = HttpServer::new(move || {
-        App::new()
+        let mut app = App::new()
             .app_data(session_manager.clone())
             .app_data(participants.clone())
             .app_data(host_config.clone())
             .app_data(join_throttle.clone())
             .app_data(host_settings.clone())
-            .app_data(remote_bots.clone())
-            .service(index)
+            .app_data(remote_bots.clone());
+        if let Some(joiner) = &joiner {
+            app = app.app_data(joiner.clone());
+        }
+        app.service(index)
             .service(js)
             .service(js2)
             .service(css)
@@ -2438,6 +2586,7 @@ async fn main() -> std::io::Result<()> {
             .service(crate::multiplayer::host::multiplayer_ws)
             .service(multiplayer_participants)
             .service(multiplayer_participant_avatar)
+            .service(multiplayer_status)
     });
     if let Some(workers) = configured_workers() {
         server = server.workers(workers);

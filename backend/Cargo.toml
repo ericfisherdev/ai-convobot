@@ -30,6 +30,10 @@ llama-cpp-sys-2 = "0.1.156"
 encoding_rs = "0.8"
 hmac = "0.13"
 sha2 = "0.11"
+# The joiner (#130) connects outbound to a host's `/api/multiplayer/ws`;
+# `host.rs`'s tests (#129) also use it as a test client, which is why it used
+# to live under [dev-dependencies].
+tokio-tungstenite = "0.30"
 
 [features]
 cuda = ["llama-cpp-2/cuda"]
@@ -40,4 +44,3 @@ metal = ["llama-cpp-2/metal"]
 
 [dev-dependencies]
 tempfile = "3.8"
-tokio-tungstenite = "0.30"

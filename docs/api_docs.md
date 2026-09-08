@@ -16,7 +16,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 
 - **URL:** `/message`
 - **Method:** `GET`
-- **Description:** Retrieve a list of messages exchanged with the companion.
+- **Description:** Retrieve a list of messages exchanged with the companion. In `joiner` multiplayer mode, answers from this instance's mirror of the host's transcript instead of its own database.
 - **Parameters:**
   - `limit` (optional): The maximum number of messages to retrieve. Max is 50.
   - `offset` (optional): The offset for paginating through messages.
@@ -469,6 +469,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   - Status: 200 OK
   - Body: generated text
   - Status: 409 Conflict — a turn (from `/prompt`, `/prompt/stream`, or `/prompt/regenerate`) is already in flight; wait for it to finish before sending another message
+  - Status: 409 Conflict — this instance is in `joiner` multiplayer mode; send messages from the host instead
 - **Example Request:**
   ```http
   POST /prompt
@@ -488,6 +489,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   - Status: 200 OK
   - Body: generated text
   - Status: 409 Conflict — a turn is already in flight; wait for it to finish before regenerating
+  - Status: 409 Conflict — this instance is in `joiner` multiplayer mode; send messages from the host instead
 - **Example Request:**
   ```http
   GET /prompt/regenerate
@@ -510,6 +512,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
     - the final chunk: `is_complete: true`, carrying the sanitized reply in `content`, or an `error` string when generation failed.
     `attitude` and `error` are omitted when absent, so token and final chunks keep the shape older clients expect.
   - Status: 409 Conflict — a turn is already in flight; wait for it to finish before sending another message
+  - Status: 409 Conflict — this instance is in `joiner` multiplayer mode; send messages from the host instead
 - **Example Request:**
   ```http
   POST /prompt/stream
@@ -548,6 +551,38 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 - **Notes:**
   - No model is loaded, so for `PromptTemplate::Auto` the response holds the pre-template system text plus the role-tagged `chat_history` rather than the final rendered string. Every other template returns the finished prompt in `system_prompt`.
   - `docs/attitude_verification.md` records a comparison run made with this route and `backend/scripts/attitude_comparison.sh`.
+
+### 7. Multiplayer
+
+#### 7.1 Get this instance's multiplayer status
+
+- **URL:** `/multiplayer/status`
+- **Method:** `GET`
+- **Description:** This instance's own multiplayer role (`multiplayer_mode` from `/config`) and, in `joiner` mode, its connection state to the host it is configured to join.
+- **Response:**
+  - Status: 200 OK
+  - Body, `solo`/`host` mode: `{ "mode": "solo" | "host", "state": null }`. A `host` mode instance's connected participants are at `GET /multiplayer/participants` instead.
+  - Body, `joiner` mode: `{ "mode": "joiner", "state": "disconnected" | "connecting" | "connected" | "rejected", "reason": string, "last_error": string | null, "attempts": number, "host_address": string, "participant_id": string, "participants": [ParticipantSummary] }`, where `reason` is present only when `state` is `"rejected"`; `last_error` is present (`null` or a message) only when `state` is `"disconnected"`, and stays `null` until a previous connection attempt has actually failed.
+- **Example Request:**
+  ```http
+  GET /multiplayer/status
+  ```
+- **Example Response:**
+  ```json
+  {
+    "mode": "joiner",
+    "state": "connected",
+    "attempts": 1,
+    "host_address": "192.168.0.20:3000",
+    "participant_id": "bot1",
+    "participants": [
+      { "id": "user", "display_name": "Alice", "kind": "human", "avatar_url": null, "connected": true }
+    ]
+  }
+  ```
+- **Notes:**
+  - A `"rejected"` state (wrong password, or a duplicate/reserved participant id) is terminal: this instance stops retrying and stays in that state until restarted with a corrected config.
+  - While in `joiner` mode, `GET /message` answers from this instance's mirror of the host's transcript, and `/prompt`, `/prompt/stream` and `/prompt/regenerate` all answer `409 Conflict`; see their entries above.
 
 ## Route index
 
@@ -594,6 +629,7 @@ Endpoint sections above cover the core messaging, companion, user, configuration
 | `DELETE` | `/api/message/{id}` |
 | `GET` | `/api/message/{id}` |
 | `PUT` | `/api/message/{id}` |
+| `GET` | `/api/multiplayer/status` |
 | `GET` | `/api/persons` |
 | `POST` | `/api/persons/cleanup-duplicates` |
 | `POST` | `/api/persons/cleanup-invalid` |

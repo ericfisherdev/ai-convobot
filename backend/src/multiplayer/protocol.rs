@@ -8,16 +8,19 @@
 //! Heartbeats use native WebSocket ping/pong control frames (`host.rs`'s
 //! `Session::ping`/`AggregatedMessage::Pong`), not a JSON variant here.
 //!
+//! `ServerFrame::Message`, `ServerFrame::GenerateRequest` and
+//! `ClientFrame::ReplyFailed` are added by #130 (the joiner matches or sends
+//! all three) even though #131's host-side round orchestrator is what
+//! actually constructs and routes them in production: `RemoteBots::send`
+//! targets one bot with `GenerateRequest`, and `RemoteBots::route_inbound`
+//! delivers a `ReplyFailed` back to the round that requested it.
+//!
 //! Reserved, not sent or received by this issue (listed so a future issue's
 //! variant addition is the only change needed, and so clippy's dead-code
 //! lint has nothing to fire on until then):
-//! - `ServerFrame::Message(database::Message)`: broadcast by #131 for every
-//!   reply it persists.
-//! - `ClientFrame::GenerateRequest { round_id: u64, transcript: Vec<database::Message> }`,
-//!   `ClientFrame::Token { round_id: u64, text: String }`,
-//!   `ClientFrame::ReplyComplete { round_id: u64, text: String }`,
-//!   `ClientFrame::ReplyFailed { round_id: u64, reason: String }`: #131's
-//!   remote-generation round protocol.
+//! - `ClientFrame::Token { round_id: u64, text: String }`,
+//!   `ClientFrame::ReplyComplete { round_id: u64, text: String }`: #153's
+//!   real joiner generation, streaming a reply back token by token.
 
 use serde::{Deserialize, Serialize};
 
@@ -54,17 +57,22 @@ pub enum ClientFrame {
         /// where `nonce` is `handshake::decode(Challenge.nonce)`.
         proof: String,
     },
+    /// Sent by the joiner instead of a generated reply when it cannot
+    /// answer a [`ServerFrame::GenerateRequest`] — #130 ships only
+    /// `UnimplementedGeneration`, which sends this immediately for every
+    /// round; #153 sends it for a real generation failure instead.
+    ReplyFailed { round_id: u64, reason: String },
 }
 
 impl ClientFrame {
     /// The round id this frame belongs to, or `None` if it is not
-    /// round-scoped. Every variant in this issue returns `None` (`Join` is
-    /// not round-scoped); #131 adds the `Token`/`ReplyComplete`/
-    /// `ReplyFailed` arms when it adds those variants. This is the one
+    /// round-scoped. `Join` is never round-scoped; #153 adds the `Token`/
+    /// `ReplyComplete` arms when it adds those variants. This is the one
     /// accessor `RemoteBots::route_inbound` keys on.
     pub fn round_id(&self) -> Option<u64> {
         match self {
             ClientFrame::Join { .. } => None,
+            ClientFrame::ReplyFailed { round_id, .. } => Some(*round_id),
         }
     }
 }
@@ -122,6 +130,18 @@ pub enum ServerFrame {
     ParticipantJoined(ParticipantSummary),
     /// Broadcast to every other connected participant when one disconnects.
     ParticipantLeft { id: ParticipantId },
+    /// A message the host persisted, mirrored to every joiner so its own
+    /// transcript stays in sync (#131 broadcasts this; the joiner's
+    /// `RemoteTranscript::push` is the counterpart).
+    Message(DbMessage),
+    /// Sent to one remote bot when it is its turn to generate a reply.
+    /// `transcript` is the context to generate from, sent by the host so
+    /// the joiner never has to trust its own possibly-stale mirror for a
+    /// round's correctness.
+    GenerateRequest {
+        round_id: u64,
+        transcript: Vec<DbMessage>,
+    },
 }
 
 #[cfg(test)]
@@ -192,6 +212,18 @@ mod tests {
     #[test]
     fn round_id_is_none_for_join() {
         assert_eq!(sample_join().round_id(), None);
+    }
+
+    #[test]
+    fn reply_failed_round_trips_and_carries_its_round_id() {
+        let frame = ClientFrame::ReplyFailed {
+            round_id: 7,
+            reason: "generation not implemented on this joiner".to_string(),
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        let back: ClientFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, frame);
+        assert_eq!(frame.round_id(), Some(7));
     }
 
     #[test]
@@ -279,5 +311,32 @@ mod tests {
         };
         let json = serde_json::to_string(&left).unwrap();
         assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), left);
+    }
+
+    fn sample_message() -> DbMessage {
+        DbMessage {
+            id: 1,
+            ai: false,
+            speaker_id: "user".to_string(),
+            content: "hi".to_string(),
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn message_round_trips_through_json() {
+        let frame = ServerFrame::Message(sample_message());
+        let json = serde_json::to_string(&frame).unwrap();
+        assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
+    }
+
+    #[test]
+    fn generate_request_round_trips_through_json() {
+        let frame = ServerFrame::GenerateRequest {
+            round_id: 3,
+            transcript: vec![sample_message()],
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
     }
 }
