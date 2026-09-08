@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
@@ -6,9 +6,10 @@ use tokio::sync::mpsc;
 
 use crate::attitude_formatter::AttitudeDelta;
 use crate::database::CompanionAttitude;
+use crate::participants::ParticipantId;
 
 /// Post-turn attitude state, carried by the stream's attitude chunk.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttitudeStreamUpdate {
     /// The companion's attitude toward the user after the turn was scored.
     pub attitude: CompanionAttitude,
@@ -19,30 +20,160 @@ pub struct AttitudeStreamUpdate {
     pub deltas: Vec<AttitudeDelta>,
 }
 
-/// One Server-Sent Event on `/api/prompt/stream`.
+/// What kind of [`StreamChunk`] this is, so a client can switch on it
+/// instead of inferring meaning from which optional fields are set.
 ///
-/// Three kinds travel over the same struct:
-/// - token chunks: `is_complete: false`, `content` holds the next token;
-/// - the attitude chunk: `is_complete: false`, empty `content`, `attitude` set,
-///   sent once after generation when the turn moved any dimension;
-/// - the final chunk: `is_complete: true`, `content` holds the sanitized reply,
-///   or `error` is set when generation failed.
+/// `ReplyStarted` opens a new bubble for `speaker_id`; `Token` appends
+/// `content` to the current speaker's bubble (or, when `attitude` is set
+/// instead, carries the attitude update and no content); `ReplyComplete`
+/// replaces the current bubble's content with the sanitized `content` and
+/// carries `message_id`; `RoundComplete` and `Error` are the two terminal
+/// events (`is_complete: true`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamEvent {
+    ReplyStarted,
+    Token,
+    ReplyComplete,
+    RoundComplete,
+    Error,
+}
+
+/// One Server-Sent Event on `/api/prompt/stream`, one per speaker action in
+/// the round.
 ///
-/// `attitude` and `error` are omitted when `None`, so token and final chunks
-/// keep the shape older clients expect.
-#[derive(Debug, Clone, Serialize)]
+/// `event` says which of five kinds this is; `speaker_id` is the
+/// [`ParticipantId`] the chunk is about (empty on the attitude chunk and on
+/// `round_complete`/`error`, which are round-wide rather than per-speaker).
+/// A full round is `reply_started`, then zero or more `token`s, then
+/// `reply_complete`, repeated once per speaker (a skipped speaker's notice
+/// arrives as a bare `reply_complete` for `speaker_id: "system"`, with no
+/// preceding `reply_started`); an optional attitude chunk (a `token`-event
+/// chunk with empty `content` and `attitude` set, unchanged shape from
+/// before this struct grew `event`) follows the last `reply_complete`; then
+/// `round_complete` ends the stream. `is_complete` is `true` only on
+/// `round_complete` and `error`, so a client that only tracks that field
+/// still terminates correctly.
+///
+/// `message_id`, `error` and `attitude` are omitted when `None`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamChunk {
     pub request_id: String,
+    pub event: StreamEvent,
     pub content: String,
     pub is_complete: bool,
     pub token_count: Option<usize>,
-    /// Set on the final chunk when generation failed, so a client can tell a
-    /// failure apart from a normal completion.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_id: String,
+    /// Set on `reply_complete`: the persisted message's row id.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub message_id: Option<i32>,
+    /// Set on the terminal `error` chunk, so a client can tell a failure
+    /// apart from a normal completion.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub error: Option<String>,
     /// Set only on the attitude chunk.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub attitude: Option<AttitudeStreamUpdate>,
+}
+
+impl StreamChunk {
+    /// Opens a bubble for `speaker` about to generate.
+    pub fn reply_started(request_id: String, speaker: &ParticipantId) -> Self {
+        StreamChunk {
+            request_id,
+            event: StreamEvent::ReplyStarted,
+            content: String::new(),
+            is_complete: false,
+            token_count: None,
+            speaker_id: speaker.as_str().to_string(),
+            message_id: None,
+            error: None,
+            attitude: None,
+        }
+    }
+
+    /// One token from `speaker`, with the stream's running token count.
+    pub fn token(request_id: String, speaker: &ParticipantId, text: &str, count: usize) -> Self {
+        StreamChunk {
+            request_id,
+            event: StreamEvent::Token,
+            content: text.to_string(),
+            is_complete: false,
+            token_count: Some(count),
+            speaker_id: speaker.as_str().to_string(),
+            message_id: None,
+            error: None,
+            attitude: None,
+        }
+    }
+
+    /// `speaker`'s finished, persisted reply.
+    pub fn reply_complete(
+        request_id: String,
+        speaker: &ParticipantId,
+        text: &str,
+        message_id: i32,
+        count: usize,
+    ) -> Self {
+        StreamChunk {
+            request_id,
+            event: StreamEvent::ReplyComplete,
+            content: text.to_string(),
+            is_complete: false,
+            token_count: Some(count),
+            speaker_id: speaker.as_str().to_string(),
+            message_id: Some(message_id),
+            error: None,
+            attitude: None,
+        }
+    }
+
+    /// The attitude chunk: a `token`-event chunk with empty content and
+    /// `attitude` set, kept exactly the shape it had before `event` existed.
+    pub fn attitude(request_id: String, update: AttitudeStreamUpdate, count: usize) -> Self {
+        StreamChunk {
+            request_id,
+            event: StreamEvent::Token,
+            content: String::new(),
+            is_complete: false,
+            token_count: Some(count),
+            speaker_id: String::new(),
+            message_id: None,
+            error: None,
+            attitude: Some(update),
+        }
+    }
+
+    /// The terminal chunk on a successful round.
+    pub fn round_complete(request_id: String, count: Option<usize>) -> Self {
+        StreamChunk {
+            request_id,
+            event: StreamEvent::RoundComplete,
+            content: String::new(),
+            is_complete: true,
+            token_count: count,
+            speaker_id: String::new(),
+            message_id: None,
+            error: None,
+            attitude: None,
+        }
+    }
+
+    /// The terminal chunk on a failed round, including `StreamSession::Drop`'s
+    /// own terminal chunk when a caller never reaches `finish`.
+    pub fn error(request_id: String, message: String, count: Option<usize>) -> Self {
+        StreamChunk {
+            request_id,
+            event: StreamEvent::Error,
+            content: String::new(),
+            is_complete: true,
+            token_count: count,
+            speaker_id: String::new(),
+            message_id: None,
+            error: Some(message),
+            attitude: None,
+        }
+    }
 }
 
 /// Inference optimization statistics
@@ -220,14 +351,7 @@ impl Drop for StreamSession {
         // failure path regardless of whether the send lands.
         let _ = self.optimizer.stream_chunk(
             &self.session_id,
-            StreamChunk {
-                request_id: self.session_id.clone(),
-                content: String::new(),
-                is_complete: true,
-                token_count: None,
-                error: Some(message.to_string()),
-                attitude: None,
-            },
+            StreamChunk::error(self.session_id.clone(), message.to_string(), None),
         );
         self.optimizer.end_streaming_session(&self.session_id);
     }
@@ -306,13 +430,6 @@ mod tests {
     }
 
     fn dummy_chunk(session_id: &str) -> StreamChunk {
-        StreamChunk {
-            request_id: session_id.to_string(),
-            content: "reply".to_string(),
-            is_complete: true,
-            token_count: Some(1),
-            error: None,
-            attitude: None,
-        }
+        StreamChunk::round_complete(session_id.to_string(), Some(1))
     }
 }

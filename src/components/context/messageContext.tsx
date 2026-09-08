@@ -11,6 +11,7 @@ interface MessagesContextType {
   refreshMessages: () => void;
   pushMessage: (message: MessageInterface) => void;
   updateMessage: (id: number, content: string) => void;
+  settleMessage: (tempId: number, patch: { id: number; content: string }) => void;
   loadMoreMessages: () => Promise<boolean>;
   resetStart : () => void;
   isLoadingMore: boolean;
@@ -79,6 +80,18 @@ export const MessagesProvider: React.FC<MessagesProviderProps> = ({ children }) 
     );
   };
 
+  // Swaps a placeholder's negative temp id for its persisted row id and
+  // final content in one update, so a round's settled bubble never briefly
+  // shows the wrong id to a caller keying off it (e.g. a later effect for
+  // the same bubble).
+  const settleMessage = (tempId: number, patch: { id: number; content: string }) => {
+    setMessages(prevMessages =>
+      prevMessages.map(message =>
+        message.id === tempId ? { ...message, id: patch.id, content: patch.content } : message
+      )
+    );
+  };
+
   const loadMoreMessages = async (): Promise<boolean> => {
     if (isLoadingMore || !hasMoreMessages) {
       return false;
@@ -120,6 +133,7 @@ export const MessagesProvider: React.FC<MessagesProviderProps> = ({ children }) 
       refreshMessages,
       pushMessage,
       updateMessage,
+      settleMessage,
       loadMoreMessages,
       resetStart,
       isLoadingMore,
