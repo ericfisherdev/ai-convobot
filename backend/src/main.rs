@@ -57,7 +57,8 @@ use crate::multiplayer::remote_bots::RemoteBots;
 use crate::multiplayer::round::{
     plan_round, run_round, NoRemotes, NoopSink, RemoteGenerator, RoundPlan, RoundSink,
 };
-use crate::participants::{avatar_from, ParticipantId, ParticipantRegistry};
+use crate::multiplayer::routing::RoutingPolicy;
+use crate::participants::{avatar_from, normalise_mentions, ParticipantId, ParticipantRegistry};
 use std::sync::Arc;
 #[cfg(test)]
 pub(crate) mod simple_tests;
@@ -496,16 +497,25 @@ async fn message(
 #[post("/api/message")]
 async fn message_post(
     received: web::Json<NewMessageRequest>,
+    participants: web::Data<RwLock<ParticipantRegistry>>,
     joiner: Option<web::Data<JoinerHandle>>,
 ) -> HttpResponse {
     if let Some(response) = reject_if_joiner(&joiner) {
         return response;
     }
 
-    let new_message: NewMessage = match received.into_inner().try_into() {
+    let mut new_message: NewMessage = match received.into_inner().try_into() {
         Ok(new_message) => new_message,
         Err(e) => return HttpResponse::BadRequest().body(e.to_string()),
     };
+    // Stored messages always carry `@id` mentions, never `@Display Name`
+    // (#126/#132): a solo chat's registry holds only `user`/`char`, so
+    // `@<companion name>` becomes `@char` and text without mentions is
+    // byte-identical.
+    new_message.content = normalise_mentions(
+        &new_message.content,
+        &snapshot_speakers(&participants).registry,
+    );
     match Database::insert_message(new_message) {
         Ok(_) => HttpResponse::Ok().body("Message added!"),
         Err(e) => {
@@ -553,13 +563,18 @@ async fn message_id(id: web::Path<i32>) -> HttpResponse {
 async fn message_put(
     id: web::Path<i32>,
     received: web::Json<MessageEdit>,
+    participants: web::Data<RwLock<ParticipantRegistry>>,
     joiner: Option<web::Data<JoinerHandle>>,
 ) -> HttpResponse {
     if let Some(response) = reject_if_joiner(&joiner) {
         return response;
     }
 
-    match Database::edit_message(*id, received.into_inner()) {
+    let mut edit = received.into_inner();
+    // See `message_post`'s identical normalisation: an edit is stored the
+    // same way a fresh message is.
+    edit.content = normalise_mentions(&edit.content, &snapshot_speakers(&participants).registry);
+    match Database::edit_message(*id, edit) {
         Ok(_) => HttpResponse::Ok().body(format!("Message edited at id {}!", id)),
         Err(e) => {
             println!("Failed to edit message at id {}: {}", id, e);
@@ -940,8 +955,12 @@ mod stream_turn_tests {
     use tokio::sync::mpsc::error::TryRecvError;
 
     fn solo_plan() -> RoundPlan {
-        RoundPlan {
-            speakers: vec![ParticipantId::CHAR],
+        RoundPlan::from_speakers([ParticipantId::CHAR])
+    }
+
+    fn no_followups() -> RoutingPolicy {
+        RoutingPolicy {
+            max_followup_depth: 0,
         }
     }
 
@@ -950,8 +969,16 @@ mod stream_turn_tests {
         static SLOT: TurnSlot = TurnSlot::new();
         let guard = SLOT.try_claim().expect("slot should be free");
         let store = Arc::new(RecordingStore::new(None));
-        let pending = PendingTurn::begin(&guard, store.as_ref(), 1, 1, "hello".to_string())
-            .expect("insert should succeed");
+        let registry = ParticipantRegistry::solo("Alice", "Bob", None);
+        let pending = PendingTurn::begin(
+            &guard,
+            store.as_ref(),
+            1,
+            1,
+            "hello".to_string(),
+            registry.clone(),
+        )
+        .expect("insert should succeed");
 
         let session_id = format!("test-{}", Uuid::new_v4());
         let (stream, mut rx) = INFERENCE_OPTIMIZER.start_streaming_session(session_id);
@@ -964,6 +991,8 @@ mod stream_turn_tests {
                 stream,
                 thread_store.as_ref(),
                 solo_plan(),
+                &registry,
+                &no_followups(),
                 |_prompt, _on_token| Err(std::io::Error::other("no model")),
                 &NoRemotes,
                 Duration::from_secs(30),
@@ -992,8 +1021,16 @@ mod stream_turn_tests {
         static SLOT: TurnSlot = TurnSlot::new();
         let guard = SLOT.try_claim().expect("slot should be free");
         let store = Arc::new(RecordingStore::new(None));
-        let pending = PendingTurn::begin(&guard, store.as_ref(), 1, 1, "hello".to_string())
-            .expect("insert should succeed");
+        let registry = ParticipantRegistry::solo("Alice", "Bob", None);
+        let pending = PendingTurn::begin(
+            &guard,
+            store.as_ref(),
+            1,
+            1,
+            "hello".to_string(),
+            registry.clone(),
+        )
+        .expect("insert should succeed");
 
         let session_id = format!("test-{}", Uuid::new_v4());
         let (stream, mut rx) = INFERENCE_OPTIMIZER.start_streaming_session(session_id);
@@ -1006,6 +1043,8 @@ mod stream_turn_tests {
                 stream,
                 thread_store.as_ref(),
                 solo_plan(),
+                &registry,
+                &no_followups(),
                 |_prompt, on_token| {
                     on_token("Hel");
                     on_token("lo");
@@ -1085,15 +1124,20 @@ async fn prompt_message(
         Ok(id) => id,
         Err(response) => return response,
     };
-    // The round's remote timeout budget: read once here rather than inside
-    // `run_round` (#131's round orchestrator, `multiplayer::round`, is
-    // `Database`-free), so it stays testable against a fake `TurnStore`.
-    let timeout = match off_worker("Error while getting config", Database::get_config).await {
-        Ok(loaded_config) => {
-            std::time::Duration::from_secs(loaded_config.remote_generation_timeout_secs)
-        }
-        Err(response) => return response,
-    };
+    // The round's remote timeout budget and mention-follow-up depth: read
+    // once here rather than inside `run_round` (#131's round orchestrator,
+    // `multiplayer::round`, is `Database`-free), so it stays testable
+    // against a fake `TurnStore`.
+    let (timeout, policy) =
+        match off_worker("Error while getting config", Database::get_config).await {
+            Ok(loaded_config) => (
+                std::time::Duration::from_secs(loaded_config.remote_generation_timeout_secs),
+                RoutingPolicy {
+                    max_followup_depth: loaded_config.mention_followup_depth as usize,
+                },
+            ),
+            Err(response) => return response,
+        };
     // Claimed before the user-turn insert below and moved into the blocking
     // closure below, which holds it for the whole round: an overlapping call
     // cannot insert its own user message between this one and the replies it
@@ -1107,7 +1151,7 @@ async fn prompt_message(
 
     let speakers = snapshot_speakers(&registry);
     let participant_names = participant_display_names(&speakers);
-    let plan = plan_round(&prompt_message, &speakers.registry);
+    let plan = plan_round(&prompt_message, &speakers.registry, &policy);
 
     let result = web::block(move || -> Result<Option<String>, TurnError> {
         let _turn_guard = turn_guard;
@@ -1119,6 +1163,7 @@ async fn prompt_message(
             companion_id,
             user_id,
             prompt_message.clone(),
+            speakers.registry.clone(),
         )
         .map_err(|source| TurnError::Database {
             step: "Error while adding message to database",
@@ -1145,6 +1190,8 @@ async fn prompt_message(
             pending,
             plan,
             &store,
+            &speakers.registry,
+            &policy,
             &mut |generation_prompt, _on_token| {
                 prompt(
                     generation_prompt,
@@ -1169,8 +1216,9 @@ async fn prompt_message(
 
     match result {
         Ok(Ok(Some(reply))) => HttpResponse::Ok().body(reply),
-        // Unreachable until #132 can filter the host bot out of a round's
-        // plan; `plan_round` always puts `char` first today.
+        // A mention-filtered plan (#132) that excludes `char`, e.g. a
+        // solo `@bot1 hi` with joiners connected: the round still ran, just
+        // never gave `char` a turn, so there is no host reply to return.
         Ok(Ok(None)) => HttpResponse::NoContent().finish(),
         Ok(Err(turn_error)) => turn_error.into_response(),
         Err(blocking) => {
@@ -1978,6 +2026,8 @@ fn stream_round(
     stream: StreamSession,
     store: &impl TurnStore,
     plan: RoundPlan,
+    registry: &ParticipantRegistry,
+    policy: &RoutingPolicy,
     mut host_generate: impl FnMut(&str, &mut dyn FnMut(&str)) -> std::io::Result<String>,
     remotes: &dyn RemoteGenerator,
     timeout: std::time::Duration,
@@ -1988,6 +2038,8 @@ fn stream_round(
         pending,
         plan,
         store,
+        registry,
+        policy,
         &mut host_generate,
         remotes,
         timeout,
@@ -2029,13 +2081,18 @@ async fn start_streaming_session(
         Err(response) => return response,
     };
     // See `prompt_message`'s identical fetch: the round's remote timeout
-    // budget, read once here since `multiplayer::round` is `Database`-free.
-    let timeout = match off_worker("Error while getting config", Database::get_config).await {
-        Ok(loaded_config) => {
-            std::time::Duration::from_secs(loaded_config.remote_generation_timeout_secs)
-        }
-        Err(response) => return response,
-    };
+    // budget and mention-follow-up depth, read here since `multiplayer::round`
+    // is `Database`-free.
+    let (timeout, policy) =
+        match off_worker("Error while getting config", Database::get_config).await {
+            Ok(loaded_config) => (
+                std::time::Duration::from_secs(loaded_config.remote_generation_timeout_secs),
+                RoutingPolicy {
+                    max_followup_depth: loaded_config.mention_followup_depth as usize,
+                },
+            ),
+            Err(response) => return response,
+        };
     // Claimed before the user-turn insert below: without it, a second
     // request's insert could land between this one and the worker thread
     // reading history, and the worker would answer both messages at once.
@@ -2052,8 +2109,9 @@ async fn start_streaming_session(
     let speakers = snapshot_speakers(&registry);
     let participant_names = participant_display_names(&speakers);
     let stream_participant_names = participant_names.clone();
-    // With no registered joiners the plan is always `[char]`.
-    let plan = plan_round(&user_message, &speakers.registry);
+    // With no mention and no registered joiners the plan is always `[char]`.
+    let plan = plan_round(&user_message, &speakers.registry, &policy);
+    let begin_registry = speakers.registry.clone();
 
     // The generator reads recent messages back out of the database, so the
     // user's turn has to be persisted before generation starts. The turn
@@ -2065,8 +2123,14 @@ async fn start_streaming_session(
     let (pending, turn_guard) =
         match off_worker("Error while adding message to database", move || {
             let store = SqliteTurnStore::new(participant_names);
-            let pending =
-                PendingTurn::begin(&turn_guard, &store, companion_id, user_id, user_message)?;
+            let pending = PendingTurn::begin(
+                &turn_guard,
+                &store,
+                companion_id,
+                user_id,
+                user_message,
+                begin_registry,
+            )?;
             Ok::<_, rusqlite::Error>((pending, turn_guard))
         })
         .await
@@ -2089,6 +2153,8 @@ async fn start_streaming_session(
                 stream,
                 &store,
                 plan,
+                &speakers.registry,
+                &policy,
                 |generation_prompt, on_token| {
                     prompt_streaming(
                         generation_prompt,
