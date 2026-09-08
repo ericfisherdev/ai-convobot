@@ -491,7 +491,14 @@ async fn message(
 }
 
 #[post("/api/message")]
-async fn message_post(received: web::Json<NewMessageRequest>) -> HttpResponse {
+async fn message_post(
+    received: web::Json<NewMessageRequest>,
+    joiner: Option<web::Data<JoinerHandle>>,
+) -> HttpResponse {
+    if let Some(response) = reject_if_joiner(&joiner) {
+        return response;
+    }
+
     let new_message: NewMessage = match received.into_inner().try_into() {
         Ok(new_message) => new_message,
         Err(e) => return HttpResponse::BadRequest().body(e.to_string()),
@@ -507,7 +514,11 @@ async fn message_post(received: web::Json<NewMessageRequest>) -> HttpResponse {
 }
 
 #[delete("/api/message")]
-async fn clear_messages() -> HttpResponse {
+async fn clear_messages(joiner: Option<web::Data<JoinerHandle>>) -> HttpResponse {
+    if let Some(response) = reject_if_joiner(&joiner) {
+        return response;
+    }
+
     match Database::erase_messages() {
         Ok(_) => HttpResponse::Ok().body("Chat log cleared!"),
         Err(e) => {
@@ -536,7 +547,15 @@ async fn message_id(id: web::Path<i32>) -> HttpResponse {
 }
 
 #[put("/api/message/{id}")]
-async fn message_put(id: web::Path<i32>, received: web::Json<MessageEdit>) -> HttpResponse {
+async fn message_put(
+    id: web::Path<i32>,
+    received: web::Json<MessageEdit>,
+    joiner: Option<web::Data<JoinerHandle>>,
+) -> HttpResponse {
+    if let Some(response) = reject_if_joiner(&joiner) {
+        return response;
+    }
+
     match Database::edit_message(*id, received.into_inner()) {
         Ok(_) => HttpResponse::Ok().body(format!("Message edited at id {}!", id)),
         Err(e) => {
@@ -550,7 +569,14 @@ async fn message_put(id: web::Path<i32>, received: web::Json<MessageEdit>) -> Ht
 }
 
 #[delete("/api/message/{id}")]
-async fn message_delete(id: web::Path<i32>) -> HttpResponse {
+async fn message_delete(
+    id: web::Path<i32>,
+    joiner: Option<web::Data<JoinerHandle>>,
+) -> HttpResponse {
+    if let Some(response) = reject_if_joiner(&joiner) {
+        return response;
+    }
+
     match Database::delete_message(*id) {
         Ok(_) => HttpResponse::Ok().body(format!("Message deleted at id {}!", id)),
         Err(e) => {
@@ -1210,11 +1236,22 @@ async fn config_post(received: web::Json<ConfigModify>) -> HttpResponse {
     // Read before the write so a role change can be reported: `main()`
     // builds the joiner's identity, and registers its routes' `app_data`,
     // once at startup (#130), so flipping `multiplayer_mode` here has no
-    // effect until the process restarts.
-    let previous_mode = Database::get_config()
-        .ok()
-        .map(|c| c.multiplayer_mode.to_string());
-    let mode_changed = previous_mode.as_deref() != Some(received.multiplayer_mode.as_str());
+    // effect until the process restarts. A read failure here is reported
+    // as its own error rather than folded into `mode_changed`: silently
+    // treating "could not read the previous mode" as "the mode changed"
+    // would misreport a restart requirement on every save until the read
+    // starts working again.
+    // `config_view`, not `config`: a unit struct named `config` already
+    // exists in this module for the `GET /api/config` handler.
+    let previous_mode = match Database::get_config() {
+        Ok(config_view) => config_view.multiplayer_mode.to_string(),
+        Err(e) => {
+            println!("Failed to read config before update: {}", e);
+            return HttpResponse::InternalServerError()
+                .body("Error while reading config, check logs for more information");
+        }
+    };
+    let mode_changed = previous_mode != received.multiplayer_mode;
 
     match Database::change_config(received.into_inner()) {
         Ok(_) if mode_changed => HttpResponse::Ok()

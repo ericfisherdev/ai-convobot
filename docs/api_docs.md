@@ -57,6 +57,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 - **Response:**
   - Status: 200 OK
   - Body: Chat log cleared!
+  - Status: 409 Conflict — this instance is in `joiner` multiplayer mode; send messages from the host instead
 - **Example Request:**
   ```http
   DELETE /message
@@ -78,6 +79,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   - Body: Message added!
   - Status: 400 Bad Request
   - Body: error text, if neither `speaker_id` nor `ai` is given, or the two disagree.
+  - Status: 409 Conflict — this instance is in `joiner` multiplayer mode; send messages from the host instead
 - **Example Request:**
   ```http
   POST /message
@@ -139,6 +141,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 - **Response:**
   - Status: 200 OK
   - Body: Message edited at id {id}
+  - Status: 409 Conflict — this instance is in `joiner` multiplayer mode; send messages from the host instead
 - **Example Request:**
   ```http
   PUT /message/{id}
@@ -159,6 +162,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 - **Response:**
   - Status: 200 OK
   - Body: Message deleted at id {id}
+  - Status: 409 Conflict — this instance is in `joiner` multiplayer mode; send messages from the host instead
 - **Example Request:**
   ```http
   DELETE /message/1
