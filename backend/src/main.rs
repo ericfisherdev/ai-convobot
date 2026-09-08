@@ -67,6 +67,12 @@ use std::sync::RwLock;
 /// `failure` is the user-facing prefix already used by the handlers ("Error
 /// while getting config"); it is logged with the cause and returned as the
 /// 500 body with the usual ", check logs for more information" tail.
+///
+/// `Result<T, HttpResponse>` trips `clippy::result_large_err` on the
+/// dependency versions this crate resolves to; every caller matches on
+/// `Ok`/`Err(response)` and returns `response` as-is, so boxing it here
+/// would just move an identical `Box::new`/deref pair into each of them.
+#[allow(clippy::result_large_err)]
 async fn off_worker<T, E>(
     failure: &'static str,
     task: impl FnOnce() -> Result<T, E> + Send + 'static,
