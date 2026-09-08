@@ -255,11 +255,16 @@ interface AiMessageProps extends MessageProps {
 const AiMessage = ({ id, content, created_at, regenerate: regenerateProp, displayName, avatarUrl }: AiMessageProps) => {
   const { refreshMessages } = useMessages();
   const configDataContext = useConfigData();
+  // `ConfigProvider` starts with `config: null` until its fetch resolves;
+  // before that, `isJoinerInstance` would read as false and briefly show
+  // the control on a joiner instance. Require the config to have loaded, not
+  // just checked, before honouring `regenerateProp`.
+  const isConfigLoaded = configDataContext?.config != null;
   // A joiner's `GET /api/message` answers from a read-only mirror of the
   // host's transcript (#130): regenerating from here would 409 every time,
   // so the control is suppressed regardless of what the caller passed.
   const isJoinerInstance = configDataContext?.config?.multiplayer_mode === MultiplayerMode.Joiner;
-  const regenerate = regenerateProp && !isJoinerInstance;
+  const regenerate = regenerateProp && isConfigLoaded && !isJoinerInstance;
 
   const [displayedContent, setDisplayedContent] = useState(content);
   const [editing, setEditing] = useState(false);
