@@ -17,6 +17,8 @@ import {
 } from "@/components/ui/tooltip"
 
 import { ConfigInterface, MultiplayerMode } from "../interfaces/Config"
+import { ConnectionStatus } from "../multiplayer/ConnectionStatus"
+import { useParticipants } from "../context/participantsContext"
 
 interface MultiplayerSettingsProps {
   config: ConfigInterface;
@@ -49,6 +51,9 @@ function FieldLabel({ htmlFor, children, tooltip }: { htmlFor: string; children:
 
 export function MultiplayerSettings({ config, onChange }: MultiplayerSettingsProps) {
   const mode = config.multiplayer_mode ?? MultiplayerMode.Solo;
+  // The live, persisted connection state -- not the unsaved form edits
+  // above, which only take effect after a save and restart.
+  const { status } = useParticipants();
 
   return (
     <div className="space-y-6">
@@ -70,7 +75,9 @@ export function MultiplayerSettings({ config, onChange }: MultiplayerSettingsPro
         <p className="text-sm text-muted-foreground">{MODE_DESCRIPTIONS[mode]}</p>
       </div>
 
-      <div data-testid="multiplayer-connection-status" />
+      <div data-testid="multiplayer-connection-status">
+        {status.mode !== 'solo' && <ConnectionStatus status={status} />}
+      </div>
 
       {mode === MultiplayerMode.Host && (
         <div className="space-y-4">

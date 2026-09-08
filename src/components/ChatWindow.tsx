@@ -26,6 +26,10 @@ import { cn } from "../lib/utils";
 import { AttitudeSummaryBar } from "./attitude/AttitudeSummaryBar";
 import { useAttitude } from "./context/attitudeContext";
 import { useSession } from "./context/sessionContext";
+import { useParticipants } from "./context/participantsContext";
+import { ConnectionStatus } from "./multiplayer/ConnectionStatus";
+import { ParticipantsStrip } from "./multiplayer/ParticipantsStrip";
+import { JoinerBanner } from "./multiplayer/JoinerBanner";
 import {
     initialRoundStreamState,
     parseStreamChunk,
@@ -42,6 +46,7 @@ const ChatWindow = () => {
   const { refreshMessages, pushMessage, updateMessage, settleMessage } = useMessages();
   const { applyAttitudeStreamUpdate } = useAttitude();
   const { session } = useSession();
+  const { status, refreshParticipants } = useParticipants();
 
   const [userMessage, setUserMessage] = useState('');
   const [companionMessage, setCompanionMessage] = useState('');
@@ -143,6 +148,9 @@ const ChatWindow = () => {
               applyAttitudeStreamUpdate(effect.update);
               break;
             case 'round_complete':
+              // A bot may have dropped mid-round; pick that up immediately
+              // rather than waiting for the next poll tick.
+              refreshParticipants();
               break;
             case 'error':
               streamErrorMessage = effect.message;
@@ -191,6 +199,7 @@ const ChatWindow = () => {
     } catch (error) {
       console.error('Error sending message:', error);
       refreshMessages();
+      refreshParticipants();
       toast.error(`Error while sending a message: ${error}`);
     } finally {
       setIsSending(false);
@@ -259,7 +268,7 @@ const ChatWindow = () => {
               {!isMobile && (
                 <div className="flex flex-col">
                   <h1 className="font-semibold text-lg">{companionData.name || "AI Companion"}</h1>
-                  <p className="text-sm text-muted-foreground">Online</p>
+                  <ConnectionStatus status={status} />
                 </div>
               )}
               {isMobile && (
@@ -273,13 +282,18 @@ const ChatWindow = () => {
             </div>
           </div>
 
+          {/* Participant list - host/joiner mode only */}
+          {status.mode !== 'solo' && <ParticipantsStrip />}
+
           {/* Messages - takes remaining space and allows scrolling */}
           <div className="flex-1 min-h-0">
             <MessageScroll />
           </div>
 
           {/* Input - mobile optimized (moved above attitude summary) */}
-          {isMobile ? (
+          {status.mode === 'joiner' ? (
+            <JoinerBanner status={status} />
+          ) : isMobile ? (
             <MobileChatInput
               value={isImpersonating ? companionMessage : userMessage}
               onChange={(value) => isImpersonating ? setCompanionMessage(value) : setUserMessage(value)}

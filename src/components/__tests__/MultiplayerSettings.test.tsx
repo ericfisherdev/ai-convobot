@@ -1,7 +1,16 @@
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { MultiplayerSettings } from '../editData/MultiplayerSettings'
+import { ParticipantsProvider } from '../context/participantsContext'
 import { ConfigInterface, Device, MultiplayerMode, PromptTemplate } from '../interfaces/Config'
+
+// `MultiplayerSettings` fills its connection-status slot from
+// `useParticipants()`, which throws outside a `ParticipantsProvider`. No
+// `ConfigProvider`/`UserDataProvider`/`CompanionDataProvider` ancestor is
+// needed here: those hooks return `null` outside their own providers, and
+// `ParticipantsProvider` treats that as solo mode (no network calls).
+const renderMultiplayerSettings = (ui: React.ReactElement) =>
+  render(<ParticipantsProvider>{ui}</ParticipantsProvider>)
 
 const baseConfig: ConfigInterface = {
   device: Device.CPU,
@@ -25,7 +34,7 @@ const baseConfig: ConfigInterface = {
 
 describe('MultiplayerSettings', () => {
   it('shows only the mode description in solo mode', () => {
-    render(<MultiplayerSettings config={baseConfig} onChange={vi.fn()} />)
+    renderMultiplayerSettings(<MultiplayerSettings config={baseConfig} onChange={vi.fn()} />)
 
     expect(screen.queryByLabelText('Host address')).not.toBeInTheDocument()
     expect(screen.queryByLabelText('Participant ID')).not.toBeInTheDocument()
@@ -33,7 +42,7 @@ describe('MultiplayerSettings', () => {
   })
 
   it('shows host address and participant ID inputs in joiner mode', () => {
-    render(
+    renderMultiplayerSettings(
       <MultiplayerSettings
         config={{ ...baseConfig, multiplayer_mode: MultiplayerMode.Joiner }}
         onChange={vi.fn()}
@@ -46,7 +55,7 @@ describe('MultiplayerSettings', () => {
   })
 
   it('hides host address and participant ID inputs in solo mode', () => {
-    render(
+    renderMultiplayerSettings(
       <MultiplayerSettings
         config={{ ...baseConfig, multiplayer_mode: MultiplayerMode.Solo }}
         onChange={vi.fn()}
@@ -58,7 +67,7 @@ describe('MultiplayerSettings', () => {
   })
 
   it('shows the password field with the "leave blank" placeholder when a password is already set', () => {
-    render(
+    renderMultiplayerSettings(
       <MultiplayerSettings
         config={{ ...baseConfig, multiplayer_mode: MultiplayerMode.Host, multiplayer_password_set: true }}
         onChange={vi.fn()}
@@ -71,7 +80,7 @@ describe('MultiplayerSettings', () => {
   })
 
   it('shows the required placeholder in host mode when no password is stored yet', () => {
-    render(
+    renderMultiplayerSettings(
       <MultiplayerSettings
         config={{ ...baseConfig, multiplayer_mode: MultiplayerMode.Host, multiplayer_password_set: false }}
         onChange={vi.fn()}

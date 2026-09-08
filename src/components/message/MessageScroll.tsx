@@ -131,6 +131,7 @@ export function MessageScroll() {
                 regenerate={message.ai && index === messages.length - 1 && index !== 0}
                 content={message.content}
                 created_at={message.created_at}
+                speakerId={message.speaker_id}
               />
             </div>
           ))}

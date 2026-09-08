@@ -6,6 +6,7 @@ import { MessagesProvider, useMessages } from '../context/messageContext'
 import { UserDataProvider } from '../context/userContext'
 import { CompanionDataProvider } from '../context/companionContext'
 import { ConfigProvider } from '../context/configContext'
+import { ParticipantsProvider } from '../context/participantsContext'
 import { AttitudeProvider } from '../context/attitudeContext'
 import { SessionProvider } from '../context/sessionContext'
 import { ThemeProvider } from '../theme-provider'
@@ -102,11 +103,13 @@ const MockProviders: React.FC<{ children: React.ReactNode }> = ({ children }) =>
       <UserDataProvider>
         <CompanionDataProvider>
           <ConfigProvider>
-            <AttitudeProvider>
-              <SessionProvider>
-                {children}
-              </SessionProvider>
-            </AttitudeProvider>
+            <ParticipantsProvider>
+              <AttitudeProvider>
+                <SessionProvider>
+                  {children}
+                </SessionProvider>
+              </AttitudeProvider>
+            </ParticipantsProvider>
           </ConfigProvider>
         </CompanionDataProvider>
       </UserDataProvider>
@@ -120,6 +123,9 @@ describe('ChatWindow Component', () => {
     // Mock fetch for API calls
     global.fetch = vi.fn((input: RequestInfo | URL) => {
       const url = typeof input === 'string' ? input : input.toString()
+      if (url.startsWith('/api/config')) {
+        return Promise.resolve(jsonResponse({ multiplayer_mode: 'solo' }))
+      }
       if (url.startsWith('/api/session')) {
         return Promise.resolve(jsonResponse(session))
       }
@@ -536,5 +542,78 @@ describe('ChatWindow Component', () => {
     expect(textarea).not.toBeDisabled()
     await user.type(textarea, 'again')
     expect(screen.getByRole('button', { name: /^send message$/i })).not.toBeDisabled()
+  })
+
+  it('shows the participants strip in host mode', async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.startsWith('/api/config')) {
+        return Promise.resolve(jsonResponse({ multiplayer_mode: 'host' }))
+      }
+      if (url.startsWith('/api/multiplayer/participants')) {
+        return Promise.resolve(jsonResponse([
+          { id: 'bot1', display_name: 'Ada', kind: 'RemoteBot', avatar_url: null, connected: true },
+        ]))
+      }
+      if (url.startsWith('/api/session')) {
+        return Promise.resolve(jsonResponse(session))
+      }
+      if (url.startsWith('/api/attitude/summary/')) {
+        return Promise.resolve(jsonResponse({ attitude, summary: 'neutral' }))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+    global.fetch = fetchMock as unknown as typeof fetch
+
+    render(
+      <MockProviders>
+        <ChatWindow />
+      </MockProviders>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId('participants-strip')).toBeInTheDocument()
+    })
+    expect(screen.getByRole('textbox')).toBeInTheDocument()
+  })
+
+  it('shows the mirrored-chat banner and disables the input in joiner mode', async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.startsWith('/api/config')) {
+        return Promise.resolve(jsonResponse({ multiplayer_mode: 'joiner' }))
+      }
+      if (url.startsWith('/api/multiplayer/status')) {
+        return Promise.resolve(jsonResponse({
+          mode: 'joiner',
+          state: 'connected',
+          attempts: 1,
+          host_address: '192.168.0.20:3000',
+          participant_id: 'bot1',
+          participants: [
+            { id: 'user', display_name: 'Alice', kind: 'Human', avatar_url: null, connected: true },
+          ],
+        }))
+      }
+      if (url.startsWith('/api/session')) {
+        return Promise.resolve(jsonResponse(session))
+      }
+      if (url.startsWith('/api/attitude/summary/')) {
+        return Promise.resolve(jsonResponse({ attitude, summary: 'neutral' }))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+    global.fetch = fetchMock as unknown as typeof fetch
+
+    render(
+      <MockProviders>
+        <ChatWindow />
+      </MockProviders>
+    )
+
+    await waitFor(() => {
+      expect(screen.getByTestId('joiner-banner')).toBeInTheDocument()
+    })
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument()
   })
 })
