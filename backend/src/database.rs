@@ -113,11 +113,6 @@ impl NewMessage {
     pub fn from_user(content: impl Into<String>) -> Self {
         NewMessage::new(USER_SPEAKER_ID, content)
     }
-
-    // `char` is a Rust keyword, so this cannot be named `char`.
-    pub fn from_companion(content: impl Into<String>) -> Self {
-        NewMessage::new(CHAR_SPEAKER_ID, content)
-    }
 }
 
 /// Error returned by `resolve_speaker` when a `POST /api/message` body's
@@ -2635,8 +2630,13 @@ impl Database {
 
     // Automatic Person Detection System
 
-    pub fn detect_new_persons_in_message(message: &str, companion_id: i32) -> Result<Vec<i32>> {
-        let detected_names = Database::extract_person_names(message);
+    pub fn detect_new_persons_in_message(
+        message: &str,
+        companion_id: i32,
+        excluded_names: &[String],
+    ) -> Result<Vec<i32>> {
+        let detected_names =
+            Database::drop_excluded_names(Database::extract_person_names(message), excluded_names);
         let mut new_person_ids = Vec::new();
 
         // Get user name to filter it out from third party detection
@@ -4495,7 +4495,7 @@ impl Database {
     }
 
     /// Check for third-party mentions in message and track them, returning console output
-    pub fn track_third_party_mentions(message: &str) -> Result<String> {
+    pub fn track_third_party_mentions(message: &str, excluded_names: &[String]) -> Result<String> {
         let mut console_output = Vec::new();
 
         // Get all existing third parties to check for mentions
@@ -4538,7 +4538,10 @@ impl Database {
 
         // Also check for new person names that might not be in the database yet
         // This is a simplified detection - in practice you might want more sophisticated NER
-        let potential_names = Database::extract_potential_names(&message_lower);
+        let potential_names = Database::drop_excluded_names(
+            Database::extract_potential_names(&message_lower),
+            excluded_names,
+        );
         for potential_name in potential_names {
             // Check if this is a new person (not in database)
             if Database::get_third_party_by_name(&potential_name)?.is_none() {
@@ -4592,6 +4595,17 @@ impl Database {
         }
 
         names
+    }
+
+    /// Drops any name in `names` that case-insensitively matches an entry in
+    /// `excluded`, so a chat participant's own display name (the user's, the
+    /// host companion's, or a joined bot's) is never treated as a third
+    /// party mentioned in the conversation.
+    fn drop_excluded_names(names: Vec<String>, excluded: &[String]) -> Vec<String> {
+        names
+            .into_iter()
+            .filter(|name| !excluded.iter().any(|excl| excl.eq_ignore_ascii_case(name)))
+            .collect()
     }
 }
 
@@ -4964,6 +4978,16 @@ mod tests {
 
         assert!(!is_ai_speaker(&new_message.speaker_id));
         assert_eq!(new_message.content, "User message");
+    }
+
+    #[test]
+    fn drop_excluded_names_is_case_insensitive_and_keeps_unmatched_names() {
+        let names = vec!["Bob".to_string(), "bob".to_string(), "Carol".to_string()];
+        let excluded = vec!["Bob".to_string()];
+        assert_eq!(
+            Database::drop_excluded_names(names, &excluded),
+            vec!["Carol".to_string()]
+        );
     }
 
     #[test]

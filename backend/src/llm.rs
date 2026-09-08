@@ -16,7 +16,7 @@ use crate::long_term_mem::LongTermMem;
 use crate::model_cache::{ModelKey, ResidentCache};
 use crate::model_metadata::{self, ModelFacts};
 use crate::participants::{
-    avatar_from, expand_placeholders, placeholder, ParticipantId, ParticipantRegistry,
+    expand_placeholders, placeholder, Participant, ParticipantId, ParticipantRegistry,
 };
 
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -69,10 +69,34 @@ fn llama_backend() -> Result<&'static LlamaBackend, std::io::Error> {
     Ok(LLAMA_BACKEND.get_or_init(|| backend))
 }
 
+/// Merges consecutive turns from the same speaker into one, because several
+/// chat templates reject a history that does not strictly alternate. The
+/// bool is "spoken by `self_id`" (see `AssembledPrompt::chat_history`), so
+/// merging two different non-self speakers (e.g. two other bots, or a bot
+/// and the user) into one produces a single `user`-role message carrying
+/// both of their lines.
+fn merge_consecutive_turns(history: &[(bool, String)]) -> Vec<(bool, String)> {
+    let mut merged: Vec<(bool, String)> = Vec::with_capacity(history.len());
+    for (is_self, content) in history {
+        match merged.last_mut() {
+            Some((last_is_self, last_content)) if last_is_self == is_self => {
+                last_content.push('\n');
+                last_content.push_str(content);
+            }
+            _ => merged.push((*is_self, content.clone())),
+        }
+    }
+    merged
+}
+
 /// Renders the prompt using the chat template stored inside the GGUF file.
 ///
-/// Consecutive turns from the same speaker are merged, because several chat
-/// templates reject a history that does not strictly alternate.
+/// llama.cpp chat templates only know `system`/`user`/`assistant` roles, so
+/// this can express at most two speakers: the turn's own participant is
+/// `assistant`, everyone else is `user`. With more than one other
+/// participant that collapses several speakers onto the `user` role; they
+/// are told apart by the `Name: ` prefix `render_history` already put in
+/// their content.
 ///
 /// # Errors
 /// Returns a message describing why the model's template could not be used,
@@ -94,19 +118,10 @@ fn apply_gguf_chat_template(
         );
     }
 
-    let mut merged: Vec<(bool, String)> = Vec::with_capacity(history.len());
-    for (is_ai, content) in history {
-        match merged.last_mut() {
-            Some((last_is_ai, last_content)) if last_is_ai == is_ai => {
-                last_content.push('\n');
-                last_content.push_str(content);
-            }
-            _ => merged.push((*is_ai, content.clone())),
-        }
-    }
+    let merged = merge_consecutive_turns(history);
 
-    for (is_ai, content) in &merged {
-        let role = if *is_ai { "assistant" } else { "user" };
+    for (is_self, content) in &merged {
+        let role = if *is_self { "assistant" } else { "user" };
         messages.push(
             LlamaChatMessage::new(role.to_string(), content.clone())
                 .map_err(|e| format!("invalid chat message: {}", e))?,
@@ -122,10 +137,30 @@ fn apply_gguf_chat_template(
         .map_err(|e| format!("failed to apply chat template: {}", e))
 }
 
+/// Joins display names into prose: `A` for one, `A and B` for two, `A, B and
+/// C` for three or more.
+fn join_names(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [only] => only.to_string(),
+        [first, second] => format!("{} and {}", first, second),
+        _ => {
+            let (last, rest) = names.split_last().expect("names is non-empty here");
+            format!("{} and {}", rest.join(", "), last)
+        }
+    }
+}
+
 /// Builds the system-portion components of the prompt for the given
 /// template, inserting `attitude_context` (when non-empty) as its own
 /// component before the template's instruct terminator, so it always ends up
 /// inside the system block rather than after the conversation history.
+///
+/// Names come from `speakers`; personas, example dialogue and dialogue
+/// tuning still come from the caller's own `user`/`companion` rows (a
+/// joiner's own persona, not the host's). When a bot other than `speakers`'
+/// own turn is present, an `Also present: ...` component names the rest, so
+/// no other participant is left for the model to invent.
 fn build_base_components(
     template: &PromptTemplate,
     user: &UserView,
@@ -133,26 +168,48 @@ fn build_base_components(
     rp: &str,
     tuned_dialogue: &str,
     attitude_context: &str,
-    participants: &ParticipantRegistry,
+    speakers: &PromptSpeakers,
 ) -> Vec<String> {
+    let participants = &speakers.registry;
+    let user_name = speakers.user_name();
+    let self_name = speakers.self_name();
+    let all_names: Vec<&str> = participants
+        .iter()
+        .map(|p| p.display_name.as_str())
+        .collect();
+    let other_bot_names: Vec<&str> = speakers
+        .others()
+        .filter(|p| p.id != ParticipantId::USER)
+        .map(|p| p.display_name.as_str())
+        .collect();
+    let also_present = if other_bot_names.is_empty() {
+        String::new()
+    } else {
+        format!("Also present: {}.\n", join_names(&other_bot_names))
+    };
+
     if *template == PromptTemplate::Default || *template == PromptTemplate::Auto {
         let mut components = vec![
             format!(
-                "Text transcript of a conversation between {} and {}. {}\n",
-                user.name, companion.name, rp
+                "Text transcript of a conversation between {}. {}\n",
+                join_names(&all_names),
+                rp
             ),
             format!(
                 "{}'s Persona: {}\n",
-                user.name,
+                user_name,
                 expand_placeholders(&user.persona, participants)
             ),
         ];
+        if !also_present.is_empty() {
+            components.push(also_present);
+        }
         if !attitude_context.is_empty() {
             components.push(attitude_context.to_string());
         }
         components.push(format!(
             "{}'s Persona: {}\n<START>\n",
-            companion.name,
+            self_name,
             expand_placeholders(&companion.persona, participants)
         ));
         components.push(format!(
@@ -164,16 +221,19 @@ fn build_base_components(
     } else if *template == PromptTemplate::Llama2 {
         let mut components = vec![format!(
             "<<SYS>>\nYou are {}, {}\n",
-            companion.name,
+            self_name,
             expand_placeholders(&companion.persona, participants)
         )];
+        if !also_present.is_empty() {
+            components.push(also_present);
+        }
         if !attitude_context.is_empty() {
             components.push(attitude_context.to_string());
         }
         components.push(format!(
             "you are talking with {}, {} is {}\n{}\n[INST]\n",
-            user.name,
-            user.name,
+            user_name,
+            user_name,
             expand_placeholders(&user.persona, participants),
             rp
         ));
@@ -186,21 +246,25 @@ fn build_base_components(
     } else {
         let mut components = vec![
             format!(
-                "<s>[INST]Text transcript of a conversation between {} and {}. {}\n",
-                user.name, companion.name, rp
+                "<s>[INST]Text transcript of a conversation between {}. {}\n",
+                join_names(&all_names),
+                rp
             ),
             format!(
                 "{}'s Persona: {}\n",
-                user.name,
+                user_name,
                 expand_placeholders(&user.persona, participants)
             ),
         ];
+        if !also_present.is_empty() {
+            components.push(also_present);
+        }
         if !attitude_context.is_empty() {
             components.push(attitude_context.to_string());
         }
         components.push(format!(
             "{}'s Persona: {}[/INST]\n<s>[INST]\n",
-            companion.name,
+            self_name,
             expand_placeholders(&companion.persona, participants)
         ));
         components.push(format!(
@@ -217,8 +281,13 @@ fn build_base_components(
 /// # Errors
 /// Propagates model load, tokenization and decode failures as
 /// `std::io::ErrorKind::Other`.
-pub fn prompt(prompt: &str, companion_id: i32) -> Result<String, std::io::Error> {
-    generate(prompt, companion_id, &mut |_token| {})
+pub fn prompt(
+    prompt: &str,
+    companion_id: i32,
+    transcript: &dyn TranscriptSource,
+    speakers: &PromptSpeakers,
+) -> Result<String, std::io::Error> {
+    generate(prompt, companion_id, &mut |_token| {}, transcript, speakers)
 }
 
 /// Generates a reply, invoking `on_token` with each token as it is produced.
@@ -232,8 +301,10 @@ pub fn prompt_streaming(
     prompt: &str,
     companion_id: i32,
     on_token: &mut dyn FnMut(&str),
+    transcript: &dyn TranscriptSource,
+    speakers: &PromptSpeakers,
 ) -> Result<String, std::io::Error> {
-    generate(prompt, companion_id, on_token)
+    generate(prompt, companion_id, on_token, transcript, speakers)
 }
 
 /// Whether each turn should print the full attitude block it injected.
@@ -269,6 +340,101 @@ fn sampler_seed() -> u32 {
     }
 }
 
+/// The conversation record a prompt is assembled from: the newest messages,
+/// read before generation, and the reply just generated, appended after it.
+///
+/// One abstraction because both halves read/write the same record. Solo and
+/// host turns use [`SqliteTranscript`]; a joiner (#130) generates from a
+/// transcript it received over the wire and has no database row of its own
+/// to append to, hence [`InMemoryTranscript`].
+pub trait TranscriptSource {
+    /// The newest `limit` messages, oldest first.
+    ///
+    /// # Errors
+    /// Returns `std::io::ErrorKind::Other` if the underlying read fails.
+    fn recent_messages(&self, limit: usize) -> std::io::Result<Vec<Message>>;
+
+    /// Appends the reply just generated for `speaker_id` to the record this
+    /// transcript is read from.
+    ///
+    /// # Errors
+    /// Returns `std::io::ErrorKind::Other` if the underlying write fails.
+    /// `generate` logs the error and never treats it as fatal, so
+    /// implementations do not need to retry internally.
+    fn record_reply(&self, speaker_id: &ParticipantId, reply: &str) -> std::io::Result<()>;
+}
+
+/// The production [`TranscriptSource`], backed by `companion_database.db`.
+pub struct SqliteTranscript;
+
+impl TranscriptSource for SqliteTranscript {
+    fn recent_messages(&self, limit: usize) -> std::io::Result<Vec<Message>> {
+        Database::get_x_messages(limit, 0).map_err(|e| {
+            eprintln!("Error while getting short term memory entries: {}", e);
+            std::io::Error::other("Error while getting short term memory entries")
+        })
+    }
+
+    fn record_reply(&self, speaker_id: &ParticipantId, reply: &str) -> std::io::Result<()> {
+        Database::insert_message(NewMessage::new(speaker_id.to_string(), reply))
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+}
+
+/// A [`TranscriptSource`] over a fixed, in-memory list of messages: used by
+/// tests now, and by #130's joiner, whose replies are persisted by the host
+/// rather than by the joiner itself, so `record_reply` is a no-op.
+#[allow(dead_code)] // wired up by #130's joiner; exercised directly by this module's tests today
+pub struct InMemoryTranscript(pub Vec<Message>);
+
+impl TranscriptSource for InMemoryTranscript {
+    fn recent_messages(&self, limit: usize) -> std::io::Result<Vec<Message>> {
+        let start = self.0.len().saturating_sub(limit);
+        Ok(self.0[start..].to_vec())
+    }
+
+    fn record_reply(&self, _speaker_id: &ParticipantId, _reply: &str) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// An owned, `Clone + Send` snapshot of who is in the chat and which of them
+/// the current turn is generating for. Owned so it can move into
+/// `web::block` closures and the `stream-generation` thread without holding
+/// the shared registry's lock across a generation.
+#[derive(Clone)]
+pub struct PromptSpeakers {
+    pub registry: ParticipantRegistry,
+    pub self_id: ParticipantId,
+}
+
+impl PromptSpeakers {
+    /// The display name of the participant this turn is generating for.
+    /// Falls back to the raw id if `self_id` is somehow not in the registry
+    /// (never expected: every registry always carries `char`, and a joiner
+    /// always knows its own id).
+    pub fn self_name(&self) -> &str {
+        self.registry
+            .display_name(&self.self_id)
+            .unwrap_or(self.self_id.as_str())
+    }
+
+    /// The display name of the human participant. Falls back to the raw id
+    /// for the same reason as `self_name`.
+    pub fn user_name(&self) -> &str {
+        self.registry
+            .display_name(&ParticipantId::USER)
+            .unwrap_or(ParticipantId::USER.as_str())
+    }
+
+    /// Every participant except the one this turn is generating for, in join
+    /// order.
+    pub fn others(&self) -> impl Iterator<Item = &Participant> {
+        let self_id = &self.self_id;
+        self.registry.iter().filter(move |p| &p.id != self_id)
+    }
+}
+
 /// Everything a prompt is made of, before the model is involved.
 ///
 /// Returned by `assemble_prompt` so the exact text a turn would send — the
@@ -284,6 +450,93 @@ pub struct AssembledPrompt {
     pub attitude_context: String,
     /// The history after `ContextManager` trimming.
     pub managed_messages: Vec<Message>,
+}
+
+/// The result of rendering a message history for one turn.
+struct RenderedHistory {
+    /// Text ready to append to the system prompt, for every template but
+    /// `Auto` (which uses `chat_history` instead and ignores this).
+    spliced: String,
+    /// Role-tagged history, used only by the `Auto` template. The bool is
+    /// "spoken by `speakers.self_id`", documented on
+    /// `AssembledPrompt::chat_history`.
+    chat_history: Vec<(bool, String)>,
+}
+
+/// Renders `managed` (already trimmed by `ContextManager`) into both the
+/// plain-text splice used by every template but `Auto`, and the role-tagged
+/// `chat_history` `Auto` renders through the model's own chat template.
+///
+/// Speaker names come from `speakers.registry`; a `speaker_id` no longer in
+/// the registry (a bot that has since left) falls back to the raw id rather
+/// than being attributed to `self`.
+///
+/// Under `Auto`, a non-self turn is prefixed with `"{name}: "` only when
+/// there is more than one non-self participant — i.e. some bot other than
+/// `self` besides the user — since with exactly two participants the chat
+/// template's own role framing already identifies the other speaker and
+/// solo output must stay byte-identical.
+fn render_history(
+    managed: &[Message],
+    speakers: &PromptSpeakers,
+    template: &PromptTemplate,
+) -> RenderedHistory {
+    let len = managed.len();
+    let auto_show_names = speakers.others().count() > 1;
+    let mut spliced = String::new();
+    let mut chat_history: Vec<(bool, String)> = Vec::with_capacity(len);
+
+    for (message_counter, message) in (1..).zip(managed.iter()) {
+        let participant_id = ParticipantId::parse(&message.speaker_id).ok();
+        let is_self = participant_id.as_ref() == Some(&speakers.self_id);
+        let display_name = participant_id
+            .as_ref()
+            .and_then(|id| speakers.registry.display_name(id))
+            .unwrap_or(message.speaker_id.as_str());
+        let text = &message.content;
+        let mut formatted_message = format!("{}: {}\n", display_name, text);
+        let inject_time = message_counter == len && contains_time_question(&formatted_message);
+        if inject_time {
+            formatted_message = format!(
+                "\n* it's currently {} *\n{}",
+                get_current_date(),
+                formatted_message
+            );
+        }
+        match template {
+            PromptTemplate::Auto => {
+                // The chat template supplies the speaker framing for the
+                // only other participant in solo chat, so the message
+                // carries its own text rather than a "Name: " prefix; with
+                // more than one other participant, the role alone can no
+                // longer say who spoke, so the name is spelled out.
+                let mut content = if auto_show_names && !is_self {
+                    format!("{}: {}", display_name, text)
+                } else {
+                    text.clone()
+                };
+                if inject_time {
+                    content = format!("* it's currently {} *\n{}", get_current_date(), content);
+                }
+                chat_history.push((is_self, content));
+            }
+            PromptTemplate::Llama2 | PromptTemplate::Mistral => {
+                if !is_self {
+                    spliced += &format!("[INST]{}", formatted_message);
+                } else {
+                    spliced += &format!("{}[/INST]\n", formatted_message);
+                }
+            }
+            _ => {
+                spliced += &formatted_message;
+            }
+        }
+    }
+
+    RenderedHistory {
+        spliced,
+        chat_history,
+    }
 }
 
 /// Builds the prompt for one turn without loading a model.
@@ -305,6 +558,8 @@ pub fn assemble_prompt(
     companion_id: i32,
     long_term_memory: &LongTermMem,
     config: &ConfigView,
+    transcript: &dyn TranscriptSource,
+    speakers: &PromptSpeakers,
 ) -> Result<AssembledPrompt, std::io::Error> {
     let user: UserView = match Database::get_user_data() {
         Ok(user) => user,
@@ -320,15 +575,11 @@ pub fn assemble_prompt(
             return Err(std::io::Error::other("Error while getting companion data"));
         }
     };
-    // Built fresh from the rows just loaded above, so a name edited via the
-    // settings dialog takes effect on the next turn with nothing to
-    // invalidate. Solo chat only for now; #127 replaces this with a snapshot
-    // of the shared registry that also carries any joined bots.
-    let participants = ParticipantRegistry::solo(
-        &user.name,
-        &companion.name,
-        avatar_from(&companion.avatar_path),
-    );
+    // Every name below comes from `speakers`, not from the `user`/`companion`
+    // rows above: a joiner's own `companion` row is its own card, but the
+    // names in its prompt must reflect the host's shared registry so it
+    // names the host's user (and any other bots) correctly.
+    let participants = &speakers.registry;
     let mut base_prompt: String;
     let mut rp: &str = "";
     let mut tuned_dialogue: String = String::from("");
@@ -339,7 +590,10 @@ pub fn assemble_prompt(
         if let Ok(dialogue) = DialogueTuning::get_random_dialogue() {
             tuned_dialogue = format!(
                 "{}: {}\n{}: {}",
-                user.name, dialogue.user_msg, companion.name, dialogue.ai_msg
+                speakers.user_name(),
+                dialogue.user_msg,
+                speakers.self_name(),
+                dialogue.ai_msg
             );
         };
     }
@@ -371,8 +625,11 @@ pub fn assemble_prompt(
 
     // Add attitude context to prompt if attitudes exist
     let attitude_context = if !attitudes.is_empty() {
-        let context =
-            attitude_formatter.format_attitude_context(&attitudes, &third_parties, &user.name);
+        let context = attitude_formatter.format_attitude_context(
+            &attitudes,
+            &third_parties,
+            speakers.user_name(),
+        );
         if !context.is_empty() {
             format!("\n{}\n", context)
         } else {
@@ -430,7 +687,7 @@ pub fn assemble_prompt(
         rp,
         &tuned_dialogue,
         &attitude_context,
-        &participants,
+        speakers,
     );
 
     base_prompt = base_components.join("");
@@ -447,7 +704,7 @@ pub fn assemble_prompt(
                 }
             };
         for entry in long_term_memory_entries {
-            let entry = expand_placeholders(&entry, &participants);
+            let entry = expand_placeholders(&entry, participants);
             if config.prompt_template == PromptTemplate::Llama2 {
                 base_prompt += &format!("[INST]{}[/INST]\n", entry);
             } else if config.prompt_template == PromptTemplate::Mistral {
@@ -457,70 +714,19 @@ pub fn assemble_prompt(
             }
         }
     }
-    let short_term_memory_entries: Vec<Message> = match Database::get_x_messages(
-        if companion.short_term_mem > 0 {
+    // `TranscriptSource` impls log the cause of a read failure themselves.
+    let short_term_memory_entries: Vec<Message> =
+        transcript.recent_messages(if companion.short_term_mem > 0 {
             companion.short_term_mem
         } else {
             50
-        },
-        0,
-    ) {
-        Ok(entries) => entries,
-        Err(e) => {
-            eprintln!("Error while getting short term memory entries: {}", e);
-            return Err(std::io::Error::other(
-                "Error while getting short term memory entries",
-            ));
-        }
-    };
+        })?;
 
     // Apply context management to optimize memory usage
     let managed_messages = context_manager.manage_message_context(short_term_memory_entries);
-    let short_term_mem_len = managed_messages.len();
-    // Role-tagged history, used only by the Auto template. The string templates
-    // below keep splicing turns straight into base_prompt.
-    let mut chat_history: Vec<(bool, String)> = Vec::with_capacity(managed_messages.len());
-    for (message_counter, message) in (1..).zip(managed_messages.iter()) {
-        let prefix = if message.ai {
-            &companion.name
-        } else {
-            &user.name
-        };
-        let text = &message.content;
-        let mut formatted_message = format!("{}: {}\n", prefix, text);
-        let inject_time =
-            message_counter == short_term_mem_len && contains_time_question(&formatted_message);
-        if inject_time {
-            formatted_message = format!(
-                "\n* it's currently {} *\n{}",
-                get_current_date(),
-                formatted_message
-            );
-        }
-        if config.prompt_template == PromptTemplate::Auto {
-            // The chat template supplies the speaker framing, so the message
-            // carries its own text rather than a "Name: " prefix.
-            let mut content = text.clone();
-            if inject_time {
-                content = format!("* it's currently {} *\n{}", get_current_date(), content);
-            }
-            chat_history.push((message.ai, content));
-        } else if config.prompt_template == PromptTemplate::Llama2 {
-            if !message.ai {
-                base_prompt += &format!("[INST]{}", formatted_message);
-            } else {
-                base_prompt += &format!("{}[/INST]\n", formatted_message);
-            }
-        } else if config.prompt_template == PromptTemplate::Mistral {
-            if !message.ai {
-                base_prompt += &format!("<s>[INST]{}", formatted_message);
-            } else {
-                base_prompt += &format!("{}[/INST]\n", formatted_message);
-            }
-        } else {
-            base_prompt += &formatted_message;
-        }
-    }
+    let rendered = render_history(&managed_messages, speakers, &config.prompt_template);
+    base_prompt += &rendered.spliced;
+    let chat_history = rendered.chat_history;
 
     if attitude_debug_enabled() && !attitude_context.is_empty() {
         // `managed_messages` is the trimmed history, so its length is the turn
@@ -673,10 +879,97 @@ pub fn unload_model() -> (bool, Option<String>) {
     }
 }
 
+/// Fixed template tokens that end a reply no matter which participants are
+/// in the chat.
+const TOKEN_MARKERS: [&str; 4] = ["[/INST]", "<</SYS>>", "[s]", "<|user|>"];
+
+/// Precomputes the markers `generate`'s halting and cleanup logic watch for,
+/// generalising the old two-participant checks (`\n{user}:`, `{companion}:`,
+/// `{user}:`, plus the four template tokens above) to however many
+/// participants are in the chat.
+struct ReplyTrimmer {
+    /// `"\n{name}:"` for every participant except `self`: the model starting
+    /// a new line as someone else means it has begun impersonating them.
+    line_markers: Vec<String>,
+    /// `"{name}:"` for every participant, `self` included: catches a speaker
+    /// named mid-line rather than at the start of one.
+    speaker_markers: Vec<String>,
+    /// `"\n{name}: "` (trailing space) for every participant, used only to
+    /// find where a spurious extra turn begins so it can be cut off.
+    cut_markers: Vec<String>,
+}
+
+impl ReplyTrimmer {
+    fn new(speakers: &PromptSpeakers) -> Self {
+        let line_markers = speakers
+            .others()
+            .map(|p| format!("\n{}:", p.display_name))
+            .collect();
+        let speaker_markers = speakers
+            .registry
+            .iter()
+            .map(|p| format!("{}:", p.display_name))
+            .collect();
+        let cut_markers = speakers
+            .registry
+            .iter()
+            .map(|p| format!("\n{}: ", p.display_name))
+            .collect();
+        ReplyTrimmer {
+            line_markers,
+            speaker_markers,
+            cut_markers,
+        }
+    }
+
+    /// Whether `generated` shows the model starting to speak as, or name,
+    /// another participant, or emitting one of the fixed template tokens.
+    fn should_stop(&self, generated: &str) -> bool {
+        self.speaker_markers
+            .iter()
+            .any(|marker| generated.contains(marker.as_str()))
+            || self
+                .line_markers
+                .iter()
+                .any(|marker| generated.contains(marker.as_str()))
+            || TOKEN_MARKERS
+                .iter()
+                .any(|marker| generated.contains(marker))
+    }
+
+    /// Strips every marker above and template token out of `generated`, cuts
+    /// off anything from the earliest spurious extra turn onward, and trims
+    /// the leading whitespace generation tends to start with.
+    fn clean(&self, generated: &str) -> String {
+        let mut cleaned = generated.to_string();
+        for marker in &self.line_markers {
+            cleaned = cleaned.replace(marker.as_str(), "");
+        }
+        cleaned = cleaned
+            .replace("[INST]", "")
+            .replace("[/INST]", "")
+            .replace("<</SYS>>", "")
+            .replace("<s>", "")
+            .replace("</s>", "")
+            .replace("<|user|>", "");
+        if let Some(cut_at) = self
+            .cut_markers
+            .iter()
+            .filter_map(|marker| cleaned.find(marker.as_str()))
+            .min()
+        {
+            cleaned.truncate(cut_at);
+        }
+        cleaned.trim_start().to_string()
+    }
+}
+
 fn generate(
     prompt: &str,
     companion_id: i32,
     on_token: &mut dyn FnMut(&str),
+    transcript: &dyn TranscriptSource,
+    speakers: &PromptSpeakers,
 ) -> Result<String, std::io::Error> {
     let _generation_guard = GENERATION_LOCK
         .lock()
@@ -698,20 +991,6 @@ fn generate(
             return Err(std::io::Error::other("Error while getting config"));
         }
     };
-    let user: UserView = match Database::get_user_data() {
-        Ok(user) => user,
-        Err(e) => {
-            eprintln!("Error while getting user data: {}", e);
-            return Err(std::io::Error::other("Error while getting user data"));
-        }
-    };
-    let companion: CompanionView = match Database::get_companion_data() {
-        Ok(companion) => companion,
-        Err(e) => {
-            eprintln!("Error while getting companion data: {}", e);
-            return Err(std::io::Error::other("Error while getting companion data"));
-        }
-    };
 
     let backend = llama_backend()?;
 
@@ -730,7 +1009,14 @@ fn generate(
         .unwrap_or(4); // Fallback to 4 cores if detection fails
 
     println!("🚀 Generating AI response with optimized session...");
-    let assembled = assemble_prompt(prompt, companion_id, long_term_memory, &config)?;
+    let assembled = assemble_prompt(
+        prompt,
+        companion_id,
+        long_term_memory,
+        &config,
+        transcript,
+        speakers,
+    )?;
     let AssembledPrompt {
         system_prompt: base_prompt,
         chat_history,
@@ -826,16 +1112,27 @@ fn generate(
                     "⚠️ Auto template unavailable ({}), falling back to the transcript format",
                     e
                 );
+                // `render_history` already embedded a "Name: " prefix into
+                // non-self content whenever there was more than one other
+                // participant to tell apart; here that content is used as
+                // is, and only the two bare cases (self, and the sole other
+                // participant in solo chat) need a prefix added.
+                let auto_show_names = speakers.others().count() > 1;
                 let mut fallback = base_prompt.clone();
-                for (is_ai, content) in &chat_history {
-                    let speaker = if *is_ai { &companion.name } else { &user.name };
-                    fallback += &format!("{}: {}\n", speaker, content);
+                for (is_self, content) in &chat_history {
+                    if *is_self {
+                        fallback += &format!("{}: {}\n", speakers.self_name(), content);
+                    } else if auto_show_names {
+                        fallback += &format!("{}\n", content);
+                    } else {
+                        fallback += &format!("{}: {}\n", speakers.user_name(), content);
+                    }
                 }
-                format!("{}{}: ", fallback, companion.name)
+                format!("{}{}: ", fallback, speakers.self_name())
             }
         }
     } else {
-        format!("{}{}: ", base_prompt, companion.name)
+        format!("{}{}: ", base_prompt, speakers.self_name())
     };
     let prompt_tokens = match model.str_to_token(&full_prompt, AddBos::Always) {
         Ok(tokens) => tokens,
@@ -881,7 +1178,7 @@ fn generate(
     let mut tokens_generated = 0u32;
     let mut first_token_recorded = false;
     let mut first_token_at: Option<std::time::Duration> = None;
-    let eog = format!("\n{}:", user.name);
+    let trimmer = ReplyTrimmer::new(speakers);
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut n_cur = prompt_tokens.len() as i32;
 
@@ -925,14 +1222,7 @@ fn generate(
             tracker.update_token_count(&session_id, tokens_generated);
         }
 
-        if end_of_generation.contains(&eog)
-            || end_of_generation.contains("[/INST]")
-            || end_of_generation.contains("<</SYS>>")
-            || end_of_generation.contains("[s]")
-            || end_of_generation.contains(&format!("{}:", companion.name))
-            || end_of_generation.contains(&format!("{}:", user.name))
-            || end_of_generation.contains("<|user|>")
-        {
+        if trimmer.should_stop(&end_of_generation) {
             break;
         }
 
@@ -949,31 +1239,19 @@ fn generate(
     }
     println!();
 
-    let x: String = end_of_generation
-        .replace(&eog, "")
-        .replace("[INST]", "")
-        .replace("[/INST]", "")
-        .replace("<</SYS>>", "")
-        .replace("<s>", "")
-        .replace("</s>", "")
-        .replace("<|user|>", "");
-    let companion_text = x
-        .split(&format!("\n{}: ", companion.name))
-        .next()
-        .unwrap_or("");
-    match Database::insert_message(NewMessage::from_companion(companion_text)) {
-        Ok(_) => {}
-        Err(e) => eprintln!(
+    let companion_text = trimmer.clean(&end_of_generation);
+    if let Err(e) = transcript.record_reply(&speakers.self_id, &companion_text) {
+        eprintln!(
             "Error while adding message to database/short-term memory: {}",
             e
-        ),
-    };
+        );
+    }
     match long_term_memory.add_entry(&format!(
         "{}{}: {}\n{}: {}\n",
         formatted_date,
         placeholder(&ParticipantId::USER),
         prompt,
-        placeholder(&ParticipantId::CHAR),
+        placeholder(&speakers.self_id),
         companion_text
     )) {
         Ok(_) => {}
@@ -1025,12 +1303,13 @@ fn generate(
         );
     }
 
-    Ok(companion_text.trim_start().to_string())
+    Ok(companion_text)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::participants::ParticipantKind;
 
     const ATTITUDE_MARKER: &str = "MARKER: current relationship context";
 
@@ -1055,8 +1334,46 @@ mod tests {
         }
     }
 
-    fn participants() -> ParticipantRegistry {
-        ParticipantRegistry::solo(&user().name, &companion().name, None)
+    /// Solo-chat speakers: `user` = TestUser, `char` = TestCompanion,
+    /// generating for `char` — the two-participant case every solo-mode
+    /// regression guard below is checked against.
+    fn solo_speakers() -> PromptSpeakers {
+        PromptSpeakers {
+            registry: ParticipantRegistry::solo(&user().name, &companion().name, None),
+            self_id: ParticipantId::CHAR,
+        }
+    }
+
+    /// Three-speaker registry used by the multi-speaker tests below:
+    /// `user` = Alice, `char` = Ada, `bot1` = Bob, in join order.
+    fn three_speaker_registry() -> ParticipantRegistry {
+        let mut registry = ParticipantRegistry::solo("Alice", "Ada", None);
+        registry
+            .insert(Participant {
+                id: ParticipantId::parse("bot1").unwrap(),
+                display_name: "Bob".to_string(),
+                kind: ParticipantKind::HostBot,
+                avatar: None,
+            })
+            .unwrap();
+        registry
+    }
+
+    fn three_speaker_speakers(self_id: ParticipantId) -> PromptSpeakers {
+        PromptSpeakers {
+            registry: three_speaker_registry(),
+            self_id,
+        }
+    }
+
+    fn message(speaker_id: &str, content: &str) -> Message {
+        Message {
+            id: 0,
+            ai: speaker_id != "user",
+            speaker_id: speaker_id.to_string(),
+            content: content.to_string(),
+            created_at: String::new(),
+        }
     }
 
     fn marker_index(joined: &str) -> usize {
@@ -1074,7 +1391,7 @@ mod tests {
             "",
             "",
             ATTITUDE_MARKER,
-            &participants(),
+            &solo_speakers(),
         );
         let joined = components.join("");
         let start_index = joined
@@ -1092,7 +1409,7 @@ mod tests {
             "",
             "",
             ATTITUDE_MARKER,
-            &participants(),
+            &solo_speakers(),
         );
         let joined = components.join("");
         let start_index = joined
@@ -1110,7 +1427,7 @@ mod tests {
             "",
             "",
             ATTITUDE_MARKER,
-            &participants(),
+            &solo_speakers(),
         );
         let joined = components.join("");
         let inst_index = joined
@@ -1128,7 +1445,7 @@ mod tests {
             "",
             "",
             ATTITUDE_MARKER,
-            &participants(),
+            &solo_speakers(),
         );
         let joined = components.join("");
         let inst_index = joined
@@ -1146,7 +1463,7 @@ mod tests {
             "",
             "",
             ATTITUDE_MARKER,
-            &participants(),
+            &solo_speakers(),
         );
         let without_attitude = build_base_components(
             &PromptTemplate::Default,
@@ -1155,9 +1472,157 @@ mod tests {
             "",
             "",
             "",
-            &participants(),
+            &solo_speakers(),
         );
         assert_eq!(with_attitude.len(), without_attitude.len() + 1);
         assert!(!without_attitude.join("").contains(ATTITUDE_MARKER));
+    }
+
+    #[test]
+    fn three_speaker_header_lists_everyone_and_names_other_bots() {
+        let speakers = three_speaker_speakers(ParticipantId::CHAR);
+        let components = build_base_components(
+            &PromptTemplate::Default,
+            &user(),
+            &companion(),
+            "",
+            "",
+            "",
+            &speakers,
+        );
+        let joined = components.join("");
+        assert!(joined.contains("Alice, Ada and Bob"));
+        assert!(joined.contains("Also present: Bob."));
+    }
+
+    #[test]
+    fn solo_header_has_no_also_present_component() {
+        let components = build_base_components(
+            &PromptTemplate::Default,
+            &user(),
+            &companion(),
+            "",
+            "",
+            "",
+            &solo_speakers(),
+        );
+        let joined = components.join("");
+        assert!(joined.contains("TestUser and TestCompanion"));
+        assert!(!joined.contains("Also present"));
+    }
+
+    #[test]
+    fn join_names_covers_one_two_and_three_or_more() {
+        assert_eq!(join_names(&["Alice"]), "Alice");
+        assert_eq!(join_names(&["Alice", "Bob"]), "Alice and Bob");
+        assert_eq!(
+            join_names(&["Alice", "Bob", "Carol"]),
+            "Alice, Bob and Carol"
+        );
+    }
+
+    #[test]
+    fn render_history_default_template_lists_every_speaker_by_name() {
+        let speakers = three_speaker_speakers(ParticipantId::parse("bot1").unwrap());
+        let managed = vec![
+            message("user", "hi"),
+            message("char", "hello"),
+            message("bot1", "hey"),
+        ];
+        let rendered = render_history(&managed, &speakers, &PromptTemplate::Default);
+        assert_eq!(rendered.spliced, "Alice: hi\nAda: hello\nBob: hey\n");
+    }
+
+    #[test]
+    fn render_history_auto_only_self_turns_are_bare_and_marked_assistant() {
+        let speakers = three_speaker_speakers(ParticipantId::parse("bot1").unwrap());
+        let managed = vec![
+            message("user", "hi"),
+            message("char", "hello"),
+            message("bot1", "hey"),
+        ];
+        let rendered = render_history(&managed, &speakers, &PromptTemplate::Auto);
+        assert_eq!(
+            rendered.chat_history,
+            vec![
+                (false, "Alice: hi".to_string()),
+                (false, "Ada: hello".to_string()),
+                (true, "hey".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_history_auto_stays_bare_in_solo_chat() {
+        let managed = vec![message("user", "hi"), message("char", "hello")];
+        let rendered = render_history(&managed, &solo_speakers(), &PromptTemplate::Auto);
+        assert_eq!(
+            rendered.chat_history,
+            vec![(false, "hi".to_string()), (true, "hello".to_string())]
+        );
+    }
+
+    #[test]
+    fn merge_consecutive_turns_combines_adjacent_non_self_speakers() {
+        let history = vec![
+            (false, "Alice: hi".to_string()),
+            (false, "Ada: hello".to_string()),
+            (true, "hey".to_string()),
+        ];
+        let merged = merge_consecutive_turns(&history);
+        assert_eq!(
+            merged,
+            vec![
+                (false, "Alice: hi\nAda: hello".to_string()),
+                (true, "hey".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn reply_trimmer_should_stop_fires_on_any_participant_name() {
+        let speakers = three_speaker_speakers(ParticipantId::parse("bot1").unwrap());
+        let trimmer = ReplyTrimmer::new(&speakers);
+        assert!(trimmer.should_stop("sure thing\nBob:"));
+        assert!(trimmer.should_stop("sure thing\nAlice:"));
+    }
+
+    #[test]
+    fn reply_trimmer_clean_cuts_at_the_earliest_extra_turn() {
+        let speakers = three_speaker_speakers(ParticipantId::parse("bot1").unwrap());
+        let trimmer = ReplyTrimmer::new(&speakers);
+        assert_eq!(trimmer.clean("sure!\nBob: hi"), "sure!");
+    }
+
+    #[test]
+    fn reply_trimmer_reproduces_solo_behaviour() {
+        let trimmer = ReplyTrimmer::new(&solo_speakers());
+        assert_eq!(trimmer.clean("Hello there!\nTestUser:"), "Hello there!");
+    }
+
+    #[test]
+    fn in_memory_transcript_returns_the_tail_oldest_first() {
+        let transcript = InMemoryTranscript(vec![
+            message("user", "a"),
+            message("char", "b"),
+            message("user", "c"),
+        ]);
+        let recent = transcript.recent_messages(2).unwrap();
+        assert_eq!(
+            recent
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "c"]
+        );
+    }
+
+    #[test]
+    fn in_memory_transcript_record_reply_is_a_no_op() {
+        let transcript = InMemoryTranscript(vec![message("user", "a")]);
+        assert!(transcript
+            .record_reply(&ParticipantId::CHAR, "reply")
+            .is_ok());
+        assert_eq!(transcript.0.len(), 1);
     }
 }
