@@ -98,6 +98,7 @@ fn peer_ip(req: &HttpRequest) -> Option<IpAddr> {
 /// `Ok(Err(response))` for the `404` a non-`Host` mode returns, or the
 /// `500` a config read failure returns; both are ready-to-send responses so
 /// callers do not have to build their own.
+#[allow(clippy::result_large_err)] // see off_worker's doc comment in main.rs
 async fn host_password_or_404(
     host_config: &Arc<dyn HostConfigSource>,
 ) -> Result<String, HttpResponse> {
@@ -115,6 +116,7 @@ async fn host_password_or_404(
 /// Gates `GET /api/multiplayer/participants` and the avatar route on `Host`
 /// mode, discarding the password `host_password_or_404` reads: those two
 /// routes only need to know the mode, not the secret.
+#[allow(clippy::result_large_err)] // see off_worker's doc comment in main.rs
 pub async fn require_host_mode(
     host_config: &Arc<dyn HostConfigSource>,
 ) -> Result<(), HttpResponse> {
