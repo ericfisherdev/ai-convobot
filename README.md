@@ -60,6 +60,7 @@ AI Companion is a full-stack local chatbot application that runs entirely on you
 - **Roleplay Support**: Actions between asterisks (*waves hello*)
 - **Real-time Learning**: AI learns about users through conversation
 - **Time Awareness**: AI can access current date/time and remember when conversations occurred
+- **Multi-instance chat**: a host instance plus remote bots, each with its own model and card — see [DEPLOYMENT.md](DEPLOYMENT.md#multi-instance-chat-host-and-joiners)
 
 ## Quick Start
 

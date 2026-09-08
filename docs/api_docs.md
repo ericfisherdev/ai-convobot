@@ -599,6 +599,80 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   - A `"rejected"` state (wrong password, or a duplicate/reserved participant id) is terminal: this instance stops retrying and stays in that state until restarted with a corrected config.
   - While in `joiner` mode, `GET /message` answers from this instance's mirror of the host's transcript, and `/prompt`, `/prompt/stream` and `/prompt/regenerate` all answer `409 Conflict`; see their entries above.
 
+#### 7.2 List connected participants
+
+- **URL:** `/multiplayer/participants`
+- **Method:** `GET`
+- **Description:** Every participant in the chat, in join order (`user`, then `char`, then every remote bot in the order it joined). Only meaningful on a `host` mode instance — a joiner's own roster is `participants` inside `GET /multiplayer/status` instead.
+- **Response:**
+  - Status: 200 OK
+  - Body: array of `{ id, display_name, kind, avatar_url, connected }`. `kind` is one of `"Human"`, `"HostBot"`, `"RemoteBot"` (the Rust enum's own variant names — not lower- or snake-cased). `avatar_url` is `null` for `user` and `char` unless the companion has its own avatar; `connected` is always `true` for `Human`/`HostBot` and reflects the live socket connection for a `RemoteBot`.
+  - Status: 404 Not Found — this instance is not currently in `host` mode.
+- **Example Request:**
+  ```http
+  GET /multiplayer/participants
+  ```
+- **Example Response:**
+  ```json
+  [
+    { "id": "user", "display_name": "Alice", "kind": "Human", "avatar_url": null, "connected": true },
+    { "id": "char", "display_name": "Assistant", "kind": "HostBot", "avatar_url": "/assets/companion_avatar-4rust.jpg", "connected": true },
+    { "id": "bot1", "display_name": "Ada", "kind": "RemoteBot", "avatar_url": "/api/multiplayer/participants/bot1/avatar", "connected": true }
+  ]
+  ```
+
+#### 7.3 Get a remote bot's avatar
+
+- **URL:** `/multiplayer/participants/{id}/avatar`
+- **Method:** `GET`
+- **Description:** The avatar a remote bot uploaded when it joined, if any. Only the format detected from the image's own magic bytes at upload time is served, regardless of what the joiner claimed its MIME type was.
+- **Path Parameters:**
+  - `id` (string): the participant id.
+- **Response:**
+  - Status: 200 OK
+  - Content-Type: `image/png` or `image/jpeg`
+  - Body: the raw image bytes.
+  - Status: 404 Not Found — this instance is not currently in `host` mode, `id` is not a known participant, or that participant joined with no avatar.
+- **Example Request:**
+  ```http
+  GET /multiplayer/participants/bot1/avatar
+  ```
+
+#### 7.4 Join the host's chat over WebSocket
+
+- **URL:** `/multiplayer/ws`
+- **Method:** `GET` (WebSocket upgrade)
+- **Description:** The socket a joiner connects to. Registered on every instance, but only serves an upgrade in `host` mode; a `solo` or `joiner` instance answers `404` here just like 7.2 and 7.3.
+- **Response:**
+  - `101 Switching Protocols` on success, followed by the handshake below.
+  - Status: 404 Not Found — this instance is not currently in `host` mode.
+  - Status: 429 Too Many Requests — this address has had 5 failed join attempts within the last 10 minutes.
+
+**Handshake.** Immediately after the upgrade, the host sends a `Challenge`. The joiner has 10 seconds to answer with a `Join`; anything else (a timeout, a malformed frame, or an unsupported `protocol_version`) gets `Rejected` and the socket is closed. On success the host answers `Joined`; every other currently-connected participant is sent a `ParticipantJoined` broadcast.
+
+| Direction | Frame | Fields |
+| --- | --- | --- |
+| host → joiner | `Challenge` | `protocol_version` (`1`), `nonce` (base64, 32 random bytes) |
+| joiner → host | `Join` | `protocol_version`, `id`, `display_name`, `avatar` (`{ mime, data_base64 }` or `null`, max 2 MB decoded, detected as PNG or JPEG from magic bytes), `proof` (base64 `HMAC-SHA256(key = password, msg = nonce_bytes ++ id_bytes)`) |
+| host → joiner | `Joined` | `self_id`, `participants` (`[ParticipantSummary]`, same shape as 7.2's array), `transcript` (the last 50 messages, same shape `GET /message` returns) |
+| host → joiner | `Rejected` | `reason`: one of the tag-only strings `"unsupported_protocol"`, `"bad_proof"`, `"no_host_password"`, `"duplicate_id"`, `"reserved_id"`, `"join_timeout"`, or `{ "invalid_avatar": "<detail>" }` |
+
+Once admitted, both sides exchange:
+
+| Direction | Frame | Fields |
+| --- | --- | --- |
+| host → joiner | `ParticipantJoined` | a `ParticipantSummary` (7.2's shape), flattened alongside `"type"` |
+| host → joiner | `ParticipantLeft` | `id` |
+| host → joiner | `Message` | one persisted message (`GET /message`'s row shape), flattened alongside `"type"` |
+| host → joiner | `MessageEdited` | `message` (the edited row, in full) |
+| host → joiner | `MessageRemoved` | `id` |
+| host → joiner | `GenerateRequest` | `round_id`, `transcript` (the newest 50 messages, this round's context) |
+| joiner → host | `Token` | `round_id`, `text` — one token of the reply this `GenerateRequest` asked for |
+| joiner → host | `ReplyComplete` | `round_id`, `text` — the finished, persisted reply |
+| joiner → host | `ReplyFailed` | `round_id`, `reason` — sent instead of a reply when the joiner cannot answer (a local turn already in progress, a failed generation thread, or the model erroring) |
+
+Every frame is a JSON object tagged `"type"` (snake_case, e.g. `"reply_complete"`). Heartbeats are native WebSocket ping/pong control frames, not a JSON type of their own; the host pings every 15 seconds and drops the connection after 2 missed pongs.
+
 ## Route index
 
 Endpoint sections above cover the core messaging, companion, user, configuration, memory and prompting routes. The table below lists every route the backend registers, including those not yet written up in full. It is generated from the handler attributes in `backend/src/main.rs`.
@@ -644,7 +718,10 @@ Endpoint sections above cover the core messaging, companion, user, configuration
 | `DELETE` | `/api/message/{id}` |
 | `GET` | `/api/message/{id}` |
 | `PUT` | `/api/message/{id}` |
+| `GET` | `/api/multiplayer/participants` |
+| `GET` | `/api/multiplayer/participants/{id}/avatar` |
 | `GET` | `/api/multiplayer/status` |
+| `GET` | `/api/multiplayer/ws` |
 | `GET` | `/api/persons` |
 | `POST` | `/api/persons/cleanup-duplicates` |
 | `POST` | `/api/persons/cleanup-invalid` |
