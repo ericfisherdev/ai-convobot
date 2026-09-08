@@ -8,36 +8,35 @@
 //! keeps running, so each one uses `ChildGuard` to make sure the process is
 //! always killed and reaped, even if an assertion panics.
 
-use std::net::SocketAddr;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 mod common;
-use common::{free_port, wait_until_listening, ChildGuard};
+use common::spawn_on_a_free_port;
 
 #[test]
 fn honours_port_and_data_dir() {
-    let port = free_port();
     let cwd_dir = tempfile::tempdir().expect("failed to create the working-directory temp dir");
     let data_root = tempfile::tempdir().expect("failed to create the data-dir temp dir");
     // Nested and not yet created, to prove `create_dir_all` rather than a
     // bare `create_dir`.
     let data_dir = data_root.path().join("nested").join("data");
 
-    let child = Command::new(env!("CARGO_BIN_EXE_ai-companion"))
-        .current_dir(cwd_dir.path())
-        .env("COMPANION_HOST", "127.0.0.1")
-        .env("COMPANION_PORT", port.to_string())
-        .env("COMPANION_DATA_DIR", &data_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn the ai-companion binary");
-    let _guard = ChildGuard(child);
-
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    wait_until_listening(addr, Duration::from_secs(10));
+    let (_port, _addr, _guard) = spawn_on_a_free_port(
+        |port| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_ai-companion"));
+            command
+                .current_dir(cwd_dir.path())
+                .env("COMPANION_HOST", "127.0.0.1")
+                .env("COMPANION_PORT", port.to_string())
+                .env("COMPANION_DATA_DIR", &data_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            command
+        },
+        Duration::from_secs(10),
+    );
 
     assert!(
         data_dir.join("companion_database.db").exists(),
@@ -60,22 +59,22 @@ fn honours_port_and_data_dir() {
 
 #[test]
 fn defaults_to_the_working_directory() {
-    let port = free_port();
     let cwd_dir = tempfile::tempdir().expect("failed to create the working-directory temp dir");
 
-    let child = Command::new(env!("CARGO_BIN_EXE_ai-companion"))
-        .current_dir(cwd_dir.path())
-        .env("COMPANION_HOST", "127.0.0.1")
-        .env("COMPANION_PORT", port.to_string())
-        .env_remove("COMPANION_DATA_DIR")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn the ai-companion binary");
-    let _guard = ChildGuard(child);
-
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    wait_until_listening(addr, Duration::from_secs(10));
+    let (_port, _addr, _guard) = spawn_on_a_free_port(
+        |port| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_ai-companion"));
+            command
+                .current_dir(cwd_dir.path())
+                .env("COMPANION_HOST", "127.0.0.1")
+                .env("COMPANION_PORT", port.to_string())
+                .env_remove("COMPANION_DATA_DIR")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            command
+        },
+        Duration::from_secs(10),
+    );
 
     assert!(
         cwd_dir.path().join("companion_database.db").exists(),

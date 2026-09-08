@@ -29,7 +29,7 @@ use sha2::Sha256;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 mod common;
-use common::{free_port, wait_until_listening, ChildGuard};
+use common::spawn_on_a_free_port;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -96,20 +96,21 @@ fn join_proof(password: &str, nonce: &[u8], id: &str) -> String {
 
 #[tokio::test]
 async fn a_joiner_answers_a_generate_request_and_its_reply_is_persisted_and_broadcast() {
-    let port = free_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let data_dir = tempfile::tempdir().expect("failed to create the data-dir temp dir");
 
-    let child = Command::new(env!("CARGO_BIN_EXE_ai-companion"))
-        .env("COMPANION_HOST", "127.0.0.1")
-        .env("COMPANION_PORT", port.to_string())
-        .env("COMPANION_DATA_DIR", data_dir.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn the ai-companion binary");
-    let _guard = ChildGuard(child);
-    wait_until_listening(addr, Duration::from_secs(10));
+    let (port, addr, _guard) = spawn_on_a_free_port(
+        |port| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_ai-companion"));
+            command
+                .env("COMPANION_HOST", "127.0.0.1")
+                .env("COMPANION_PORT", port.to_string())
+                .env("COMPANION_DATA_DIR", data_dir.path())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            command
+        },
+        Duration::from_secs(10),
+    );
 
     // Switch to `host` mode with a password, over the same `PUT
     // /api/config` a real deployment would use: read the current config,
