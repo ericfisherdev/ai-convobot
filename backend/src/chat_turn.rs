@@ -1,6 +1,8 @@
 //! Owns the turn lifecycle shared between the prompting HTTP handlers
-//! (`/api/prompt` and `/api/prompt/stream`): insert the user's turn, generate
-//! a reply from it, then score and persist the turn's attitude effect.
+//! (`/api/prompt` and `/api/prompt/stream`): insert the user's turn, then
+//! generate and persist each speaker's reply in turn (#131's round
+//! orchestrator, `multiplayer::round::run_round`), and finally score and
+//! persist the turn's attitude effect.
 //!
 //! # Why a two-step type, not one function
 //!
@@ -9,15 +11,17 @@
 //! function covering "insert then generate" would have to move the insert
 //! onto the generation thread too, turning a pre-stream failure (500) into
 //! an SSE error chunk instead. Splitting the sequence into [`PendingTurn::begin`]
-//! (the insert) and [`PendingTurn::complete`] (generate, then score and
-//! persist) lets each handler run the two steps on whichever thread it
-//! already uses, while the type system still enforces the order —
-//! `complete` needs a `PendingTurn`, which only `begin` can produce — and
-//! that generation is attempted at most once, since `complete` consumes
-//! `self`.
+//! (the insert) and [`PendingTurn::reply`]/[`PendingTurn::finish`] (generate
+//! and persist one speaker's reply; once the round is over, score and
+//! persist the attitude effect) lets each handler run the steps on whichever
+//! thread it already uses, while the type system still enforces the order —
+//! `reply` and `finish` need a `PendingTurn`, which only `begin` can produce
+//! — and that scoring is attempted at most once per round, since `finish`
+//! consumes `self`.
 
 use crate::attitude_engine::{LexiconScorer, ScorerConfig, TurnScorer};
-use crate::database::{CompanionAttitude, Database, NewMessage};
+use crate::database::{CompanionAttitude, Database, Message, NewMessage};
+use crate::participants::ParticipantId;
 use crate::turn_slot::TurnGuard;
 
 /// The persistence seam between [`PendingTurn`] and the database, so the
@@ -33,6 +37,15 @@ pub trait TurnStore {
 
     /// Persists the user's half of the turn.
     fn insert_user_turn(&self, content: &str) -> rusqlite::Result<()>;
+
+    /// Persists one speaker's reply and returns the new message's id, for
+    /// [`PersistedReply::message_id`].
+    fn insert_reply(&self, speaker_id: &ParticipantId, content: &str) -> rusqlite::Result<i32>;
+
+    /// The newest `limit` messages, oldest first — what a round hands a
+    /// remote speaker as its view of the conversation so far (including any
+    /// replies earlier in the same round).
+    fn transcript_tail(&self, limit: usize) -> rusqlite::Result<Vec<Message>>;
 
     /// Scores the turn and persists the resulting attitude change.
     ///
@@ -71,7 +84,15 @@ impl TurnStore for SqliteTurnStore {
     }
 
     fn insert_user_turn(&self, content: &str) -> rusqlite::Result<()> {
-        Database::insert_message(NewMessage::from_user(content))
+        Database::insert_message(NewMessage::from_user(content)).map(|_id| ())
+    }
+
+    fn insert_reply(&self, speaker_id: &ParticipantId, content: &str) -> rusqlite::Result<i32> {
+        Database::insert_message(NewMessage::new(speaker_id.to_string(), content))
+    }
+
+    fn transcript_tail(&self, limit: usize) -> rusqlite::Result<Vec<Message>> {
+        Database::get_x_messages(limit, 0)
     }
 
     fn finish_turn(
@@ -278,10 +299,14 @@ pub struct PendingTurn {
     generation_prompt: String,
 }
 
-/// The reply half of a turn, once generation and scoring have both run.
-pub struct CompletedTurn {
-    pub reply: String,
-    pub attitude: Option<(CompanionAttitude, CompanionAttitude)>,
+/// One speaker's reply, once generated and persisted: the new message's id,
+/// who said it, and the cleaned text. `message_id` is what #133's
+/// `reply_complete` SSE chunks carry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistedReply {
+    pub message_id: i32,
+    pub speaker_id: ParticipantId,
+    pub text: String,
 }
 
 impl PendingTurn {
@@ -310,29 +335,63 @@ impl PendingTurn {
         })
     }
 
-    /// Generates the reply and, on success, scores and persists the turn's
-    /// attitude effect.
+    /// Generates one speaker's reply and persists it.
     ///
-    /// On `Err`, the store is never touched: no second insert, no second
-    /// generation, no `finish_turn` call. This is the #84 regression guard.
-    /// Consuming `self` is what makes "generation is attempted at most
-    /// once" a compile error to violate.
-    pub fn complete(
+    /// Takes `&self` rather than consuming it, so a round
+    /// (`multiplayer::round::run_round`) can call this once per speaker
+    /// while still generating every reply from the same
+    /// `generation_prompt` `begin` prepared. On `Err`, the store is never
+    /// touched: no insert for this speaker. This is the #84 regression
+    /// guard, now scoped to one speaker's attempt instead of the whole turn.
+    pub fn reply(
+        &self,
+        store: &impl TurnStore,
+        speaker_id: ParticipantId,
+        generate: impl FnOnce(&str) -> std::io::Result<String>,
+    ) -> std::io::Result<PersistedReply> {
+        let text = generate(&self.generation_prompt)?;
+        let message_id = store
+            .insert_reply(&speaker_id, &text)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        Ok(PersistedReply {
+            message_id,
+            speaker_id,
+            text,
+        })
+    }
+
+    /// Scores the round and persists the resulting attitude effect.
+    ///
+    /// Scores against what the user said (`self.user_message`), never
+    /// against `generation_prompt`. `host_reply` is `None` when the host
+    /// companion did not speak this round (a mention-filtered round, #132),
+    /// in which case this returns `None` without touching the store.
+    /// Consuming `self` is what makes "scoring is attempted at most once per
+    /// round" a compile error to violate.
+    pub fn finish(
         self,
         store: &impl TurnStore,
-        generate: impl FnOnce(&str) -> std::io::Result<String>,
-    ) -> std::io::Result<CompletedTurn> {
-        let reply = generate(&self.generation_prompt)?;
-        let attitude =
-            store.finish_turn(self.companion_id, self.user_id, &self.user_message, &reply);
-        Ok(CompletedTurn { reply, attitude })
+        host_reply: Option<&str>,
+    ) -> Option<(CompanionAttitude, CompanionAttitude)> {
+        let host_reply = host_reply?;
+        store.finish_turn(
+            self.companion_id,
+            self.user_id,
+            &self.user_message,
+            host_reply,
+        )
     }
 }
 
 #[cfg(test)]
 pub(crate) struct RecordingStore {
     pub(crate) inserted: std::sync::Mutex<Vec<String>>,
+    pub(crate) replies: std::sync::Mutex<Vec<(ParticipantId, String)>>,
     pub(crate) finished: std::sync::Mutex<Vec<(String, String)>>,
+    /// Every insert (`insert_user_turn` and `insert_reply`), in call order —
+    /// what `transcript_tail` reads its tail from, so a round test can
+    /// assert a later speaker saw an earlier one's reply.
+    log: std::sync::Mutex<Vec<Message>>,
     interaction_prompt: Option<String>,
 }
 
@@ -341,9 +400,27 @@ impl RecordingStore {
     pub(crate) fn new(interaction_prompt: Option<String>) -> Self {
         Self {
             inserted: std::sync::Mutex::new(Vec::new()),
+            replies: std::sync::Mutex::new(Vec::new()),
             finished: std::sync::Mutex::new(Vec::new()),
+            log: std::sync::Mutex::new(Vec::new()),
             interaction_prompt,
         }
+    }
+
+    /// Appends `speaker_id`/`content` to `log` and returns the row id it was
+    /// given, shared by `insert_user_turn` and `insert_reply` so the two can
+    /// never assign a duplicate id.
+    fn log_message(&self, speaker_id: &ParticipantId, content: &str) -> i32 {
+        let mut log = self.log.lock().unwrap();
+        let id = log.len() as i32 + 1;
+        log.push(Message {
+            id,
+            ai: speaker_id != &ParticipantId::USER,
+            speaker_id: speaker_id.to_string(),
+            content: content.to_string(),
+            created_at: String::new(),
+        });
+        id
     }
 }
 
@@ -355,7 +432,22 @@ impl TurnStore for RecordingStore {
 
     fn insert_user_turn(&self, content: &str) -> rusqlite::Result<()> {
         self.inserted.lock().unwrap().push(content.to_string());
+        self.log_message(&ParticipantId::USER, content);
         Ok(())
+    }
+
+    fn insert_reply(&self, speaker_id: &ParticipantId, content: &str) -> rusqlite::Result<i32> {
+        self.replies
+            .lock()
+            .unwrap()
+            .push((speaker_id.clone(), content.to_string()));
+        Ok(self.log_message(speaker_id, content))
+    }
+
+    fn transcript_tail(&self, limit: usize) -> rusqlite::Result<Vec<Message>> {
+        let log = self.log.lock().unwrap();
+        let start = log.len().saturating_sub(limit);
+        Ok(log[start..].to_vec())
     }
 
     fn finish_turn(
@@ -391,7 +483,7 @@ mod tests {
 
         let mut seen_prompt = None;
         pending
-            .complete(&store, |prompt| {
+            .reply(&store, ParticipantId::CHAR, |prompt| {
                 seen_prompt = Some(prompt.to_string());
                 Ok("reply".to_string())
             })
@@ -401,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_generation_leaves_one_user_turn_and_never_finishes() {
+    fn failed_generation_leaves_one_user_turn_and_inserts_no_reply() {
         static SLOT: TurnSlot = TurnSlot::new();
         let guard = SLOT.try_claim().expect("slot should be free");
         let store = RecordingStore::new(None);
@@ -409,11 +501,13 @@ mod tests {
         let pending = PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string())
             .expect("insert should succeed");
 
-        let result = pending.complete(&store, |_prompt| Err(std::io::Error::other("no model")));
+        let result = pending.reply(&store, ParticipantId::CHAR, |_prompt| {
+            Err(std::io::Error::other("no model"))
+        });
 
         assert!(result.is_err());
         assert_eq!(store.inserted.lock().unwrap().len(), 1);
-        assert!(store.finished.lock().unwrap().is_empty());
+        assert!(store.replies.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -425,11 +519,17 @@ mod tests {
         let pending = PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string())
             .expect("insert should succeed");
 
-        let completed = pending
-            .complete(&store, |_prompt| Ok("reply".to_string()))
+        let persisted = pending
+            .reply(&store, ParticipantId::CHAR, |_prompt| {
+                Ok("reply".to_string())
+            })
             .expect("generation should succeed");
 
-        assert_eq!(completed.reply, "reply");
+        assert_eq!(persisted.text, "reply");
+        assert_eq!(persisted.speaker_id, ParticipantId::CHAR);
+
+        pending.finish(&store, Some(&persisted.text));
+
         assert_eq!(
             *store.finished.lock().unwrap(),
             vec![("hello".to_string(), "reply".to_string())]

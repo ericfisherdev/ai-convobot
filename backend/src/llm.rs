@@ -6,7 +6,7 @@ use crate::attitude_formatter::AttitudeFormatter;
 use crate::context_manager::ContextManager;
 use crate::database::{
     contains_time_question, get_current_date, CompanionView, ConfigView, Database, Device, Message,
-    NewMessage, PromptTemplate, UserView,
+    PromptTemplate, UserView,
 };
 use crate::dialogue_tuning::DialogueTuning;
 use crate::gpu_allocator::GpuAllocator;
@@ -278,6 +278,10 @@ fn build_base_components(
 
 /// Generates a reply and returns it once generation finishes.
 ///
+/// Does not persist the reply: the caller (#131's `PendingTurn::reply`)
+/// inserts it through `TurnStore::insert_reply`, so every reply — local or
+/// remote — is persisted through the one store call.
+///
 /// # Errors
 /// Propagates model load, tokenization and decode failures as
 /// `std::io::ErrorKind::Other`.
@@ -292,7 +296,8 @@ pub fn prompt(
 
 /// Generates a reply, invoking `on_token` with each token as it is produced.
 ///
-/// The callback runs on the generating thread, so it must not block.
+/// The callback runs on the generating thread, so it must not block. Does
+/// not persist the reply; see [`prompt`].
 ///
 /// # Errors
 /// Propagates model load, tokenization and decode failures as
@@ -341,27 +346,21 @@ fn sampler_seed() -> u32 {
 }
 
 /// The conversation record a prompt is assembled from: the newest messages,
-/// read before generation, and the reply just generated, appended after it.
+/// read before generation.
 ///
-/// One abstraction because both halves read/write the same record. Solo and
-/// host turns use [`SqliteTranscript`]; a joiner (#130) generates from a
-/// transcript it received over the wire and has no database row of its own
-/// to append to, hence [`InMemoryTranscript`].
+/// Read-only: `generate` used to append the reply it just produced through
+/// this same seam, but #131 moved that persistence out to the caller
+/// (`PendingTurn::reply`, via `TurnStore::insert_reply`), so every reply —
+/// local or remote — goes through one store call instead of two different
+/// ones depending on who generated it. Solo and host turns read through
+/// [`SqliteTranscript`]; a joiner (#130) generates from a transcript it
+/// received over the wire, hence [`InMemoryTranscript`].
 pub trait TranscriptSource {
     /// The newest `limit` messages, oldest first.
     ///
     /// # Errors
     /// Returns `std::io::ErrorKind::Other` if the underlying read fails.
     fn recent_messages(&self, limit: usize) -> std::io::Result<Vec<Message>>;
-
-    /// Appends the reply just generated for `speaker_id` to the record this
-    /// transcript is read from.
-    ///
-    /// # Errors
-    /// Returns `std::io::ErrorKind::Other` if the underlying write fails.
-    /// `generate` logs the error and never treats it as fatal, so
-    /// implementations do not need to retry internally.
-    fn record_reply(&self, speaker_id: &ParticipantId, reply: &str) -> std::io::Result<()>;
 }
 
 /// The production [`TranscriptSource`], backed by `companion_database.db`.
@@ -374,16 +373,10 @@ impl TranscriptSource for SqliteTranscript {
             std::io::Error::other("Error while getting short term memory entries")
         })
     }
-
-    fn record_reply(&self, speaker_id: &ParticipantId, reply: &str) -> std::io::Result<()> {
-        Database::insert_message(NewMessage::new(speaker_id.to_string(), reply))
-            .map_err(|e| std::io::Error::other(e.to_string()))
-    }
 }
 
 /// A [`TranscriptSource`] over a fixed, in-memory list of messages: used by
-/// tests now, and by #130's joiner, whose replies are persisted by the host
-/// rather than by the joiner itself, so `record_reply` is a no-op.
+/// tests now, and by #130's joiner.
 #[allow(dead_code)] // wired up by #130's joiner; exercised directly by this module's tests today
 pub struct InMemoryTranscript(pub Vec<Message>);
 
@@ -391,10 +384,6 @@ impl TranscriptSource for InMemoryTranscript {
     fn recent_messages(&self, limit: usize) -> std::io::Result<Vec<Message>> {
         let start = self.0.len().saturating_sub(limit);
         Ok(self.0[start..].to_vec())
-    }
-
-    fn record_reply(&self, _speaker_id: &ParticipantId, _reply: &str) -> std::io::Result<()> {
-        Ok(())
     }
 }
 
@@ -1258,12 +1247,6 @@ fn generate(
     println!();
 
     let companion_text = trimmer.clean(&end_of_generation);
-    if let Err(e) = transcript.record_reply(&speakers.self_id, &companion_text) {
-        eprintln!(
-            "Error while adding message to database/short-term memory: {}",
-            e
-        );
-    }
     match long_term_memory.add_entry(&format!(
         "{}{}: {}\n{}: {}\n",
         formatted_date,
@@ -1643,14 +1626,5 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["b", "c"]
         );
-    }
-
-    #[test]
-    fn in_memory_transcript_record_reply_is_a_no_op() {
-        let transcript = InMemoryTranscript(vec![message("user", "a")]);
-        assert!(transcript
-            .record_reply(&ParticipantId::CHAR, "reply")
-            .is_ok());
-        assert_eq!(transcript.0.len(), 1);
     }
 }

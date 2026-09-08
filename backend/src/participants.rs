@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fmt;
 
-use crate::database::{CHAR_SPEAKER_ID, USER_SPEAKER_ID};
+use crate::database::{CHAR_SPEAKER_ID, SYSTEM_SPEAKER_ID, USER_SPEAKER_ID};
 
 /// A participant identifier: `user`, `char`, or a joiner id like `bot1`.
 ///
@@ -34,6 +34,11 @@ impl ParticipantId {
     pub const USER: ParticipantId = ParticipantId(Cow::Borrowed(USER_SPEAKER_ID));
     /// The reserved id for the (single, solo-mode) companion.
     pub const CHAR: ParticipantId = ParticipantId(Cow::Borrowed(CHAR_SPEAKER_ID));
+    /// The id #131's round orchestrator persists a skipped-speaker notice
+    /// under. Not a chat participant — it is never inserted into a
+    /// [`ParticipantRegistry`] and [`ParticipantId::is_reserved`] does not
+    /// need to guard against it for that reason.
+    pub const SYSTEM: ParticipantId = ParticipantId(Cow::Borrowed(SYSTEM_SPEAKER_ID));
 
     /// Validates `value` against the id grammar.
     ///

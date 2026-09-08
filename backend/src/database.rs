@@ -18,6 +18,11 @@ pub const USER_SPEAKER_ID: &str = "user";
 /// Reserved speaker id for the (single, solo-mode) companion. #126's
 /// `ParticipantId` reserved IDs must reuse this constant, not redefine it.
 pub const CHAR_SPEAKER_ID: &str = "char";
+/// Speaker id for a system-generated notice (e.g. a remote speaker that did
+/// not respond in time). Not a chat participant, so it never appears in a
+/// `ParticipantRegistry`; #131's `ParticipantId::SYSTEM` reuses this
+/// constant, not redefine it.
+pub const SYSTEM_SPEAKER_ID: &str = "system";
 
 /// Derives the legacy `ai` flag from a `speaker_id`. The single source of
 /// truth for that derivation, used by both the row mapper and every insert,
@@ -1372,7 +1377,9 @@ impl Database {
         Ok(row)
     }
 
-    pub fn insert_message(message: NewMessage) -> Result<(), Error> {
+    /// Inserts `message` and returns the new row's id — what #131's
+    /// `TurnStore::insert_reply` puts on `PersistedReply::message_id`.
+    pub fn insert_message(message: NewMessage) -> Result<i32, Error> {
         let con = Self::open()?;
         Self::insert_message_on(&con, message)
     }
@@ -1380,7 +1387,7 @@ impl Database {
     /// Testable half of `insert_message`, taking a caller-provided connection
     /// so tests can point it at a `TempDir`-backed database instead of the
     /// hardwired `paths::db_path()`, mirroring `pop_latest_ai_reply_on`.
-    fn insert_message_on(con: &Connection, message: NewMessage) -> Result<(), Error> {
+    fn insert_message_on(con: &Connection, message: NewMessage) -> Result<i32, Error> {
         con.execute(
             "INSERT INTO messages (ai, speaker_id, content, created_at) VALUES (?, ?, ?, ?)",
             params![
@@ -1390,11 +1397,12 @@ impl Database {
                 get_current_date()
             ],
         )?;
+        let id = con.last_insert_rowid() as i32;
 
         // Clear message cache when new message is inserted
         Database::clear_message_cache();
 
-        Ok(())
+        Ok(id)
     }
 
     /// Updates a message's text without ever touching its role. Deliberately
