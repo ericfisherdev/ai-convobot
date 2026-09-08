@@ -2,19 +2,18 @@ import { Avatar, AvatarFallback, AvatarImage } from "../ui/avatar";
 import { Pencil, RotateCw, ThumbsUp, Trash2, Smile, Check, CheckCheck } from "lucide-react";
 import { useUserData } from "../context/userContext";
 import { useCompanionData } from "../context/companionContext";
+import { useParticipants } from "../context/participantsContext";
 
-import companionAvatar from "../../assets/companion_avatar.jpg";
-import { CompanionData } from "../interfaces/CompanionData";
 import { UserData } from "../interfaces/UserData";
-import { useEffect, useState, lazy } from "react";
+import { useEffect, useState } from "react";
 import { cn, formatMessageDate } from "../../lib/utils";
 import { useMessages } from "../context/messageContext";
 import { Textarea } from "../ui/textarea";
 import { TooltipProvider, Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
 import { toast } from "sonner";
 import { MessageEdit } from "../interfaces/MessageEdit";
-
-const Markdown = lazy(() => import('react-markdown'));
+import { MessageMarkdown } from "./MessageMarkdown";
+import { resolveSpeaker } from "./speakerResolution";
 
 /// Shared by `UserMessage.handleSave` and `AiMessage.handleSave`: an edit
 /// only ever changes text, so the request body carries no role flag and
@@ -28,22 +27,19 @@ const updateMessageContent = (id: number, content: string): Promise<Response> =>
     body: JSON.stringify({ content } satisfies MessageEdit),
   });
 
-interface MessageScrollProps {
-  received: boolean;
-}
-
-interface MessageScrollProps extends MessageProps {
-  regenerate: boolean;
-  content: string;
-  created_at: string;
-}
-
-
 interface MessageProps {
   id: number;
   regenerate: boolean;
   content: string;
   created_at: string;
+}
+
+interface MessageScrollProps extends MessageProps {
+  // Kept for one release so existing callers (`MessageScroll.tsx`,
+  // `VirtualMessageList.tsx`) still compile; the render branch is derived
+  // from `speakerId`, not this flag.
+  received: boolean;
+  speakerId: string;
 }
 
 const UserMessage = ({ id, content, created_at }: MessageProps) => {
@@ -184,7 +180,7 @@ const UserMessage = ({ id, content, created_at }: MessageProps) => {
             {editing ? (
               <Textarea value={editedContent} onChange={(e) => setEditedContent(e.target.value)} />
             ) : (
-              <Markdown>{content}</Markdown>
+              <MessageMarkdown content={content} />
             )}
           </div>
 
@@ -249,10 +245,12 @@ const UserMessage = ({ id, content, created_at }: MessageProps) => {
 };
 
 
-const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
-  const companionDataContext = useCompanionData();
-  const companionData: CompanionData = companionDataContext?.companionData ?? {} as CompanionData;
+interface AiMessageProps extends MessageProps {
+  displayName: string;
+  avatarUrl: string;
+}
 
+const AiMessage = ({ id, content, created_at, regenerate, displayName, avatarUrl }: AiMessageProps) => {
   const { refreshMessages } = useMessages();
 
   const [displayedContent, setDisplayedContent] = useState(content);
@@ -374,10 +372,10 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
       <div className="message-header flex items-center justify-between w-full mb-2">
         <div className="message-info flex items-center gap-2">
           <Avatar className="w-6 h-6">
-            <AvatarImage src={companionData.avatar_path || companionAvatar} alt="Companion Avatar" />
+            <AvatarImage src={avatarUrl} alt={`${displayName} avatar`} />
             <AvatarFallback className="text-xs">AI</AvatarFallback>
           </Avatar>
-          <span className="font-medium text-sm">{companionData.name || "Assistant"}</span>
+          <span className="font-medium text-sm">{displayName}</span>
           <span className="text-xs opacity-50">{formatMessageDate(created_at)}</span>
           {isTyping && (
             <span className="text-xs text-muted-foreground italic animate-pulse">
@@ -480,7 +478,7 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
                     <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce animation-delay-200" />
                   </div>
                 ) : (
-                  <Markdown>{displayedContent}</Markdown>
+                  <MessageMarkdown content={displayedContent} />
                 )}
               </div>
               {!editing && !isTyping && (
@@ -517,7 +515,7 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
                   <div className="w-2 h-2 bg-muted-foreground rounded-full animate-bounce" style={{animationDelay: '0.2s'}} />
                 </div>
               ) : (
-                <Markdown>{displayedContent}</Markdown>
+                <MessageMarkdown content={displayedContent} />
               )}
             </div>
           )}
@@ -569,10 +567,48 @@ const AiMessage = ({ id, content, created_at, regenerate }: MessageProps) => {
   );
 };
 
-export function Message({ received, regenerate, id, content, created_at }: MessageScrollProps) {
-  return (
-    <>
-      {received ? <AiMessage key={id} content={content} id={id} created_at={created_at} regenerate={regenerate} />: <UserMessage key={id} content={content} id={id} created_at={created_at} regenerate={false} /> }
-    </>
-  );
+// A skipped-speaker or other round-wide notice (`speaker_id: "system"`,
+// see `ParticipantId::SYSTEM` on the backend). Muted, centred, and carries
+// none of `UserMessage`/`AiMessage`'s edit/delete/regenerate actions -- a
+// system notice is not a real participant's turn to revise.
+const SystemNotice = ({ content, created_at }: { content: string; created_at: string }) => (
+  <div className="message-container flex justify-center animate-in fade-in-0 duration-300">
+    <div className="flex flex-col items-center gap-1 text-center max-w-[85%]">
+      <div className="chat-bubble text-xs text-muted-foreground bg-muted/50 rounded-full px-3 py-1">
+        <MessageMarkdown content={content} />
+      </div>
+      <span className="text-[10px] opacity-50">{formatMessageDate(created_at)}</span>
+    </div>
+  </div>
+);
+
+export function Message({ regenerate, id, content, created_at, speakerId }: MessageScrollProps) {
+  const { participants } = useParticipants();
+  const userDataContext = useUserData();
+  const companionDataContext = useCompanionData();
+
+  const resolved = resolveSpeaker(speakerId, participants, {
+    userName: userDataContext?.userData?.name || "User",
+    companionName: companionDataContext?.companionData?.name || "Assistant",
+    companionAvatarUrl: companionDataContext?.companionData?.avatar_path || "",
+  });
+
+  switch (resolved.kind) {
+    case 'user':
+      return <UserMessage key={id} content={content} id={id} created_at={created_at} regenerate={false} />;
+    case 'system':
+      return <SystemNotice key={id} content={content} created_at={created_at} />;
+    default:
+      return (
+        <AiMessage
+          key={id}
+          content={content}
+          id={id}
+          created_at={created_at}
+          regenerate={regenerate}
+          displayName={resolved.displayName}
+          avatarUrl={resolved.avatarUrl ?? ''}
+        />
+      );
+  }
 }

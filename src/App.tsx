@@ -9,6 +9,7 @@ import { MessagesProvider } from './components/context/messageContext'
 import { UserDataProvider } from './components/context/userContext'
 import { CompanionDataProvider } from './components/context/companionContext'
 import { ConfigProvider } from './components/context/configContext'
+import { ParticipantsProvider } from './components/context/participantsContext'
 import { AttitudeProvider } from './components/context/attitudeContext'
 import { SessionProvider } from './components/context/sessionContext'
 import { useMobile } from './hooks/useMobile'
@@ -24,17 +25,19 @@ function App() {
         <ConfigProvider>
           <UserDataProvider>
             <CompanionDataProvider>
-              <AttitudeProvider>
-                <SessionProvider>
-                  <MessagesProvider>
-                    <div className='max-container'>
-                      <ChatWindow />
-                    </div>
-                    <Toaster />
-                    <PWAInstallPrompt />
-                  </MessagesProvider>
-                </SessionProvider>
-              </AttitudeProvider>
+              <ParticipantsProvider>
+                <AttitudeProvider>
+                  <SessionProvider>
+                    <MessagesProvider>
+                      <div className='max-container'>
+                        <ChatWindow />
+                      </div>
+                      <Toaster />
+                      <PWAInstallPrompt />
+                    </MessagesProvider>
+                  </SessionProvider>
+                </AttitudeProvider>
+              </ParticipantsProvider>
             </CompanionDataProvider>
           </UserDataProvider>
         </ConfigProvider>

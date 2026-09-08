@@ -160,6 +160,7 @@ export function VirtualMessageList({
                     regenerate={message.ai && messageIndex === messages.length - 1 && messageIndex !== 0}
                     content={message.content}
                     created_at={message.created_at}
+                    speakerId={message.speaker_id}
                   />
                 </div>
               );

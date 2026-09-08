@@ -5,13 +5,19 @@ import { Message } from '../message/Message'
 import { MessagesProvider } from '../context/messageContext'
 import { UserDataProvider } from '../context/userContext'
 import { CompanionDataProvider } from '../context/companionContext'
+import { ConfigProvider } from '../context/configContext'
+import { ParticipantsProvider } from '../context/participantsContext'
 import { formatMessageDate } from '../../lib/utils'
 
 const MockProviders: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   <MessagesProvider>
     <UserDataProvider>
       <CompanionDataProvider>
-        {children}
+        <ConfigProvider>
+          <ParticipantsProvider>
+            {children}
+          </ParticipantsProvider>
+        </ConfigProvider>
       </CompanionDataProvider>
     </UserDataProvider>
   </MessagesProvider>
@@ -35,7 +41,7 @@ describe('Message Component', () => {
   it('renders user message correctly', async () => {
     render(
       <MockProviders>
-        <Message received={false} regenerate={false} id={1} content="Hello, this is a test message" created_at="2024-01-15 10:30" />
+        <Message received={false} regenerate={false} id={1} content="Hello, this is a test message" created_at="2024-01-15 10:30" speakerId="user" />
       </MockProviders>
     )
 
@@ -46,7 +52,7 @@ describe('Message Component', () => {
   it('renders AI message correctly', async () => {
     render(
       <MockProviders>
-        <Message received={true} regenerate={false} id={2} content="Hello! How can I help you today?" created_at="2024-01-15 10:31" />
+        <Message received={true} regenerate={false} id={2} content="Hello! How can I help you today?" created_at="2024-01-15 10:31" speakerId="char" />
       </MockProviders>
     )
 
@@ -56,7 +62,7 @@ describe('Message Component', () => {
   it('displays edit and delete buttons for messages', async () => {
     render(
       <MockProviders>
-        <Message received={false} regenerate={false} id={1} content="Hello, this is a test message" created_at="2024-01-15 10:30" />
+        <Message received={false} regenerate={false} id={1} content="Hello, this is a test message" created_at="2024-01-15 10:30" speakerId="user" />
       </MockProviders>
     )
 
@@ -69,7 +75,7 @@ describe('Message Component', () => {
   it('shows markdown content correctly', async () => {
     render(
       <MockProviders>
-        <Message received={true} regenerate={false} id={3} content="**Bold text** and *italic text*" created_at="2024-01-15 10:32" />
+        <Message received={true} regenerate={false} id={3} content="**Bold text** and *italic text*" created_at="2024-01-15 10:32" speakerId="char" />
       </MockProviders>
     )
 
@@ -80,7 +86,7 @@ describe('Message Component', () => {
   it('renders the regenerate control on a trailing AI message', async () => {
     render(
       <MockProviders>
-        <Message received={true} regenerate={true} id={4} content="Hello! How can I help you today?" created_at="2024-01-15 10:33" />
+        <Message received={true} regenerate={true} id={4} content="Hello! How can I help you today?" created_at="2024-01-15 10:33" speakerId="char" />
       </MockProviders>
     )
 
@@ -91,7 +97,7 @@ describe('Message Component', () => {
   it('never renders the regenerate control on a user message', async () => {
     render(
       <MockProviders>
-        <Message received={false} regenerate={true} id={5} content="Hello, this is a test message" created_at="2024-01-15 10:34" />
+        <Message received={false} regenerate={true} id={5} content="Hello, this is a test message" created_at="2024-01-15 10:34" speakerId="user" />
       </MockProviders>
     )
 
@@ -104,7 +110,7 @@ describe('Message Component', () => {
 
     render(
       <MockProviders>
-        <Message received={true} regenerate={false} id={2} content="Hello! How can I help you today?" created_at="2024-01-15 10:31" />
+        <Message received={true} regenerate={false} id={2} content="Hello! How can I help you today?" created_at="2024-01-15 10:31" speakerId="char" />
       </MockProviders>
     )
 
@@ -127,7 +133,7 @@ describe('Message Component', () => {
 
     render(
       <MockProviders>
-        <Message received={false} regenerate={false} id={1} content="Hello, this is a test message" created_at="2024-01-15 10:30" />
+        <Message received={false} regenerate={false} id={1} content="Hello, this is a test message" created_at="2024-01-15 10:30" speakerId="user" />
       </MockProviders>
     )
 
@@ -143,5 +149,45 @@ describe('Message Component', () => {
     const lastPutCall = putCalls[putCalls.length - 1]
     expect(lastPutCall[0]).toBe('/api/message/1')
     expect(JSON.parse(lastPutCall[1].body)).toEqual({ content: 'edited user message' })
+  })
+
+  it('shows a bot participant\'s display name and avatar for a multiplayer speaker', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.startsWith('/api/config')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ multiplayer_mode: 'host' }) })
+      }
+      if (url.startsWith('/api/multiplayer/participants')) {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve([
+            { id: 'bot1', display_name: 'Ada', kind: 'RemoteBot', avatar_url: '/api/multiplayer/participants/bot1/avatar', connected: true },
+          ]),
+        })
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}), text: () => Promise.resolve('') })
+    }))
+
+    render(
+      <MockProviders>
+        <Message received={true} regenerate={false} id={6} content="hi from bot1" created_at="2024-01-15 10:35" speakerId="bot1" />
+      </MockProviders>
+    )
+
+    expect(await screen.findByText('Ada')).toBeInTheDocument()
+    expect(await screen.findByAltText('Ada avatar')).toHaveAttribute('src', '/api/multiplayer/participants/bot1/avatar')
+  })
+
+  it('renders a system message as a centred notice with no action buttons', async () => {
+    render(
+      <MockProviders>
+        <Message received={true} regenerate={false} id={7} content="bot1 did not respond" created_at="2024-01-15 10:36" speakerId="system" />
+      </MockProviders>
+    )
+
+    expect(await screen.findByText('bot1 did not respond')).toBeInTheDocument()
+    // A system notice carries none of `UserMessage`/`AiMessage`'s edit,
+    // delete, reaction or regenerate controls.
+    expect(screen.queryAllByRole('button')).toHaveLength(0)
   })
 })
