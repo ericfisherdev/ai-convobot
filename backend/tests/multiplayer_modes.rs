@@ -19,17 +19,32 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 mod common;
-use common::{free_port, wait_until_listening, ChildGuard};
+use common::{spawn_on_a_free_port, wait_until_listening, ChildGuard};
 
-fn spawn_instance(port: u16, data_dir: &Path) -> ChildGuard {
-    let child = Command::new(env!("CARGO_BIN_EXE_ai-companion"))
+/// Builds (without spawning) the command for one instance on `port` against
+/// `data_dir`, so both the initial, race-safe spawn (via
+/// [`spawn_on_a_free_port`]) and a later respawn on the same, already-secured
+/// port can share it.
+fn instance_command(port: u16, data_dir: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ai-companion"));
+    command
         .env("COMPANION_HOST", "127.0.0.1")
         .env("COMPANION_PORT", port.to_string())
         .env("COMPANION_DATA_DIR", data_dir)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+/// Respawns an instance on a port already secured by an earlier
+/// [`spawn_on_a_free_port`] call (used after killing the previous process
+/// to pick up a saved `multiplayer_mode` change) — no fresh port allocation
+/// here, so no new race to lose.
+fn respawn_instance(port: u16, addr: SocketAddr, data_dir: &Path) -> ChildGuard {
+    let child = instance_command(port, data_dir)
         .spawn()
         .expect("failed to spawn the ai-companion binary");
+    wait_until_listening(addr, Duration::from_secs(10));
     ChildGuard(child)
 }
 
@@ -82,12 +97,7 @@ fn a_joiner_appears_in_the_hosts_participant_list_and_disappears_when_it_leaves(
         .build()
         .into();
 
-    let host_port = free_port();
-    let host_addr: SocketAddr = format!("127.0.0.1:{host_port}").parse().unwrap();
     let host_data = tempfile::tempdir().expect("failed to create the host data-dir temp dir");
-
-    let joiner_port = free_port();
-    let joiner_addr: SocketAddr = format!("127.0.0.1:{joiner_port}").parse().unwrap();
     let joiner_data = tempfile::tempdir().expect("failed to create the joiner data-dir temp dir");
 
     // `PUT /api/config` saves a `multiplayer_mode` change but it only takes
@@ -95,23 +105,27 @@ fn a_joiner_appears_in_the_hosts_participant_list_and_disappears_when_it_leaves(
     // identity and the host's `app_data` are both built once at startup).
     // Each instance is spawned once in its default `solo` role just to save
     // its new role, then killed (the block's guard drops at its end) and
-    // respawned against the same data directory below.
+    // respawned on the same, already-secured port below.
     let password = "test-multiplayer-secret";
 
+    let (host_port, host_addr, _initial) = spawn_on_a_free_port(
+        |port| instance_command(port, host_data.path()),
+        Duration::from_secs(10),
+    );
     {
-        let _initial = spawn_instance(host_port, host_data.path());
-        wait_until_listening(host_addr, Duration::from_secs(10));
         let mut host_config = get_json(&agent, &format!("http://{host_addr}/api/config"));
         host_config["multiplayer_mode"] = json!("host");
         host_config["multiplayer_password"] = json!(password);
         assert_eq!(put_config(&agent, host_addr, &host_config), 200);
     }
-    let host_guard = spawn_instance(host_port, host_data.path());
-    wait_until_listening(host_addr, Duration::from_secs(10));
+    drop(_initial);
+    let host_guard = respawn_instance(host_port, host_addr, host_data.path());
 
+    let (joiner_port, joiner_addr, _initial) = spawn_on_a_free_port(
+        |port| instance_command(port, joiner_data.path()),
+        Duration::from_secs(10),
+    );
     {
-        let _initial = spawn_instance(joiner_port, joiner_data.path());
-        wait_until_listening(joiner_addr, Duration::from_secs(10));
         let mut joiner_config = get_json(&agent, &format!("http://{joiner_addr}/api/config"));
         joiner_config["multiplayer_mode"] = json!("joiner");
         joiner_config["multiplayer_host_address"] = json!(format!("127.0.0.1:{host_port}"));
@@ -119,8 +133,8 @@ fn a_joiner_appears_in_the_hosts_participant_list_and_disappears_when_it_leaves(
         joiner_config["multiplayer_password"] = json!(password);
         assert_eq!(put_config(&agent, joiner_addr, &joiner_config), 200);
     }
-    let joiner_guard = spawn_instance(joiner_port, joiner_data.path());
-    wait_until_listening(joiner_addr, Duration::from_secs(10));
+    drop(_initial);
+    let joiner_guard = respawn_instance(joiner_port, joiner_addr, joiner_data.path());
 
     // The joiner connects on its own at startup; poll the host until it
     // shows up connected, with the companion name a fresh joiner instance

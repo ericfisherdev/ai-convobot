@@ -591,7 +591,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
     "host_address": "192.168.0.20:3000",
     "participant_id": "bot1",
     "participants": [
-      { "id": "user", "display_name": "Alice", "kind": "human", "avatar_url": null, "connected": true }
+      { "id": "user", "display_name": "Alice", "kind": "Human", "avatar_url": null, "connected": true }
     ]
   }
   ```
