@@ -50,11 +50,24 @@ pub trait TurnStore {
 }
 
 /// The production [`TurnStore`], backed by `companion_database.db`.
-pub struct SqliteTurnStore;
+///
+/// Carries the current chat's participant display names (constructor
+/// injection from a snapshot of the shared registry) so `preprocess` never
+/// mistakes the user, the host companion or a joined bot for a new
+/// third-party person mentioned in the conversation.
+pub struct SqliteTurnStore {
+    participant_names: Vec<String>,
+}
+
+impl SqliteTurnStore {
+    pub fn new(participant_names: Vec<String>) -> Self {
+        SqliteTurnStore { participant_names }
+    }
+}
 
 impl TurnStore for SqliteTurnStore {
     fn preprocess(&self, user_message: &str, companion_id: i32) -> Option<String> {
-        preprocess_user_message(user_message, companion_id)
+        preprocess_user_message(user_message, companion_id, &self.participant_names)
     }
 
     fn insert_user_turn(&self, content: &str) -> rusqlite::Result<()> {
@@ -75,11 +88,19 @@ impl TurnStore for SqliteTurnStore {
 /// Pre-processing shared by `/api/prompt` and `/api/prompt/stream`: third-party
 /// mention tracking, new-person detection and interaction detection.
 ///
+/// `excluded_names` are the current chat's participant display names (user,
+/// host companion, any joined bots), so none of them is ever mistaken for a
+/// newly mentioned third party.
+///
 /// Returns the prompt to generate from when an interaction with a recorded
 /// outcome matched, so the caller can generate with that added context.
-fn preprocess_user_message(user_message: &str, companion_id: i32) -> Option<String> {
+fn preprocess_user_message(
+    user_message: &str,
+    companion_id: i32,
+    excluded_names: &[String],
+) -> Option<String> {
     // Track third-party mentions and display console output
-    match Database::track_third_party_mentions(user_message) {
+    match Database::track_third_party_mentions(user_message, excluded_names) {
         Ok(mention_output) => {
             if !mention_output.is_empty() {
                 println!("{}", mention_output);
@@ -89,7 +110,9 @@ fn preprocess_user_message(user_message: &str, companion_id: i32) -> Option<Stri
     }
 
     // Automatically detect new persons in the message
-    if let Err(e) = Database::detect_new_persons_in_message(user_message, companion_id) {
+    if let Err(e) =
+        Database::detect_new_persons_in_message(user_message, companion_id, excluded_names)
+    {
         eprintln!("Failed to detect persons in message: {}", e);
         // Continue processing even if person detection fails
     }
