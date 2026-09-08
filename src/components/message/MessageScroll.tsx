@@ -6,6 +6,7 @@ import { TypingIndicator } from "./TypingIndicator";
 import { useMessages } from "../context/messageContext";
 import { useMobile } from "../../hooks/useMobile";
 import { cn } from "../../lib/utils";
+import { isBotSpeaker } from "../../lib/speakers";
 
 export function MessageScroll() {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -128,7 +129,7 @@ export function MessageScroll() {
               <Message
                 received={message.ai}
                 id={message.id}
-                regenerate={message.ai && index === messages.length - 1 && index !== 0}
+                regenerate={isBotSpeaker(message) && index === messages.length - 1 && index !== 0}
                 content={message.content}
                 created_at={message.created_at}
                 speakerId={message.speaker_id}

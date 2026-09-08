@@ -3,6 +3,8 @@ import { Pencil, RotateCw, ThumbsUp, Trash2, Smile, Check, CheckCheck } from "lu
 import { useUserData } from "../context/userContext";
 import { useCompanionData } from "../context/companionContext";
 import { useParticipants } from "../context/participantsContext";
+import { useConfigData } from "../context/configContext";
+import { MultiplayerMode } from "../interfaces/Config";
 
 import { UserData } from "../interfaces/UserData";
 import { useEffect, useState } from "react";
@@ -250,8 +252,14 @@ interface AiMessageProps extends MessageProps {
   avatarUrl: string;
 }
 
-const AiMessage = ({ id, content, created_at, regenerate, displayName, avatarUrl }: AiMessageProps) => {
+const AiMessage = ({ id, content, created_at, regenerate: regenerateProp, displayName, avatarUrl }: AiMessageProps) => {
   const { refreshMessages } = useMessages();
+  const configDataContext = useConfigData();
+  // A joiner's `GET /api/message` answers from a read-only mirror of the
+  // host's transcript (#130): regenerating from here would 409 every time,
+  // so the control is suppressed regardless of what the caller passed.
+  const isJoinerInstance = configDataContext?.config?.multiplayer_mode === MultiplayerMode.Joiner;
+  const regenerate = regenerateProp && !isJoinerInstance;
 
   const [displayedContent, setDisplayedContent] = useState(content);
   const [editing, setEditing] = useState(false);
@@ -354,7 +362,10 @@ const AiMessage = ({ id, content, created_at, regenerate, displayName, avatarUrl
         refreshMessages();
         setDisplayedContent(await response.text());
       } else {
-        toast.error('Failed to regenerate prompt');
+        // The 409 body names the specific reason (e.g. an offline bot);
+        // fall back to the generic message when it is empty.
+        const body = await response.text();
+        toast.error(body || 'Failed to regenerate prompt');
         console.error('Failed to regenerate prompt');
         setDisplayedContent(oc);
       }

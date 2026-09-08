@@ -53,7 +53,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 #### 1.2 Erase messages
 - **URL:** `/message`
 - **Method:** `DELETE`
-- **Description:** Delete every message saved in short-term memory and chat log
+- **Description:** Delete every message saved in short-term memory and chat log. Unlike editing, deleting, or regenerating a single message, this is **not** mirrored to a connected joiner in `host` mode — a joiner's own transcript keeps showing the pre-clear history until it reconnects (known gap).
 - **Response:**
   - Status: 200 OK
   - Body: Chat log cleared!
@@ -490,11 +490,13 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 
 - **URL:** `/prompt/regenerate`
 - **Method:** `GET`
-- **Description:** Regenerate answer to your AI prompt (answer is saved in short-term, long-term memory and chat log)
+- **Description:** Removes the newest bot reply (the host companion's own, or the trailing reply of a connected joiner from a round, #131) and regenerates it from the same owner — a joiner's bot regenerates on the joiner's own instance, over the same round protocol a live round uses, not on the host. The reply is anchored on the newest preceding user turn, which is not always its immediate predecessor (a mention follow-up can put another bot's reply in between). The answer is saved in short-term, long-term memory and the chat log exactly as a normal reply is; regenerating does not re-score attitude. In `host` mode, a connected joiner's transcript mirror is updated to match (the old reply removed, then the new one added) before this responds.
 - **Response:**
   - Status: 200 OK
   - Body: generated text
   - Status: 409 Conflict — a turn is already in flight; wait for it to finish before regenerating
+  - Status: 409 Conflict — the newest message is not a bot reply with a preceding user turn (it is a user message, a system notice, or the conversation has no earlier user turn to regenerate from); body: `The newest message is not a companion reply, so there is nothing to regenerate`
+  - Status: 409 Conflict — the newest reply's owner is a remote bot that is not currently connected; nothing is changed; body: `{speaker_id} is not connected, so its reply cannot be regenerated`
   - Status: 409 Conflict — this instance is in `joiner` multiplayer mode; send messages from the host instead
 - **Example Request:**
   ```http

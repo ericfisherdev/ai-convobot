@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Message } from '../message/Message'
 import { MessagesProvider } from '../context/messageContext'
@@ -8,6 +8,16 @@ import { CompanionDataProvider } from '../context/companionContext'
 import { ConfigProvider } from '../context/configContext'
 import { ParticipantsProvider } from '../context/participantsContext'
 import { formatMessageDate } from '../../lib/utils'
+import { isBotSpeaker } from '../../lib/speakers'
+import { toast } from 'sonner'
+
+vi.mock('sonner', () => ({
+  toast: {
+    success: vi.fn(),
+    error: vi.fn(),
+    info: vi.fn(),
+  },
+}))
 
 const MockProviders: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   <MessagesProvider>
@@ -189,5 +199,83 @@ describe('Message Component', () => {
     // A system notice carries none of `UserMessage`/`AiMessage`'s edit,
     // delete, reaction or regenerate controls.
     expect(screen.queryAllByRole('button')).toHaveLength(0)
+  })
+
+  it('renders the regenerate control for a trailing bot1 reply', async () => {
+    render(
+      <MockProviders>
+        <Message
+          received={true}
+          regenerate={isBotSpeaker({ speaker_id: 'bot1' })}
+          id={8}
+          content="hi from bot1"
+          created_at="2024-01-15 10:37"
+          speakerId="bot1"
+        />
+      </MockProviders>
+    )
+
+    await screen.findByText('hi from bot1')
+    expect(screen.getByRole('button', { name: 'Regenerate message' })).toBeInTheDocument()
+  })
+
+  it('suppresses the regenerate control in joiner mode even when the caller passes regenerate true', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.startsWith('/api/config')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ multiplayer_mode: 'joiner' }) })
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}), text: () => Promise.resolve('') })
+    }))
+
+    render(
+      <MockProviders>
+        <Message received={true} regenerate={true} id={11} content="hi from bot1" created_at="2024-01-15 10:40" speakerId="bot1" />
+      </MockProviders>
+    )
+
+    await screen.findByText('hi from bot1')
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: 'Regenerate message' })).not.toBeInTheDocument()
+    )
+  })
+
+  it('never renders the regenerate control on a trailing system notice, even if the caller passes regenerate true', async () => {
+    render(
+      <MockProviders>
+        <Message received={true} regenerate={true} id={9} content="bot1 did not respond" created_at="2024-01-15 10:38" speakerId="system" />
+      </MockProviders>
+    )
+
+    await screen.findByText('bot1 did not respond')
+    expect(screen.queryByRole('button', { name: 'Regenerate message' })).not.toBeInTheDocument()
+  })
+
+  it('surfaces the regenerate 409 body through the toast', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url === '/api/prompt/regenerate') {
+        return Promise.resolve({
+          ok: false,
+          text: () => Promise.resolve('bot1 is not connected, so its reply cannot be regenerated'),
+        })
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}), text: () => Promise.resolve('') })
+    }))
+
+    const user = userEvent.setup()
+    render(
+      <MockProviders>
+        <Message received={true} regenerate={true} id={10} content="hi from bot1" created_at="2024-01-15 10:39" speakerId="bot1" />
+      </MockProviders>
+    )
+
+    await screen.findByText('hi from bot1')
+    await user.click(screen.getByRole('button', { name: 'Regenerate message' }))
+
+    const mockError = toast.error as unknown as ReturnType<typeof vi.fn>
+    await waitFor(() => expect(mockError).toHaveBeenCalled())
+    const lastCall = mockError.mock.calls[mockError.mock.calls.length - 1]
+    expect(lastCall[0]).toBe('bot1 is not connected, so its reply cannot be regenerated')
   })
 })
