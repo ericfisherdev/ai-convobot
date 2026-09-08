@@ -16,9 +16,9 @@
 //! test's own WS client) reply is ever generated.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::net::{SocketAddr, TcpStream};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
@@ -28,39 +28,10 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+mod common;
+use common::{free_port, wait_until_listening, ChildGuard};
+
 type HmacSha256 = Hmac<Sha256>;
-
-/// Kills and reaps the wrapped child on drop — see `tests/env_config.rs`'s
-/// identical guard for why this matters even when a test only reads state.
-struct ChildGuard(Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind an ephemeral port");
-    listener
-        .local_addr()
-        .expect("failed to read the ephemeral port's local address")
-        .port()
-}
-
-fn wait_until_listening(addr: SocketAddr, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-            return;
-        }
-        if Instant::now() >= deadline {
-            panic!("server at {addr} did not start listening within {timeout:?}");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
 
 /// A minimal blocking HTTP/1.1 client good enough for this test's three
 /// calls (`GET`/`PUT /api/config`, `GET /api/message`, `POST /api/prompt`):

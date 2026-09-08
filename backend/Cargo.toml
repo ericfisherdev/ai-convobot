@@ -44,3 +44,8 @@ metal = ["llama-cpp-2/metal"]
 
 [dev-dependencies]
 tempfile = "3.8"
+# `backend/tests/multiplayer_modes.rs` (#136): a minimal blocking HTTP
+# client for `GET`/`PUT /api/config` and `GET /api/multiplayer/*` against
+# two spawned instances, with `http_status_as_error(false)` so a 404/409
+# response can be asserted on directly instead of surfacing as an `Err`.
+ureq = { version = "3", features = ["json"] }

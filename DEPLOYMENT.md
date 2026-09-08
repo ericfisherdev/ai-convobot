@@ -261,6 +261,130 @@ COMPANION_PORT=3100 COMPANION_DATA_DIR=./instance-b ./ai-companion
    - 13B models: 8-16GB VRAM
    - 30B+ models: 24GB+ VRAM
 
+## Multi-instance chat (host and joiners)
+
+AI Companion can run as several instances that share one conversation: one
+instance is the **host**, the others **join** it. This is a distinct feature
+from the "two instances on one machine" scenario above (two unrelated,
+unconnected chats) — here every instance is part of the same chat.
+
+### How it works
+
+One instance is the host and owns the chat: every message and reply is
+generated and persisted there. Each joiner runs its own model and its own
+character card, and connects outbound to the host over a WebSocket at
+`/api/multiplayer/ws`; when it is a joiner's bot's turn to speak, the host
+asks it over that connection and the joiner generates with its own model. A
+user talks to the host's UI as normal; a joiner's UI shows a read-only
+mirror of the same conversation, with its own settings dialog reporting its
+connection state. Every instance — host and every joiner — still needs its
+own GGUF model loaded; a joiner's bot never runs on the host's model.
+
+### Host setup
+
+1. Open the host instance's Settings dialog → Multiplayer, set the mode to
+   `host`, and set a password. This is the shared secret joiners use to
+   authenticate; it is never sent in the clear (see "Security model" below).
+2. Note the host's listening port (`COMPANION_PORT`, default `3000`) and
+   make sure it is reachable from every joiner's machine. On a firewalled
+   host:
+   ```bash
+   ufw allow from <joiner-ip> to any port 3000
+   ```
+3. **Switching `multiplayer_mode` takes effect after a restart**, not
+   immediately: `PUT /api/config` saves the new mode, but the running
+   process keeps its old role (and, for a joiner, its old identity) until
+   it is restarted. Restart the instance after changing the mode.
+
+### Joiner setup
+
+1. Open the joiner instance's Settings dialog → Multiplayer, set the mode
+   to `joiner`, and fill in:
+   - **Host address**: `host-ip:3000` — a bare `host:port`, no `ws://` or
+     `http://` scheme; the client builds the WebSocket URL itself.
+   - **Participant ID**: this instance's id in the chat, matching
+     `^[a-z][a-z0-9_]{0,15}$` (1-16 lowercase letters, digits or `_`,
+     starting with a letter), e.g. `bot1`. Must be unique among everyone
+     already connected.
+   - **Password**: the same password the host set.
+2. The joiner's own companion card supplies its display name and avatar,
+   sent to the host as part of the join handshake — there is nothing
+   separate to configure for that.
+3. As with the host, a mode change only takes effect after a restart.
+4. Once restarted, the joiner connects automatically. Its connection state
+   (`disconnected`, `connecting`, `connected`, or `rejected`) is shown in
+   its own settings dialog and available at `GET /api/multiplayer/status`.
+   If the connection drops for any reason other than a rejected handshake,
+   the joiner reconnects on its own, backing off from 1 second up to 30
+   seconds between attempts.
+5. A joiner answers `GenerateRequest`s with its own model, its own card,
+   its own dialogue tuning and its own long-term memory — only the
+   transcript and the roster of who else is in the chat come from the host.
+
+### Two instances on one machine
+
+The "Running two instances on one machine" snippet under Environment
+Variables above (`COMPANION_PORT`/`COMPANION_DATA_DIR`) works for a
+host/joiner pair too — each still needs its own port and data directory so
+they do not contend for the same database or long-term memory index. Point
+the joiner's host address at `127.0.0.1:3000` (the first instance's port).
+
+Running a host and a joiner this way keeps two full models resident at
+once: budget RAM/VRAM for both. The host can free its own model with
+`POST /api/llm/unload` when it is not generating, but a joiner needs its
+model loaded whenever it might be asked to speak, so unloading it defeats
+the point.
+
+### Docker Compose
+
+```bash
+docker compose --profile cpu --profile multiplayer up -d
+```
+
+This starts the CPU host (`ai-companion-cpu`, `http://localhost:3000`) and
+a joiner (`ai-companion-joiner`, `http://localhost:3001`) from the same
+compose file. Inside the compose network, the joiner's host address is the
+host's **service name and container port**, not the published port:
+`ai-companion-cpu:3000`. Configure both instances' Settings dialogs exactly
+as in "Host setup" and "Joiner setup" above — see `docker-compose.yml`'s
+`multiplayer` profile for the service definition.
+
+### Security model
+
+**The password protects only the join handshake.** It authenticates a
+joiner to the host with an HMAC-SHA256 challenge/response; the password
+itself never crosses the wire, only proof that both sides know it. It does
+**not** protect anything else:
+
+- Every REST route on every instance (host or joiner) is unauthenticated —
+  anyone who can reach the port can read and write the chat, its
+  configuration, and its character card, with or without multiplayer
+  enabled.
+- The multiplayer WebSocket is plaintext `ws://`. The transcript, every
+  generated token, and the join handshake's nonce and proof are all
+  readable to anyone on the network path between host and joiner.
+- The `nginx` example under Production Deployment below already forwards
+  the `Upgrade` headers a WebSocket needs, but putting TLS in front of a
+  joiner's *outbound* `ws://` connection to the host is out of scope here
+  and not configured by anything in this repository.
+
+Assume a trusted LAN or VPN for multi-instance chat. Never expose a host's
+port, or a joiner's outbound connection, to a public, untrusted network.
+
+### Troubleshooting
+
+- **`Rejected` at join**: the password is wrong, the participant ID is
+  already connected or reserved (`user`/`char`), or the two instances are
+  running different protocol versions.
+- **`429 Too Many Requests` on `/api/multiplayer/ws`**: the host throttles
+  an address after 5 failed join attempts within a 10-minute window.
+- **`404` on `/api/multiplayer/ws`**: the instance you connected to is not
+  currently in `host` mode (including a `host` mode saved but not yet
+  applied by a restart).
+- **A bot is listed but "did not respond"**: the round timed out waiting
+  for that joiner (`remote_generation_timeout_secs`, default 120 seconds),
+  or the joiner had no model loaded when the host asked it to speak.
+
 ## Production Deployment
 
 ### Security Considerations

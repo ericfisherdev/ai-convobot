@@ -64,3 +64,10 @@ pub mod remote_generator;
 pub mod remote_transcript;
 pub mod round;
 pub mod routing;
+
+/// #136: a real host `HttpServer` and a real joiner `joiner::run`, talking
+/// over an actual loopback socket, exercising #131's round orchestrator and
+/// #154's socket-backed `RemoteGenerator` end to end with no model and no
+/// SQLite.
+#[cfg(test)]
+mod two_instance_tests;

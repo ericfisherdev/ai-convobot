@@ -91,8 +91,41 @@ services:
     profiles:
       - prebuilt-cpu
 
+  # Joiner: a second instance that connects to ai-companion-cpu as a
+  # multi-instance chat participant (see DEPLOYMENT.md's "Multi-instance
+  # chat" section). It needs its own model, and its multiplayer role is
+  # configured in its own Settings dialog, not via env vars: set mode
+  # `joiner`, host address `ai-companion-cpu:3000` (the host's service
+  # name and *container* port, not the published 3000), and a participant
+  # id and password matching the host — do that at http://localhost:3001.
+  ai-companion-joiner:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./models:/app/models:ro
+      - joiner-data:/app/data
+    environment:
+      - RUST_LOG=info
+      - COMPANION_HOST=0.0.0.0
+      - COMPANION_PORT=3000
+      - COMPANION_DATA_DIR=/app/data
+    depends_on:
+      # Not `service_healthy`: the CPU image's HEALTHCHECK runs `curl`,
+      # which the runtime stage does not install (#93), so a health
+      # condition here would never become healthy.
+      ai-companion-cpu:
+        condition: service_started
+    restart: unless-stopped
+    profiles:
+      - multiplayer
+
 volumes:
   models:
     driver: local
   data:
+    driver: local
+  joiner-data:
     driver: local
