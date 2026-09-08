@@ -1,4 +1,4 @@
-import React, { createContext, useState, useContext, useEffect, useCallback, ReactNode } from 'react';
+import React, { createContext, useState, useContext, useEffect, useCallback, useRef, ReactNode } from 'react';
 import { toast } from "sonner";
 import { useConfigData } from './configContext';
 import { useUserData } from './userContext';
@@ -60,7 +60,17 @@ export const ParticipantsProvider: React.FC<ParticipantsProviderProps> = ({ chil
     { id: 'char', display_name: companionName, kind: 'HostBot', avatar_url: companionAvatarUrl, connected: true },
   ];
 
+  // A poll tick and a caller-triggered `refreshParticipants()` (`ChatWindow`
+  // calls it after `round_complete`/a stream error) can be in flight at
+  // once; if the older request's response lands after the newer one's, it
+  // must not overwrite the newer state. Each call claims the next id and
+  // only applies its result while it is still the most recent one issued.
+  const latestRequestId = useRef(0);
+
   const fetchParticipants = useCallback(async (): Promise<void> => {
+    const requestId = ++latestRequestId.current;
+    const isStale = () => requestId !== latestRequestId.current;
+
     if (mode === MultiplayerMode.Host) {
       try {
         const response = await fetch('/api/multiplayer/participants');
@@ -68,13 +78,21 @@ export const ParticipantsProvider: React.FC<ParticipantsProviderProps> = ({ chil
           throw new Error('');
         }
         const data: Participant[] = await response.json();
+        if (isStale()) {
+          return;
+        }
         setRemoteParticipants(mergeRemote(data));
         setStatus({ mode: 'host', state: null });
       } catch (error) {
+        if (isStale()) {
+          return;
+        }
         console.error(error);
         toast.error(`Error while fetching multiplayer participants: ${error}`);
       } finally {
-        setLoaded(true);
+        if (!isStale()) {
+          setLoaded(true);
+        }
       }
       return;
     }
@@ -86,18 +104,27 @@ export const ParticipantsProvider: React.FC<ParticipantsProviderProps> = ({ chil
           throw new Error('');
         }
         const data: MultiplayerStatus = await response.json();
+        if (isStale()) {
+          return;
+        }
         setRemoteParticipants(mergeRemote(data.participants ?? []));
         setStatus(data);
       } catch (error) {
+        if (isStale()) {
+          return;
+        }
         console.error(error);
         toast.error(`Error while fetching multiplayer status: ${error}`);
       } finally {
-        setLoaded(true);
+        if (!isStale()) {
+          setLoaded(true);
+        }
       }
       return;
     }
 
-    // Solo mode: no `/api/multiplayer/*` requests at all.
+    // Solo mode: no `/api/multiplayer/*` requests at all, so there is
+    // nothing to race.
     setRemoteParticipants([]);
     setStatus(SOLO_STATUS);
     setLoaded(true);
