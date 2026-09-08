@@ -5,12 +5,15 @@
 //! Everything here is `Database`-free: [`plan_round`] and [`run_round`] are
 //! driven entirely through the [`crate::chat_turn::TurnStore`],
 //! [`RemoteGenerator`] and [`RoundSink`] seams, so a round can be exercised
-//! with fakes in tests without a real sqlite file or model. The real
-//! socket-backed `RemoteGenerator`, wired over `RemoteBots`, and the
-//! transcript broadcasts that go with it, are #154 (Part B); this issue
-//! ships [`NoRemotes`], which reports every remote speaker offline, so a
-//! round with no joiners behaves exactly as `PendingTurn::complete` did
-//! before this module existed.
+//! with fakes in tests without a real sqlite file or model. [`NoRemotes`]
+//! reports every remote speaker offline, so a round with no joiners behaves
+//! exactly as `PendingTurn::complete` did before this module existed; the
+//! real socket-backed `RemoteGenerator` is #154's `SocketRemoteGenerator`
+//! (`multiplayer::remote_generator`), wired over `RemoteBots`. This module's
+//! own `broadcast` parameter is the other half of #154: every persisted
+//! message of the round (the user's turn, each reply, each skip notice) is
+//! handed to it in persistence order, so `main.rs` can mirror the round to
+//! every joiner via `RemoteBots::broadcast`.
 //!
 //! The speaker order itself — who talks, and who an `@mention` in a reply
 //! adds mid-round — is `routing.rs`'s (#132): [`RoundPlan`], [`plan_round`]
@@ -23,6 +26,7 @@ use std::time::Duration;
 
 use crate::chat_turn::{PendingTurn, PersistedReply, TurnStore};
 use crate::database::{CompanionAttitude, Message};
+use crate::multiplayer::protocol::ServerFrame;
 pub use crate::multiplayer::routing::{plan_round, RoundPlan};
 use crate::multiplayer::routing::{schedule_follow_ups, RoutingPolicy};
 use crate::participants::{ParticipantId, ParticipantRegistry};
@@ -49,11 +53,9 @@ pub trait RemoteGenerator {
 
 /// One remote speaker's turn: what it is generating for, and what it can see.
 ///
-/// `NoRemotes` (this issue's only `RemoteGenerator`) ignores every field;
-/// #154's production implementation is what actually reads them, so they are
-/// dead code from `cargo build`'s point of view until then. This module's
-/// own tests exercise them today through `FakeRemote`.
-#[allow(dead_code)]
+/// `NoRemotes` ignores every field; #154's `SocketRemoteGenerator`
+/// (`multiplayer::remote_generator`) is what actually reads them. This
+/// module's own tests exercise them through `FakeRemote`.
 pub struct RemoteRequest<'a> {
     pub round_id: u64,
     pub speaker: &'a ParticipantId,
@@ -68,23 +70,21 @@ pub struct RemoteRequest<'a> {
 
 /// Why a remote speaker did not produce a reply.
 ///
-/// Only `Offline` is constructed outside tests today (`NoRemotes` always
-/// returns it); `Timeout` and `Failed` are #154's production
-/// `RemoteGenerator`'s to construct, once a real socket round-trip can
-/// actually time out or fail. This module's tests construct all three.
+/// `NoRemotes` always returns `Offline`; `Timeout` and `Failed` are
+/// `SocketRemoteGenerator`'s (#154) to construct, once a real socket
+/// round-trip times out or the joiner reports `ReplyFailed`. This module's
+/// tests construct all three.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteFailure {
     Offline,
-    #[allow(dead_code)] // constructed by #154's production RemoteGenerator
     Timeout,
-    #[allow(dead_code)] // constructed by #154's production RemoteGenerator
     Failed(String),
 }
 
 /// A [`RemoteGenerator`] with no remotes: every request reports the speaker
-/// offline. Used by both prompting handlers until #154 wires the real,
-/// socket-backed implementation in, so a round with no joiners is
-/// unaffected by this module's existence.
+/// offline. What both prompting handlers use in `Solo` mode, so a round
+/// with no joiners is unaffected by `RemoteBots`' existence — `main.rs`
+/// switches to `SocketRemoteGenerator` (#154) only in `Host` mode.
 pub struct NoRemotes;
 
 impl RemoteGenerator for NoRemotes {
@@ -158,6 +158,26 @@ fn next_round_id() -> u64 {
     NEXT_ROUND_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Looks `id` back up through `store` and hands it to `broadcast` as a
+/// `ServerFrame::Message`, so every joiner's transcript mirror gets the
+/// exact row the host just persisted — same id, same `created_at`. Called
+/// for the user's turn and for every reply and skip notice `run_round`
+/// persists, in the same order they were inserted.
+///
+/// A lookup failure only means a joiner's mirror misses this one message
+/// (it still has everything the `Joined` handshake seeded it with, plus
+/// whatever else the round broadcasts); it must never fail the round
+/// itself, so this logs and returns rather than propagating.
+fn broadcast_message(store: &impl TurnStore, id: i32, broadcast: &dyn Fn(ServerFrame)) {
+    match store.get_message(id) {
+        Ok(row) => broadcast(ServerFrame::Message(row)),
+        Err(e) => eprintln!(
+            "multiplayer: failed to load message {} to broadcast to joiners: {}",
+            id, e
+        ),
+    }
+}
+
 /// Runs one round on the calling (blocking) thread, exactly like
 /// `PendingTurn::complete` did before this module existed.
 ///
@@ -181,11 +201,14 @@ pub fn run_round(
     policy: &RoutingPolicy,
     host: &mut dyn FnMut(&str, &mut dyn FnMut(&str)) -> io::Result<String>,
     remotes: &dyn RemoteGenerator,
+    broadcast: &dyn Fn(ServerFrame),
     timeout: Duration,
     sink: &mut dyn RoundSink,
 ) -> io::Result<RoundOutcome> {
     let _turn_guard = turn_guard;
     let round_id = next_round_id();
+
+    broadcast_message(store, pending.user_message_id(), broadcast);
 
     let mut host_reply: Option<PersistedReply> = None;
     let mut replies: Vec<PersistedReply> = Vec::new();
@@ -201,6 +224,7 @@ pub fn run_round(
             let persisted = pending.reply(store, speaker.clone(), |generation_prompt| {
                 host(generation_prompt, &mut |token| sink.token(speaker, token))
             })?;
+            broadcast_message(store, persisted.message_id, broadcast);
             sink.reply_complete(&persisted);
             for followup in schedule_follow_ups(&mut plan, &persisted.text, &next, registry, policy)
             {
@@ -234,6 +258,7 @@ pub fn run_round(
 
         match attempt {
             Ok(persisted) => {
+                broadcast_message(store, persisted.message_id, broadcast);
                 sink.reply_complete(&persisted);
                 for followup in
                     schedule_follow_ups(&mut plan, &persisted.text, &next, registry, policy)
@@ -256,6 +281,7 @@ pub fn run_round(
                     speaker_id: ParticipantId::SYSTEM,
                     text: notice_text,
                 };
+                broadcast_message(store, notice.message_id, broadcast);
                 sink.speaker_skipped(speaker, &notice);
             }
         }
@@ -441,6 +467,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi from char".to_string()),
             &remotes,
+            &|_frame| {},
             Duration::from_secs(30),
             &mut sink,
         )
@@ -510,6 +537,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi from char".to_string()),
             &remotes,
+            &|_frame| {},
             Duration::from_secs(30),
             &mut sink,
         )
@@ -563,6 +591,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| Err(std::io::Error::other("no model")),
             &remotes,
+            &|_frame| {},
             Duration::from_secs(30),
             &mut sink,
         );
@@ -613,6 +642,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi".to_string()),
             &NoRemotes,
+            &|_frame| {},
             Duration::from_secs(30),
             &mut sink,
         )
@@ -652,6 +682,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi".to_string()),
             &remotes,
+            &|_frame| {},
             Duration::from_secs(30),
             &mut sink,
         )
@@ -699,6 +730,7 @@ mod tests {
             },
             &mut |_prompt, _on_token| Ok("hi @bot1 do you agree?".to_string()),
             &remotes,
+            &|_frame| {},
             Duration::from_secs(30),
             &mut sink,
         )
@@ -748,6 +780,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| panic!("char should never be asked to speak"),
             &remotes,
+            &|_frame| {},
             Duration::from_secs(30),
             &mut sink,
         )
@@ -774,6 +807,61 @@ mod tests {
         assert!(
             store.finished.lock().unwrap().is_empty(),
             "finish should return None (and never call finish_turn) when char did not speak"
+        );
+    }
+
+    #[test]
+    fn broadcast_sees_the_user_turn_every_reply_and_the_notice_in_persistence_order() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = RecordingStore::new(None);
+        let registry = registry_with_bots();
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), registry.clone())
+                .expect("insert should succeed");
+
+        let plan = RoundPlan::from_speakers([ParticipantId::CHAR, bot("bot1"), bot("bot2")]);
+        let remotes = FakeRemote::new(vec![
+            (bot("bot1"), Err(RemoteFailure::Timeout)),
+            (bot("bot2"), Ok("hi from bot2")),
+        ]);
+        let mut sink = RecordingSink::default();
+        let broadcasts: Mutex<Vec<ServerFrame>> = Mutex::new(Vec::new());
+
+        run_round(
+            guard,
+            pending,
+            plan,
+            &store,
+            &registry,
+            &no_followups(),
+            &mut |_prompt, _on_token| Ok("hi from char".to_string()),
+            &remotes,
+            &|frame| broadcasts.lock().unwrap().push(frame),
+            Duration::from_secs(30),
+            &mut sink,
+        )
+        .expect("a skipped speaker should not fail the round");
+
+        let broadcast_contents: Vec<(String, String)> = broadcasts
+            .into_inner()
+            .unwrap()
+            .into_iter()
+            .map(|frame| match frame {
+                ServerFrame::Message(message) => (message.speaker_id, message.content),
+                other => panic!("expected only Message frames, got {:?}", other),
+            })
+            .collect();
+
+        assert_eq!(
+            broadcast_contents,
+            vec![
+                ("user".to_string(), "hello".to_string()),
+                ("char".to_string(), "hi from char".to_string()),
+                ("system".to_string(), "bot1 did not respond".to_string()),
+                ("bot2".to_string(), "hi from bot2".to_string()),
+            ],
+            "the user turn, then char's reply, then bot1's skip notice, then bot2's reply"
         );
     }
 }

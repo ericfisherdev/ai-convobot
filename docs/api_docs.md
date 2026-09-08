@@ -468,7 +468,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 
 - **URL:** `/prompt`
 - **Method:** `POST`
-- **Description:** Prompt the ai, (message and response are saved in short-term, long-term memory and chat log)
+- **Description:** Prompt the ai, (message and response are saved in short-term, long-term memory and chat log). In `host` multiplayer mode this runs the whole round — the host companion, then each connected joiner in join order, over the same socket connection `/api/multiplayer/ws` accepted — but the response body is only the host companion's reply; every joiner's reply (and any skip notice for one that did not respond) lands in the same round, visible via `GET /message` or `/prompt/stream`. A second `/prompt`, `/prompt/stream`, or `/prompt/regenerate` sent while a round is still in flight gets 409, whether or not the round has any joiners.
 - **Request Body:**
   - `prompt` (string): Prompt to the AI
 - **Response:**

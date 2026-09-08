@@ -51,8 +51,10 @@ use crate::multiplayer::host::{
 };
 use crate::multiplayer::join_throttle::JoinThrottle;
 use crate::multiplayer::joiner::{JoinerHandle, JoinerIdentity, JoinerShared};
+use crate::multiplayer::protocol::ServerFrame;
 use crate::multiplayer::remote_bots::RemoteBots;
 use crate::multiplayer::remote_generation::LocalModelGeneration;
+use crate::multiplayer::remote_generator::SocketRemoteGenerator;
 use crate::multiplayer::round::{
     plan_round, run_round, NoRemotes, NoopSink, RemoteGenerator, RoundPlan, RoundSink,
 };
@@ -1029,12 +1031,16 @@ mod stream_turn_tests {
             self.inner.preprocess(user_message, companion_id)
         }
 
-        fn insert_user_turn(&self, content: &str) -> rusqlite::Result<()> {
+        fn insert_user_turn(&self, content: &str) -> rusqlite::Result<i32> {
             self.inner.insert_user_turn(content)
         }
 
         fn insert_reply(&self, speaker_id: &ParticipantId, content: &str) -> rusqlite::Result<i32> {
             self.inner.insert_reply(speaker_id, content)
+        }
+
+        fn get_message(&self, id: i32) -> rusqlite::Result<Message> {
+            self.inner.get_message(id)
         }
 
         fn transcript_tail(&self, limit: usize) -> rusqlite::Result<Vec<Message>> {
@@ -1083,6 +1089,7 @@ mod stream_turn_tests {
                 &no_followups(),
                 |_prompt, _on_token| Err(std::io::Error::other("no model")),
                 &NoRemotes,
+                &|_frame| {},
                 Duration::from_secs(30),
             );
         });
@@ -1143,6 +1150,7 @@ mod stream_turn_tests {
                     Ok("Hello".to_string())
                 },
                 &NoRemotes,
+                &|_frame| {},
                 Duration::from_secs(30),
             );
         });
@@ -1222,6 +1230,7 @@ mod stream_turn_tests {
                 &no_followups(),
                 |_prompt, _on_token| Ok("hi from char".to_string()),
                 &remotes,
+                &|_frame| {},
                 Duration::from_secs(30),
             );
         });
@@ -1301,6 +1310,7 @@ mod stream_turn_tests {
                 &no_followups(),
                 |_prompt, _on_token| Ok("hi from char".to_string()),
                 &remotes,
+                &|_frame| {},
                 Duration::from_secs(30),
             );
         });
@@ -1362,6 +1372,7 @@ mod stream_turn_tests {
                 &no_followups(),
                 |_prompt, _on_token| Ok("hi".to_string()),
                 &NoRemotes,
+                &|_frame| {},
                 Duration::from_secs(30),
             );
         });
@@ -1407,11 +1418,42 @@ fn reject_if_joiner(joiner: &Option<web::Data<JoinerHandle>>) -> Option<HttpResp
     })
 }
 
+/// Builds the [`RemoteGenerator`] and broadcast closure a round runs with,
+/// for both prompting handlers: `Host` mode wires both to `remote_bots` (the
+/// real, socket-backed `SocketRemoteGenerator`, #154, and a broadcast of
+/// every persisted message to every joiner); every other mode (`Solo`,
+/// and — unreachable in practice, since [`reject_if_joiner`] already 409s
+/// a joiner — `Joiner`) gets [`NoRemotes`] and a no-op broadcast, so a round
+/// never so much as looks at `remote_bots` outside `Host` mode.
+///
+/// Boxed rather than returned as a bare reference: both prompting handlers
+/// move the pair into a `web::block`/spawned-thread closure that outlives
+/// this function's stack frame.
+#[allow(clippy::type_complexity)]
+fn round_remotes(
+    mode: MultiplayerMode,
+    remote_bots: &web::Data<RemoteBots>,
+) -> (
+    Box<dyn RemoteGenerator + Send>,
+    Box<dyn Fn(ServerFrame) + Send>,
+) {
+    if mode == MultiplayerMode::Host {
+        let broadcast_bots = remote_bots.clone();
+        (
+            Box::new(SocketRemoteGenerator::new(remote_bots.clone())),
+            Box::new(move |frame| broadcast_bots.broadcast(frame, None)),
+        )
+    } else {
+        (Box::new(NoRemotes), Box::new(|_frame| {}))
+    }
+}
+
 #[post("/api/prompt")]
 async fn prompt_message(
     received: web::Json<Prompt>,
     registry: web::Data<RwLock<ParticipantRegistry>>,
     joiner: Option<web::Data<JoinerHandle>>,
+    remote_bots: web::Data<RemoteBots>,
 ) -> HttpResponse {
     if let Some(response) = reject_if_joiner(&joiner) {
         return response;
@@ -1429,20 +1471,22 @@ async fn prompt_message(
         Ok(id) => id,
         Err(response) => return response,
     };
-    // The round's remote timeout budget and mention-follow-up depth: read
-    // once here rather than inside `run_round` (#131's round orchestrator,
-    // `multiplayer::round`, is `Database`-free), so it stays testable
-    // against a fake `TurnStore`.
-    let (timeout, policy) =
+    // The round's remote timeout budget, mention-follow-up depth and
+    // network role: read once here rather than inside `run_round` (#131's
+    // round orchestrator, `multiplayer::round`, is `Database`-free), so it
+    // stays testable against a fake `TurnStore`.
+    let (timeout, policy, mode) =
         match off_worker("Error while getting config", Database::get_config).await {
             Ok(loaded_config) => (
                 std::time::Duration::from_secs(loaded_config.remote_generation_timeout_secs),
                 RoutingPolicy {
                     max_followup_depth: loaded_config.mention_followup_depth as usize,
                 },
+                loaded_config.multiplayer_mode,
             ),
             Err(response) => return response,
         };
+    let (remotes, broadcast) = round_remotes(mode, &remote_bots);
     // Claimed before the user-turn insert below and moved into the blocking
     // closure below, which holds it for the whole round: an overlapping call
     // cannot insert its own user message between this one and the replies it
@@ -1505,7 +1549,8 @@ async fn prompt_message(
                     &speakers,
                 )
             },
-            &NoRemotes,
+            remotes.as_ref(),
+            broadcast.as_ref(),
             timeout,
             &mut NoopSink,
         )
@@ -2339,6 +2384,7 @@ fn stream_round(
     policy: &RoutingPolicy,
     mut host_generate: impl FnMut(&str, &mut dyn FnMut(&str)) -> std::io::Result<String>,
     remotes: &dyn RemoteGenerator,
+    broadcast: &dyn Fn(ServerFrame),
     timeout: std::time::Duration,
 ) {
     let mut sink = SseRoundSink::new(stream);
@@ -2351,6 +2397,7 @@ fn stream_round(
         policy,
         &mut host_generate,
         remotes,
+        broadcast,
         timeout,
         &mut sink,
     );
@@ -2369,6 +2416,7 @@ async fn start_streaming_session(
     received: web::Json<StreamingRequest>,
     registry: web::Data<RwLock<ParticipantRegistry>>,
     joiner: Option<web::Data<JoinerHandle>>,
+    remote_bots: web::Data<RemoteBots>,
 ) -> HttpResponse {
     if let Some(response) = reject_if_joiner(&joiner) {
         return response;
@@ -2390,18 +2438,20 @@ async fn start_streaming_session(
         Err(response) => return response,
     };
     // See `prompt_message`'s identical fetch: the round's remote timeout
-    // budget and mention-follow-up depth, read here since `multiplayer::round`
-    // is `Database`-free.
-    let (timeout, policy) =
+    // budget, mention-follow-up depth and network role, read here since
+    // `multiplayer::round` is `Database`-free.
+    let (timeout, policy, mode) =
         match off_worker("Error while getting config", Database::get_config).await {
             Ok(loaded_config) => (
                 std::time::Duration::from_secs(loaded_config.remote_generation_timeout_secs),
                 RoutingPolicy {
                     max_followup_depth: loaded_config.mention_followup_depth as usize,
                 },
+                loaded_config.multiplayer_mode,
             ),
             Err(response) => return response,
         };
+    let (remotes, broadcast) = round_remotes(mode, &remote_bots);
     // Claimed before the user-turn insert below: without it, a second
     // request's insert could land between this one and the worker thread
     // reading history, and the worker would answer both messages at once.
@@ -2473,7 +2523,8 @@ async fn start_streaming_session(
                         &speakers,
                     )
                 },
-                &NoRemotes,
+                remotes.as_ref(),
+                broadcast.as_ref(),
                 timeout,
             );
         });

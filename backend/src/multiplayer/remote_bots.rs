@@ -35,7 +35,6 @@ pub struct AlreadyConnected;
 
 /// `send` targeted an id that is not currently connected (never joined, or
 /// its receiver/task has gone away).
-#[allow(dead_code)] // wired up by #131: RemoteBots::send's error type
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotConnected;
 
@@ -96,7 +95,6 @@ impl RemoteBots {
     /// # Errors
     /// [`NotConnected`] if `id` is not registered, or its receiving end has
     /// been dropped (the connection task has already exited).
-    #[allow(dead_code)] // wired up by #131, for a targeted reply
     pub fn send(&self, id: &ParticipantId, frame: ServerFrame) -> Result<(), NotConnected> {
         let peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
         let handle = peers.get(id).ok_or(NotConnected)?;
@@ -116,11 +114,10 @@ impl RemoteBots {
         }
     }
 
-    /// Opens a channel for round `round_id`: #131's round orchestrator reads
-    /// from the returned receiver (typically with `recv_timeout`) while
-    /// [`RemoteBots::route_inbound`] forwards frames whose
+    /// Opens a channel for round `round_id`: #154's `SocketRemoteGenerator`
+    /// reads from the returned receiver (typically with `recv_timeout`)
+    /// while [`RemoteBots::route_inbound`] forwards frames whose
     /// [`ClientFrame::round_id`] matches.
-    #[allow(dead_code)] // wired up by #131, at the start of a generation round
     pub fn subscribe_round(
         &self,
         round_id: u64,
@@ -134,7 +131,6 @@ impl RemoteBots {
     /// Closes round `round_id`'s inbound channel. Any frame that arrives
     /// after this is dropped by `route_inbound` like any other unsubscribed
     /// round.
-    #[allow(dead_code)] // wired up by #131, once a generation round completes
     pub fn unsubscribe_round(&self, round_id: u64) {
         let mut rounds = self.rounds.lock().unwrap_or_else(|p| p.into_inner());
         rounds.remove(&round_id);

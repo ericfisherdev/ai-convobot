@@ -29,7 +29,19 @@
 //! `round.rs` (#131) is the round orchestrator: `run_round` turns one user
 //! message into a sequence of speaker replies, all under one held turn slot.
 //! Its `RemoteGenerator` trait is the seam a joiner's reply is generated
-//! through, on the *host* side; #154 implements it over `remote_bots.rs`.
+//! through, on the *host* side; `remote_generator.rs` (#154) implements it
+//! over `remote_bots.rs`. `run_round`'s own `broadcast` parameter (also
+//! #154) is the other half: every persisted message of the round — the
+//! user's turn, each reply, each skip notice — goes out to every joiner
+//! through it via `RemoteBots::broadcast`, so a joiner's transcript mirror
+//! (`remote_transcript.rs`) stays in step with the host database.
+//!
+//! `remote_generator.rs` (#154) is [`round::RemoteGenerator`]'s production
+//! implementation: `SocketRemoteGenerator` sends a `GenerateRequest` to one
+//! bot over `remote_bots.rs`'s `RemoteBots` and waits on its
+//! `subscribe_round` channel for that bot's `Token`/`ReplyComplete`/
+//! `ReplyFailed` frames, translating a timeout or a closed channel into
+//! `RemoteFailure::Timeout`/`Offline`.
 //!
 //! `routing.rs` (#132) is where `round.rs`'s speaker order actually comes
 //! from: `plan_round` turns an `@mention`d user message into a speaker
@@ -48,6 +60,7 @@ pub mod joiner;
 pub mod protocol;
 pub mod remote_bots;
 pub mod remote_generation;
+pub mod remote_generator;
 pub mod remote_transcript;
 pub mod round;
 pub mod routing;
