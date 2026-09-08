@@ -365,7 +365,6 @@ pub fn expand_placeholders(text: &str, registry: &ParticipantRegistry) -> String
 
 /// A recognised `@mention` in a piece of text: the byte range it occupies in
 /// the original string, and the participant it refers to.
-#[allow(dead_code)] // wired up by #127/#132; used internally by find/normalise/render_mentions today
 struct MentionSpan {
     start: usize,
     end: usize,
@@ -410,7 +409,6 @@ fn boundary_ok(after: &str, matched_len: usize) -> bool {
 /// insensitively; then every raw id, case sensitively (ids are lowercase by
 /// construction). The scan resumes immediately after each match, so spans
 /// can never overlap.
-#[allow(dead_code)] // wired up by #127/#132; exercised directly by this module's tests today
 fn scan_mentions(text: &str, registry: &ParticipantRegistry) -> Vec<MentionSpan> {
     let mut display_names: Vec<(&str, &ParticipantId)> = registry
         .iter()
@@ -471,7 +469,6 @@ fn scan_mentions(text: &str, registry: &ParticipantRegistry) -> Vec<MentionSpan>
 
 /// Every participant mentioned in `text`, in order of first appearance,
 /// deduplicated.
-#[allow(dead_code)] // wired up by #127/#132
 pub fn find_mentions(text: &str, registry: &ParticipantRegistry) -> Vec<ParticipantId> {
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
@@ -504,14 +501,14 @@ fn rewrite_mentions(
 }
 
 /// Rewrites every mention in `text` to its storage form, `@id`. Used by
-/// #125's `speaker_id` messages and #132's routing.
-#[allow(dead_code)] // wired up by #132
+/// #125's `speaker_id` messages and #132's `chat_turn.rs`/`main.rs` write
+/// paths.
 pub fn normalise_mentions(text: &str, registry: &ParticipantRegistry) -> String {
     rewrite_mentions(text, registry, |id, _registry| format!("@{}", id))
 }
 
 /// Rewrites every mention in `text` to its prompt form, `@Display Name`.
-#[allow(dead_code)] // wired up by #127
+/// Used by #132's `llm.rs` history rendering.
 pub fn render_mentions(text: &str, registry: &ParticipantRegistry) -> String {
     rewrite_mentions(text, registry, |id, registry| {
         format!("@{}", registry.display_name(id).unwrap_or(id.as_str()))

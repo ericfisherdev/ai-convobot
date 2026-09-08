@@ -11,6 +11,11 @@
 //! ships [`NoRemotes`], which reports every remote speaker offline, so a
 //! round with no joiners behaves exactly as `PendingTurn::complete` did
 //! before this module existed.
+//!
+//! The speaker order itself — who talks, and who an `@mention` in a reply
+//! adds mid-round — is `routing.rs`'s (#132): [`RoundPlan`], [`plan_round`]
+//! and `schedule_follow_ups` are re-exported from there so this module's own
+//! call sites and tests need no separate import.
 
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +23,8 @@ use std::time::Duration;
 
 use crate::chat_turn::{PendingTurn, PersistedReply, TurnStore};
 use crate::database::{CompanionAttitude, Message};
+pub use crate::multiplayer::routing::{plan_round, RoundPlan};
+use crate::multiplayer::routing::{schedule_follow_ups, RoutingPolicy};
 use crate::participants::{ParticipantId, ParticipantRegistry};
 use crate::turn_slot::TurnGuard;
 
@@ -25,27 +32,6 @@ use crate::turn_slot::TurnGuard;
 /// the same page length `GET /api/message` uses for the frontend's first
 /// page.
 const TRANSCRIPT_TAIL_MESSAGES: usize = 50;
-
-/// Who speaks, and in what order, for one round.
-pub struct RoundPlan {
-    pub speakers: Vec<ParticipantId>,
-}
-
-/// Builds a round's speaker order: the host companion, then every connected
-/// joiner, in join order.
-///
-/// A joiner is only ever present in `registry` while its socket is
-/// connected (`host.rs` inserts it on join and removes it on disconnect),
-/// so `registry.iter_bots()` already is the connected set — there is no
-/// separate "is this bot online" check to make here.
-///
-/// `user_message` is accepted but ignored today; #132 adds @mention-based
-/// speaker filtering here without changing any call site.
-pub fn plan_round(_user_message: &str, registry: &ParticipantRegistry) -> RoundPlan {
-    RoundPlan {
-        speakers: registry.iter_bots().map(|p| p.id.clone()).collect(),
-    }
-}
 
 /// The seam between the round orchestrator and a remote joiner's socket
 /// connection. The production implementation, over the host WebSocket via
@@ -189,8 +175,10 @@ fn next_round_id() -> u64 {
 pub fn run_round(
     turn_guard: TurnGuard,
     pending: PendingTurn,
-    plan: RoundPlan,
+    mut plan: RoundPlan,
     store: &impl TurnStore,
+    registry: &ParticipantRegistry,
+    policy: &RoutingPolicy,
     host: &mut dyn FnMut(&str, &mut dyn FnMut(&str)) -> io::Result<String>,
     remotes: &dyn RemoteGenerator,
     timeout: Duration,
@@ -202,7 +190,8 @@ pub fn run_round(
     let mut host_reply: Option<PersistedReply> = None;
     let mut replies: Vec<PersistedReply> = Vec::new();
 
-    for speaker in &plan.speakers {
+    while let Some(next) = plan.next_speaker() {
+        let speaker = &next.id;
         sink.reply_started(speaker);
 
         if *speaker == ParticipantId::CHAR {
@@ -213,6 +202,14 @@ pub fn run_round(
                 host(generation_prompt, &mut |token| sink.token(speaker, token))
             })?;
             sink.reply_complete(&persisted);
+            for followup in schedule_follow_ups(&mut plan, &persisted.text, &next, registry, policy)
+            {
+                println!(
+                    "Follow-up scheduled: {} (depth {})",
+                    followup,
+                    next.depth + 1
+                );
+            }
             host_reply = Some(persisted.clone());
             replies.push(persisted);
             continue;
@@ -238,6 +235,15 @@ pub fn run_round(
         match attempt {
             Ok(persisted) => {
                 sink.reply_complete(&persisted);
+                for followup in
+                    schedule_follow_ups(&mut plan, &persisted.text, &next, registry, policy)
+                {
+                    println!(
+                        "Follow-up scheduled: {} (depth {})",
+                        followup,
+                        next.depth + 1
+                    );
+                }
                 replies.push(persisted);
             }
             Err(_) => {
@@ -367,16 +373,33 @@ mod tests {
         }
     }
 
-    #[test]
-    fn plan_round_orders_char_then_connected_joiners_by_join_order() {
+    /// `user`/`char` plus `bot1`/`bot2`, for tests that need a registry
+    /// `run_round`'s `schedule_follow_ups` call can look bots up in.
+    fn registry_with_bots() -> ParticipantRegistry {
         let mut registry = ParticipantRegistry::solo("Alice", "Bob", None);
         insert_bot(&mut registry, "bot1", "Ada");
         insert_bot(&mut registry, "bot2", "Grace");
+        registry
+    }
 
-        let plan = plan_round("hi", &registry);
+    /// A policy that never schedules a follow-up. What every `run_round`
+    /// test below uses: none of them are testing `routing.rs`'s own
+    /// follow-up behaviour (that is `routing.rs`'s tests), so a plan that
+    /// never grows keeps these tests' assertions exactly as fixed lists.
+    fn no_followups() -> RoutingPolicy {
+        RoutingPolicy {
+            max_followup_depth: 0,
+        }
+    }
+
+    #[test]
+    fn plan_round_orders_char_then_connected_joiners_by_join_order() {
+        let registry = registry_with_bots();
+
+        let plan = plan_round("hi", &registry, &no_followups());
 
         assert_eq!(
-            plan.speakers,
+            plan.pending_ids(),
             vec![ParticipantId::CHAR, bot("bot1"), bot("bot2")]
         );
     }
@@ -387,9 +410,9 @@ mod tests {
         // absent from the registry: `host.rs` removes it on disconnect.
         let registry = ParticipantRegistry::solo("Alice", "Bob", None);
 
-        let plan = plan_round("hi", &registry);
+        let plan = plan_round("hi", &registry, &no_followups());
 
-        assert_eq!(plan.speakers, vec![ParticipantId::CHAR]);
+        assert_eq!(plan.pending_ids(), vec![ParticipantId::CHAR]);
     }
 
     #[test]
@@ -397,12 +420,12 @@ mod tests {
         static SLOT: TurnSlot = TurnSlot::new();
         let guard = SLOT.try_claim().expect("slot should be free");
         let store = RecordingStore::new(None);
-        let pending = PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string())
-            .expect("insert should succeed");
+        let registry = registry_with_bots();
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), registry.clone())
+                .expect("insert should succeed");
 
-        let plan = RoundPlan {
-            speakers: vec![ParticipantId::CHAR, bot("bot1"), bot("bot2")],
-        };
+        let plan = RoundPlan::from_speakers([ParticipantId::CHAR, bot("bot1"), bot("bot2")]);
         let remotes = FakeRemote::new(vec![
             (bot("bot1"), Ok("hi from bot1")),
             (bot("bot2"), Ok("hi from bot2")),
@@ -414,6 +437,8 @@ mod tests {
             pending,
             plan,
             &store,
+            &registry,
+            &no_followups(),
             &mut |_prompt, _on_token| Ok("hi from char".to_string()),
             &remotes,
             Duration::from_secs(30),
@@ -464,12 +489,12 @@ mod tests {
         static SLOT: TurnSlot = TurnSlot::new();
         let guard = SLOT.try_claim().expect("slot should be free");
         let store = RecordingStore::new(None);
-        let pending = PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string())
-            .expect("insert should succeed");
+        let registry = registry_with_bots();
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), registry.clone())
+                .expect("insert should succeed");
 
-        let plan = RoundPlan {
-            speakers: vec![ParticipantId::CHAR, bot("bot1"), bot("bot2")],
-        };
+        let plan = RoundPlan::from_speakers([ParticipantId::CHAR, bot("bot1"), bot("bot2")]);
         let remotes = FakeRemote::new(vec![
             (bot("bot1"), Err(RemoteFailure::Timeout)),
             (bot("bot2"), Ok("hi from bot2")),
@@ -481,6 +506,8 @@ mod tests {
             pending,
             plan,
             &store,
+            &registry,
+            &no_followups(),
             &mut |_prompt, _on_token| Ok("hi from char".to_string()),
             &remotes,
             Duration::from_secs(30),
@@ -518,12 +545,12 @@ mod tests {
         static SLOT: TurnSlot = TurnSlot::new();
         let guard = SLOT.try_claim().expect("slot should be free");
         let store = RecordingStore::new(None);
-        let pending = PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string())
-            .expect("insert should succeed");
+        let registry = registry_with_bots();
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), registry.clone())
+                .expect("insert should succeed");
 
-        let plan = RoundPlan {
-            speakers: vec![ParticipantId::CHAR, bot("bot1")],
-        };
+        let plan = RoundPlan::from_speakers([ParticipantId::CHAR, bot("bot1")]);
         let remotes = FakeRemote::new(vec![]);
         let mut sink = RecordingSink::default();
 
@@ -532,6 +559,8 @@ mod tests {
             pending,
             plan,
             &store,
+            &registry,
+            &no_followups(),
             &mut |_prompt, _on_token| Err(std::io::Error::other("no model")),
             &remotes,
             Duration::from_secs(30),
@@ -550,8 +579,10 @@ mod tests {
         static SLOT: TurnSlot = TurnSlot::new();
         let guard = SLOT.try_claim().expect("slot should be free");
         let store = RecordingStore::new(None);
-        let pending = PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string())
-            .expect("insert should succeed");
+        let registry = registry_with_bots();
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), registry.clone())
+                .expect("insert should succeed");
 
         struct SlotCheckSink {
             claimable_during_round_complete: Option<bool>,
@@ -572,14 +603,14 @@ mod tests {
             claimable_during_round_complete: None,
         };
 
-        let plan = RoundPlan {
-            speakers: vec![ParticipantId::CHAR],
-        };
+        let plan = RoundPlan::from_speakers([ParticipantId::CHAR]);
         run_round(
             guard,
             pending,
             plan,
             &store,
+            &registry,
+            &no_followups(),
             &mut |_prompt, _on_token| Ok("hi".to_string()),
             &NoRemotes,
             Duration::from_secs(30),
@@ -603,10 +634,12 @@ mod tests {
         static SLOT: TurnSlot = TurnSlot::new();
         let guard = SLOT.try_claim().expect("slot should be free");
         let store = RecordingStore::new(None);
-        let pending = PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string())
-            .expect("insert should succeed");
+        let registry = ParticipantRegistry::solo("Alice", "Bob", None);
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), registry.clone())
+                .expect("insert should succeed");
 
-        let plan = plan_round("hello", &ParticipantRegistry::solo("Alice", "Bob", None));
+        let plan = plan_round("hello", &registry, &no_followups());
         let remotes = FakeRemote::new(vec![]);
         let mut sink = RecordingSink::default();
 
@@ -615,6 +648,8 @@ mod tests {
             pending,
             plan,
             &store,
+            &registry,
+            &no_followups(),
             &mut |_prompt, _on_token| Ok("hi".to_string()),
             &remotes,
             Duration::from_secs(30),
@@ -625,5 +660,120 @@ mod tests {
         assert_eq!(store.inserted.lock().unwrap().len(), 1);
         assert_eq!(store.replies.lock().unwrap().len(), 1);
         assert_eq!(store.finished.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_host_reply_mentioning_a_bot_persists_exactly_one_extra_reply() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = RecordingStore::new(None);
+        let registry = registry_with_bots();
+        let pending = PendingTurn::begin(
+            &guard,
+            &store,
+            1,
+            1,
+            "@char hi".to_string(),
+            registry.clone(),
+        )
+        .expect("insert should succeed");
+
+        let plan = plan_round(
+            "@char hi",
+            &registry,
+            &RoutingPolicy {
+                max_followup_depth: 1,
+            },
+        );
+        let remotes = FakeRemote::new(vec![(bot("bot1"), Ok("sure"))]);
+        let mut sink = RecordingSink::default();
+
+        let outcome = run_round(
+            guard,
+            pending,
+            plan,
+            &store,
+            &registry,
+            &RoutingPolicy {
+                max_followup_depth: 1,
+            },
+            &mut |_prompt, _on_token| Ok("hi @bot1 do you agree?".to_string()),
+            &remotes,
+            Duration::from_secs(30),
+            &mut sink,
+        )
+        .expect("round should succeed");
+
+        assert_eq!(
+            outcome
+                .replies
+                .iter()
+                .map(|r| r.speaker_id.clone())
+                .collect::<Vec<_>>(),
+            vec![ParticipantId::CHAR, bot("bot1")],
+            "bot1's mention in char's reply should schedule exactly one follow-up"
+        );
+        assert_eq!(
+            outcome.host_reply.as_ref().map(|r| r.text.as_str()),
+            Some("hi @bot1 do you agree?")
+        );
+    }
+
+    #[test]
+    fn a_user_mention_of_one_bot_runs_only_it_and_finish_returns_none() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = RecordingStore::new(None);
+        let registry = registry_with_bots();
+        let pending = PendingTurn::begin(
+            &guard,
+            &store,
+            1,
+            1,
+            "@bot1 hi".to_string(),
+            registry.clone(),
+        )
+        .expect("insert should succeed");
+
+        let plan = plan_round("@bot1 hi", &registry, &no_followups());
+        let remotes = FakeRemote::new(vec![(bot("bot1"), Ok("hello"))]);
+        let mut sink = RecordingSink::default();
+
+        let outcome = run_round(
+            guard,
+            pending,
+            plan,
+            &store,
+            &registry,
+            &no_followups(),
+            &mut |_prompt, _on_token| panic!("char should never be asked to speak"),
+            &remotes,
+            Duration::from_secs(30),
+            &mut sink,
+        )
+        .expect("round should succeed");
+
+        assert!(outcome.host_reply.is_none());
+        assert_eq!(
+            outcome
+                .replies
+                .iter()
+                .map(|r| r.speaker_id.clone())
+                .collect::<Vec<_>>(),
+            vec![bot("bot1")]
+        );
+        assert!(
+            store
+                .replies
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(id, _)| *id != ParticipantId::CHAR),
+            "char never spoke, so insert_reply(char) must never have been called"
+        );
+        assert!(
+            store.finished.lock().unwrap().is_empty(),
+            "finish should return None (and never call finish_turn) when char did not speak"
+        );
     }
 }

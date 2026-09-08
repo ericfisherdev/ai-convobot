@@ -17,10 +17,16 @@
 //! `backoff.rs`'s `ReconnectBackoff` when the connection drops.
 //!
 //! `round.rs` (#131) is the round orchestrator: `run_round` turns one user
-//! message into the host companion's reply followed by each connected
-//! joiner's, in join order, all under one held turn slot. Its
-//! `RemoteGenerator` trait is the seam a joiner's reply is generated
+//! message into a sequence of speaker replies, all under one held turn slot.
+//! Its `RemoteGenerator` trait is the seam a joiner's reply is generated
 //! through; #154 implements it over `remote_bots.rs`.
+//!
+//! `routing.rs` (#132) is where `round.rs`'s speaker order actually comes
+//! from: `plan_round` turns an `@mention`d user message into a speaker
+//! order (falling back to `round.rs`'s old "host then every joiner" order
+//! when nothing is mentioned), and `schedule_follow_ups` lets a bot's own
+//! `@mention` of another bot queue it a follow-up turn, bounded by
+//! `RoutingPolicy::max_followup_depth` so a chain can never run forever.
 
 pub mod avatar;
 pub mod backoff;
@@ -33,3 +39,4 @@ pub mod protocol;
 pub mod remote_bots;
 pub mod remote_transcript;
 pub mod round;
+pub mod routing;

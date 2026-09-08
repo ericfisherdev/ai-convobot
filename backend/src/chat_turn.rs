@@ -21,7 +21,7 @@
 
 use crate::attitude_engine::{LexiconScorer, ScorerConfig, TurnScorer};
 use crate::database::{CompanionAttitude, Database, Message, NewMessage};
-use crate::participants::ParticipantId;
+use crate::participants::{normalise_mentions, ParticipantId, ParticipantRegistry};
 use crate::turn_slot::TurnGuard;
 
 /// The persistence seam between [`PendingTurn`] and the database, so the
@@ -291,12 +291,18 @@ fn finish_turn(
 pub struct PendingTurn {
     companion_id: i32,
     user_id: i32,
-    /// What the user actually said. The attitude engine scores the turn
-    /// against this, never against `generation_prompt`.
+    /// What the user actually said, already normalised to `@id` mention
+    /// form. The attitude engine scores the turn against this, never
+    /// against `generation_prompt`.
     user_message: String,
     /// The prompt to generate from: the interaction-context prompt when one
     /// matched during `begin`, otherwise `user_message` itself.
     generation_prompt: String,
+    /// The chat's participant snapshot `begin` was called with, kept so
+    /// [`PendingTurn::reply`] can normalise every speaker's `@mention`s to
+    /// `@id` form before it persists them, regardless of which model
+    /// produced the text.
+    registry: ParticipantRegistry,
 }
 
 /// One speaker's reply, once generated and persisted: the new message's id,
@@ -312,6 +318,11 @@ pub struct PersistedReply {
 impl PendingTurn {
     /// Persists the user's turn and prepares the prompt to generate from.
     ///
+    /// `user_message` is normalised to `@id` mention form (`registry`,
+    /// #126/#132) before `preprocess` and the insert, so the stored row, the
+    /// attitude scorer input and `generation_prompt` all carry `@id` rather
+    /// than whatever display-name form the client sent.
+    ///
     /// `_claimed` is compile-time proof that the turn slot was claimed
     /// before this call (the #95 invariant: the insert must never happen
     /// outside a claimed turn slot); the guard itself is not stored. Errors
@@ -323,7 +334,9 @@ impl PendingTurn {
         companion_id: i32,
         user_id: i32,
         user_message: String,
+        registry: ParticipantRegistry,
     ) -> rusqlite::Result<PendingTurn> {
+        let user_message = normalise_mentions(&user_message, &registry);
         let interaction_prompt = store.preprocess(&user_message, companion_id);
         store.insert_user_turn(&user_message)?;
         let generation_prompt = interaction_prompt.unwrap_or_else(|| user_message.clone());
@@ -332,10 +345,16 @@ impl PendingTurn {
             user_id,
             user_message,
             generation_prompt,
+            registry,
         })
     }
 
     /// Generates one speaker's reply and persists it.
+    ///
+    /// The generated text is normalised to `@id` mention form (`self.registry`)
+    /// before it is persisted, so a model's `@Ada` is stored as `@bot2`
+    /// regardless of which speaker produced it — this is the single choke
+    /// point both the host bot's reply and every remote reply pass through.
     ///
     /// Takes `&self` rather than consuming it, so a round
     /// (`multiplayer::round::run_round`) can call this once per speaker
@@ -350,6 +369,7 @@ impl PendingTurn {
         generate: impl FnOnce(&str) -> std::io::Result<String>,
     ) -> std::io::Result<PersistedReply> {
         let text = generate(&self.generation_prompt)?;
+        let text = normalise_mentions(&text, &self.registry);
         let message_id = store
             .insert_reply(&speaker_id, &text)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -470,14 +490,21 @@ mod tests {
     use super::*;
     use crate::turn_slot::TurnSlot;
 
+    /// `user` ("TestUser") and `char` ("TestCompanion") only, as the
+    /// Implementation Plan for #132's normalisation tests specifies.
+    fn solo_registry() -> ParticipantRegistry {
+        ParticipantRegistry::solo("TestUser", "TestCompanion", None)
+    }
+
     #[test]
     fn begin_inserts_the_user_turn_exactly_once_and_generates_from_the_interaction_prompt() {
         static SLOT: TurnSlot = TurnSlot::new();
         let guard = SLOT.try_claim().expect("slot should be free");
         let store = RecordingStore::new(Some("augmented prompt".to_string()));
 
-        let pending = PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string())
-            .expect("insert should succeed");
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), solo_registry())
+                .expect("insert should succeed");
 
         assert_eq!(*store.inserted.lock().unwrap(), vec!["hello".to_string()]);
 
@@ -493,13 +520,59 @@ mod tests {
     }
 
     #[test]
+    fn begin_normalises_a_display_name_mention_to_its_id_before_inserting() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = RecordingStore::new(None);
+
+        PendingTurn::begin(
+            &guard,
+            &store,
+            1,
+            1,
+            "hey @TestCompanion".to_string(),
+            solo_registry(),
+        )
+        .expect("insert should succeed");
+
+        assert_eq!(
+            *store.inserted.lock().unwrap(),
+            vec!["hey @char".to_string()]
+        );
+    }
+
+    #[test]
+    fn reply_normalises_a_display_name_mention_to_its_id_before_inserting() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = RecordingStore::new(None);
+
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), solo_registry())
+                .expect("insert should succeed");
+
+        let persisted = pending
+            .reply(&store, ParticipantId::CHAR, |_prompt| {
+                Ok("hi @TestCompanion".to_string())
+            })
+            .expect("generation should succeed");
+
+        assert_eq!(persisted.text, "hi @char");
+        assert_eq!(
+            *store.replies.lock().unwrap(),
+            vec![(ParticipantId::CHAR, "hi @char".to_string())]
+        );
+    }
+
+    #[test]
     fn failed_generation_leaves_one_user_turn_and_inserts_no_reply() {
         static SLOT: TurnSlot = TurnSlot::new();
         let guard = SLOT.try_claim().expect("slot should be free");
         let store = RecordingStore::new(None);
 
-        let pending = PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string())
-            .expect("insert should succeed");
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), solo_registry())
+                .expect("insert should succeed");
 
         let result = pending.reply(&store, ParticipantId::CHAR, |_prompt| {
             Err(std::io::Error::other("no model"))
@@ -516,8 +589,9 @@ mod tests {
         let guard = SLOT.try_claim().expect("slot should be free");
         let store = RecordingStore::new(Some("augmented prompt".to_string()));
 
-        let pending = PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string())
-            .expect("insert should succeed");
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), solo_registry())
+                .expect("insert should succeed");
 
         let persisted = pending
             .reply(&store, ParticipantId::CHAR, |_prompt| {

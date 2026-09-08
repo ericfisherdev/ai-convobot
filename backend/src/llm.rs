@@ -16,7 +16,8 @@ use crate::long_term_mem::LongTermMem;
 use crate::model_cache::{ModelKey, ResidentCache};
 use crate::model_metadata::{self, ModelFacts};
 use crate::participants::{
-    expand_placeholders, placeholder, Participant, ParticipantId, ParticipantRegistry,
+    expand_placeholders, placeholder, render_mentions, Participant, ParticipantId,
+    ParticipantRegistry,
 };
 
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -496,7 +497,9 @@ fn render_history(
             .as_ref()
             .and_then(|id| speakers.registry.display_name(id))
             .unwrap_or(message.speaker_id.as_str());
-        let text = &message.content;
+        // Stored messages carry `@id` mentions (#126/#132); the model should
+        // only ever see the display-name form.
+        let text = render_mentions(&message.content, &speakers.registry);
         let mut formatted_message = format!("{}: {}\n", display_name, text);
         let inject_time = message_counter == len && contains_time_question(&formatted_message);
         if inject_time {
@@ -1551,6 +1554,16 @@ mod tests {
                 (true, "hey".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn render_history_renders_a_stored_id_mention_as_a_display_name() {
+        // Stored messages carry `@id` (#126/#132's normalisation); the model
+        // must only ever see the `@Display Name` form.
+        let speakers = three_speaker_speakers(ParticipantId::CHAR);
+        let managed = vec![message("user", "hey @bot1, what do you think?")];
+        let rendered = render_history(&managed, &speakers, &PromptTemplate::Default);
+        assert_eq!(rendered.spliced, "Alice: hey @Bob, what do you think?\n");
     }
 
     #[test]

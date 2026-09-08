@@ -72,7 +72,8 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 - **Request Body:**
   - `speaker_id` (string, preferred): Who sent the message (e.g. `"user"` or `"char"`).
   - `ai` (boolean, legacy): Indicates whether the message is from the AI (true) or user (false). Still accepted; `true` resolves to `speaker_id: "char"` and `false` to `speaker_id: "user"`.
-  - `content` (string): The content of the message.
+  - `content` (string): The content of the message. Any `@Display Name` mention of a chat
+    participant is stored as `@id` (e.g. `@bot1`), never in display-name form.
   - Either `speaker_id` or `ai` must be given. If both are given they must agree, or the request is rejected.
 - **Response:**
   - Status: 200 OK
@@ -137,7 +138,8 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 - **Path Parameters:**
   - `id` (integer): The ID of the message to edit
 - **Request Body:**
-  - `content` (string): The new content of the message.
+  - `content` (string): The new content of the message. As with `POST /api/message`, any
+    `@Display Name` mention is stored as `@id`.
 - **Response:**
   - Status: 200 OK
   - Body: Message edited at id {id}
