@@ -546,6 +546,12 @@ async fn run_connection(
         nonce: handshake::encode(&nonce),
     };
     if send_frame(&mut session, &challenge).await.is_err() {
+        // Never got as far as reading a proof, so this was not a password
+        // guess — release the reservation `multiplayer_ws` made rather
+        // than leave it counted for the rest of the window.
+        if let Some(ip) = peer_ip {
+            throttle.release(ip, Instant::now());
+        }
         return;
     }
 
