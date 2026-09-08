@@ -4506,6 +4506,12 @@ impl Database {
 
         for party in &third_parties {
             let name_lower = party.name.to_lowercase();
+            if excluded_names
+                .iter()
+                .any(|excl| excl.to_lowercase() == name_lower)
+            {
+                continue;
+            }
 
             // Check if this person is mentioned in the message
             if message_lower.contains(&name_lower) {
@@ -4538,8 +4544,10 @@ impl Database {
 
         // Also check for new person names that might not be in the database yet
         // This is a simplified detection - in practice you might want more sophisticated NER
+        // `extract_potential_names` requires an uppercase first letter, so it
+        // must see the original casing, not `message_lower`.
         let potential_names = Database::drop_excluded_names(
-            Database::extract_potential_names(&message_lower),
+            Database::extract_potential_names(message),
             excluded_names,
         );
         for potential_name in potential_names {
@@ -4604,7 +4612,12 @@ impl Database {
     fn drop_excluded_names(names: Vec<String>, excluded: &[String]) -> Vec<String> {
         names
             .into_iter()
-            .filter(|name| !excluded.iter().any(|excl| excl.eq_ignore_ascii_case(name)))
+            .filter(|name| {
+                let name_lower = name.to_lowercase();
+                !excluded
+                    .iter()
+                    .any(|excl| excl.to_lowercase() == name_lower)
+            })
             .collect()
     }
 }
@@ -4984,6 +4997,16 @@ mod tests {
     fn drop_excluded_names_is_case_insensitive_and_keeps_unmatched_names() {
         let names = vec!["Bob".to_string(), "bob".to_string(), "Carol".to_string()];
         let excluded = vec!["Bob".to_string()];
+        assert_eq!(
+            Database::drop_excluded_names(names, &excluded),
+            vec!["Carol".to_string()]
+        );
+    }
+
+    #[test]
+    fn drop_excluded_names_folds_case_beyond_ascii() {
+        let names = vec!["zoë".to_string(), "Carol".to_string()];
+        let excluded = vec!["Zoë".to_string()];
         assert_eq!(
             Database::drop_excluded_names(names, &excluded),
             vec!["Carol".to_string()]
