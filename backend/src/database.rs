@@ -473,6 +473,19 @@ pub struct ConfigView {
     /// #130 reads it too, for the joiner's own HMAC proof.
     #[serde(skip)]
     pub multiplayer_password: String,
+    /// Token budget a companion's recent-message window must exceed before
+    /// compaction (#172) triggers a draft. `None` means "derive at runtime
+    /// from `TokenBudget::recent_messages`" rather than a fixed number.
+    pub compact_threshold_tokens: Option<usize>,
+    /// Fewest uncompacted messages compaction (#172) will ever fire on,
+    /// regardless of token count.
+    pub compact_min_messages: usize,
+    /// Model used for compaction's summarisation/extraction passes. `None`
+    /// means "use `llm_model_path`".
+    pub compaction_model_path: Option<String>,
+    /// Whether #173's extraction pass should also run the heuristic
+    /// person-detection path already used elsewhere in the codebase.
+    pub heuristic_person_detection: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -506,6 +519,14 @@ pub struct ConfigModify {
     /// unchanged, so the frontend never has to resend it on every save.
     #[serde(default)]
     pub multiplayer_password: Option<String>,
+    #[serde(default)]
+    pub compact_threshold_tokens: Option<usize>,
+    #[serde(default = "default_compact_min_messages")]
+    pub compact_min_messages: usize,
+    #[serde(default)]
+    pub compaction_model_path: Option<String>,
+    #[serde(default = "default_heuristic_person_detection")]
+    pub heuristic_person_detection: bool,
 }
 
 fn default_multiplayer_mode() -> String {
@@ -518,6 +539,14 @@ fn default_mention_followup_depth() -> u8 {
 
 fn default_remote_generation_timeout_secs() -> u64 {
     120
+}
+
+fn default_compact_min_messages() -> usize {
+    8
+}
+
+fn default_heuristic_person_detection() -> bool {
+    true
 }
 
 /// The one way `Database::write_config` (#128) can reject a `PUT
@@ -880,7 +909,7 @@ impl Database {
         Self::open_at(crate::paths::db_path())
     }
 
-    fn open_at(path: impl AsRef<Path>) -> Result<Connection> {
+    pub(crate) fn open_at(path: impl AsRef<Path>) -> Result<Connection> {
         let con = Connection::open(path)?;
         con.busy_timeout(Duration::from_secs(5))?;
         con.pragma_update(None, "journal_mode", "WAL")?;
@@ -899,7 +928,7 @@ impl Database {
 /// The `messages` DDL, shared by `init` and the test fixtures so the column
 /// list only exists once. `speaker_id` defaults to `''`: `migrate_messages_speaker_id`
 /// backfills it from `ai` on databases created before this column existed.
-fn messages_ddl() -> &'static str {
+pub(crate) fn messages_ddl() -> &'static str {
     "CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ai BOOLEAN,
@@ -982,10 +1011,12 @@ impl Database {
                 short_term_mem INTEGER,
                 roleplay BOOLEAN,
                 dialogue_tuning BOOLEAN,
-                avatar_path TEXT
+                avatar_path TEXT,
+                compacted_through INTEGER
             )",
             [],
         )?;
+        Database::migrate_companion_compacted_through(&con)?;
         con.execute(
             "CREATE TABLE IF NOT EXISTS user (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1018,7 +1049,11 @@ impl Database {
                 multiplayer_host_address TEXT DEFAULT '',
                 multiplayer_participant_id TEXT DEFAULT '',
                 mention_followup_depth INTEGER DEFAULT 1,
-                remote_generation_timeout_secs INTEGER DEFAULT 120
+                remote_generation_timeout_secs INTEGER DEFAULT 120,
+                compact_threshold_tokens INTEGER,
+                compact_min_messages INTEGER DEFAULT 8,
+                compaction_model_path TEXT,
+                heuristic_person_detection BOOLEAN DEFAULT true
             )",
             [],
         )?;
@@ -1238,6 +1273,10 @@ impl Database {
 
         // Migrate config table to add new context window fields if they don't exist
         Database::migrate_config_table(&con)?;
+
+        // Compaction tables (#171): facts reference `companion` and
+        // `messages`, both already created above.
+        crate::compaction::store::create_tables(&con)?;
 
         // Migrate companion_attitudes table to add new attitude dimensions if they don't exist
         Database::migrate_companion_attitudes_table(&con)?;
@@ -1628,10 +1667,11 @@ impl Database {
     /// path (matches how `migrate_config_table` already takes a
     /// connection).
     fn read_config(con: &Connection) -> Result<ConfigView> {
-        let mut stmt = con.prepare("SELECT device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb, dynamic_gpu_allocation, gpu_safety_margin, min_free_vram_mb, enable_hybrid_context, max_system_ram_usage_gb, context_expansion_strategy, ram_safety_margin_gb, multiplayer_mode, multiplayer_password, multiplayer_host_address, multiplayer_participant_id, mention_followup_depth, remote_generation_timeout_secs FROM config LIMIT 1")?;
+        let mut stmt = con.prepare("SELECT device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb, dynamic_gpu_allocation, gpu_safety_margin, min_free_vram_mb, enable_hybrid_context, max_system_ram_usage_gb, context_expansion_strategy, ram_safety_margin_gb, multiplayer_mode, multiplayer_password, multiplayer_host_address, multiplayer_participant_id, mention_followup_depth, remote_generation_timeout_secs, compact_threshold_tokens, compact_min_messages, compaction_model_path, heuristic_person_detection FROM config LIMIT 1")?;
         let row = stmt.query_row([], |row| {
             let multiplayer_password: String =
                 row.get::<_, Option<String>>(16)?.unwrap_or_default();
+            let compaction_model_path: Option<String> = row.get::<_, Option<String>>(23)?;
             Ok(ConfigView {
                 device: row.get(0)?,
                 llm_model_path: row.get(1)?,
@@ -1659,6 +1699,11 @@ impl Database {
                 multiplayer_participant_id: row.get::<_, Option<String>>(18)?.unwrap_or_default(),
                 mention_followup_depth: row.get::<_, Option<u8>>(19)?.unwrap_or(1),
                 remote_generation_timeout_secs: row.get::<_, Option<u64>>(20)?.unwrap_or(120),
+                compact_threshold_tokens: row.get::<_, Option<usize>>(21)?,
+                compact_min_messages: row.get::<_, Option<usize>>(22)?.unwrap_or(8),
+                // Empty string and NULL both read as "use llm_model_path".
+                compaction_model_path: compaction_model_path.filter(|s| !s.is_empty()),
+                heuristic_person_detection: row.get::<_, Option<bool>>(24)?.unwrap_or(true),
             })
         })?;
         Ok(row)
@@ -1731,9 +1776,22 @@ impl Database {
             ));
         }
 
+        if config.compact_min_messages < 2 {
+            return Err(ConfigChangeError::Invalid(
+                "compact_min_messages must be at least 2".to_string(),
+            ));
+        }
+        if let Some(threshold) = config.compact_threshold_tokens {
+            if threshold < 256 {
+                return Err(ConfigChangeError::Invalid(
+                    "compact_threshold_tokens must be at least 256".to_string(),
+                ));
+            }
+        }
+
         let tx = con.unchecked_transaction()?;
         tx.execute(
-            "UPDATE config SET device = ?, llm_model_path = ?, gpu_layers = ?, prompt_template = ?, context_window_size = ?, max_response_tokens = ?, enable_dynamic_context = ?, vram_limit_gb = ?, dynamic_gpu_allocation = ?, gpu_safety_margin = ?, min_free_vram_mb = ?, enable_hybrid_context = ?, max_system_ram_usage_gb = ?, context_expansion_strategy = ?, ram_safety_margin_gb = ?, multiplayer_mode = ?, multiplayer_host_address = ?, multiplayer_participant_id = ?, mention_followup_depth = ?, remote_generation_timeout_secs = ?",
+            "UPDATE config SET device = ?, llm_model_path = ?, gpu_layers = ?, prompt_template = ?, context_window_size = ?, max_response_tokens = ?, enable_dynamic_context = ?, vram_limit_gb = ?, dynamic_gpu_allocation = ?, gpu_safety_margin = ?, min_free_vram_mb = ?, enable_hybrid_context = ?, max_system_ram_usage_gb = ?, context_expansion_strategy = ?, ram_safety_margin_gb = ?, multiplayer_mode = ?, multiplayer_host_address = ?, multiplayer_participant_id = ?, mention_followup_depth = ?, remote_generation_timeout_secs = ?, compact_threshold_tokens = ?, compact_min_messages = ?, compaction_model_path = ?, heuristic_person_detection = ?",
             params![
                 &device as &dyn ToSql,
                 &config.llm_model_path,
@@ -1755,6 +1813,10 @@ impl Database {
                 &config.multiplayer_participant_id,
                 &config.mention_followup_depth,
                 &config.remote_generation_timeout_secs,
+                &config.compact_threshold_tokens,
+                &config.compact_min_messages,
+                &config.compaction_model_path,
+                &config.heuristic_person_detection,
             ],
         )?;
 
@@ -4557,6 +4619,30 @@ impl Database {
         Ok(())
     }
 
+    /// Adds the `compacted_through` column (#171) to a `companion` table
+    /// that predates conversation compaction. `NULL` is the correct initial
+    /// state ("never compacted"), so unlike `migrate_messages_speaker_id`
+    /// there is no backfill, just the `ALTER TABLE`. Idempotent, via the
+    /// same `PRAGMA table_info` check.
+    pub fn migrate_companion_compacted_through(con: &Connection) -> Result<()> {
+        let mut stmt = con.prepare("PRAGMA table_info(companion)")?;
+        let has_compacted_through = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>>>()?
+            .iter()
+            .any(|name| name == "compacted_through");
+        drop(stmt);
+
+        if !has_compacted_through {
+            con.execute(
+                "ALTER TABLE companion ADD COLUMN compacted_through INTEGER",
+                [],
+            )?;
+        }
+
+        Ok(())
+    }
+
     /// Adds every `config` column introduced after the original four
     /// (`device`, `llm_model_path`, `gpu_layers`, `prompt_template`) to a
     /// database that predates it. Table-driven rather than one `has_*` bool
@@ -4637,6 +4723,22 @@ impl Database {
             (
                 "remote_generation_timeout_secs",
                 "ALTER TABLE config ADD COLUMN remote_generation_timeout_secs INTEGER DEFAULT 120",
+            ),
+            (
+                "compact_threshold_tokens",
+                "ALTER TABLE config ADD COLUMN compact_threshold_tokens INTEGER",
+            ),
+            (
+                "compact_min_messages",
+                "ALTER TABLE config ADD COLUMN compact_min_messages INTEGER DEFAULT 8",
+            ),
+            (
+                "compaction_model_path",
+                "ALTER TABLE config ADD COLUMN compaction_model_path TEXT",
+            ),
+            (
+                "heuristic_person_detection",
+                "ALTER TABLE config ADD COLUMN heuristic_person_detection BOOLEAN DEFAULT true",
             ),
         ];
 
@@ -5992,7 +6094,11 @@ mod tests {
                 multiplayer_host_address TEXT DEFAULT '',
                 multiplayer_participant_id TEXT DEFAULT '',
                 mention_followup_depth INTEGER DEFAULT 1,
-                remote_generation_timeout_secs INTEGER DEFAULT 120
+                remote_generation_timeout_secs INTEGER DEFAULT 120,
+                compact_threshold_tokens INTEGER,
+                compact_min_messages INTEGER DEFAULT 8,
+                compaction_model_path TEXT,
+                heuristic_person_detection BOOLEAN DEFAULT true
             )",
             [],
         )
@@ -6029,6 +6135,10 @@ mod tests {
             mention_followup_depth: 1,
             remote_generation_timeout_secs: 120,
             multiplayer_password: None,
+            compact_threshold_tokens: None,
+            compact_min_messages: 8,
+            compaction_model_path: None,
+            heuristic_person_detection: true,
         }
     }
 
@@ -6068,6 +6178,10 @@ mod tests {
             "multiplayer_participant_id",
             "mention_followup_depth",
             "remote_generation_timeout_secs",
+            "compact_threshold_tokens",
+            "compact_min_messages",
+            "compaction_model_path",
+            "heuristic_person_detection",
         ] {
             assert!(columns.contains(column), "missing column {column}");
         }
@@ -6140,5 +6254,124 @@ mod tests {
 
         let err = Database::write_config(&con, modify).unwrap_err();
         assert!(matches!(err, ConfigChangeError::Invalid(ref msg) if msg.contains("password")));
+    }
+
+    #[test]
+    fn write_config_then_read_config_round_trips_compaction_fields() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_config_table(&con);
+
+        let mut modify = valid_config_modify();
+        modify.compact_threshold_tokens = Some(4096);
+        modify.compact_min_messages = 12;
+        modify.compaction_model_path = Some("/models/compact.gguf".to_string());
+        modify.heuristic_person_detection = false;
+        Database::write_config(&con, modify).unwrap();
+
+        let view = Database::read_config(&con).unwrap();
+        assert_eq!(view.compact_threshold_tokens, Some(4096));
+        assert_eq!(view.compact_min_messages, 12);
+        assert_eq!(
+            view.compaction_model_path,
+            Some("/models/compact.gguf".to_string())
+        );
+        assert!(!view.heuristic_person_detection);
+
+        // None round-trips through NULL back to None, not a stored empty
+        // string or a default.
+        let mut reset = valid_config_modify();
+        reset.compact_threshold_tokens = None;
+        reset.compaction_model_path = None;
+        Database::write_config(&con, reset).unwrap();
+        let view = Database::read_config(&con).unwrap();
+        assert_eq!(view.compact_threshold_tokens, None);
+        assert_eq!(view.compaction_model_path, None);
+    }
+
+    #[test]
+    fn write_config_rejects_compact_min_messages_below_two() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_config_table(&con);
+
+        let mut modify = valid_config_modify();
+        modify.compact_min_messages = 1;
+
+        let err = Database::write_config(&con, modify).unwrap_err();
+        assert!(
+            matches!(err, ConfigChangeError::Invalid(ref msg) if msg.contains("compact_min_messages"))
+        );
+    }
+
+    #[test]
+    fn write_config_rejects_compact_threshold_tokens_below_256() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_config_table(&con);
+
+        let mut modify = valid_config_modify();
+        modify.compact_threshold_tokens = Some(100);
+
+        let err = Database::write_config(&con, modify).unwrap_err();
+        assert!(
+            matches!(err, ConfigChangeError::Invalid(ref msg) if msg.contains("compact_threshold_tokens"))
+        );
+    }
+
+    /// The pre-compaction `companion` DDL (no `compacted_through`), matching
+    /// what `init()` created before #171.
+    fn create_legacy_companion_table(con: &Connection) {
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS companion (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                persona TEXT,
+                example_dialogue TEXT,
+                first_message TEXT,
+                long_term_mem INTEGER,
+                short_term_mem INTEGER,
+                roleplay BOOLEAN,
+                dialogue_tuning BOOLEAN,
+                avatar_path TEXT
+            )",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO companion (name, persona, example_dialogue, first_message, long_term_mem, short_term_mem, roleplay, dialogue_tuning, avatar_path) VALUES ('Assistant', '', '', '', 2, 5, 1, 1, '')",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migrate_companion_compacted_through_is_idempotent_and_keeps_rows() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_legacy_companion_table(&con);
+
+        Database::migrate_companion_compacted_through(&con).unwrap();
+        // Running it again on an already-migrated table must still be Ok.
+        Database::migrate_companion_compacted_through(&con).unwrap();
+
+        let mut stmt = con.prepare("PRAGMA table_info(companion)").unwrap();
+        let columns: HashSet<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_>>()
+            .unwrap();
+        drop(stmt);
+        assert!(columns.contains("compacted_through"));
+
+        let (name, compacted_through): (String, Option<i32>) = con
+            .query_row(
+                "SELECT name, compacted_through FROM companion LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "Assistant");
+        assert_eq!(compacted_through, None);
     }
 }
