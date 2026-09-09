@@ -30,6 +30,10 @@ const baseConfig: ConfigInterface = {
   multiplayer_participant_id: '',
   mention_followup_depth: 1,
   remote_generation_timeout_secs: 120,
+  compact_threshold_tokens: null,
+  compact_min_messages: 8,
+  compaction_model_path: null,
+  heuristic_person_detection: true,
 }
 
 describe('MultiplayerSettings', () => {

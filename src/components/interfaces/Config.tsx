@@ -38,6 +38,12 @@ export interface ConfigInterface {
     remote_generation_timeout_secs: number;
     /** Write-only: only ever populated by the form and sent on PUT. */
     multiplayer_password?: string;
+    /** `null` means "derive at runtime from the recent-message budget". */
+    compact_threshold_tokens: number | null;
+    compact_min_messages: number;
+    /** `null` means "use llm_model_path". */
+    compaction_model_path: string | null;
+    heuristic_person_detection: boolean;
 }
 
 export interface ModelInfo {

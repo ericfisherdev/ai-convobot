@@ -357,7 +357,11 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
     "multiplayer_host_address": "",
     "multiplayer_participant_id": "",
     "mention_followup_depth": 1,
-    "remote_generation_timeout_secs": 120
+    "remote_generation_timeout_secs": 120,
+    "compact_threshold_tokens": null,
+    "compact_min_messages": 8,
+    "compaction_model_path": null,
+    "heuristic_person_detection": true
   }
   ```
   Note: `multiplayer_password` is never returned; `multiplayer_password_set` reports whether a host password is currently stored.
@@ -378,6 +382,10 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   - `mention_followup_depth` (integer, 0-10): How many rounds of `@mention` follow-ups a reply can trigger.
   - `remote_generation_timeout_secs` (integer, 5-3600): How long to wait for a joiner bot's remote reply.
   - `multiplayer_password` (string, optional, write-only): The shared host/joiner password. Omitted or empty leaves the currently stored password unchanged; it is never echoed back by `GET /config`.
+  - `compact_threshold_tokens` (integer, optional, >= 256): Token budget a companion's recent-message window must exceed before conversation compaction drafts a checkpoint. `null` (the default) derives the threshold at runtime instead of using a fixed number.
+  - `compact_min_messages` (integer, >= 2, default 8): Fewest uncompacted messages compaction will ever fire on, regardless of token count.
+  - `compaction_model_path` (string, optional): Model used for compaction's summarisation/extraction passes. `null` (the default) uses `llm_model_path`.
+  - `heuristic_person_detection` (boolean, default true): Whether compaction's extraction pass also runs the existing heuristic person-detection path.
 - **Response:**
   - Status: 200 OK
   - Body: Config updated!
@@ -397,7 +405,11 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
     "multiplayer_host_address": "",
     "multiplayer_participant_id": "",
     "mention_followup_depth": 1,
-    "remote_generation_timeout_secs": 120
+    "remote_generation_timeout_secs": 120,
+    "compact_threshold_tokens": null,
+    "compact_min_messages": 8,
+    "compaction_model_path": null,
+    "heuristic_person_detection": true
   }
   ```
 

@@ -40,6 +40,7 @@ mod turn_slot;
 use crate::turn_slot::{TurnGuard, ACTIVE_TURN};
 mod chat_turn;
 use crate::chat_turn::{PendingTurn, PersistedReply, SqliteTurnStore, TurnStore};
+mod compaction;
 mod multiplayer;
 mod participants;
 mod paths;
