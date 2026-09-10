@@ -479,7 +479,7 @@ pub struct SqliteTranscript;
 
 impl TranscriptSource for SqliteTranscript {
     fn recent_messages(&self, after: Option<i32>, limit: usize) -> std::io::Result<Vec<Message>> {
-        Database::get_messages_after(after, limit).map_err(|e| {
+        Database::get_x_messages_after(after, limit).map_err(|e| {
             eprintln!("Error while getting short term memory entries: {}", e);
             std::io::Error::other("Error while getting short term memory entries")
         })
