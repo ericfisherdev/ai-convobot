@@ -574,7 +574,9 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   - `prompt` (string, optional): message the long-term memory recall is keyed on. Omitted, the prompt is assembled with no recalled entries.
 - **Response:**
   - Status: 200 OK
-  - Body: `{ "system_prompt": string, "chat_history": [[bool, string]], "attitude_context": string, "managed_messages": [Message] }`
+  - Body: `{ "system_prompt": string, "chat_history": [[bool, string]], "attitude_context": string, "managed_messages": [Message], "compaction": CompactionBlocks, "compacted_through": integer | null }`
+  - `compaction` (conversation compaction): `{ "user_overlay": string, "companion_overlay": string, "rules": string, "story_so_far": string, "recent_detail": string, "pins": string, "over_budget_by": integer | null }` — the rendered compaction blocks folded into `system_prompt`, each `""` when that section has nothing to say. `over_budget_by` is only set when the user overlay, companion overlay, and rules block together exceed the compaction token slice (those three are never trimmed).
+  - `compacted_through`: the checkpoint `managed_messages` starts after, `null` for a companion that has never been compacted.
 - **Notes:**
   - No model is loaded, so for `PromptTemplate::Auto` the response holds the pre-template system text plus the role-tagged `chat_history` rather than the final rendered string. Every other template returns the finished prompt in `system_prompt`.
   - `docs/attitude_verification.md` records a comparison run made with this route and `backend/scripts/attitude_comparison.sh`.

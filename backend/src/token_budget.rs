@@ -7,11 +7,26 @@ pub struct TokenBudget {
     pub attitude_data: usize,
     #[allow(dead_code)]
     pub third_party_info: usize,
+    /// The compaction slice (#174): overlays, rules, story-so-far, recent
+    /// detail, pins, and recalled facts all render out of this budget, via
+    /// `ContextManager::compaction_token_budget`.
+    pub compaction: usize,
     pub recent_messages: usize,
     pub response_buffer: usize,
     #[allow(dead_code)]
     pub vram_tier: VramTier,
 }
+
+/// The six slices `TokenBudget::from_vram_limit` splits `total` into.
+/// Named so `shares_sum_to_one_hundred_percent` can assert they add up to
+/// 1.0 without re-typing each literal, and so the split is documented in
+/// exactly one place.
+const SYSTEM_SHARE: f32 = 0.15;
+const ATTITUDE_SHARE: f32 = 0.10;
+const THIRD_PARTY_SHARE: f32 = 0.05;
+const COMPACTION_SHARE: f32 = 0.15;
+const RECENT_MESSAGES_SHARE: f32 = 0.40;
+const RESPONSE_SHARE: f32 = 0.15;
 
 #[derive(Debug, Clone)]
 pub enum VramTier {
@@ -34,17 +49,19 @@ impl TokenBudget {
         let total = std::cmp::min(total, max_configured);
 
         // Allocation strategy based on specifications
-        let system_prompt = (total as f32 * 0.15) as usize; // 15% for system prompts
-        let attitude_data = (total as f32 * 0.20) as usize; // 20% for attitude/memory context
-        let third_party_info = (total as f32 * 0.10) as usize; // 10% for third-party information
-        let recent_messages = (total as f32 * 0.40) as usize; // 40% for recent conversation
-        let response_buffer = (total as f32 * 0.15) as usize; // 15% for response generation
+        let system_prompt = (total as f32 * SYSTEM_SHARE) as usize;
+        let attitude_data = (total as f32 * ATTITUDE_SHARE) as usize;
+        let third_party_info = (total as f32 * THIRD_PARTY_SHARE) as usize;
+        let compaction = (total as f32 * COMPACTION_SHARE) as usize;
+        let recent_messages = (total as f32 * RECENT_MESSAGES_SHARE) as usize;
+        let response_buffer = (total as f32 * RESPONSE_SHARE) as usize;
 
         Self {
             total,
             system_prompt,
             attitude_data,
             third_party_info,
+            compaction,
             recent_messages,
             response_buffer,
             vram_tier: tier,
@@ -54,11 +71,12 @@ impl TokenBudget {
     #[allow(dead_code)]
     pub fn get_allocation_summary(&self) -> String {
         format!(
-            "Token Budget ({}): System: {}, Attitude: {}, Third-party: {}, Messages: {}, Response: {}",
+            "Token Budget ({}): System: {}, Attitude: {}, Third-party: {}, Compaction: {}, Messages: {}, Response: {}",
             self.total,
             self.system_prompt,
             self.attitude_data,
             self.third_party_info,
+            self.compaction,
             self.recent_messages,
             self.response_buffer
         )
@@ -83,6 +101,8 @@ pub struct TokenUsage {
     pub attitude_tokens: usize,
     #[allow(dead_code)]
     pub third_party_tokens: usize,
+    #[allow(dead_code)]
+    pub compaction_tokens: usize,
     #[allow(dead_code)]
     pub message_tokens: usize,
     #[allow(dead_code)]
@@ -437,6 +457,7 @@ impl TokenUsageMonitor {
         self.current_usage.total_context_tokens = self.current_usage.system_tokens
             + self.current_usage.attitude_tokens
             + self.current_usage.third_party_tokens
+            + self.current_usage.compaction_tokens
             + self.current_usage.message_tokens;
 
         let remaining_response_tokens = self.budget.response_buffer.min(
@@ -545,6 +566,10 @@ impl TokenUsageStatistics {
             self.current_usage.third_party_tokens, self.budget.third_party_info
         );
         println!(
+            "   Compaction: {}/{} tokens",
+            self.current_usage.compaction_tokens, self.budget.compaction
+        );
+        println!(
             "   Messages: {}/{} tokens",
             self.current_usage.message_tokens, self.budget.recent_messages
         );
@@ -602,20 +627,48 @@ mod tests {
         assert_eq!(budget.total, 2048);
         assert!(matches!(budget.vram_tier, VramTier::Standard));
 
-        // Verify allocation percentages (allow for small rounding differences)
+        // Verify allocation percentages (allow for small rounding differences
+        // across all six slices).
         let total_allocated = budget.system_prompt
             + budget.attitude_data
             + budget.third_party_info
+            + budget.compaction
             + budget.recent_messages
             + budget.response_buffer;
-        assert!((total_allocated as i32 - budget.total as i32).abs() <= 2); // Allow small rounding differences
+        assert!((total_allocated as i32 - budget.total as i32).abs() <= 2);
 
         // Check specific allocations
-        assert_eq!(budget.system_prompt, (2048_f32 * 0.15) as usize);
-        assert_eq!(budget.attitude_data, (2048_f32 * 0.20) as usize);
-        assert_eq!(budget.third_party_info, (2048_f32 * 0.10) as usize);
-        assert_eq!(budget.recent_messages, (2048_f32 * 0.40) as usize);
-        assert_eq!(budget.response_buffer, (2048_f32 * 0.15) as usize);
+        assert_eq!(budget.system_prompt, (2048_f32 * SYSTEM_SHARE) as usize);
+        assert_eq!(budget.attitude_data, (2048_f32 * ATTITUDE_SHARE) as usize);
+        assert_eq!(
+            budget.third_party_info,
+            (2048_f32 * THIRD_PARTY_SHARE) as usize
+        );
+        assert_eq!(budget.compaction, (2048_f32 * COMPACTION_SHARE) as usize);
+        assert_eq!(
+            budget.recent_messages,
+            (2048_f32 * RECENT_MESSAGES_SHARE) as usize
+        );
+        assert_eq!(budget.response_buffer, (2048_f32 * RESPONSE_SHARE) as usize);
+    }
+
+    #[test]
+    fn shares_sum_to_one_hundred_percent() {
+        let total = SYSTEM_SHARE
+            + ATTITUDE_SHARE
+            + THIRD_PARTY_SHARE
+            + COMPACTION_SHARE
+            + RECENT_MESSAGES_SHARE
+            + RESPONSE_SHARE;
+        assert!((total - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// The recent-message slice must stay 40% exactly as it is today: #174
+    /// found its 15 points by halving attitude (20% -> 10%) and third-party
+    /// (10% -> 5%), never touching the message slice.
+    #[test]
+    fn recent_message_slice_is_unchanged_at_forty_percent() {
+        assert_eq!(RECENT_MESSAGES_SHARE, 0.40);
     }
 
     #[test]

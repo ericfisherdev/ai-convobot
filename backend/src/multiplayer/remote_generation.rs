@@ -22,8 +22,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::chat_turn::{SqliteTurnStore, TurnStore};
+use crate::compaction::context::CompactionContext;
 use crate::database::{Message, USER_SPEAKER_ID};
-use crate::llm::{self, InMemoryTranscript, PromptSpeakers};
+use crate::llm::{self, FixedCompaction, InMemoryTranscript, PromptSpeakers};
 use crate::multiplayer::joiner::{GenerateRequestHandler, JoinerHandle};
 use crate::multiplayer::protocol::{ClientFrame, ParticipantSummary};
 use crate::participants::{AvatarRef, Participant, ParticipantId, ParticipantRegistry};
@@ -78,7 +79,10 @@ impl LocalModelGeneration {
     /// the transcript the host sent (never the joiner's own local
     /// `messages` table, which a remote reply never touches) and keyed by
     /// the newest user message in it, the same way a local turn's
-    /// long-term memory recall is keyed by what the user just said.
+    /// long-term memory recall is keyed by what the user just said. Passes
+    /// a default (never-compacted) `CompactionContext` until #182 replaces
+    /// this with its own `HostContinuity` impl built from the host's
+    /// `ContinuityPayload`.
     pub fn with_local_model(
         companion_id: i32,
         self_id: ParticipantId,
@@ -95,6 +99,7 @@ impl LocalModelGeneration {
                     on_token,
                     &InMemoryTranscript(transcript.to_vec()),
                     speakers,
+                    &FixedCompaction(CompactionContext::default()),
                 )
             },
         );

@@ -48,11 +48,22 @@
 //! [`SpeakerInfo`] is shared by `validate.rs` and `extract.rs`: what the
 //! extraction pass needs to know about a speaker, independent of either
 //! message view above.
+//!
+//! `context.rs` (#174) is the pure, SQLite-free input to rendering:
+//! `CompactionContext` buckets active facts by category, plus the latest
+//! committed checkpoint's summaries and pinned messages, built either
+//! directly (`from_facts`, for tests and #182's joiner) or from the store
+//! (`load`). `render.rs` (#174) turns a `CompactionContext` into the
+//! `RenderedBlocks` `llm.rs::build_base_components` splices into the
+//! system prompt, re-splitting the compaction token slice when overlays,
+//! rules, summaries and pins do not all fit.
 #![allow(dead_code)]
 
+pub mod context;
 pub mod extract;
 pub mod hook;
 pub mod range;
+pub mod render;
 pub mod store;
 pub mod trigger;
 pub mod types;

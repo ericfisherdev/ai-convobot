@@ -1365,6 +1365,55 @@ impl Database {
         Ok(result)
     }
 
+    /// The oldest-first `limit` messages with `id > after` (`None` behaves
+    /// as `Some(0)`, since message ids start at 1) — the same shape
+    /// `get_x_messages` returns, but anchored on `compacted_through`
+    /// (#174's `TranscriptSource::recent_messages`) instead of a plain
+    /// offset from the end. Same `MESSAGE_CACHE` pattern as `get_x_messages`;
+    /// `clear_message_cache` already wipes every key, this one included.
+    pub fn get_messages_after(after: Option<i32>, limit: usize) -> Result<Vec<Message>> {
+        let cache_key = format!("messages_after:{:?}:{}", after, limit);
+
+        if let Ok(cache) = MESSAGE_CACHE.lock() {
+            if let Some((messages, timestamp)) = cache.get(&cache_key) {
+                if timestamp.elapsed() < Duration::from_secs(120) {
+                    return Ok(messages.clone());
+                }
+            }
+        }
+
+        let con = Self::open()?;
+        let result = Self::get_messages_after_on(&con, after, limit)?;
+
+        if let Ok(mut cache) = MESSAGE_CACHE.lock() {
+            if cache.len() > 50 {
+                cache.clear();
+            }
+            cache.insert(cache_key, (result.clone(), Instant::now()));
+        }
+
+        Ok(result)
+    }
+
+    /// Testable half of `get_messages_after`, taking a caller-provided
+    /// connection so tests can point it at a `TempDir`-backed database
+    /// instead of the hardwired `paths::db_path()`.
+    fn get_messages_after_on(
+        con: &Connection,
+        after: Option<i32>,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        let mut stmt = con.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE id > ?1 ORDER BY id DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![after.unwrap_or(0), limit], message_from_row)?;
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row?);
+        }
+        Ok(messages.into_iter().rev().collect())
+    }
+
     pub fn get_total_message_count() -> Result<usize> {
         let con = Self::open()?;
         let count: i64 = con.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
@@ -5268,6 +5317,48 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn get_messages_after_returns_the_oldest_first_tail_beyond_the_cutoff() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        insert_message_row(&con, USER_SPEAKER_ID, "one");
+        insert_message_row(&con, CHAR_SPEAKER_ID, "two");
+        insert_message_row(&con, USER_SPEAKER_ID, "three");
+        insert_message_row(&con, CHAR_SPEAKER_ID, "four");
+
+        let after_two = Database::get_messages_after_on(&con, Some(2), 10).unwrap();
+        assert_eq!(
+            after_two
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["three", "four"]
+        );
+
+        let no_cutoff = Database::get_messages_after_on(&con, None, 10).unwrap();
+        assert_eq!(no_cutoff.len(), 4);
+    }
+
+    #[test]
+    fn get_messages_after_respects_the_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        for i in 1..=5 {
+            insert_message_row(&con, USER_SPEAKER_ID, &format!("msg {i}"));
+        }
+
+        let limited = Database::get_messages_after_on(&con, None, 2).unwrap();
+        assert_eq!(
+            limited
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["msg 4", "msg 5"]
+        );
     }
 
     #[test]
