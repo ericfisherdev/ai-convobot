@@ -154,6 +154,50 @@ describe('CompactionDraftCard', () => {
     expect(screen.getByText('moved in together')).toBeInTheDocument();
   });
 
+  it('does not re-apply serverRejections on mount when controlled, so a remount cannot re-strike a re-accepted item', () => {
+    // `PendingDraftMarker` (the controlled owner) applies a `422`
+    // rejection itself, once, at the moment it arrives -- not on every
+    // mount of this card. Without the `onStateChange`-gated mount effect,
+    // the mobile drawer unmounting and remounting this card (its state
+    // persists in the owner, but `serverRejections` does not change) would
+    // re-strike an item the user had since re-accepted. Simulate that by
+    // mounting directly with a controlled `state` that already shows the
+    // item re-accepted alongside the same rejection that originally struck
+    // it, and assert the mount effect leaves it alone.
+    const rejectedFact = aFact({ id: 1, category: 'rule', text: 'never set foot near the lake' });
+    const draft = aDraft([rejectedFact]);
+    const reaccepted: ReviewState = {
+      summary: 'a summary',
+      items: [
+        {
+          fact: rejectedFact,
+          accepted: true,
+          text: rejectedFact.text,
+          quote: rejectedFact.text,
+          serverReason: 'quote is not verbatim in any cited message',
+        },
+      ],
+    };
+    const onStateChange = vi.fn();
+
+    render(
+      <CompactionDraftCard
+        draft={draft}
+        messagesSinceDraft={0}
+        busy={false}
+        onCommit={noop}
+        onDiscard={noop}
+        onJumpToMessage={noop}
+        serverRejections={[{ item_id: 1, reason: 'quote is not verbatim in any cited message' }]}
+        state={reaccepted}
+        onStateChange={onStateChange}
+      />
+    );
+
+    expect(onStateChange).not.toHaveBeenCalled();
+    expect(screen.getByRole('checkbox', { name: 'Accept Rule item' })).toBeChecked();
+  });
+
   it('calls onJumpToMessage with the source id when a #id chip is clicked', async () => {
     const user = userEvent.setup();
     const draft = aDraft([aFact({ id: 1, sources: [42] })]);
