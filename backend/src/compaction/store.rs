@@ -231,6 +231,61 @@ pub(crate) fn latest_committed_on(
     .optional()
 }
 
+/// The highest-id `committed`-*or*-`stale` row for `companion_id` (#181):
+/// what a turn's prompt should render. `context_snapshot` uses this instead
+/// of [`latest_committed_on`] so a checkpoint's `rolling_summary`/`summary`
+/// (the bulk of what it contributes to the prompt) do not vanish the moment
+/// an edit marks it `Stale` — only its facts were kept alive by widening
+/// `active_facts_on`; the narrative needs the same treatment.
+/// [`crate::compaction::commit::plan_commit`]'s use of `latest_committed`
+/// stays `committed`-only on purpose: folding a stale summary forward into
+/// the next rolling summary would be wrong.
+pub(crate) fn latest_renderable_on(
+    con: &Connection,
+    companion_id: i32,
+) -> Result<Option<Checkpoint>> {
+    con.query_row(
+        &format!(
+            "SELECT {CHECKPOINT_COLUMNS} FROM compactions WHERE companion_id = ? AND status IN (?, ?) ORDER BY id DESC LIMIT 1"
+        ),
+        params![
+            companion_id,
+            &CompactionStatus::Committed as &dyn ToSql,
+            &CompactionStatus::Stale as &dyn ToSql
+        ],
+        checkpoint_from_row,
+    )
+    .optional()
+}
+
+/// The highest-id `status = 'committed'` row whose `through_message_id` ends
+/// strictly before `from_message_id` (#181): the checkpoint a draft starting
+/// at `from_message_id` actually continues from. Before re-compaction
+/// existed every draft started right after `compacted_through`, so "highest
+/// id" and "ends before this draft" were the same row; a re-compaction can
+/// start earlier than `compacted_through`, so [`crate::compaction::commit::commit`]
+/// uses this instead of the plain highest-id [`latest_committed_on`] to
+/// avoid folding a checkpoint the new draft's own range re-covers into its
+/// rolling summary.
+pub(crate) fn latest_committed_before_on(
+    con: &Connection,
+    companion_id: i32,
+    from_message_id: i32,
+) -> Result<Option<Checkpoint>> {
+    con.query_row(
+        &format!(
+            "SELECT {CHECKPOINT_COLUMNS} FROM compactions WHERE companion_id = ? AND status = ? AND through_message_id < ? ORDER BY id DESC LIMIT 1"
+        ),
+        params![
+            companion_id,
+            &CompactionStatus::Committed as &dyn ToSql,
+            from_message_id
+        ],
+        checkpoint_from_row,
+    )
+    .optional()
+}
+
 /// Sets `status`, also stamping `committed_at` when transitioning to
 /// `Committed`. `QueryReturnedNoRows` when `id` does not exist (checked via
 /// `changes() == 0`, so a silent no-op is impossible).
@@ -446,30 +501,79 @@ pub(crate) fn oldest_stale_from_on(con: &Connection, companion_id: i32) -> Resul
     )
 }
 
-/// Retires every `Stale` checkpoint for `companion_id` whose range lies
-/// inside `[from, through]` — flips it to `Discarded` and deactivates its
-/// facts — and returns the retired checkpoint ids (`Ok(vec![])` when none
-/// match). Called on the caller's own transaction, not its own: #175's
+/// Flips every pending `Draft` checkpoint containing `message_id` to
+/// `Discarded` (#181). A draft describes messages it has not been extracted
+/// from yet, or has been but not yet reviewed; an edit/delete inside its
+/// range makes it describe content that no longer exists the moment it
+/// would be committed, and neither `fill_draft` nor `commit` re-checks the
+/// source text against what is stored. Discarding it here closes both
+/// windows: an extraction already in flight over the old text fails
+/// `DraftNotPending` when it tries to write its result, and a pending
+/// review card simply disappears (the hook re-queues on the next round).
+/// Returns the number of rows flipped — always 0 or 1, since a companion has
+/// at most one pending draft at a time. Must run before the
+/// `compacted_through IS NULL` short-circuit in `mark_stale_for_message_on`:
+/// a chat's very first draft is pending while `compacted_through` is still
+/// `NULL`.
+pub(crate) fn discard_draft_containing_on(
+    con: &Connection,
+    companion_id: i32,
+    message_id: i32,
+) -> Result<usize> {
+    con.execute(
+        "UPDATE compactions SET status = ? WHERE companion_id = ? AND status = ? AND from_message_id <= ? AND ? <= through_message_id",
+        params![
+            &CompactionStatus::Discarded as &dyn ToSql,
+            companion_id,
+            &CompactionStatus::Draft as &dyn ToSql,
+            message_id,
+            message_id,
+        ],
+    )
+}
+
+/// Retires every `Stale` or `Committed` checkpoint for `companion_id`
+/// (other than `draft_id` itself) whose range *overlaps* `[from, through]`
+/// — flips it to `Discarded` and deactivates its facts — and returns the
+/// retired checkpoint ids (`Ok(vec![])` when none match). Called on the
+/// caller's own transaction, not its own: #175's
 /// `SqliteCompactionStore::commit_checkpoint` runs this as one more step of
-/// its existing `Immediate` transaction, right before it sets
-/// `compacted_through`, so a fresh checkpoint that re-covers a stale range
-/// heals it atomically with the rest of the commit.
+/// its existing `Immediate` transaction, right after `draft_id` itself has
+/// already been flipped to `Committed` (hence excluding it explicitly)
+/// and right before it sets `compacted_through`, so a fresh checkpoint that
+/// re-covers a stale or ordinary committed range heals it atomically with
+/// the rest of the commit.
+///
+/// Overlap, not containment: a re-compaction's own range
+/// (`crate::compaction::range::select_recompaction_range`) is cut by the
+/// short-term-tail boundary, not by any stale checkpoint's own end, so a
+/// stale checkpoint can extend past the new draft's `through` — containment
+/// would leave it stuck `Stale` forever, since `oldest_stale_from` would
+/// keep pointing at it and every later re-compaction would reproduce the
+/// same non-healing draft. Overlap also lets a re-compaction spanning
+/// multiple prior checkpoints (one stale, one still `Committed`) retire
+/// both: the `Committed` one's content becomes redundant with the new
+/// checkpoint's own range the moment they overlap, exactly like the stale
+/// one's does.
 pub(crate) fn retire_stale_within_on(
     con: &Connection,
     companion_id: i32,
+    draft_id: i64,
     from: i32,
     through: i32,
 ) -> Result<Vec<i64>> {
     let mut stmt = con.prepare(
-        "SELECT id FROM compactions WHERE companion_id = ? AND status = ? AND from_message_id >= ? AND through_message_id <= ?",
+        "SELECT id FROM compactions WHERE companion_id = ? AND id != ? AND status IN (?, ?) AND from_message_id <= ? AND through_message_id >= ?",
     )?;
     let ids: Vec<i64> = stmt
         .query_map(
             params![
                 companion_id,
+                draft_id,
                 &CompactionStatus::Stale as &dyn ToSql,
-                from,
-                through
+                &CompactionStatus::Committed as &dyn ToSql,
+                through,
+                from
             ],
             |row| row.get(0),
         )?
@@ -673,17 +777,35 @@ pub trait CompactionStore {
     /// Ordered by `id`, all statuses.
     fn list_checkpoints(&self, companion_id: i32) -> Result<Vec<Checkpoint>>;
 
-    /// Highest-id `status = 'committed'` row (#174 renders its
-    /// `summary`/`rolling_summary` every turn).
+    /// Highest-id `status = 'committed'` row. [`crate::compaction::commit::commit`]
+    /// no longer uses this directly for a draft's predecessor — see
+    /// [`Self::latest_committed_before`] — but `extract.rs`'s
+    /// `build_prior_notes` still reads it for the extraction prompt's prior
+    /// rolling summary.
     fn latest_committed(&self, companion_id: i32) -> Result<Option<Checkpoint>>;
 
-    /// `active_facts`, `compacted_through`, and `latest_committed` for
-    /// `companion_id`, read from one consistent snapshot — the production
-    /// impl wraps all three in a single transaction — so a checkpoint
-    /// commit racing this read can never combine, say, the facts from
-    /// before the commit with the cutoff/summary from after it (or vice
-    /// versa). `compaction::context::CompactionContext::load` (#174) is the
-    /// sole caller.
+    /// The highest-id `status = 'committed'` row whose `through_message_id`
+    /// ends strictly before `from_message_id` (#181): the checkpoint a draft
+    /// starting at `from_message_id` actually continues from.
+    /// [`crate::compaction::commit::commit`] uses this instead of
+    /// [`Self::latest_committed`] so a re-compaction (which can start
+    /// earlier than `compacted_through`) never folds a checkpoint its own
+    /// range re-covers into its rolling summary.
+    fn latest_committed_before(
+        &self,
+        companion_id: i32,
+        from_message_id: i32,
+    ) -> Result<Option<Checkpoint>>;
+
+    /// `active_facts`, `compacted_through`, and the latest `committed`-or-
+    /// `stale` checkpoint (#181: a stale checkpoint's summary still renders
+    /// until it is retired) for `companion_id`, read from one consistent
+    /// snapshot — the production impl wraps all three in a single
+    /// transaction — so a checkpoint commit racing this read can never
+    /// combine, say, the facts from before the commit with the cutoff/
+    /// summary from after it (or vice versa).
+    /// `compaction::context::CompactionContext::load` (#174) is the sole
+    /// caller.
     fn context_snapshot(
         &self,
         companion_id: i32,
@@ -815,6 +937,15 @@ impl CompactionStore for SqliteCompactionStore {
         latest_committed_on(&con, companion_id)
     }
 
+    fn latest_committed_before(
+        &self,
+        companion_id: i32,
+        from_message_id: i32,
+    ) -> Result<Option<Checkpoint>> {
+        let con = Database::open()?;
+        latest_committed_before_on(&con, companion_id, from_message_id)
+    }
+
     fn context_snapshot(
         &self,
         companion_id: i32,
@@ -823,7 +954,7 @@ impl CompactionStore for SqliteCompactionStore {
         let tx = con.unchecked_transaction()?;
         let facts = active_facts_on(&tx, companion_id)?;
         let compacted_through = compacted_through_on(&tx, companion_id)?;
-        let latest_committed = latest_committed_on(&tx, companion_id)?;
+        let latest_committed = latest_renderable_on(&tx, companion_id)?;
         tx.commit()?;
         Ok((facts, compacted_through, latest_committed))
     }
@@ -944,14 +1075,15 @@ impl CompactionStore for SqliteCompactionStore {
                 record.draft_id,
             ],
         )?;
-        // #181: heals any `Stale` checkpoint this commit's range now
-        // re-covers, on the same transaction as the rest of the commit.
-        // Runs on every commit, not only ones queued specifically to
-        // re-compact a stale range — a normal threshold commit that happens
-        // to span one heals it too.
+        // #181: heals any `Stale` or ordinary `Committed` checkpoint this
+        // commit's range now overlaps, on the same transaction as the rest
+        // of the commit. Runs on every commit, not only ones queued
+        // specifically to re-compact a stale range — a normal threshold
+        // commit that happens to span one heals it too.
         retire_stale_within_on(
             &tx,
             record.companion_id,
+            record.draft_id,
             record.from_message_id,
             record.through_message_id,
         )?;
@@ -1057,6 +1189,25 @@ impl CompactionStore for RecordingStore {
             .cloned())
     }
 
+    fn latest_committed_before(
+        &self,
+        companion_id: i32,
+        from_message_id: i32,
+    ) -> Result<Option<Checkpoint>> {
+        Ok(self
+            .checkpoints
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| {
+                c.companion_id == companion_id
+                    && c.status == CompactionStatus::Committed
+                    && c.through_message_id < from_message_id
+            })
+            .max_by_key(|c| c.id)
+            .cloned())
+    }
+
     fn context_snapshot(
         &self,
         companion_id: i32,
@@ -1065,10 +1216,24 @@ impl CompactionStore for RecordingStore {
         // real transaction buys nothing here; calling straight through
         // still exercises the same three reads `CompactionContext::load`
         // relies on.
+        let latest_renderable = self
+            .checkpoints
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| {
+                c.companion_id == companion_id
+                    && matches!(
+                        c.status,
+                        CompactionStatus::Committed | CompactionStatus::Stale
+                    )
+            })
+            .max_by_key(|c| c.id)
+            .cloned();
         Ok((
             self.active_facts(companion_id)?,
             self.compacted_through(companion_id)?,
-            self.latest_committed(companion_id)?,
+            latest_renderable,
         ))
     }
 
@@ -1335,17 +1500,23 @@ impl CompactionStore for RecordingStore {
             }
         }
 
-        // #181: heals any `Stale` checkpoint this commit's range now
-        // re-covers, mirroring `retire_stale_within_on`'s SQL side.
+        // #181: heals any `Stale` or ordinary `Committed` checkpoint this
+        // commit's range now overlaps, mirroring `retire_stale_within_on`'s
+        // SQL side (overlap, not containment; excludes `record.draft_id`
+        // itself, already flipped to `Committed` above).
         {
             let mut checkpoints = self.checkpoints.lock().unwrap();
             let retired: Vec<i64> = checkpoints
                 .iter()
                 .filter(|c| {
                     c.companion_id == record.companion_id
-                        && c.status == CompactionStatus::Stale
-                        && c.from_message_id >= record.from_message_id
-                        && c.through_message_id <= record.through_message_id
+                        && c.id != record.draft_id
+                        && matches!(
+                            c.status,
+                            CompactionStatus::Stale | CompactionStatus::Committed
+                        )
+                        && c.from_message_id <= record.through_message_id
+                        && c.through_message_id >= record.from_message_id
                 })
                 .map(|c| c.id)
                 .collect();
@@ -1739,6 +1910,70 @@ mod tests {
         assert_eq!(compacted_through_on(&con, 999).unwrap(), None);
     }
 
+    /// #181 review finding: widening `active_facts_on` to include `Stale`
+    /// kept a stale checkpoint's *facts* rendering, but `context_snapshot`
+    /// still read the narrative through `latest_committed_on`
+    /// (`committed`-only), so the summary/rolling_summary vanished from the
+    /// prompt the moment the checkpoint went stale. `latest_renderable_on`
+    /// is the fix: it must still find the checkpoint once `Stale`.
+    #[test]
+    fn latest_renderable_on_still_finds_a_checkpoint_once_it_goes_stale() {
+        let (_dir, con) = fresh_db();
+        let id = a_committed_checkpoint(&con, 1, 3);
+        let checkpoint = get_checkpoint_on(&con, id).unwrap().unwrap();
+        assert!(checkpoint.summary.is_none()); // a_committed_checkpoint sets none
+
+        // Give it a summary directly (a_committed_checkpoint doesn't), so
+        // the "still non-empty" half of the assertion means something.
+        con.execute(
+            "UPDATE compactions SET summary = 'the story so far', rolling_summary = 'rolling' WHERE id = ?",
+            params![id],
+        )
+        .unwrap();
+
+        assert_eq!(latest_renderable_on(&con, 1).unwrap().unwrap().id, id);
+
+        mark_stale_containing_on(&con, 1, 2).unwrap();
+        assert_eq!(
+            get_checkpoint_on(&con, id).unwrap().unwrap().status,
+            CompactionStatus::Stale
+        );
+
+        // Still found, and still carrying its summary/rolling_summary — the
+        // narrative does not vanish just because the checkpoint went stale.
+        let renderable = latest_renderable_on(&con, 1).unwrap().unwrap();
+        assert_eq!(renderable.id, id);
+        assert_eq!(renderable.summary.as_deref(), Some("the story so far"));
+        assert_eq!(renderable.rolling_summary.as_deref(), Some("rolling"));
+
+        // `latest_committed_on` (used by `plan_commit`, which must not fold
+        // a stale summary forward) correctly no longer finds it.
+        assert!(latest_committed_on(&con, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn recording_store_context_snapshot_keeps_a_stale_checkpoints_summary_visible() {
+        let store = RecordingStore::new();
+        let id = store
+            .insert_draft(NewDraft {
+                companion_id: 1,
+                from_message_id: 1,
+                through_message_id: 3,
+                trigger: CompactionTrigger::Threshold,
+                raw_model_output: None,
+            })
+            .unwrap();
+        store
+            .update_status(id, CompactionStatus::Committed)
+            .unwrap();
+        store.set_compacted_through(1, Some(3)).unwrap();
+
+        store.mark_stale_containing(1, 2).unwrap();
+
+        let (_facts, _compacted_through, latest_renderable) = store.context_snapshot(1).unwrap();
+        assert_eq!(latest_renderable.unwrap().id, id);
+    }
+
     /// `context_snapshot`'s whole point is that these three reads happen
     /// inside one transaction (`SqliteCompactionStore::context_snapshot`
     /// wraps them in `unchecked_transaction`); this exercises exactly the
@@ -2109,6 +2344,53 @@ mod tests {
     }
 
     #[test]
+    fn discard_draft_containing_on_flips_only_the_containing_pending_draft() {
+        let (_dir, con) = fresh_db();
+        let containing_draft = insert_draft_on(
+            &con,
+            &NewDraft {
+                companion_id: 1,
+                from_message_id: 1,
+                through_message_id: 3,
+                trigger: CompactionTrigger::Threshold,
+                raw_model_output: None,
+            },
+        )
+        .unwrap();
+        let committed = a_committed_checkpoint(&con, 4, 6);
+
+        let changed = discard_draft_containing_on(&con, 1, 2).unwrap();
+
+        assert_eq!(changed, 1);
+        assert_eq!(
+            get_checkpoint_on(&con, containing_draft)
+                .unwrap()
+                .unwrap()
+                .status,
+            CompactionStatus::Discarded
+        );
+        // A `Committed` checkpoint is never touched by this helper, even if
+        // (hypothetically) its range contained the message: `Committed`
+        // rows go through `mark_stale_containing_on` instead.
+        assert_eq!(
+            get_checkpoint_on(&con, committed).unwrap().unwrap().status,
+            CompactionStatus::Committed
+        );
+    }
+
+    #[test]
+    fn discard_draft_containing_on_a_message_outside_the_drafts_range_changes_nothing() {
+        let (_dir, con) = fresh_db();
+        let draft_id = insert_draft_on(&con, &a_draft()).unwrap();
+
+        assert_eq!(discard_draft_containing_on(&con, 1, 999).unwrap(), 0);
+        assert_eq!(
+            get_checkpoint_on(&con, draft_id).unwrap().unwrap().status,
+            CompactionStatus::Draft
+        );
+    }
+
+    #[test]
     fn oldest_stale_from_on_returns_the_lowest_from_message_id_among_stale_checkpoints() {
         let (_dir, con) = fresh_db();
         assert_eq!(oldest_stale_from_on(&con, 1).unwrap(), None);
@@ -2141,7 +2423,7 @@ mod tests {
         let fact_ids = insert_facts_on(&con, stale_id, std::slice::from_ref(&fact_draft)).unwrap();
         mark_stale_containing_on(&con, 1, 2).unwrap();
 
-        let retired = retire_stale_within_on(&con, 1, 1, 3).unwrap();
+        let retired = retire_stale_within_on(&con, 1, 999, 1, 3).unwrap();
 
         assert_eq!(retired, vec![stale_id]);
         assert_eq!(
@@ -2162,7 +2444,7 @@ mod tests {
         let stale_id = a_committed_checkpoint(&con, 10, 12);
         mark_stale_containing_on(&con, 1, 11).unwrap();
 
-        let retired = retire_stale_within_on(&con, 1, 1, 3).unwrap();
+        let retired = retire_stale_within_on(&con, 1, 999, 1, 3).unwrap();
 
         assert!(retired.is_empty());
         assert_eq!(
@@ -2175,8 +2457,74 @@ mod tests {
     fn retire_stale_within_on_with_no_stale_checkpoints_is_a_no_op() {
         let (_dir, con) = fresh_db();
         assert_eq!(
-            retire_stale_within_on(&con, 1, 1, 3).unwrap(),
+            retire_stale_within_on(&con, 1, 999, 1, 3).unwrap(),
             Vec::<i64>::new()
+        );
+    }
+
+    #[test]
+    fn retire_stale_within_on_retires_on_overlap_not_just_containment() {
+        // #181 review finding: a stale checkpoint's `through_message_id` can
+        // lie past a re-compaction's own `through` (`select_recompaction_range`
+        // cuts at the short-term-tail boundary, not at any stale checkpoint's
+        // end), so containment would leave it stuck `Stale` forever.
+        let (_dir, con) = fresh_db();
+        let stale_id = a_committed_checkpoint(&con, 1, 10);
+        mark_stale_containing_on(&con, 1, 5).unwrap();
+
+        // A re-compaction draft covering only [1,5]: under the old
+        // containment predicate this would not retire the [1,10] stale
+        // checkpoint at all.
+        let retired = retire_stale_within_on(&con, 1, 999, 1, 5).unwrap();
+
+        assert_eq!(retired, vec![stale_id]);
+        assert_eq!(
+            get_checkpoint_on(&con, stale_id).unwrap().unwrap().status,
+            CompactionStatus::Discarded
+        );
+    }
+
+    #[test]
+    fn retire_stale_within_on_also_retires_an_overlapping_committed_checkpoint_excluding_the_draft_itself(
+    ) {
+        // #181 review finding: a re-compaction spanning both a stale
+        // checkpoint and an ordinary (never-marked-stale) committed sibling
+        // must retire both — the committed one's content becomes redundant
+        // with the new checkpoint's range too. The draft being committed
+        // (`draft_id`) must never retire itself even though its own range
+        // trivially overlaps `[from, through]`.
+        let (_dir, con) = fresh_db();
+        let stale_id = a_committed_checkpoint(&con, 1, 10);
+        mark_stale_containing_on(&con, 1, 5).unwrap();
+        let sibling_committed_id = a_committed_checkpoint(&con, 11, 20);
+        let draft_id = insert_draft_on(&con, &a_draft()).unwrap();
+
+        let retired = retire_stale_within_on(&con, 1, draft_id, 1, 20).unwrap();
+
+        let mut retired_sorted = retired.clone();
+        retired_sorted.sort();
+        assert_eq!(retired_sorted, {
+            let mut expected = vec![stale_id, sibling_committed_id];
+            expected.sort();
+            expected
+        });
+        assert_eq!(
+            get_checkpoint_on(&con, stale_id).unwrap().unwrap().status,
+            CompactionStatus::Discarded
+        );
+        assert_eq!(
+            get_checkpoint_on(&con, sibling_committed_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            CompactionStatus::Discarded
+        );
+        // The draft itself, though its own range also overlaps [1, 20],
+        // must not appear in the retired set or be touched.
+        assert!(!retired.contains(&draft_id));
+        assert_eq!(
+            get_checkpoint_on(&con, draft_id).unwrap().unwrap().status,
+            CompactionStatus::Draft
         );
     }
 

@@ -329,6 +329,59 @@ mod tests {
         assert!(matches!(err, rusqlite::Error::InvalidQuery));
     }
 
+    /// #181 review finding: `active_facts` keeping a stale checkpoint's
+    /// facts alive is not "better than nothing" if `rolling_summary`/
+    /// `recent_detail` — the bulk of what a checkpoint contributes — vanish
+    /// from the prompt at the same moment. `context_snapshot` now reads the
+    /// checkpoint through `latest_renderable_on` (`committed` *or* `stale`),
+    /// so `load` must still surface both fields once the only committed
+    /// checkpoint goes stale.
+    #[test]
+    fn load_keeps_a_stale_checkpoints_summary_and_rolling_summary_visible() {
+        let store = RecordingStore::new();
+        let compaction_id = store
+            .insert_draft(NewDraft {
+                companion_id: 1,
+                from_message_id: 1,
+                through_message_id: 3,
+                trigger: CompactionTrigger::Threshold,
+                raw_model_output: None,
+            })
+            .unwrap();
+        store
+            .update_status(compaction_id, CompactionStatus::Committed)
+            .unwrap();
+        store.set_compacted_through(1, Some(3)).unwrap();
+        store
+            .set_extraction_result(
+                compaction_id,
+                None,
+                Some("the story so far".to_string()),
+                None,
+            )
+            .unwrap();
+        // `set_extraction_result` only fills `summary`; `rolling_summary` is
+        // only ever set by `commit_checkpoint`, so set it directly here to
+        // isolate this test from the commit path.
+        {
+            let mut checkpoints = store.checkpoints.lock().unwrap();
+            checkpoints
+                .iter_mut()
+                .find(|c| c.id == compaction_id)
+                .unwrap()
+                .rolling_summary = Some("rolling".to_string());
+        }
+
+        store.mark_stale_containing(1, 2).unwrap();
+
+        let lookup =
+            |_id: i32| -> rusqlite::Result<Message> { Err(rusqlite::Error::QueryReturnedNoRows) };
+        let ctx = CompactionContext::load(&store, &lookup, 1).unwrap();
+
+        assert_eq!(ctx.recent_detail, "the story so far");
+        assert_eq!(ctx.rolling_summary, "rolling");
+    }
+
     #[test]
     fn load_defaults_to_empty_summaries_when_nothing_was_ever_committed() {
         let store = RecordingStore::new();
