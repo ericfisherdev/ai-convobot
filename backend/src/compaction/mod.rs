@@ -57,11 +57,24 @@
 //! `RenderedBlocks` `llm.rs::build_base_components` splices into the
 //! system prompt, re-splitting the compaction token slice when overlays,
 //! rules, summaries and pins do not all fit.
+//!
+//! `commit.rs` (#175) commits a reviewed draft in one transaction:
+//! `commit` promotes the fact rows #185's `fill_draft` already stored (it
+//! never inserts a second copy), folds the previous checkpoint's detail
+//! into the rolling summary via a `SummaryMerger`, flips the checkpoint to
+//! `Committed`, and runs the registered `CommitObserver`s (#176 attitude,
+//! #177 persons, #178 tantivy) with only the newly active facts.
+//! `discard` is the trivial counterpart. `merge.rs` (#175) is the
+//! production `SummaryMerger`, `LlmSummaryMerger`, built on #183's
+//! `Extractor` seam. [`production_commit_deps`] below wires the two
+//! together for #179's handler; `main.rs` never assembles this inline.
 #![allow(dead_code)]
 
+pub mod commit;
 pub mod context;
 pub mod extract;
 pub mod hook;
+pub mod merge;
 pub mod range;
 pub mod render;
 pub mod store;
@@ -72,6 +85,20 @@ pub mod validate;
 use serde::Deserialize;
 
 use crate::database::{self, Message};
+use crate::llm::Extractor;
+
+/// Builds the real [`commit::CommitDeps`] used in production: an
+/// [`merge::LlmSummaryMerger`] wrapping `extractor`, and an initially
+/// empty observer list. #176 (attitude), #177 (persons), and #178
+/// (tantivy) each push their own [`commit::CommitObserver`] into the
+/// returned value, so `main.rs` never assembles this wiring inline.
+/// #179's handler calls this with `&llm::ResidentExtractor`.
+pub fn production_commit_deps(extractor: &dyn Extractor) -> commit::CommitDeps<'_> {
+    commit::CommitDeps {
+        merger: Box::new(merge::LlmSummaryMerger { extractor }),
+        observers: Vec::new(),
+    }
+}
 
 /// One message's identity as the trigger/range logic in [`trigger`] and
 /// [`range`] needs it: no content, just enough to sum tokens and locate
