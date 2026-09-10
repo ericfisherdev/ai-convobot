@@ -29,6 +29,10 @@ pub enum RejectReason {
     /// A `rules`/`key_quotes` item's text is not a verbatim substring of
     /// any cited message.
     QuoteNotVerbatim,
+    /// A `rules`/`key_quotes` item's quote is verbatim in a cited message,
+    /// but not one said by the speaker (`user`/`companion`) the draft
+    /// claims via `quote_speaker`.
+    SpeakerMismatch,
     /// The item's `text` is longer than [`MAX_ITEM_WORDS`] words.
     TooLong { words: usize },
     /// The item's normalised text matches an active fact in the same
@@ -48,6 +52,9 @@ impl fmt::Display for RejectReason {
             }
             RejectReason::QuoteNotVerbatim => {
                 write!(f, "quote is not verbatim in any cited message")
+            }
+            RejectReason::SpeakerMismatch => {
+                write!(f, "quote is verbatim but attributed to the wrong speaker")
             }
             RejectReason::TooLong { words } => {
                 write!(
@@ -136,21 +143,49 @@ fn check_canon(
 }
 
 /// Rule 3: `rules`/`key_quotes` items must be a verbatim (whitespace- and
-/// nothing-else-normalised) substring of at least one cited message.
-fn check_verbatim(draft: &FactDraft, range: &[CitedMessage]) -> Option<RejectReason> {
+/// nothing-else-normalised) substring of at least one cited message, said by
+/// the speaker the draft claims via `quote_speaker` (`"user"`/`"companion"`,
+/// matched against `is_canon` — `"user"` must be canon, `"companion"` must
+/// not). A draft with no `quote_speaker` claim (never produced by
+/// `extract::to_fact_drafts`, which always sets one for these categories)
+/// skips the speaker check rather than treating the absence as a claim.
+fn check_verbatim(
+    draft: &FactDraft,
+    range: &[CitedMessage],
+    is_canon: &dyn Fn(&str) -> bool,
+) -> Option<RejectReason> {
     if !matches!(draft.category, FactCategory::Rule | FactCategory::KeyQuote) {
         return None;
     }
     let quote = normalise_ws(&draft.text);
-    let verbatim = draft
+    let cited: Vec<&CitedMessage> = draft
         .sources
         .iter()
         .filter_map(|id| find_message(range, *id))
-        .any(|m| normalise_ws(&m.content).contains(&quote));
-    if verbatim {
-        None
-    } else {
-        Some(RejectReason::QuoteNotVerbatim)
+        .collect();
+    let text_matches = |m: &&CitedMessage| normalise_ws(&m.content).contains(&quote);
+
+    if !cited.iter().any(text_matches) {
+        return Some(RejectReason::QuoteNotVerbatim);
+    }
+
+    let expected_canon = match draft.quote_speaker.as_deref() {
+        Some("user") => Some(true),
+        Some("companion") => Some(false),
+        _ => None,
+    };
+    match expected_canon {
+        None => None,
+        Some(expected_canon) => {
+            let attributed_correctly = cited
+                .iter()
+                .any(|m| text_matches(m) && is_canon(&m.speaker_id) == expected_canon);
+            if attributed_correctly {
+                None
+            } else {
+                Some(RejectReason::SpeakerMismatch)
+            }
+        }
     }
 }
 
@@ -184,14 +219,23 @@ fn filter_replaces(draft: &mut FactDraft, active: &[Fact]) {
 
 /// Rule 5 (checked last, after [`filter_replaces`]): `text`, normalised,
 /// must not match an active fact in the same category that this draft does
-/// not itself replace.
-fn check_duplicate(draft: &FactDraft, active: &[Fact]) -> Option<RejectReason> {
+/// not itself replace, and must not repeat a `(category, key)` already
+/// accepted earlier in the same [`validate`] call — one extraction that
+/// emits the same fact twice must not insert it twice.
+fn check_duplicate(
+    draft: &FactDraft,
+    active: &[Fact],
+    accepted_this_batch: &[(FactCategory, String)],
+) -> Option<RejectReason> {
     let category = draft.category;
     let key = normalise_key(&draft.text);
-    let duplicate = active.iter().any(|f| {
+    let duplicate_of_active = active.iter().any(|f| {
         f.category == category && !draft.replaces.contains(&f.id) && normalise_key(&f.text) == key
     });
-    if duplicate {
+    let duplicate_in_batch = accepted_this_batch
+        .iter()
+        .any(|(c, k)| *c == category && *k == key);
+    if duplicate_of_active || duplicate_in_batch {
         Some(RejectReason::Duplicate)
     } else {
         None
@@ -215,12 +259,18 @@ pub fn validate(
     active: &[Fact],
     is_canon: &dyn Fn(&str) -> bool,
 ) -> Vec<FactDraft> {
+    // `(category, normalised text)` of every draft accepted so far in this
+    // call, so two drafts in the same extraction that assert the same fact
+    // do not both get inserted (`check_duplicate` on its own only compares
+    // against already-committed `active` facts).
+    let mut accepted_this_batch: Vec<(FactCategory, String)> = Vec::new();
+
     for draft in drafts.iter_mut() {
         draft.canon = is_canon_sourced(draft, range, is_canon);
 
         let rejection = check_sources(draft, range)
             .or_else(|| check_canon(draft, range, is_canon))
-            .or_else(|| check_verbatim(draft, range))
+            .or_else(|| check_verbatim(draft, range, is_canon))
             .or_else(|| check_length(draft));
 
         if let Some(reason) = rejection {
@@ -229,8 +279,9 @@ pub fn validate(
         }
 
         filter_replaces(draft, active);
-        if let Some(reason) = check_duplicate(draft, active) {
-            draft.rejected_reason = Some(reason.to_string());
+        match check_duplicate(draft, active, &accepted_this_batch) {
+            Some(reason) => draft.rejected_reason = Some(reason.to_string()),
+            None => accepted_this_batch.push((draft.category, normalise_key(&draft.text))),
         }
     }
     drafts
@@ -470,6 +521,36 @@ mod tests {
     }
 
     #[test]
+    fn a_verbatim_quote_attributed_to_the_wrong_speaker_is_rejected() {
+        let range = synthetic_range();
+        // Message 53 ("I promise I will never lie to you...") is a `user`
+        // turn, but this draft claims a `companion` said it.
+        let mut draft = a_draft(
+            FactCategory::Rule,
+            "I promise I will never lie to you, no matter what happens.",
+            vec![53],
+        );
+        draft.quote_speaker = Some("companion".to_string());
+
+        let rejected = validate(vec![draft], &range, &[], &user_is_canon);
+        assert_rejected(&rejected[0], RejectReason::SpeakerMismatch);
+    }
+
+    #[test]
+    fn a_verbatim_quote_attributed_to_the_right_speaker_is_accepted() {
+        let range = synthetic_range();
+        let mut draft = a_draft(
+            FactCategory::Rule,
+            "I promise I will never lie to you, no matter what happens.",
+            vec![53],
+        );
+        draft.quote_speaker = Some("user".to_string());
+
+        let accepted = validate(vec![draft], &range, &[], &user_is_canon);
+        assert_accepted(&accepted[0]);
+    }
+
+    #[test]
     fn verbatim_check_ignores_extra_whitespace_but_not_case() {
         let range = synthetic_range();
         let accepted = validate(
@@ -597,6 +678,22 @@ mod tests {
             &user_is_canon,
         );
         assert_accepted(&accepted[0]);
+    }
+
+    #[test]
+    fn two_identical_drafts_in_one_validate_call_are_not_both_accepted() {
+        let range = synthetic_range();
+        let result = validate(
+            vec![
+                a_draft(FactCategory::Milestone, "left home for good", vec![46]),
+                a_draft(FactCategory::Milestone, "left home for good", vec![46]),
+            ],
+            &range,
+            &[],
+            &user_is_canon,
+        );
+        assert_accepted(&result[0]);
+        assert_rejected(&result[1], RejectReason::Duplicate);
     }
 
     // --- canon flag ---
