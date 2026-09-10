@@ -55,6 +55,18 @@ impl Drop for TurnGuard {
 /// The process-wide turn slot used by the prompting endpoints.
 pub static ACTIVE_TURN: TurnSlot = TurnSlot::new();
 
+/// A joiner's own auto-extraction (#186) serialises against itself only: at
+/// most one extraction in flight per joiner. It must never contend with
+/// [`ACTIVE_TURN`], which a reply claims for the duration of its own
+/// `GenerateRequest` — extraction runs on `llm::ResidentExtractor` and
+/// `compaction::commit::commit`, neither of which touches the state
+/// `ACTIVE_TURN` protects, and both are already serialised against a
+/// concurrent reply by `llm::GENERATION_LOCK`. Claiming `ACTIVE_TURN` for
+/// extraction instead would fail every `GenerateRequest` that lands while an
+/// extraction (a model-bound extract + merge) is still running, not just the
+/// one frame that queued it.
+pub static JOINER_EXTRACTION: TurnSlot = TurnSlot::new();
+
 #[cfg(test)]
 mod tests {
     use super::TurnSlot;
