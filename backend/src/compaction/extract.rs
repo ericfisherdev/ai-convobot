@@ -405,18 +405,32 @@ pub fn build_extraction_prompt(
 /// `LlamaSampler::grammar` requires. `companion_state`/`user_state` items may
 /// carry an optional trailing `"replaces"` array of prior fact ids; every
 /// other item type has no such key.
-pub const EXTRACTION_GRAMMAR: &str = r#"root ::= "{" ws
-  "\"companion_state\"" ws ":" ws state-array ws "," ws
-  "\"user_state\"" ws ":" ws state-array ws "," ws
-  "\"milestones\"" ws ":" ws text-array ws "," ws
-  "\"backstory\"" ws ":" ws backstory-array ws "," ws
-  "\"open_threads\"" ws ":" ws text-array ws "," ws
-  "\"rules\"" ws ":" ws quote-array ws "," ws
-  "\"people\"" ws ":" ws person-array ws "," ws
-  "\"key_quotes\"" ws ":" ws quote-array ws "," ws
-  "\"summary\"" ws ":" ws string ws "," ws
-  "\"attitude\"" ws ":" ws attitude
-ws "}"
+///
+/// Every rule definition here is a single physical line (`root`/`attitude`
+/// reference named per-field sub-rules rather than wrapping), because
+/// llama.cpp's C grammar parser only treats a bare newline as insignificant
+/// while inside an unclosed `(...)` group — outside of one, a newline ends
+/// the current rule, and the next line is then parsed as if it must start a
+/// new `name ::=` definition. A rule split across lines like the pre-#207
+/// version of `root` therefore fails with `expecting name at ...` against a
+/// real model, even though every unit test here (which never hands this
+/// string to llama.cpp) passes. `#[cfg(test)] mod tests`'s
+/// `gbnf_rule_boundary_lint` module-free-checks this constraint on every
+/// grammar constant below; `llm.rs`'s
+/// `extract_returns_grammar_valid_json_when_a_test_gguf_is_available` test
+/// exercises this exact constant against a real GGUF when one is available.
+pub const EXTRACTION_GRAMMAR: &str = r#"root ::= "{" ws companion-state-field ws "," ws user-state-field ws "," ws milestones-field ws "," ws backstory-field ws "," ws open-threads-field ws "," ws rules-field ws "," ws people-field ws "," ws key-quotes-field ws "," ws summary-field ws "," ws attitude-field ws "}"
+
+companion-state-field ::= "\"companion_state\"" ws ":" ws state-array
+user-state-field ::= "\"user_state\"" ws ":" ws state-array
+milestones-field ::= "\"milestones\"" ws ":" ws text-array
+backstory-field ::= "\"backstory\"" ws ":" ws backstory-array
+open-threads-field ::= "\"open_threads\"" ws ":" ws text-array
+rules-field ::= "\"rules\"" ws ":" ws quote-array
+people-field ::= "\"people\"" ws ":" ws person-array
+key-quotes-field ::= "\"key_quotes\"" ws ":" ws quote-array
+summary-field ::= "\"summary\"" ws ":" ws string
+attitude-field ::= "\"attitude\"" ws ":" ws attitude
 
 state-array ::= "[" ws (state-item (ws "," ws state-item){0,11})? ws "]"
 text-array ::= "[" ws (text-item (ws "," ws text-item){0,11})? ws "]"
@@ -430,16 +444,16 @@ backstory-item ::= "{" ws "\"about\"" ws ":" ws party ws "," ws "\"text\"" ws ":
 quote-item ::= "{" ws "\"quote\"" ws ":" ws string ws "," ws "\"speaker\"" ws ":" ws party ws "," ws "\"sources\"" ws ":" ws sources ws "}"
 person-item ::= "{" ws "\"name\"" ws ":" ws string ws "," ws "\"relation_to\"" ws ":" ws party ws "," ws "\"relation\"" ws ":" ws string ws "," ws "\"sources\"" ws ":" ws sources ws "}"
 
-attitude ::= "{" ws
-  "\"trust\"" ws ":" ws rating ws "," ws
-  "\"love\"" ws ":" ws rating ws "," ws
-  "\"fear\"" ws ":" ws rating ws "," ws
-  "\"anger\"" ws ":" ws rating ws "," ws
-  "\"joy\"" ws ":" ws rating ws "," ws
-  "\"sorrow\"" ws ":" ws rating ws "," ws
-  "\"suspicion\"" ws ":" ws rating ws "," ws
-  "\"gratitude\"" ws ":" ws rating
-ws "}"
+attitude ::= "{" ws trust-field ws "," ws love-field ws "," ws fear-field ws "," ws anger-field ws "," ws joy-field ws "," ws sorrow-field ws "," ws suspicion-field ws "," ws gratitude-field ws "}"
+
+trust-field ::= "\"trust\"" ws ":" ws rating
+love-field ::= "\"love\"" ws ":" ws rating
+fear-field ::= "\"fear\"" ws ":" ws rating
+anger-field ::= "\"anger\"" ws ":" ws rating
+joy-field ::= "\"joy\"" ws ":" ws rating
+sorrow-field ::= "\"sorrow\"" ws ":" ws rating
+suspicion-field ::= "\"suspicion\"" ws ":" ws rating
+gratitude-field ::= "\"gratitude\"" ws ":" ws rating
 
 fact-ids ::= "[" ws (int (ws "," ws int){0,7})? ws "]"
 sources ::= "[" ws int (ws "," ws int){0,7} ws "]"
@@ -458,6 +472,98 @@ string ::= "\"" char{1,400} "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 ws ::= [ \n\t]{0,20}
 "#;
+
+/// Model-free GBNF syntax guard (#207): `llama-cpp-2` exposes no way to
+/// parse a grammar without a loaded `LlamaModel` (`LlamaSampler::grammar`
+/// takes `&LlamaModel`; the crate's own `src/grammar/` parser is not wired
+/// into `lib.rs` and is unreachable outside its own crate), so this
+/// reimplements the one constraint of llama.cpp's C parser
+/// (`llama-grammar.cpp`'s `parse_sequence`) that actually broke
+/// `EXTRACTION_GRAMMAR`: at paren depth 0, a term is followed by
+/// `parse_space(pos, is_nested)` with `is_nested = false`, which does not
+/// treat `\n` as insignificant whitespace — so a bare newline outside any
+/// `(...)` group ends the current rule's production, and the parser then
+/// requires the next line to start a new `name ::=` definition. This is not
+/// a full GBNF grammar checker; it only catches that one failure mode, since
+/// that is the one nothing else in CI catches (every extraction test here
+/// uses `FakeExtractor` and never hands this text to a real parser).
+///
+/// Returns `Err` describing the offending line on the first bare newline
+/// found at depth 0 that isn't immediately followed (modulo whitespace and
+/// `#` comment lines) by a new `name ::=` rule or the end of the grammar.
+#[cfg(test)]
+fn check_gbnf_rule_boundaries(gbnf: &str) -> Result<(), String> {
+    fn rule_starts_or_grammar_ends(rest: &str) -> bool {
+        let mut s = rest;
+        loop {
+            s = s.trim_start_matches([' ', '\t', '\r', '\n']);
+            match s.strip_prefix('#') {
+                Some(after_hash) => {
+                    s = match after_hash.find('\n') {
+                        Some(idx) => &after_hash[idx + 1..],
+                        None => "",
+                    };
+                }
+                None => break,
+            }
+        }
+        if s.is_empty() {
+            return true;
+        }
+        let name_end = s
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+            .unwrap_or(s.len());
+        name_end > 0
+            && s[name_end..]
+                .trim_start_matches([' ', '\t'])
+                .starts_with("::=")
+    }
+
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut in_char_class = false;
+    let mut escaped = false;
+    let mut line_no = 1usize;
+    let mut skip_to_eol = false;
+    for (byte_idx, ch) in gbnf.char_indices() {
+        if skip_to_eol {
+            if ch == '\n' {
+                skip_to_eol = false;
+            } else {
+                continue;
+            }
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string || in_char_class => escaped = true,
+            '"' if !in_char_class => in_string = !in_string,
+            '[' if !in_string => in_char_class = true,
+            ']' if !in_string => in_char_class = false,
+            '#' if !in_string && !in_char_class => skip_to_eol = true,
+            '(' if !in_string && !in_char_class => depth += 1,
+            ')' if !in_string && !in_char_class => depth -= 1,
+            '\n' if depth == 0
+                && !in_string
+                && !in_char_class
+                && !rule_starts_or_grammar_ends(&gbnf[byte_idx + 1..]) =>
+            {
+                return Err(format!(
+                    "line {line_no}: bare newline at paren depth 0 outside a rule \
+                     boundary; llama.cpp's grammar parser ends the rule here and then \
+                     fails to parse the next line as a new `name ::=` definition"
+                ));
+            }
+            _ => {}
+        }
+        if ch == '\n' {
+            line_no += 1;
+        }
+    }
+    Ok(())
+}
 
 /// Splits `range` into chunks that each fit `context_window -
 /// CONTEXT_RESERVE_TOKENS - scaffold_tokens`, greedily at message
@@ -1390,6 +1496,65 @@ mod tests {
             SLOT.try_claim().is_some(),
             "slot should be released even though the job panicked"
         );
+    }
+
+    // --- #207: model-free GBNF syntax guard ---
+    //
+    // Neither of these needs a GGUF, so unlike `extracts_from_a_real_gguf`
+    // below they always run in CI. This is the guard the issue calls "the
+    // actual root cause" — a malformed grammar constant must fail here, not
+    // only on hardware.
+
+    #[test]
+    fn every_shipped_grammar_constant_passes_the_gbnf_rule_boundary_lint() {
+        for (name, gbnf) in [
+            ("EXTRACTION_GRAMMAR", EXTRACTION_GRAMMAR),
+            ("SUMMARY_GRAMMAR", SUMMARY_GRAMMAR),
+        ] {
+            assert_eq!(
+                check_gbnf_rule_boundaries(gbnf),
+                Ok(()),
+                "{name} should pass the GBNF rule-boundary lint"
+            );
+        }
+    }
+
+    /// Falsifies the lint above: reconstructs the exact pre-#207 shape of
+    /// `root` (a multi-line top-level sequence, unindented sub-rules split
+    /// across lines with no enclosing parens) and confirms the lint rejects
+    /// it. Without this, `every_shipped_grammar_constant_passes_the_gbnf_rule_boundary_lint`
+    /// could pass merely because `check_gbnf_rule_boundaries` is a no-op.
+    #[test]
+    fn the_lint_rejects_the_original_pre_207_multi_line_root() {
+        let pre_207_root = r#"root ::= "{" ws
+  "\"companion_state\"" ws ":" ws state-array ws "," ws
+  "\"summary\"" ws ":" ws string
+ws "}"
+
+state-array ::= "[" ws "]"
+string ::= "\"" char{1,400} "\""
+char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
+ws ::= [ \n\t]{0,20}
+"#;
+        assert!(
+            check_gbnf_rule_boundaries(pre_207_root).is_err(),
+            "the lint should reject a rule whose production is split across \
+             lines outside any parentheses, matching the pre-#207 bug"
+        );
+    }
+
+    /// Confirms the lint does not merely reject every multi-line grammar:
+    /// a newline nested inside an unclosed `(...)` group, as llama.cpp's
+    /// own bundled `json.gbnf` uses, is legal.
+    #[test]
+    fn the_lint_allows_a_newline_nested_inside_parens() {
+        let nested = r#"object ::= "{" (
+  string ":" value
+)? "}"
+string ::= "\"" [a-z]* "\""
+value ::= string
+"#;
+        assert_eq!(check_gbnf_rule_boundaries(nested), Ok(()));
     }
 
     // --- manual/CI-optional acceptance test ---
