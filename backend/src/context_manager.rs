@@ -299,15 +299,17 @@ impl ContextManager {
         &self,
         system_tokens: usize,
         attitude_tokens: usize,
+        compaction_tokens: usize,
         message_tokens: usize,
     ) -> MemoryStats {
-        let used_tokens = system_tokens + attitude_tokens + message_tokens;
+        let used_tokens = system_tokens + attitude_tokens + compaction_tokens + message_tokens;
         let available_response_tokens = self.get_response_token_limit(used_tokens);
         let total_used = used_tokens + available_response_tokens;
 
         MemoryStats {
             system_tokens,
             attitude_tokens,
+            compaction_tokens,
             message_tokens,
             response_tokens: available_response_tokens,
             total_used_tokens: total_used,
@@ -720,6 +722,11 @@ impl OptimizedContext {
 pub struct MemoryStats {
     pub system_tokens: usize,
     pub attitude_tokens: usize,
+    /// The rendered compaction blocks' token count (#174): overlays, rules,
+    /// story-so-far, recent detail, and pins, already folded into
+    /// `system_prompt` by `build_base_components` but reported under its
+    /// own line here instead of being double-counted as system tokens.
+    pub compaction_tokens: usize,
     pub message_tokens: usize,
     pub response_tokens: usize,
     pub total_used_tokens: usize,
@@ -732,6 +739,7 @@ impl MemoryStats {
         println!("🧠 Context Window Memory Usage:");
         println!("   System Prompt: {} tokens", self.system_tokens);
         println!("   Attitude Data: {} tokens", self.attitude_tokens);
+        println!("   Compaction: {} tokens", self.compaction_tokens);
         println!("   Messages: {} tokens", self.message_tokens);
         println!("   Response Budget: {} tokens", self.response_tokens);
         println!(

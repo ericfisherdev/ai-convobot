@@ -448,6 +448,18 @@ pub trait CompactionStore {
     /// `summary`/`rolling_summary` every turn).
     fn latest_committed(&self, companion_id: i32) -> Result<Option<Checkpoint>>;
 
+    /// `active_facts`, `compacted_through`, and `latest_committed` for
+    /// `companion_id`, read from one consistent snapshot — the production
+    /// impl wraps all three in a single transaction — so a checkpoint
+    /// commit racing this read can never combine, say, the facts from
+    /// before the commit with the cutoff/summary from after it (or vice
+    /// versa). `compaction::context::CompactionContext::load` (#174) is the
+    /// sole caller.
+    fn context_snapshot(
+        &self,
+        companion_id: i32,
+    ) -> Result<(Vec<Fact>, Option<i32>, Option<Checkpoint>)>;
+
     /// Sets `committed_at = now` when `status == Committed`;
     /// `QueryReturnedNoRows` when `id` does not exist.
     fn update_status(&self, id: i64, status: CompactionStatus) -> Result<()>;
@@ -530,6 +542,19 @@ impl CompactionStore for SqliteCompactionStore {
     fn latest_committed(&self, companion_id: i32) -> Result<Option<Checkpoint>> {
         let con = Database::open()?;
         latest_committed_on(&con, companion_id)
+    }
+
+    fn context_snapshot(
+        &self,
+        companion_id: i32,
+    ) -> Result<(Vec<Fact>, Option<i32>, Option<Checkpoint>)> {
+        let con = Database::open()?;
+        let tx = con.unchecked_transaction()?;
+        let facts = active_facts_on(&tx, companion_id)?;
+        let compacted_through = compacted_through_on(&tx, companion_id)?;
+        let latest_committed = latest_committed_on(&tx, companion_id)?;
+        tx.commit()?;
+        Ok((facts, compacted_through, latest_committed))
     }
 
     fn update_status(&self, id: i64, status: CompactionStatus) -> Result<()> {
@@ -691,6 +716,21 @@ impl CompactionStore for RecordingStore {
             .filter(|c| c.companion_id == companion_id && c.status == CompactionStatus::Committed)
             .max_by_key(|c| c.id)
             .cloned())
+    }
+
+    fn context_snapshot(
+        &self,
+        companion_id: i32,
+    ) -> Result<(Vec<Fact>, Option<i32>, Option<Checkpoint>)> {
+        // In-memory and single-threaded in every test that uses it, so a
+        // real transaction buys nothing here; calling straight through
+        // still exercises the same three reads `CompactionContext::load`
+        // relies on.
+        Ok((
+            self.active_facts(companion_id)?,
+            self.compacted_through(companion_id)?,
+            self.latest_committed(companion_id)?,
+        ))
     }
 
     fn update_status(&self, id: i64, status: CompactionStatus) -> Result<()> {
@@ -1204,5 +1244,47 @@ mod tests {
         // Matches `RecordingStore::compacted_through`, which has no
         // separate "unknown companion" error path either.
         assert_eq!(compacted_through_on(&con, 999).unwrap(), None);
+    }
+
+    /// `context_snapshot`'s whole point is that these three reads happen
+    /// inside one transaction (`SqliteCompactionStore::context_snapshot`
+    /// wraps them in `unchecked_transaction`); this exercises exactly the
+    /// same three `_on` helpers inside a transaction to prove the
+    /// combination is correct, since `SqliteCompactionStore` itself is only
+    /// reachable through the hardwired `Database::open()` path (untestable
+    /// against a `TempDir` here, same as every other trait method above).
+    #[test]
+    fn the_three_context_snapshot_reads_agree_inside_one_transaction() {
+        let (_dir, con) = fresh_db();
+        let compaction_id = insert_draft_on(&con, &a_draft()).unwrap();
+        insert_facts_on(
+            &con,
+            compaction_id,
+            &[FactDraft {
+                category: FactCategory::UserState,
+                subject: None,
+                text: "loves cats".to_string(),
+                quote_speaker: None,
+                sources: vec![1],
+                replaces: vec![],
+                relation_to: None,
+                relation: None,
+                canon: true,
+                rejected_reason: None,
+            }],
+        )
+        .unwrap();
+        update_status_on(&con, compaction_id, CompactionStatus::Committed).unwrap();
+        set_compacted_through_on(&con, 1, Some(2)).unwrap();
+
+        let tx = con.unchecked_transaction().unwrap();
+        let facts = active_facts_on(&tx, 1).unwrap();
+        let compacted_through = compacted_through_on(&tx, 1).unwrap();
+        let latest_committed = latest_committed_on(&tx, 1).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(facts.len(), 1);
+        assert_eq!(compacted_through, Some(2));
+        assert_eq!(latest_committed.unwrap().id, compaction_id);
     }
 }

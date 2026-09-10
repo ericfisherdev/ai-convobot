@@ -1439,6 +1439,7 @@ fn generate(
         chat_history,
         attitude_context,
         managed_messages,
+        compaction: compaction_blocks,
         ..
     } = assembled;
     // Built from the config passed into `assemble_prompt`, so the budgets below
@@ -1446,21 +1447,37 @@ fn generate(
     let context_manager = ContextManager::new(config.clone());
 
     // Calculate token usage for memory management. base_prompt already
-    // contains the attitude text (it was folded into base_components above),
-    // so it is subtracted back out here to avoid double counting it.
+    // contains the attitude text and the rendered compaction blocks (both
+    // were folded into base_components above), so they are subtracted back
+    // out here to avoid double counting them as system tokens.
     let attitude_tokens = ContextManager::estimate_tokens(&attitude_context);
-    let system_tokens =
-        ContextManager::estimate_tokens(&base_prompt).saturating_sub(attitude_tokens);
+    let compaction_tokens = ContextManager::estimate_tokens(&format!(
+        "{}{}{}{}{}{}",
+        compaction_blocks.user_overlay,
+        compaction_blocks.companion_overlay,
+        compaction_blocks.rules,
+        compaction_blocks.story_so_far,
+        compaction_blocks.recent_detail,
+        compaction_blocks.pins,
+    ));
+    let system_tokens = ContextManager::estimate_tokens(&base_prompt)
+        .saturating_sub(attitude_tokens)
+        .saturating_sub(compaction_tokens);
     let message_tokens = managed_messages
         .iter()
         .map(|msg| ContextManager::estimate_tokens(&msg.content))
         .sum::<usize>();
 
     // Get response token limit and print memory stats
-    let response_token_limit =
-        context_manager.get_response_token_limit(system_tokens + attitude_tokens + message_tokens);
-    let memory_stats =
-        context_manager.get_memory_stats(system_tokens, attitude_tokens, message_tokens);
+    let response_token_limit = context_manager.get_response_token_limit(
+        system_tokens + attitude_tokens + compaction_tokens + message_tokens,
+    );
+    let memory_stats = context_manager.get_memory_stats(
+        system_tokens,
+        attitude_tokens,
+        compaction_tokens,
+        message_tokens,
+    );
     memory_stats.print_stats();
 
     // Initialize performance tracking
@@ -1478,7 +1495,8 @@ fn generate(
         device_type: config.device.to_string(),
     };
 
-    let input_tokens = (system_tokens + attitude_tokens + message_tokens) as u32;
+    let input_tokens =
+        (system_tokens + attitude_tokens + compaction_tokens + message_tokens) as u32;
 
     // Start performance tracking
     if let Ok(mut tracker) = INFERENCE_TRACKER.lock() {

@@ -119,10 +119,15 @@ impl CompactionContext {
         ctx
     }
 
-    /// Store-backed builder: [`Self::from_facts`] over
-    /// `store.active_facts(companion_id)`, plus `compacted_through`, the
-    /// latest committed checkpoint's summaries, and pinned messages resolved
-    /// through `message_by_id` (production passes `Database::get_message`).
+    /// Store-backed builder: [`Self::from_facts`] over one consistent
+    /// `store.context_snapshot(companion_id)` read (active facts,
+    /// `compacted_through`, and the latest committed checkpoint's
+    /// summaries, all from the same transaction on the production impl —
+    /// see [`CompactionStore::context_snapshot`] — so a checkpoint commit
+    /// racing this load can never combine facts from one side of the
+    /// commit with the cutoff/summary from the other), plus pinned
+    /// messages resolved through `message_by_id` (production passes
+    /// `Database::get_message`).
     ///
     /// # Errors
     /// Propagates the store's `rusqlite::Error`. A pinned message whose row
@@ -133,12 +138,12 @@ impl CompactionContext {
         message_by_id: &dyn Fn(i32) -> rusqlite::Result<Message>,
         companion_id: i32,
     ) -> rusqlite::Result<Self> {
-        let facts = store.active_facts(companion_id)?;
+        let (facts, compacted_through, latest_committed) = store.context_snapshot(companion_id)?;
         let mut ctx = Self::from_facts(&facts);
 
-        ctx.compacted_through = store.compacted_through(companion_id)?;
+        ctx.compacted_through = compacted_through;
 
-        if let Some(checkpoint) = store.latest_committed(companion_id)? {
+        if let Some(checkpoint) = latest_committed {
             ctx.rolling_summary = checkpoint.rolling_summary.unwrap_or_default();
             ctx.recent_detail = checkpoint.summary.unwrap_or_default();
         }
