@@ -1107,6 +1107,23 @@ mod stream_turn_tests {
         ) -> Option<(CompanionAttitude, CompanionAttitude)> {
             Some(self.attitude.clone())
         }
+
+        fn compaction_tail(
+            &self,
+            companion_id: i32,
+        ) -> rusqlite::Result<crate::compaction::hook::CompactionTailView> {
+            self.inner.compaction_tail(companion_id)
+        }
+
+        fn queue_compaction_draft(
+            &self,
+            companion_id: i32,
+            range: crate::compaction::range::CompactionRange,
+            trigger: crate::compaction::types::CompactionTrigger,
+        ) -> rusqlite::Result<i64> {
+            self.inner
+                .queue_compaction_draft(companion_id, range, trigger)
+        }
     }
 
     #[test]

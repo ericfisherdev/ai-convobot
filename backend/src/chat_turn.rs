@@ -20,6 +20,9 @@
 //! consumes `self`.
 
 use crate::attitude_engine::{LexiconScorer, ScorerConfig, TurnScorer};
+use crate::compaction::hook::{compaction_tail_on, queue_compaction_draft_on, CompactionTailView};
+use crate::compaction::range::CompactionRange;
+use crate::compaction::types::CompactionTrigger;
 use crate::database::{CompanionAttitude, Database, Message, NewMessage};
 use crate::participants::{normalise_mentions, ParticipantId, ParticipantRegistry};
 use crate::turn_slot::TurnGuard;
@@ -70,6 +73,21 @@ pub trait TurnStore {
         user_message: &str,
         companion_reply: &str,
     ) -> Option<(CompanionAttitude, CompanionAttitude)>;
+
+    /// Reads everything compaction's hook (`crate::compaction::hook::after_round`,
+    /// #172) needs to decide whether a checkpoint draft is due: the
+    /// uncompacted tail, the companion's `short_term_mem`, whether a draft
+    /// is already pending, and the compaction config.
+    fn compaction_tail(&self, companion_id: i32) -> rusqlite::Result<CompactionTailView>;
+
+    /// Queues a new draft checkpoint spanning `range`, caused by `trigger`,
+    /// returning the new `compactions` row id.
+    fn queue_compaction_draft(
+        &self,
+        companion_id: i32,
+        range: CompactionRange,
+        trigger: CompactionTrigger,
+    ) -> rusqlite::Result<i64>;
 }
 
 /// The production [`TurnStore`], backed by `companion_database.db`.
@@ -117,6 +135,19 @@ impl TurnStore for SqliteTurnStore {
         companion_reply: &str,
     ) -> Option<(CompanionAttitude, CompanionAttitude)> {
         finish_turn(companion_id, user_id, user_message, companion_reply)
+    }
+
+    fn compaction_tail(&self, companion_id: i32) -> rusqlite::Result<CompactionTailView> {
+        compaction_tail_on(companion_id)
+    }
+
+    fn queue_compaction_draft(
+        &self,
+        companion_id: i32,
+        range: CompactionRange,
+        trigger: CompactionTrigger,
+    ) -> rusqlite::Result<i64> {
+        queue_compaction_draft_on(companion_id, range, trigger)
     }
 }
 
@@ -377,6 +408,14 @@ impl PendingTurn {
         self.user_message_id
     }
 
+    /// The companion id `begin` was called with — `multiplayer::round::run_round`
+    /// reads this before calling `finish` (which consumes `self`) so it can
+    /// still call `compaction::hook::after_round` for the right companion
+    /// once the round is over.
+    pub fn companion_id(&self) -> i32 {
+        self.companion_id
+    }
+
     /// Generates one speaker's reply and persists it.
     ///
     /// The generated text is normalised to `@id` mention form (`self.registry`)
@@ -441,6 +480,13 @@ pub(crate) struct RecordingStore {
     /// assert a later speaker saw an earlier one's reply.
     log: std::sync::Mutex<Vec<Message>>,
     interaction_prompt: Option<String>,
+    /// What `compaction_tail` returns. Defaults to an empty tail with
+    /// `draft_pending: false`, so every existing `chat_turn` and `round`
+    /// test — none of which calls `with_compaction_tail` — keeps passing
+    /// exactly as before compaction existed.
+    compaction_tail: std::sync::Mutex<CompactionTailView>,
+    /// Every draft `queue_compaction_draft` has queued, in call order.
+    pub(crate) queued_drafts: std::sync::Mutex<Vec<(CompactionRange, CompactionTrigger)>>,
 }
 
 #[cfg(test)]
@@ -452,7 +498,26 @@ impl RecordingStore {
             finished: std::sync::Mutex::new(Vec::new()),
             log: std::sync::Mutex::new(Vec::new()),
             interaction_prompt,
+            compaction_tail: std::sync::Mutex::new(CompactionTailView {
+                compacted_through: None,
+                messages: Vec::new(),
+                last_user_turn: String::new(),
+                short_term_mem: 0,
+                draft_pending: false,
+                config: crate::compaction::trigger::CompactionConfig {
+                    threshold_tokens: usize::MAX,
+                    min_messages: usize::MAX,
+                },
+            }),
+            queued_drafts: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Overrides what `compaction_tail` returns, for a test that wants
+    /// `multiplayer::round::run_round`'s compaction hook to actually fire.
+    pub(crate) fn with_compaction_tail(self, view: CompactionTailView) -> Self {
+        *self.compaction_tail.lock().unwrap() = view;
+        self
     }
 
     /// Appends `speaker_id`/`content` to `log` and returns the row id it was
@@ -519,6 +584,26 @@ impl TurnStore for RecordingStore {
             .unwrap()
             .push((user_message.to_string(), companion_reply.to_string()));
         None
+    }
+
+    fn compaction_tail(&self, _companion_id: i32) -> rusqlite::Result<CompactionTailView> {
+        Ok(self.compaction_tail.lock().unwrap().clone())
+    }
+
+    fn queue_compaction_draft(
+        &self,
+        _companion_id: i32,
+        range: CompactionRange,
+        trigger: CompactionTrigger,
+    ) -> rusqlite::Result<i64> {
+        let mut queued = self.queued_drafts.lock().unwrap();
+        let draft_id = queued.len() as i64 + 1;
+        queued.push((range, trigger));
+        drop(queued);
+        // Mirrors what SQLite would report on the next round: the draft
+        // just queued is now the pending one.
+        self.compaction_tail.lock().unwrap().draft_pending = true;
+        Ok(draft_id)
     }
 }
 
