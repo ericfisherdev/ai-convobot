@@ -108,7 +108,7 @@ function PendingDraftMarker({
       onJumpToMessage={scrollToMessage}
       serverRejections={rejections}
       state={review}
-      onStateChange={setReview}
+      onStateChange={(update) => setReview((prev) => (prev ? update(prev) : prev))}
     />
   );
 

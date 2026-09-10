@@ -1,8 +1,18 @@
+import { useState } from 'react';
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { CompactionDraftCard } from '../message/CompactionDraftCard';
-import { CheckpointDetail, CompactionFact } from '../interfaces/Compaction';
+import { initialReviewState, ReviewState } from '../message/compactionReview';
+import { CheckpointDetail, CompactionFact, RejectedItem } from '../interfaces/Compaction';
+
+// A stable reference for `ControlledHarness`'s default `serverRejections`.
+// A fresh `[]` literal as a default parameter is re-created on every render
+// of the harness; since `CompactionDraftCard`'s `useEffect` depends on
+// `serverRejections` by reference, that would retrigger the effect (which
+// itself updates state through the controlled setter) on every render,
+// looping forever.
+const NO_REJECTIONS: RejectedItem[] = [];
 
 const aFact = (overrides: Partial<CompactionFact> = {}): CompactionFact => ({
   id: 1,
@@ -165,34 +175,80 @@ describe('CompactionDraftCard', () => {
     expect(onJumpToMessage).toHaveBeenCalledWith(42);
   });
 
+  // A real controlled wrapper, mirroring how `PendingDraftMarker` wires
+  // `state`/`onStateChange`: `onStateChange` receives an updater function
+  // and threads it through `setState`, so two `applyUpdate` calls in the
+  // same handler compose instead of one clobbering the other.
+  function ControlledHarness({
+    draft,
+    onCommit = noop,
+    serverRejections = NO_REJECTIONS,
+  }: {
+    draft: CheckpointDetail;
+    onCommit?: (review: unknown) => void;
+    serverRejections?: RejectedItem[];
+  }) {
+    const [state, setState] = useState<ReviewState>(() => initialReviewState(draft));
+    return (
+      <CompactionDraftCard
+        draft={draft}
+        messagesSinceDraft={0}
+        busy={false}
+        onCommit={onCommit}
+        onDiscard={noop}
+        onJumpToMessage={noop}
+        serverRejections={serverRejections}
+        state={state}
+        onStateChange={(update) => setState((prev) => update(prev))}
+      />
+    );
+  }
+
   it('routes edits through a controlled state/onStateChange pair instead of its own useState', async () => {
     // `PendingDraftMarker` lifts `ReviewState` out of this card so it
     // survives the mobile drawer unmounting; this proves edits flow through
     // the controlled pair rather than an internal state the parent cannot see.
     const user = userEvent.setup();
     const draft = aDraft([aFact({ id: 1, category: 'milestone' })]);
-    const onStateChange = vi.fn();
+    const onCommit = vi.fn();
 
-    render(
-      <CompactionDraftCard
-        draft={draft}
-        messagesSinceDraft={0}
-        busy={false}
-        onCommit={noop}
-        onDiscard={noop}
-        onJumpToMessage={noop}
-        serverRejections={[]}
-        state={{ items: [{ fact: draft.facts[0], accepted: true, text: draft.facts[0].text, serverReason: null }], summary: 'a summary' }}
-        onStateChange={onStateChange}
-      />
-    );
+    render(<ControlledHarness draft={draft} onCommit={onCommit} />);
 
     await user.click(screen.getByRole('checkbox', { name: 'Accept Milestone item' }));
+    await user.click(screen.getByRole('button', { name: 'Commit' }));
 
-    // The mount-time `applyServerRejection` effect (a no-op against an empty
-    // `serverRejections`) also runs through the controlled setter, so check
-    // the toggle's own (most recent) call rather than the call count.
-    expect(onStateChange.mock.calls[onStateChange.mock.calls.length - 1][0].items[0].accepted).toBe(false);
+    expect(onCommit).toHaveBeenCalledTimes(1);
+    expect(onCommit.mock.calls[onCommit.mock.calls.length - 1][0].items).toEqual([
+      { id: 1, accepted: false },
+    ]);
+  });
+
+  it('saving both text and quote for a rule item in one handler keeps both edits (no stale-closure clobber)', async () => {
+    // `ItemRow.handleSave` calls `onEditText` then `onEditQuote`
+    // synchronously; against a plain `onStateChange(next)` (rather than a
+    // functional updater), the second call would overwrite the first
+    // because both read the same pre-save `state` closure.
+    const user = userEvent.setup();
+    const draft = aDraft([
+      aFact({ id: 1, category: 'rule', text: 'never go to the lake alone' }),
+    ]);
+
+    render(<ControlledHarness draft={draft} />);
+
+    await user.click(screen.getByRole('button', { name: 'Edit item' }));
+    const textbox = screen.getAllByRole('textbox')[0];
+    const quoteBox = screen.getAllByRole('textbox')[1];
+    await user.clear(textbox);
+    await user.type(textbox, 'a rewritten rule');
+    await user.clear(quoteBox);
+    await user.type(quoteBox, 'never set foot near the lake alone');
+    await user.click(screen.getByRole('button', { name: 'Save item' }));
+
+    // `toReviewPayload` only ever sends `quote` for a rule item, never
+    // `text`, so the payload alone cannot tell the two update calls apart
+    // -- check the card's own re-render, which shows both fields.
+    expect(screen.getByText('a rewritten rule')).toBeInTheDocument();
+    expect(screen.getByText(/never set foot near the lake alone/)).toBeInTheDocument();
   });
 
   it('renders no Commit/Discard controls in readOnly mode', () => {
