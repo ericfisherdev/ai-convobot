@@ -249,6 +249,26 @@ pub(crate) fn update_status_on(con: &Connection, id: i64, status: CompactionStat
     Ok(())
 }
 
+/// Fills in `raw_model_output`/`summary`/`attitude_ratings` on an existing
+/// checkpoint row. `QueryReturnedNoRows` if `id` does not exist (checked via
+/// `changes() == 0`, matching `update_status_on`).
+pub(crate) fn set_extraction_result_on(
+    con: &Connection,
+    id: i64,
+    raw_model_output: Option<String>,
+    summary: Option<String>,
+    attitude_ratings: Option<String>,
+) -> Result<()> {
+    let changed = con.execute(
+        "UPDATE compactions SET raw_model_output = ?, summary = ?, attitude_ratings = ? WHERE id = ?",
+        params![raw_model_output, summary, attitude_ratings, id],
+    )?;
+    if changed == 0 {
+        return Err(Error::QueryReturnedNoRows);
+    }
+    Ok(())
+}
+
 /// Inserts `facts` for `compaction_id`, one row per draft, returning the
 /// new ids in input order. `replaces`, `relation_to`, and `relation` are
 /// written exactly as given; the rows named in `replaces` are never
@@ -432,6 +452,20 @@ pub trait CompactionStore {
     /// `QueryReturnedNoRows` when `id` does not exist.
     fn update_status(&self, id: i64, status: CompactionStatus) -> Result<()>;
 
+    /// Fills in a draft's extraction result: the model's raw output,
+    /// summary, and attitude ratings (raw JSON; #176 gives this a typed
+    /// shape). #185's `fill_draft` calls this once on success (all three
+    /// `Some`) and once per discard path (`raw_model_output` only, the
+    /// other two `None`, immediately followed by `update_status(Discarded)`).
+    /// `QueryReturnedNoRows` if `id` does not exist.
+    fn set_extraction_result(
+        &self,
+        id: i64,
+        raw_model_output: Option<String>,
+        summary: Option<String>,
+        attitude_ratings: Option<String>,
+    ) -> Result<()>;
+
     /// One transaction, ids in input order; `SqliteFailure(ConstraintViolation)`
     /// if the checkpoint does not exist. Writes `replaces`, `relation_to`,
     /// and `relation` exactly as given; it does not touch the rows named
@@ -501,6 +535,17 @@ impl CompactionStore for SqliteCompactionStore {
     fn update_status(&self, id: i64, status: CompactionStatus) -> Result<()> {
         let con = Database::open()?;
         update_status_on(&con, id, status)
+    }
+
+    fn set_extraction_result(
+        &self,
+        id: i64,
+        raw_model_output: Option<String>,
+        summary: Option<String>,
+        attitude_ratings: Option<String>,
+    ) -> Result<()> {
+        let con = Database::open()?;
+        set_extraction_result_on(&con, id, raw_model_output, summary, attitude_ratings)
     }
 
     fn insert_facts(&self, compaction_id: i64, facts: &[FactDraft]) -> Result<Vec<i64>> {
@@ -658,6 +703,24 @@ impl CompactionStore for RecordingStore {
         if status == CompactionStatus::Committed {
             checkpoint.committed_at = Some(get_current_date());
         }
+        Ok(())
+    }
+
+    fn set_extraction_result(
+        &self,
+        id: i64,
+        raw_model_output: Option<String>,
+        summary: Option<String>,
+        attitude_ratings: Option<String>,
+    ) -> Result<()> {
+        let mut checkpoints = self.checkpoints.lock().unwrap();
+        let checkpoint = checkpoints
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or(Error::QueryReturnedNoRows)?;
+        checkpoint.raw_model_output = raw_model_output;
+        checkpoint.summary = summary;
+        checkpoint.attitude_ratings = attitude_ratings;
         Ok(())
     }
 
@@ -861,6 +924,32 @@ mod tests {
     fn update_status_on_an_unknown_id_is_query_returned_no_rows() {
         let (_dir, con) = fresh_db();
         let err = update_status_on(&con, 999, CompactionStatus::Committed).unwrap_err();
+        assert!(matches!(err, Error::QueryReturnedNoRows));
+    }
+
+    #[test]
+    fn set_extraction_result_on_fills_in_summary_and_attitude_and_errors_on_an_unknown_id() {
+        let (_dir, con) = fresh_db();
+        let compaction_id = insert_draft_on(&con, &a_draft()).unwrap();
+
+        set_extraction_result_on(
+            &con,
+            compaction_id,
+            Some("raw output".to_string()),
+            Some("a summary".to_string()),
+            Some("{\"trust\":50}".to_string()),
+        )
+        .unwrap();
+
+        let checkpoint = get_checkpoint_on(&con, compaction_id).unwrap().unwrap();
+        assert_eq!(checkpoint.raw_model_output.as_deref(), Some("raw output"));
+        assert_eq!(checkpoint.summary.as_deref(), Some("a summary"));
+        assert_eq!(
+            checkpoint.attitude_ratings.as_deref(),
+            Some("{\"trust\":50}")
+        );
+
+        let err = set_extraction_result_on(&con, 999, None, None, None).unwrap_err();
         assert!(matches!(err, Error::QueryReturnedNoRows));
     }
 
