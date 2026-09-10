@@ -35,20 +35,25 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
       "ai": true,
       "speaker_id": "char",
       "content": "Hello there!",
-      "created_at": "Saturday 20.04.2024 17:49"
+      "created_at": "Saturday 20.04.2024 17:49",
+      "pinned": false
     },
     {
       "id": 2,
       "ai": false,
       "speaker_id": "user",
       "content": "Hi, can you help me with something?",
-      "created_at": "Saturday 20.04.2024 19:02"
+      "created_at": "Saturday 20.04.2024 19:02",
+      "pinned": true
     }
   ]
   ```
   `speaker_id` is the source of truth for who sent the message; `ai` is
   always derived from it (`speaker_id != "user"`) and kept for backward
-  compatibility.
+  compatibility. `pinned` (#179) is whether the message is exempt from
+  compaction (`POST`/`DELETE /message/{id}/pin`, section 1.7/1.8); a
+  `joiner` mode instance always reports `false`, since pins live on the
+  host.
 
 #### 1.2 Erase messages
 - **URL:** `/message`
@@ -123,7 +128,8 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
       "ai": false,
       "speaker_id": "user",
       "content": "Hi, can you help me with something?",
-      "created_at": "Saturday 20.04.2024 19:02"
+      "created_at": "Saturday 20.04.2024 19:02",
+      "pinned": false
     }
   ```
 
@@ -168,6 +174,40 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 - **Example Request:**
   ```http
   DELETE /message/1
+  ```
+
+#### 1.7 Pin a message
+
+- **URL:** `/message/{id}/pin`
+- **Method:** `POST`
+- **Description:** Pins a message so it stays in the prompt verbatim regardless of what a compaction checkpoint compacts over it (#179). Idempotent: pinning an already-pinned message is not an error.
+- **Path Parameters:**
+  - `id` (integer): The ID of the message to pin.
+- **Response:**
+  - Status: 200 OK
+  - Body: Message pinned at id {id}!
+  - Status: 404 Not Found — `id` does not name a message.
+  - Status: 409 Conflict — this instance is in `joiner` multiplayer mode; pins live on the host.
+- **Example Request:**
+  ```http
+  POST /message/1/pin
+  ```
+
+#### 1.8 Unpin a message
+
+- **URL:** `/message/{id}/pin`
+- **Method:** `DELETE`
+- **Description:** Unpins a message. Idempotent: unpinning a message that was never pinned is not an error.
+- **Path Parameters:**
+  - `id` (integer): The ID of the message to unpin.
+- **Response:**
+  - Status: 200 OK
+  - Body: Message unpinned at id {id}!
+  - Status: 404 Not Found — `id` does not name a message.
+  - Status: 409 Conflict — this instance is in `joiner` multiplayer mode; pins live on the host.
+- **Example Request:**
+  ```http
+  DELETE /message/1/pin
   ```
 
 ### 2. Companion data
@@ -485,7 +525,8 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   - `prompt` (string): Prompt to the AI
 - **Response:**
   - Status: 200 OK
-  - Body: generated text
+  - Body: `{ "reply": string, "compaction_draft_id": integer | null }` (#179; was a bare `text/plain` reply before this issue). `compaction_draft_id` is set when this round's end-of-turn compaction hook queued a new checkpoint draft, so a caller can start polling `GET /compaction/{id}` without waiting for a page refresh; `null` on every other round.
+  - Status: 204 No Content — a mention-filtered round (multiplayer) that excluded the host companion; there is no reply to return.
   - Status: 409 Conflict — a turn (from `/prompt`, `/prompt/stream`, or `/prompt/regenerate`) is already in flight; wait for it to finish before sending another message
   - Status: 409 Conflict — this instance is in `joiner` multiplayer mode; send messages from the host instead
 - **Example Request:**
@@ -496,6 +537,10 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   {
     "prompt": "what time is it currently?"
   }
+  ```
+- **Example Response:**
+  ```json
+  { "reply": "It's 10:04.", "compaction_draft_id": null }
   ```
 
 #### 6.2 Regenerate the last answer
@@ -528,12 +573,12 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   - Content-Type: `text/event-stream`
   - Body: a sequence of `data:` events, each carrying one JSON chunk, one per speaker action in the round. `event` says which of five kinds a chunk is; `speaker_id` is the speaker the chunk is about (empty on the attitude chunk and on `round_complete`/`error`, which are round-wide rather than per-speaker):
     - `reply_started`: a speaker is about to generate. Empty `content`, `is_complete: false`.
-    - `token`: one token from `speaker_id`, appended to that speaker's `content` so far, `is_complete: false`. A `token`-event chunk with empty `content` and an `attitude` object instead is the attitude chunk: sent once after generation, only when the turn moved at least one attitude dimension. `attitude.attitude` is the companion's full post-turn `CompanionAttitude` toward the user, `attitude.summary` is its natural language rendering (with `{{companion}}` and `{{user}}` placeholders), and `attitude.deltas` lists `{ dimension, delta }` for the dimensions that moved.
+    - `token`: one token from `speaker_id`, appended to that speaker's `content` so far, `is_complete: false`. A `token`-event chunk with empty `content` and an `attitude` object instead is the attitude chunk: sent once after generation, only when the turn moved at least one attitude dimension. `attitude.attitude` is the companion's full post-turn `CompanionAttitude` toward the user, `attitude.summary` is its natural language rendering (with `{{companion}}` and `{{user}}` placeholders), and `attitude.deltas` lists `{ dimension, delta }` for the dimensions that moved. A `token`-event chunk with empty `content` and `compaction_draft_id` set instead (#179) is the compaction-draft-ready chunk: sent once, only when this round's end-of-turn compaction hook queued a new checkpoint draft, so the client can start polling `GET /compaction/{id}` without waiting for a page refresh.
     - `reply_complete`: `speaker_id`'s finished, persisted reply. `content` is the sanitized text, `message_id` is the new row's id, `is_complete: false`. A speaker skipped because it did not respond arrives as a bare `reply_complete` for `speaker_id: "system"` (no preceding `reply_started`) carrying the persisted notice.
     - `round_complete`: the round is over. Empty `content`, `is_complete: true`.
     - `error`: the round failed. `error` carries the failure message, empty `content`, `is_complete: true`.
 
-    A full round is `reply_started`, zero or more `token`s, then `reply_complete`, repeated once per speaker (host companion first, then each joined bot in join order), followed by the optional attitude chunk and then `round_complete`. `is_complete` is `true` only on `round_complete` and `error`, so a client that only tracks that field still terminates correctly; a client that only appends non-final `content` renders `reply_complete`'s sanitised text after the raw tokens, so a client must switch on `event` to render each speaker's reply correctly. `message_id`, `error` and `attitude` are omitted when absent.
+    A full round is `reply_started`, zero or more `token`s, then `reply_complete`, repeated once per speaker (host companion first, then each joined bot in join order), followed by the optional attitude chunk, then the optional compaction-draft-ready chunk, and then `round_complete`. `is_complete` is `true` only on `round_complete` and `error`, so a client that only tracks that field still terminates correctly; a client that only appends non-final `content` renders `reply_complete`'s sanitised text after the raw tokens, so a client must switch on `event` to render each speaker's reply correctly. `message_id`, `error`, `attitude` and `compaction_draft_id` are omitted when absent.
   - Status: 409 Conflict — a turn is already in flight; wait for it to finish before sending another message
   - Status: 409 Conflict — this instance is in `joiner` multiplayer mode; send messages from the host instead
 - **Example Request:**
@@ -706,6 +751,99 @@ Once admitted, both sides exchange:
 
 Every frame is a JSON object tagged `"type"` (snake_case, e.g. `"reply_complete"`). Heartbeats are native WebSocket ping/pong control frames, not a JSON type of their own; the host pings every 15 seconds and drops the connection after 2 missed pongs.
 
+### 8. Compaction
+
+Conversation compaction (#171-#186): a checkpoint rolls a run of messages into a summary plus extracted facts, so old turns can drop out of the prompt without the companion losing what happened. Every route below is gated the same way the prompting routes are: `409 Conflict` in `joiner` multiplayer mode, since a joiner has no compaction store of its own.
+
+#### 8.1 Trigger a draft manually
+
+- **URL:** `/compaction/draft`
+- **Method:** `POST`
+- **Description:** Queues a new checkpoint draft over the uncompacted tail, the same way the automatic threshold/scene-break trigger would, and starts extraction on it in the background.
+- **Response:**
+  - Status: 202 Accepted
+  - Body: `{ "draft_id": integer }`
+  - Status: 409 Conflict — a turn is already in flight; wait for it to finish before triggering compaction
+  - Status: 409 Conflict — a draft is already pending; body names its id, e.g. `a draft is already pending (id 3)`
+  - Status: 409 Conflict — the uncompacted tail is shorter than `compact_min_messages`; body: `chat has {n} uncompacted messages; compaction needs at least {compact_min_messages}`
+- **Example Request:**
+  ```http
+  POST /compaction/draft
+  ```
+- **Example Response:**
+  ```json
+  { "draft_id": 3 }
+  ```
+
+#### 8.2 List checkpoints and the pending draft
+
+- **URL:** `/compaction`
+- **Method:** `GET`
+- **Response:**
+  - Status: 200 OK
+  - Body: `{ "checkpoints": [CheckpointSummary], "pending_draft": PendingDraftSummary | null }`, where `CheckpointSummary` is `{ id, from_message_id, through_message_id, status, trigger, committed_at, needs_merge }` (`status` is one of `"draft"`, `"committed"`, `"discarded"`, `"stale"`; `trigger` is one of `"threshold"`, `"scene_break"`, `"manual"`) and `PendingDraftSummary` is `{ id, from_message_id, through_message_id, created_at, phase }` (`phase` is `"extracting"` while the model is still running, `"review"` once it is ready).
+- **Example Request:**
+  ```http
+  GET /compaction
+  ```
+
+#### 8.3 Get a checkpoint's detail
+
+- **URL:** `/compaction/{id}`
+- **Method:** `GET`
+- **Path Parameters:**
+  - `id` (integer): the checkpoint's id.
+- **Response:**
+  - Status: 200 OK
+  - Body: a `CheckpointSummary` (flattened) plus `{ phase, summary_text, rolling_summary, facts, attitude }`. `facts` is every extracted fact, active and rejected alike: `{ id, category, subject, text, quote_speaker, sources, replaces, relation_to, relation, canon, active, superseded_by, rejected_reason }`, with `subject`/`relation_to` flattened to a bare string (`"user"`, `"companion"`, or a person's name). `attitude` is `{ current, rated, blended }`: `current` is the companion's live `CompanionAttitude` toward the user, `rated` is this draft's own narrative rating (`null` while still extracting), `blended` is always `null` until a later issue fills it in.
+  - Status: 404 Not Found — `id` does not name a checkpoint.
+- **Example Request:**
+  ```http
+  GET /compaction/3
+  ```
+
+#### 8.4 Commit a reviewed draft
+
+- **URL:** `/compaction/{id}/commit`
+- **Method:** `POST`
+- **Description:** Applies the reviewed edits onto the draft's stored facts, re-validates whatever was touched, and promotes the result: the checkpoint flips to `committed`, its facts become active, and the companion's `compacted_through` advances. Claims the turn slot for the duration, since folding the rolling summary may run the model.
+- **Path Parameters:**
+  - `id` (integer): the draft's id.
+- **Request Body:**
+  - `items` (array): `{ id, accepted, text, quote }` per edited or struck fact — `id` is the fact's id from section 8.3's `facts`, `text`/`quote` are optional edits (`quote` for a `rule`/`key_quote` item's verbatim text, `text` for everything else), `accepted: false` strikes the item instead. A fact with no entry here keeps its stored verdict.
+  - `summary` (string, optional): overrides the extracted summary; omitted, the stored summary is kept.
+- **Response:**
+  - Status: 200 OK
+  - Body: the committed checkpoint's `CheckpointSummary`.
+  - Status: 404 Not Found — `id` does not name a draft.
+  - Status: 409 Conflict — a turn is already in flight, or the checkpoint is not a pending draft (already committed/discarded, or still extracting).
+  - Status: 422 Unprocessable Entity — an `accepted: true` item still fails validation after the edit; body: an array of `{ item_id, reason }`. Also returned (body `{ needed, budget }`) when the accepted overlay/rule items alone would exceed the compaction token slice.
+- **Example Request:**
+  ```http
+  POST /compaction/3/commit
+  Content-Type: application/json
+
+  { "items": [{ "id": 12, "accepted": false }], "summary": null }
+  ```
+
+#### 8.5 Discard a draft
+
+- **URL:** `/compaction/{id}/discard`
+- **Method:** `POST`
+- **Description:** Discards a pending draft, leaving its extracted fact rows exactly as extraction stored them (never rendered, since the checkpoint is no longer `committed`).
+- **Path Parameters:**
+  - `id` (integer): the draft's id.
+- **Response:**
+  - Status: 200 OK
+  - Status: 404 Not Found — `id` does not name a draft.
+  - Status: 409 Conflict — the checkpoint is not a pending draft.
+- **Example Request:**
+  ```http
+  POST /compaction/3/discard
+  ```
+
+See section 1.7/1.8 for the pin/unpin routes, which live under `/message/{id}/pin` rather than `/compaction` since they act on a message, not a checkpoint.
+
 ## Route index
 
 Endpoint sections above cover the core messaging, companion, user, configuration, memory and prompting routes. The table below lists every route the backend registers, including those not yet written up in full. It is generated from the handler attributes in `backend/src/main.rs`.
@@ -725,6 +863,11 @@ Endpoint sections above cover the core messaging, companion, user, configuration
 | `POST` | `/api/companion/card` |
 | `GET` | `/api/companion/characterJson` |
 | `POST` | `/api/companion/characterJson` |
+| `GET` | `/api/compaction` |
+| `POST` | `/api/compaction/draft` |
+| `GET` | `/api/compaction/{id}` |
+| `POST` | `/api/compaction/{id}/commit` |
+| `POST` | `/api/compaction/{id}/discard` |
 | `GET` | `/api/config` |
 | `PUT` | `/api/config` |
 | `POST` | `/api/estimate-response-time` |
@@ -751,6 +894,8 @@ Endpoint sections above cover the core messaging, companion, user, configuration
 | `DELETE` | `/api/message/{id}` |
 | `GET` | `/api/message/{id}` |
 | `PUT` | `/api/message/{id}` |
+| `POST` | `/api/message/{id}/pin` |
+| `DELETE` | `/api/message/{id}/pin` |
 | `GET` | `/api/multiplayer/participants` |
 | `GET` | `/api/multiplayer/participants/{id}/avatar` |
 | `GET` | `/api/multiplayer/status` |

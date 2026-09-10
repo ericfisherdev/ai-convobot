@@ -6,6 +6,7 @@ import Footer from './components/Footer'
 import ChatWindow from './components/ChatWindow'
 import { PWAInstallPrompt } from './components/mobile/PWAInstallPrompt'
 import { MessagesProvider } from './components/context/messageContext'
+import { CompactionProvider } from './components/context/compactionContext'
 import { UserDataProvider } from './components/context/userContext'
 import { CompanionDataProvider } from './components/context/companionContext'
 import { ConfigProvider } from './components/context/configContext'
@@ -29,9 +30,11 @@ function App() {
                 <AttitudeProvider>
                   <SessionProvider>
                     <MessagesProvider>
-                      <div className='max-container'>
-                        <ChatWindow />
-                      </div>
+                      <CompactionProvider>
+                        <div className='max-container'>
+                          <ChatWindow />
+                        </div>
+                      </CompactionProvider>
                       <Toaster />
                       <PWAInstallPrompt />
                     </MessagesProvider>

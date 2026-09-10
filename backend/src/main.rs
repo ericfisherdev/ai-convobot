@@ -44,6 +44,16 @@ use crate::turn_slot::{TurnGuard, ACTIVE_TURN};
 mod chat_turn;
 use crate::chat_turn::{PendingTurn, PersistedReply, SqliteTurnStore, TurnStore};
 mod compaction;
+use crate::compaction::commit::{CommitBudget, CommitError};
+use crate::compaction::review::{apply_review, CommitRequest, ReviewError};
+use crate::compaction::store::{CompactionStore, SqliteCompactionStore};
+use crate::compaction::types::{Checkpoint, CompactionTrigger};
+use crate::compaction::view::{
+    CheckpointDetail, CheckpointSummary, CompactionListing, DraftQueued, PendingDraftSummary,
+    PromptResponse,
+};
+use crate::compaction::{CitedMessage, SoloSpeakers, SpeakerInfo};
+use crate::context_manager::ContextManager;
 mod multiplayer;
 mod participants;
 mod paths;
@@ -428,9 +438,19 @@ struct MessageQuery {
 
 #[derive(serde::Serialize)]
 struct MessagePage {
-    messages: Vec<Message>,
+    messages: Vec<MessageView>,
     total_count: usize,
     has_more: bool,
+}
+
+/// A [`Message`] plus whether it is pinned (#179): pins live on the host's
+/// `pinned_messages` table, so a joiner's mirror (which has no compaction
+/// store of its own) always reports `false` rather than querying anything.
+#[derive(serde::Serialize)]
+struct MessageView {
+    #[serde(flatten)]
+    message: Message,
+    pinned: bool,
 }
 
 /// Whether older messages remain past this page. Shared by the SQLite path
@@ -460,6 +480,15 @@ async fn message(
             let shared = joiner.read().unwrap_or_else(|p| p.into_inner());
             shared.transcript.page(start_index, limit)
         };
+        // A joiner has no `pinned_messages` table of its own: pins live on
+        // the host, so every message in a joiner's mirror reports `false`.
+        let messages = messages
+            .into_iter()
+            .map(|msg| MessageView {
+                message: msg,
+                pinned: false,
+            })
+            .collect();
         MessagePage {
             messages,
             total_count,
@@ -477,18 +506,32 @@ async fn message(
             Err(response) => return response,
         };
 
-        // Query to database, and return messages
-        let messages: Vec<Message> =
-            match off_worker("Error while getting messages from database", move || {
-                Database::get_x_messages(limit, start_index)
-            })
-            .await
-            {
-                Ok(v) => v,
-                Err(response) => return response,
-            };
+        // Query to database, and the pinned ids, in one blocking call.
+        let (messages, pinned_ids): (Vec<Message>, HashSet<i32>) = match off_worker(
+            "Error while getting messages from database",
+            move || -> rusqlite::Result<(Vec<Message>, HashSet<i32>)> {
+                let messages = Database::get_x_messages(limit, start_index)?;
+                let pins = SqliteCompactionStore.pins()?;
+                Ok((messages, pins.into_iter().map(|p| p.message_id).collect()))
+            },
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
 
         let has_more = has_more_messages(start_index, messages.len(), total_count);
+        let messages = messages
+            .into_iter()
+            .map(|msg| {
+                let pinned = pinned_ids.contains(&msg.id);
+                MessageView {
+                    message: msg,
+                    pinned,
+                }
+            })
+            .collect();
         MessagePage {
             messages,
             total_count,
@@ -558,6 +601,10 @@ async fn clear_messages(joiner: Option<web::Data<JoinerHandle>>) -> HttpResponse
 
 #[get("/api/message/{id}")]
 async fn message_id(id: web::Path<i32>) -> HttpResponse {
+    // Named `msg`, not `message`: `message` is also this module's
+    // `GET /api/message` route handler, and `let message = ...` would be
+    // parsed as an (always-mismatched) pattern against that unit struct
+    // rather than a new binding.
     let msg: Message = match Database::get_message(*id) {
         Ok(v) => v,
         Err(e) => {
@@ -568,8 +615,21 @@ async fn message_id(id: web::Path<i32>) -> HttpResponse {
             ));
         }
     };
+    // A pin lookup failure is logged and treated as "not pinned" rather
+    // than failing the whole lookup: the message itself was already found.
+    let pinned = match SqliteCompactionStore.pins() {
+        Ok(pins) => pins.iter().any(|p| p.message_id == *id),
+        Err(e) => {
+            println!("Failed to check pin status for message {}: {}", id, e);
+            false
+        }
+    };
+    let view = MessageView {
+        message: msg,
+        pinned,
+    };
     let message_json =
-        serde_json::to_string(&msg).unwrap_or(String::from("Error serializing message as JSON"));
+        serde_json::to_string(&view).unwrap_or(String::from("Error serializing message as JSON"));
     HttpResponse::Ok().body(message_json)
 }
 
@@ -1481,6 +1541,148 @@ mod stream_turn_tests {
 
         assert!(attitude_stream_update(&attitude, &attitude).is_none());
     }
+
+    fn message_ref(id: i32, is_human: bool, tokens: usize) -> crate::compaction::MessageRef {
+        crate::compaction::MessageRef {
+            id,
+            is_human,
+            tokens,
+        }
+    }
+
+    /// A tail whose token sum is well past `threshold_tokens`, with no
+    /// scene-break cue, so a round against it always queues a `Threshold`
+    /// draft — the streamed-round equivalent of
+    /// `multiplayer::round::tests::over_threshold_tail`.
+    fn over_threshold_tail() -> crate::compaction::hook::CompactionTailView {
+        crate::compaction::hook::CompactionTailView {
+            compacted_through: None,
+            messages: vec![
+                message_ref(1, true, 100),
+                message_ref(2, false, 100),
+                message_ref(3, true, 100),
+            ],
+            last_user_turn: "hello there".to_string(),
+            short_term_mem: 0,
+            draft_pending: false,
+            config: crate::compaction::trigger::CompactionConfig {
+                threshold_tokens: 50,
+                min_messages: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn a_streamed_round_over_the_threshold_sends_exactly_one_compaction_draft_chunk_before_round_complete(
+    ) {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = Arc::new(RecordingStore::new(None).with_compaction_tail(over_threshold_tail()));
+        let registry = ParticipantRegistry::solo("Alice", "Bob", None);
+        let pending = PendingTurn::begin(
+            &guard,
+            store.as_ref(),
+            1,
+            1,
+            "hello".to_string(),
+            registry.clone(),
+        )
+        .expect("insert should succeed");
+
+        let session_id = format!("test-{}", Uuid::new_v4());
+        let (stream, mut rx) = INFERENCE_OPTIMIZER.start_streaming_session(session_id);
+
+        let thread_store = store.clone();
+        let handle = std::thread::spawn(move || {
+            stream_round(
+                guard,
+                pending,
+                stream,
+                thread_store.as_ref(),
+                solo_plan(),
+                &registry,
+                &no_followups(),
+                |_prompt, _on_token| Ok("hi".to_string()),
+                &NoRemotes,
+                &|_frame| {},
+                Duration::from_secs(30),
+            );
+        });
+        handle.join().expect("worker thread should not panic");
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+
+        let draft_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| c.compaction_draft_id.is_some())
+            .collect();
+        assert_eq!(
+            draft_chunks.len(),
+            1,
+            "exactly one compaction-draft-ready chunk should be sent"
+        );
+
+        let draft_index = chunks
+            .iter()
+            .position(|c| c.compaction_draft_id.is_some())
+            .unwrap();
+        let round_complete_index = chunks
+            .iter()
+            .position(|c| c.event == StreamEvent::RoundComplete)
+            .expect("a round_complete chunk should be sent");
+        assert!(
+            draft_index < round_complete_index,
+            "the compaction-draft chunk must arrive before round_complete"
+        );
+    }
+
+    #[test]
+    fn a_streamed_round_under_the_threshold_sends_no_compaction_draft_chunk() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = Arc::new(RecordingStore::new(None));
+        let registry = ParticipantRegistry::solo("Alice", "Bob", None);
+        let pending = PendingTurn::begin(
+            &guard,
+            store.as_ref(),
+            1,
+            1,
+            "hello".to_string(),
+            registry.clone(),
+        )
+        .expect("insert should succeed");
+
+        let session_id = format!("test-{}", Uuid::new_v4());
+        let (stream, mut rx) = INFERENCE_OPTIMIZER.start_streaming_session(session_id);
+
+        let thread_store = store.clone();
+        let handle = std::thread::spawn(move || {
+            stream_round(
+                guard,
+                pending,
+                stream,
+                thread_store.as_ref(),
+                solo_plan(),
+                &registry,
+                &no_followups(),
+                |_prompt, _on_token| Ok("hi".to_string()),
+                &NoRemotes,
+                &|_frame| {},
+                Duration::from_secs(30),
+            );
+        });
+        handle.join().expect("worker thread should not panic");
+
+        let mut chunks = Vec::new();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+
+        assert!(chunks.iter().all(|c| c.compaction_draft_id.is_none()));
+    }
 }
 
 /// Gates `/api/prompt`, `/api/prompt/regenerate` and `/api/prompt/stream`
@@ -1599,75 +1801,84 @@ async fn prompt_message(
     let participant_names = participant_display_names(&speakers);
     let plan = plan_round(&prompt_message, &speakers.registry, &policy);
 
-    let result = web::block(move || -> Result<Option<String>, TurnError> {
-        let _turn_guard = turn_guard;
-        let store = SqliteTurnStore::new(participant_names);
+    let result = web::block(
+        move || -> Result<(Option<String>, Option<i64>), TurnError> {
+            let _turn_guard = turn_guard;
+            let store = SqliteTurnStore::new(participant_names);
 
-        let pending = PendingTurn::begin(
-            &_turn_guard,
-            &store,
-            companion_id,
-            user_id,
-            prompt_message.clone(),
-            speakers.registry.clone(),
-        )
-        .map_err(|source| TurnError::Database {
-            step: "Error while adding message to database",
-            source,
-        })?;
+            let pending = PendingTurn::begin(
+                &_turn_guard,
+                &store,
+                companion_id,
+                user_id,
+                prompt_message.clone(),
+                speakers.registry.clone(),
+            )
+            .map_err(|source| TurnError::Database {
+                step: "Error while adding message to database",
+                source,
+            })?;
 
-        // Estimate response time based on message complexity. Console-only,
-        // so moving it after the insert (it used to run first) has no
-        // observable effect on the response.
-        let estimate = estimate_response_time_enhanced(&prompt_message);
-        println!(
-            "⏱️ Response ETA: {}s (range: {}-{}s, confidence: {:.1}%)",
-            estimate.expected_seconds,
-            estimate.min_seconds,
-            estimate.max_seconds,
-            estimate.confidence * 100.0
-        );
-        if !estimate.factors.is_empty() {
-            println!("   Factors: {}", estimate.factors.join(", "));
-        }
+            // Estimate response time based on message complexity. Console-only,
+            // so moving it after the insert (it used to run first) has no
+            // observable effect on the response.
+            let estimate = estimate_response_time_enhanced(&prompt_message);
+            println!(
+                "⏱️ Response ETA: {}s (range: {}-{}s, confidence: {:.1}%)",
+                estimate.expected_seconds,
+                estimate.min_seconds,
+                estimate.max_seconds,
+                estimate.confidence * 100.0
+            );
+            if !estimate.factors.is_empty() {
+                println!("   Factors: {}", estimate.factors.join(", "));
+            }
 
-        let outcome = run_round(
-            _turn_guard,
-            pending,
-            plan,
-            &store,
-            &speakers.registry,
-            &policy,
-            &mut |generation_prompt, _on_token| {
-                prompt(
-                    generation_prompt,
-                    companion_id,
-                    &SqliteTranscript,
-                    &speakers,
-                    &SqliteCompaction,
-                )
-            },
-            remotes.as_ref(),
-            broadcast.as_ref(),
-            timeout,
-            &mut NoopSink,
-        )
-        .map_err(TurnError::Generate)?;
+            let outcome = run_round(
+                _turn_guard,
+                pending,
+                plan,
+                &store,
+                &speakers.registry,
+                &policy,
+                &mut |generation_prompt, _on_token| {
+                    prompt(
+                        generation_prompt,
+                        companion_id,
+                        &SqliteTranscript,
+                        &speakers,
+                        &SqliteCompaction,
+                    )
+                },
+                remotes.as_ref(),
+                broadcast.as_ref(),
+                timeout,
+                &mut NoopSink,
+            )
+            .map_err(TurnError::Generate)?;
 
-        // Display actual response time
-        let elapsed = start_time.elapsed();
-        println!("✓ Response completed in {:.1}s", elapsed.as_secs_f32());
+            // Display actual response time
+            let elapsed = start_time.elapsed();
+            println!("✓ Response completed in {:.1}s", elapsed.as_secs_f32());
 
-        Ok(outcome.host_reply.map(|reply| reply.text))
-    })
+            let compaction_draft_id = outcome.queued_draft.as_ref().map(|d| d.draft_id);
+            Ok((
+                outcome.host_reply.map(|reply| reply.text),
+                compaction_draft_id,
+            ))
+        },
+    )
     .await;
 
     match result {
-        Ok(Ok(Some(reply))) => HttpResponse::Ok().body(reply),
+        Ok(Ok((Some(reply), compaction_draft_id))) => HttpResponse::Ok().json(PromptResponse {
+            reply,
+            compaction_draft_id,
+        }),
         // A mention-filtered plan (#132) that excludes `char`, e.g. a
         // solo `@bot1 hi` with joiners connected: the round still ran, just
         // never gave `char` a turn, so there is no host reply to return.
-        Ok(Ok(None)) => HttpResponse::NoContent().finish(),
+        Ok(Ok((None, _))) => HttpResponse::NoContent().finish(),
         Ok(Err(turn_error)) => turn_error.into_response(),
         Err(blocking) => {
             println!(
@@ -1823,6 +2034,433 @@ async fn regenerate_prompt(
             );
             HttpResponse::InternalServerError()
                 .body("Error while generating prompt, check logs for more information")
+        }
+    }
+}
+
+//              Compaction
+
+/// The companion's live attitude toward the user, seeding a fresh row from
+/// the companion's persona if the chat has never been scored yet — the same
+/// fallback `chat_turn::finish_turn` uses on its first read, so the
+/// compaction detail view never 500s on a database that has recorded no
+/// turns.
+fn current_user_attitude(companion_id: i32, user_id: i32) -> rusqlite::Result<CompanionAttitude> {
+    if let Some(attitude) = Database::get_attitude(companion_id, user_id, "user")? {
+        return Ok(attitude);
+    }
+    let persona = Database::get_companion_data()?.persona;
+    Database::seed_missing_user_attitude(companion_id, user_id, &persona)?;
+    Database::get_attitude(companion_id, user_id, "user")?
+        .ok_or(rusqlite::Error::QueryReturnedNoRows)
+}
+
+/// Maps the four [`CommitError`] variants shared by [`compaction_commit`]
+/// and [`compaction_discard`] to a response. `OverBudget` never actually
+/// occurs on the discard path (nothing there ever calls
+/// `overlays_and_rules_fit`), but the match must stay exhaustive.
+fn commit_error_response(err: CommitError) -> HttpResponse {
+    match err {
+        CommitError::DraftNotFound(id) => {
+            HttpResponse::NotFound().body(format!("compaction draft {id} not found"))
+        }
+        CommitError::DraftNotPending { .. } => HttpResponse::Conflict().body(err.to_string()),
+        CommitError::OverBudget { needed, budget } => HttpResponse::UnprocessableEntity()
+            .json(serde_json::json!({ "needed": needed, "budget": budget })),
+        CommitError::Storage(e) => {
+            eprintln!("compaction storage error: {}", e);
+            HttpResponse::InternalServerError()
+                .body("Error while updating the compaction draft, check logs for more information")
+        }
+    }
+}
+
+/// Why `POST /api/compaction/draft` could not queue a draft.
+enum CompactionDraftError {
+    /// A draft is already pending; carries its id for the response body.
+    AlreadyPending(i64),
+    NotEnoughMessages {
+        have: usize,
+        need: usize,
+    },
+    Storage(rusqlite::Error),
+}
+
+impl From<rusqlite::Error> for CompactionDraftError {
+    fn from(e: rusqlite::Error) -> Self {
+        CompactionDraftError::Storage(e)
+    }
+}
+
+impl CompactionDraftError {
+    fn into_response(self) -> HttpResponse {
+        match self {
+            CompactionDraftError::AlreadyPending(id) => {
+                HttpResponse::Conflict().body(format!("a draft is already pending (id {id})"))
+            }
+            CompactionDraftError::NotEnoughMessages { have, need } => HttpResponse::Conflict()
+                .body(format!(
+                    "chat has {have} uncompacted messages; compaction needs at least {need}"
+                )),
+            CompactionDraftError::Storage(e) => {
+                eprintln!("Failed to queue a compaction draft: {}", e);
+                HttpResponse::InternalServerError()
+                    .body("Error while queuing a compaction draft, check logs for more information")
+            }
+        }
+    }
+}
+
+/// Manually triggers a checkpoint draft over the uncompacted tail, the same
+/// way the end-of-round hook would (`compaction::hook::after_round`), just
+/// on demand rather than on a threshold/scene-break trigger. Claims
+/// [`ACTIVE_TURN`] like the prompting handlers do and hands it to
+/// [`crate::compaction::extract::spawn_extraction`] on success, so a chat
+/// turn cannot start while this draft's extraction is still running.
+#[post("/api/compaction/draft")]
+async fn compaction_draft(joiner: Option<web::Data<JoinerHandle>>) -> HttpResponse {
+    if let Some(response) = reject_if_joiner(&joiner) {
+        return response;
+    }
+
+    let Some(guard) = ACTIVE_TURN.try_claim() else {
+        return HttpResponse::Conflict().body(
+            "A reply is still being generated; wait for it to finish before sending another message",
+        );
+    };
+
+    let result = web::block(move || -> Result<i64, CompactionDraftError> {
+        let store = SqliteCompactionStore;
+        let companion_id = Database::get_companion_id()?;
+        if let Some(pending) = store.pending_draft(companion_id)? {
+            return Err(CompactionDraftError::AlreadyPending(pending.id));
+        }
+        let tail = crate::compaction::hook::compaction_tail_on(companion_id)?;
+        let range = crate::compaction::range::select_range(
+            tail.compacted_through,
+            &tail.messages,
+            tail.short_term_mem,
+            tail.config.min_messages,
+            CompactionTrigger::Manual,
+        )
+        .ok_or(CompactionDraftError::NotEnoughMessages {
+            have: tail.messages.len(),
+            need: tail.config.min_messages,
+        })?;
+        let draft_id = crate::compaction::hook::queue_compaction_draft_on(
+            companion_id,
+            range,
+            CompactionTrigger::Manual,
+        )?;
+        Ok(draft_id)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(draft_id)) => {
+            crate::compaction::extract::spawn_extraction(guard, draft_id);
+            HttpResponse::Accepted().json(DraftQueued { draft_id })
+        }
+        Ok(Err(err)) => err.into_response(),
+        Err(blocking) => {
+            eprintln!(
+                "Failed to queue a compaction draft: blocking task failed: {}",
+                blocking
+            );
+            HttpResponse::InternalServerError()
+                .body("Error while queuing a compaction draft, check logs for more information")
+        }
+    }
+}
+
+/// Every checkpoint plus the pending draft, if any.
+#[get("/api/compaction")]
+async fn compaction_list(joiner: Option<web::Data<JoinerHandle>>) -> HttpResponse {
+    if let Some(response) = reject_if_joiner(&joiner) {
+        return response;
+    }
+
+    let listing = off_worker(
+        "Error while getting compaction listing",
+        || -> rusqlite::Result<CompactionListing> {
+            let companion_id = Database::get_companion_id()?;
+            let store = SqliteCompactionStore;
+            let checkpoints = store.list_checkpoints(companion_id)?;
+            let pending_draft = store.pending_draft(companion_id)?;
+            Ok(CompactionListing {
+                checkpoints: checkpoints.iter().map(CheckpointSummary::from).collect(),
+                pending_draft: pending_draft.as_ref().map(PendingDraftSummary::from),
+            })
+        },
+    )
+    .await;
+
+    match listing {
+        Ok(listing) => HttpResponse::Ok().json(listing),
+        Err(response) => response,
+    }
+}
+
+/// One checkpoint's full detail: its facts (active and rejected alike) and
+/// the attitude preview the review card renders.
+#[get("/api/compaction/{id}")]
+async fn compaction_detail(
+    id: web::Path<i64>,
+    joiner: Option<web::Data<JoinerHandle>>,
+) -> HttpResponse {
+    if let Some(response) = reject_if_joiner(&joiner) {
+        return response;
+    }
+
+    let checkpoint_id = *id;
+    let user_id = 1; // Default user ID
+    let result = web::block(move || -> rusqlite::Result<Option<CheckpointDetail>> {
+        let store = SqliteCompactionStore;
+        let Some(checkpoint) = store.get_checkpoint(checkpoint_id)? else {
+            return Ok(None);
+        };
+        let facts = store.facts_for(checkpoint.id)?;
+        let current_attitude = current_user_attitude(checkpoint.companion_id, user_id)?;
+        Ok(Some(CheckpointDetail::new(
+            &checkpoint,
+            &facts,
+            current_attitude,
+        )))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(detail))) => HttpResponse::Ok().json(detail),
+        Ok(Ok(None)) => HttpResponse::NotFound()
+            .body(format!("compaction checkpoint {checkpoint_id} not found")),
+        Ok(Err(e)) => {
+            eprintln!(
+                "Failed to get compaction checkpoint {}: {}",
+                checkpoint_id, e
+            );
+            HttpResponse::InternalServerError().body(
+                "Error while getting the compaction checkpoint, check logs for more information",
+            )
+        }
+        Err(blocking) => {
+            eprintln!(
+                "Failed to get compaction checkpoint {}: blocking task failed: {}",
+                checkpoint_id, blocking
+            );
+            HttpResponse::InternalServerError().body(
+                "Error while getting the compaction checkpoint, check logs for more information",
+            )
+        }
+    }
+}
+
+/// Why `POST /api/compaction/{id}/commit` could not commit a draft.
+enum CompactionCommitError {
+    Review(ReviewError),
+    Commit(CommitError),
+}
+
+impl From<CommitError> for CompactionCommitError {
+    fn from(e: CommitError) -> Self {
+        CompactionCommitError::Commit(e)
+    }
+}
+
+impl From<rusqlite::Error> for CompactionCommitError {
+    fn from(e: rusqlite::Error) -> Self {
+        CompactionCommitError::Commit(CommitError::Storage(e))
+    }
+}
+
+impl CompactionCommitError {
+    fn into_response(self) -> HttpResponse {
+        match self {
+            CompactionCommitError::Review(ReviewError::UnknownItem(id)) => {
+                HttpResponse::UnprocessableEntity()
+                    .json(serde_json::json!({ "item_id": id, "reason": "not part of this draft" }))
+            }
+            CompactionCommitError::Review(ReviewError::Rejected(items)) => {
+                HttpResponse::UnprocessableEntity().json(items)
+            }
+            CompactionCommitError::Commit(err) => commit_error_response(err),
+        }
+    }
+}
+
+/// Reviews and commits a pending draft: `request` edits/strikes the stored
+/// facts, [`apply_review`] re-validates whatever it touched, and
+/// [`crate::compaction::commit::commit`] promotes the result. Claims
+/// [`ACTIVE_TURN`] for the duration since the production
+/// [`crate::compaction::merge::LlmSummaryMerger`] may run the model to fold
+/// the rolling summary.
+#[post("/api/compaction/{id}/commit")]
+async fn compaction_commit(
+    id: web::Path<i64>,
+    received: web::Json<CommitRequest>,
+    joiner: Option<web::Data<JoinerHandle>>,
+) -> HttpResponse {
+    if let Some(response) = reject_if_joiner(&joiner) {
+        return response;
+    }
+
+    let Some(guard) = ACTIVE_TURN.try_claim() else {
+        return HttpResponse::Conflict().body(
+            "A reply is still being generated; wait for it to finish before sending another message",
+        );
+    };
+
+    let draft_id = *id;
+    let request = received.into_inner();
+    let result = web::block(move || -> Result<Checkpoint, CompactionCommitError> {
+        let store = SqliteCompactionStore;
+        let checkpoint = store
+            .get_checkpoint(draft_id)?
+            .ok_or(CommitError::DraftNotFound(draft_id))?;
+        let facts = store.facts_for(checkpoint.id)?;
+        let range_messages = Database::get_messages_between(
+            checkpoint.from_message_id,
+            checkpoint.through_message_id,
+        )?;
+        let range: Vec<CitedMessage> = range_messages.iter().map(CitedMessage::from).collect();
+        let active = store.active_facts(checkpoint.companion_id)?;
+        // Named `user_view`/`companion_view`/`loaded_config`, not
+        // `user`/`companion`/`config`: those three names also belong to
+        // this module's own `/api/user`, `/api/companion` and `/api/config`
+        // route handlers, and `let user = ...` would be parsed as an
+        // (always-mismatched) pattern against that unit struct rather than
+        // a new binding.
+        let user_view = Database::get_user_data()?;
+        let companion_view = Database::get_companion_data()?;
+        let speakers = SoloSpeakers {
+            user_name: user_view.name.clone(),
+            companion_name: companion_view.name.clone(),
+        };
+        let is_canon = |speaker_id: &str| speakers.is_canon(speaker_id);
+        let reviewed = apply_review(&checkpoint, facts, request, &range, &active, &is_canon)
+            .map_err(CompactionCommitError::Review)?;
+
+        let loaded_config = Database::get_config()?;
+        let compaction_slice_tokens = ContextManager::new(loaded_config).compaction_token_budget;
+        let budget = CommitBudget {
+            compaction_slice_tokens,
+            rolling_summary_tokens: compaction_slice_tokens / 2,
+            user_name: user_view.name,
+            companion_name: companion_view.name,
+        };
+        let deps = crate::compaction::production_commit_deps(&llm::ResidentExtractor);
+        let committed = crate::compaction::commit::commit(&store, reviewed, &deps, &budget)?;
+        Ok(committed)
+    })
+    .await;
+
+    drop(guard);
+    match result {
+        Ok(Ok(checkpoint)) => HttpResponse::Ok().json(CheckpointSummary::from(checkpoint)),
+        Ok(Err(err)) => err.into_response(),
+        Err(blocking) => {
+            eprintln!(
+                "Failed to commit compaction draft {}: blocking task failed: {}",
+                draft_id, blocking
+            );
+            HttpResponse::InternalServerError().body(
+                "Error while committing the compaction draft, check logs for more information",
+            )
+        }
+    }
+}
+
+/// Discards a pending draft, leaving its extracted fact rows exactly as
+/// extraction stored them.
+#[post("/api/compaction/{id}/discard")]
+async fn compaction_discard(
+    id: web::Path<i64>,
+    joiner: Option<web::Data<JoinerHandle>>,
+) -> HttpResponse {
+    if let Some(response) = reject_if_joiner(&joiner) {
+        return response;
+    }
+
+    let draft_id = *id;
+    let result =
+        web::block(move || crate::compaction::commit::discard(&SqliteCompactionStore, draft_id))
+            .await;
+
+    match result {
+        Ok(Ok(())) => HttpResponse::Ok().finish(),
+        Ok(Err(err)) => commit_error_response(err),
+        Err(blocking) => {
+            eprintln!(
+                "Failed to discard compaction draft {}: blocking task failed: {}",
+                draft_id, blocking
+            );
+            HttpResponse::InternalServerError().body(
+                "Error while discarding the compaction draft, check logs for more information",
+            )
+        }
+    }
+}
+
+/// Pins a message so it stays in the prompt regardless of what a checkpoint
+/// compacts over it. Idempotent: pinning an already-pinned message is not
+/// an error.
+#[post("/api/message/{id}/pin")]
+async fn message_pin(id: web::Path<i32>, joiner: Option<web::Data<JoinerHandle>>) -> HttpResponse {
+    if let Some(response) = reject_if_joiner(&joiner) {
+        return response;
+    }
+
+    if let Err(response) = require_known_message(*id) {
+        return response;
+    }
+    match SqliteCompactionStore.pin(*id) {
+        Ok(()) => HttpResponse::Ok().body(format!("Message pinned at id {}!", id)),
+        Err(e) => {
+            println!("Failed to pin message at id {}: {}", id, e);
+            HttpResponse::InternalServerError()
+                .body("Error while pinning message, check logs for more information")
+        }
+    }
+}
+
+/// Unpins a message. Idempotent: unpinning a message that was never pinned
+/// is not an error.
+#[delete("/api/message/{id}/pin")]
+async fn message_unpin(
+    id: web::Path<i32>,
+    joiner: Option<web::Data<JoinerHandle>>,
+) -> HttpResponse {
+    if let Some(response) = reject_if_joiner(&joiner) {
+        return response;
+    }
+
+    if let Err(response) = require_known_message(*id) {
+        return response;
+    }
+    match SqliteCompactionStore.unpin(*id) {
+        Ok(()) => HttpResponse::Ok().body(format!("Message unpinned at id {}!", id)),
+        Err(e) => {
+            println!("Failed to unpin message at id {}: {}", id, e);
+            HttpResponse::InternalServerError()
+                .body("Error while unpinning message, check logs for more information")
+        }
+    }
+}
+
+/// Shared by [`message_pin`]/[`message_unpin`]: `Err` is a ready-to-return
+/// `404` when `id` names no message, or a `500` on a real lookup failure.
+/// See `off_worker`'s identical `#[allow]` for why `HttpResponse` in the
+/// `Err` position is kept as-is rather than boxed.
+#[allow(clippy::result_large_err)]
+fn require_known_message(id: i32) -> Result<(), HttpResponse> {
+    match Database::get_message(id) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            Err(HttpResponse::NotFound().body(format!("Message {} not found", id)))
+        }
+        Err(e) => {
+            println!("Failed to look up message at id {}: {}", id, e);
+            Err(HttpResponse::InternalServerError()
+                .body("Error while looking up message, check logs for more information"))
         }
     }
 }
@@ -2529,6 +3167,16 @@ impl RoundSink for SseRoundSink {
 
     fn speaker_skipped(&mut self, _speaker: &ParticipantId, notice: &PersistedReply) {
         self.send_reply_complete(&ParticipantId::SYSTEM, notice);
+    }
+
+    fn draft_queued(&mut self, draft_id: i64) {
+        if let Some(stream) = &self.stream {
+            let _ = stream.send(StreamChunk::compaction_draft(
+                self.request_id.clone(),
+                draft_id,
+                self.token_count,
+            ));
+        }
     }
 
     fn round_complete(&mut self, attitude: Option<&(CompanionAttitude, CompanionAttitude)>) {
@@ -3380,6 +4028,13 @@ async fn main() -> std::io::Result<()> {
             .service(multiplayer_participants)
             .service(multiplayer_participant_avatar)
             .service(multiplayer_status)
+            .service(compaction_draft)
+            .service(compaction_list)
+            .service(compaction_detail)
+            .service(compaction_commit)
+            .service(compaction_discard)
+            .service(message_pin)
+            .service(message_unpin)
     });
     if let Some(workers) = configured_workers() {
         server = server.workers(workers);

@@ -133,6 +133,11 @@ pub trait RoundSink {
     /// which in solo mode reproduces today's wire order exactly: the
     /// attitude chunk, then the final chunk.
     fn round_complete(&mut self, attitude: Option<&(CompanionAttitude, CompanionAttitude)>);
+    /// The compaction hook (#172) queued a draft this round (#179). Called
+    /// between the hook and [`RoundSink::round_complete`]; a default no-op
+    /// so every existing sink (`NoopSink`, and any test double implementing
+    /// this trait) keeps compiling unchanged.
+    fn draft_queued(&mut self, _draft_id: i64) {}
 }
 
 /// A [`RoundSink`] that observes nothing. Used by the non-streaming
@@ -328,6 +333,9 @@ pub fn run_round(
     // compaction failure must never fail the round, so `after_round` logs
     // and returns `None` internally rather than propagating.
     let queued_draft = compaction_after_round(store, companion_id);
+    if let Some(queued) = &queued_draft {
+        sink.draft_queued(queued.draft_id);
+    }
     sink.round_complete(attitude.as_ref());
 
     Ok(RoundOutcome {

@@ -25,6 +25,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./ui/t
 import { cn } from "../lib/utils";
 import { AttitudeSummaryBar } from "./attitude/AttitudeSummaryBar";
 import { useAttitude } from "./context/attitudeContext";
+import { useCompaction } from "./context/compactionContext";
 import { useSession } from "./context/sessionContext";
 import { useParticipants } from "./context/participantsContext";
 import { ConnectionStatus } from "./multiplayer/ConnectionStatus";
@@ -45,6 +46,7 @@ const ChatWindow = () => {
 
   const { refreshMessages, pushMessage, updateMessage, settleMessage } = useMessages();
   const { applyAttitudeStreamUpdate } = useAttitude();
+  const { draftReady } = useCompaction();
   const { session } = useSession();
   const { status, refreshParticipants } = useParticipants();
 
@@ -89,6 +91,7 @@ const ChatWindow = () => {
         speaker_id: 'user',
         content: sentMessage,
         created_at: new Date().toISOString(),
+        pinned: false,
       });
 
       const response = await fetch('/api/prompt/stream', {
@@ -131,6 +134,7 @@ const ChatWindow = () => {
                 speaker_id: effect.speakerId,
                 content: `${displayName} is typing...`,
                 created_at: new Date().toISOString(),
+                pinned: false,
               });
               break;
             }
@@ -146,6 +150,9 @@ const ChatWindow = () => {
               break;
             case 'apply_attitude':
               applyAttitudeStreamUpdate(effect.update);
+              break;
+            case 'compaction_draft':
+              draftReady(effect.draftId);
               break;
             case 'round_complete':
               // A bot may have dropped mid-round; pick that up immediately

@@ -50,12 +50,14 @@ pub enum StreamEvent {
 /// arrives as a bare `reply_complete` for `speaker_id: "system"`, with no
 /// preceding `reply_started`); an optional attitude chunk (a `token`-event
 /// chunk with empty `content` and `attitude` set, unchanged shape from
-/// before this struct grew `event`) follows the last `reply_complete`; then
-/// `round_complete` ends the stream. `is_complete` is `true` only on
-/// `round_complete` and `error`, so a client that only tracks that field
-/// still terminates correctly.
+/// before this struct grew `event`) follows the last `reply_complete`; an
+/// optional compaction-draft-ready chunk (same shape, `compaction_draft_id`
+/// set instead, #179) follows that; then `round_complete` ends the stream.
+/// `is_complete` is `true` only on `round_complete` and `error`, so a
+/// client that only tracks that field still terminates correctly.
 ///
-/// `message_id`, `error` and `attitude` are omitted when `None`.
+/// `message_id`, `error`, `attitude` and `compaction_draft_id` are omitted
+/// when `None`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamChunk {
     pub request_id: String,
@@ -74,6 +76,12 @@ pub struct StreamChunk {
     /// Set only on the attitude chunk.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub attitude: Option<AttitudeStreamUpdate>,
+    /// Set only on the compaction-draft-ready chunk (#179): the id of the
+    /// checkpoint draft `multiplayer::round::run_round`'s compaction hook
+    /// just queued, so the client can start polling
+    /// `GET /api/compaction/{id}` without waiting for a page refresh.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub compaction_draft_id: Option<i64>,
 }
 
 impl StreamChunk {
@@ -89,6 +97,7 @@ impl StreamChunk {
             message_id: None,
             error: None,
             attitude: None,
+            compaction_draft_id: None,
         }
     }
 
@@ -104,6 +113,7 @@ impl StreamChunk {
             message_id: None,
             error: None,
             attitude: None,
+            compaction_draft_id: None,
         }
     }
 
@@ -125,6 +135,7 @@ impl StreamChunk {
             message_id: Some(message_id),
             error: None,
             attitude: None,
+            compaction_draft_id: None,
         }
     }
 
@@ -141,6 +152,26 @@ impl StreamChunk {
             message_id: None,
             error: None,
             attitude: Some(update),
+            compaction_draft_id: None,
+        }
+    }
+
+    /// The compaction-draft-ready chunk (#179): a `token`-event chunk with
+    /// empty content and `compaction_draft_id` set, sent once between the
+    /// last `reply_complete`/the attitude chunk and `round_complete` when
+    /// this round's compaction hook queued a draft.
+    pub fn compaction_draft(request_id: String, draft_id: i64, count: usize) -> Self {
+        StreamChunk {
+            request_id,
+            event: StreamEvent::Token,
+            content: String::new(),
+            is_complete: false,
+            token_count: Some(count),
+            speaker_id: String::new(),
+            message_id: None,
+            error: None,
+            attitude: None,
+            compaction_draft_id: Some(draft_id),
         }
     }
 
@@ -156,6 +187,7 @@ impl StreamChunk {
             message_id: None,
             error: None,
             attitude: None,
+            compaction_draft_id: None,
         }
     }
 
@@ -172,6 +204,7 @@ impl StreamChunk {
             message_id: None,
             error: Some(message),
             attitude: None,
+            compaction_draft_id: None,
         }
     }
 }
