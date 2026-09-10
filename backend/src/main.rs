@@ -704,146 +704,6 @@ async fn message_delete(
     }
 }
 
-//              Compaction
-
-/// `POST /api/compaction/draft` body (#179 owns this route; #181 adds
-/// `from_stale`). `#[serde(default)]` so `{}` — the manual-trigger call's
-/// body — deserializes with `from_stale: false`.
-#[derive(Deserialize)]
-struct DraftRequest {
-    #[serde(default)]
-    from_stale: bool,
-}
-
-/// What queuing a re-compaction draft from the oldest stale checkpoint can
-/// come back with, decided entirely inside the blocking closure below so
-/// `off_worker` (which turns every `Err` into a 500) never sees a business
-/// outcome that should be a 409 instead.
-enum RecompactionOutcome {
-    Queued(i64),
-    PendingDraftExists,
-    NoStaleCheckpoint,
-    RangeUnavailable,
-}
-
-/// The blocking half of `compaction_draft`'s `from_stale` path: reads the
-/// oldest stale checkpoint's start, selects the range a fresh draft over it
-/// should cover, and queues that draft with `CompactionTrigger::Manual`.
-/// Every early return here is a legitimate outcome, not a failure — 409
-/// candidates are `Ok` variants of [`RecompactionOutcome`], never `Err`.
-fn queue_recompaction_draft() -> Result<RecompactionOutcome, String> {
-    use crate::compaction::store::CompactionStore;
-
-    let store = crate::compaction::store::SqliteCompactionStore;
-    let companion_id = Database::get_companion_id().map_err(|e| e.to_string())?;
-
-    if store
-        .pending_draft(companion_id)
-        .map_err(|e| e.to_string())?
-        .is_some()
-    {
-        return Ok(RecompactionOutcome::PendingDraftExists);
-    }
-
-    let Some(oldest_stale_from) = store
-        .oldest_stale_from(companion_id)
-        .map_err(|e| e.to_string())?
-    else {
-        return Ok(RecompactionOutcome::NoStaleCheckpoint);
-    };
-
-    let companion_data = Database::get_companion_data().map_err(|e| e.to_string())?;
-    let messages =
-        Database::get_messages_after(oldest_stale_from - 1).map_err(|e| e.to_string())?;
-    let message_refs: Vec<crate::compaction::MessageRef> = messages
-        .iter()
-        .map(crate::compaction::MessageRef::from)
-        .collect();
-
-    let Some(range) = crate::compaction::range::select_recompaction_range(
-        oldest_stale_from,
-        &message_refs,
-        companion_data.short_term_mem,
-    ) else {
-        return Ok(RecompactionOutcome::RangeUnavailable);
-    };
-
-    let draft_id = store
-        .insert_draft(crate::compaction::types::NewDraft {
-            companion_id,
-            from_message_id: range.from_id,
-            through_message_id: range.through_id,
-            trigger: crate::compaction::types::CompactionTrigger::Manual,
-            raw_model_output: None,
-        })
-        .map_err(|e| e.to_string())?;
-
-    Ok(RecompactionOutcome::Queued(draft_id))
-}
-
-/// Minimal `POST /api/compaction/draft` (#181): only the `{from_stale:
-/// true}` path is implemented. #179 owns this route (manual, non-stale
-/// triggering; the rest of its 409 surface; `GET /api/compaction`'s
-/// `stale` flag) and was still building it when this landed — this handler
-/// exists solely so #181's re-compaction has an entry point on `main`
-/// before then; #179 reconciles it on rebase rather than duplicating the
-/// route.
-#[post("/api/compaction/draft")]
-async fn compaction_draft(
-    body: web::Json<DraftRequest>,
-    joiner: Option<web::Data<JoinerHandle>>,
-    registry: web::Data<RwLock<ParticipantRegistry>>,
-) -> HttpResponse {
-    if let Some(response) = reject_if_joiner(&joiner) {
-        return response;
-    }
-    if !body.from_stale {
-        return HttpResponse::NotImplemented().body(
-            "Manual compaction triggering is not implemented yet, check logs for more information",
-        );
-    }
-
-    let Some(turn_guard) = ACTIVE_TURN.try_claim() else {
-        return HttpResponse::Conflict()
-            .body("A reply is still being generated; wait for it to finish before re-compacting");
-    };
-
-    // Snapshotted before the blocking closure runs, same as every other
-    // handler that calls `spawn_extraction`/`run_round`: #182's
-    // `RegistrySpeakers` needs an owned, `Send` registry, not a live lock
-    // held across the extraction thread.
-    let speaker_registry = snapshot_speakers(&registry).registry;
-
-    match off_worker(
-        "Error while queuing a re-compaction draft",
-        queue_recompaction_draft,
-    )
-    .await
-    {
-        Ok(RecompactionOutcome::Queued(draft_id)) => {
-            crate::compaction::extract::spawn_extraction(turn_guard, draft_id, speaker_registry);
-            HttpResponse::Accepted().body(format!("Re-compaction draft {} queued", draft_id))
-        }
-        Ok(RecompactionOutcome::PendingDraftExists) => {
-            drop(turn_guard);
-            HttpResponse::Conflict().body("A compaction draft is already pending review")
-        }
-        Ok(RecompactionOutcome::NoStaleCheckpoint) => {
-            drop(turn_guard);
-            HttpResponse::Conflict().body("There is no stale checkpoint to re-compact")
-        }
-        Ok(RecompactionOutcome::RangeUnavailable) => {
-            drop(turn_guard);
-            HttpResponse::Conflict()
-                .body("Every message in the stale range has been deleted; nothing to re-compact")
-        }
-        Err(response) => {
-            drop(turn_guard);
-            response
-        }
-    }
-}
-
 //              Companion
 
 #[get("/api/companion")]
@@ -2215,6 +2075,16 @@ fn commit_error_response(err: CommitError) -> HttpResponse {
     }
 }
 
+/// `POST /api/compaction/draft` body (#181): `#[serde(default)]` so an
+/// absent or `{}` body — the manual-trigger call sends neither a
+/// `Content-Type` nor a body at all — deserializes as `from_stale: false`
+/// via the `Option<web::Json<_>>` extractor below.
+#[derive(Deserialize)]
+struct DraftRequest {
+    #[serde(default)]
+    from_stale: bool,
+}
+
 /// Why `POST /api/compaction/draft` could not queue a draft.
 enum CompactionDraftError {
     /// A draft is already pending; carries its id for the response body.
@@ -2223,6 +2093,14 @@ enum CompactionDraftError {
         have: usize,
         need: usize,
     },
+    /// `{from_stale: true}` (#181), but the companion has no `Stale`
+    /// checkpoint to re-compact.
+    NoStaleCheckpoint,
+    /// `{from_stale: true}` (#181), but every message at or after the
+    /// oldest stale checkpoint's start has since been deleted (or the
+    /// short-term tail cut leaves nothing before it), so there is nothing
+    /// left to build a re-compaction range from.
+    StaleRangeUnavailable,
     Storage(rusqlite::Error),
 }
 
@@ -2242,6 +2120,12 @@ impl CompactionDraftError {
                 .body(format!(
                     "chat has {have} compactable messages outside the short-term window; compaction needs at least {need}"
                 )),
+            CompactionDraftError::NoStaleCheckpoint => {
+                HttpResponse::Conflict().body("there is no stale checkpoint to re-compact")
+            }
+            CompactionDraftError::StaleRangeUnavailable => HttpResponse::Conflict().body(
+                "every message in the stale range has been deleted; nothing to re-compact",
+            ),
             CompactionDraftError::Storage(e) => {
                 eprintln!("Failed to queue a compaction draft: {}", e);
                 HttpResponse::InternalServerError()
@@ -2251,20 +2135,27 @@ impl CompactionDraftError {
     }
 }
 
-/// Manually triggers a checkpoint draft over the uncompacted tail, the same
-/// way the end-of-round hook would (`compaction::hook::after_round`), just
-/// on demand rather than on a threshold/scene-break trigger. Claims
-/// [`ACTIVE_TURN`] like the prompting handlers do and hands it to
-/// [`crate::compaction::extract::spawn_extraction`] on success, so a chat
-/// turn cannot start while this draft's extraction is still running.
+/// Manually triggers a checkpoint draft, the same way the end-of-round hook
+/// would (`compaction::hook::after_round`), just on demand rather than on a
+/// threshold/scene-break trigger. With `{"from_stale": true}` (#181), the
+/// range instead starts at the oldest `Stale` checkpoint's own start
+/// (`select_recompaction_range`), so a checkpoint an edit/delete
+/// invalidated can be healed rather than just re-triggering the normal
+/// uncompacted-tail draft. Claims [`ACTIVE_TURN`] like the prompting
+/// handlers do and hands it to [`crate::compaction::extract::spawn_extraction`]
+/// on success, so a chat turn cannot start while this draft's extraction is
+/// still running.
 #[post("/api/compaction/draft")]
 async fn compaction_draft(
+    body: Option<web::Json<DraftRequest>>,
     joiner: Option<web::Data<JoinerHandle>>,
     registry: web::Data<RwLock<ParticipantRegistry>>,
 ) -> HttpResponse {
     if let Some(response) = reject_if_joiner(&joiner) {
         return response;
     }
+
+    let from_stale = body.map(|b| b.from_stale).unwrap_or(false);
 
     let Some(guard) = ACTIVE_TURN.try_claim() else {
         return HttpResponse::Conflict().body(
@@ -2290,22 +2181,41 @@ async fn compaction_draft(
         if let Some(pending) = store.pending_draft(companion_id)? {
             return Err(CompactionDraftError::AlreadyPending(pending.id));
         }
-        let tail = crate::compaction::hook::compaction_tail_on(companion_id)?;
-        let range = crate::compaction::range::select_range(
-            tail.compacted_through,
-            &tail.messages,
-            tail.short_term_mem,
-            tail.config.min_messages,
-            CompactionTrigger::Manual,
-        )
-        .ok_or(CompactionDraftError::NotEnoughMessages {
-            // The same quantity `select_range` actually checks against
-            // `min_messages` (the tail after the last `short_term_mem`
-            // messages are set aside), not the raw tail length — otherwise
-            // this count would not match why the request was refused.
-            have: tail.messages.len().saturating_sub(tail.short_term_mem),
-            need: tail.config.min_messages,
-        })?;
+        let range = if from_stale {
+            let oldest_stale_from = store
+                .oldest_stale_from(companion_id)?
+                .ok_or(CompactionDraftError::NoStaleCheckpoint)?;
+            let companion_data = Database::get_companion_data()?;
+            let messages = Database::get_messages_after(oldest_stale_from - 1)?;
+            let message_refs: Vec<crate::compaction::MessageRef> = messages
+                .iter()
+                .map(crate::compaction::MessageRef::from)
+                .collect();
+            crate::compaction::range::select_recompaction_range(
+                oldest_stale_from,
+                &message_refs,
+                companion_data.short_term_mem,
+            )
+            .ok_or(CompactionDraftError::StaleRangeUnavailable)?
+        } else {
+            let tail = crate::compaction::hook::compaction_tail_on(companion_id)?;
+            crate::compaction::range::select_range(
+                tail.compacted_through,
+                &tail.messages,
+                tail.short_term_mem,
+                tail.config.min_messages,
+                CompactionTrigger::Manual,
+            )
+            .ok_or(CompactionDraftError::NotEnoughMessages {
+                // The same quantity `select_range` actually checks against
+                // `min_messages` (the tail after the last `short_term_mem`
+                // messages are set aside), not the raw tail length —
+                // otherwise this count would not match why the request was
+                // refused.
+                have: tail.messages.len().saturating_sub(tail.short_term_mem),
+                need: tail.config.min_messages,
+            })?
+        };
         let draft_id = crate::compaction::hook::queue_compaction_draft_on(
             companion_id,
             range,
@@ -4139,7 +4049,6 @@ async fn main() -> std::io::Result<()> {
             .service(message_id)
             .service(message_put)
             .service(message_delete)
-            .service(compaction_draft)
             .service(message_post)
             .service(companion)
             .service(companion_edit_data)
