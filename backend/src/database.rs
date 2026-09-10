@@ -891,10 +891,14 @@ pub fn recalibration_memory_draft(
     let memory_type = "NarrativeRecalibration".to_string();
     let priority_score = calculate_priority_score(&delta, impact_score, &memory_type);
     // No dates or clock times (compaction's "user turns canon" rule): what
-    // matters is that the feelings moved to match the story, not when.
-    let description = format!(
-        "Looking back over the story so far (checkpoint {checkpoint_id}), {{{{char}}}}'s feelings settled to match what actually happened"
-    );
+    // matters is that the feelings moved to match the story, not when. No
+    // `{{char}}`/`{{user}}` placeholder either, matching every other
+    // `generate_memory_description` arm above: `format_attitude_memories`
+    // renders `description` verbatim into the prompt, with nothing left to
+    // substitute those tokens the way `insert_companion_greeting` does for
+    // the opening message.
+    let description =
+        format!("Attitude recalibrated to match the story so far (checkpoint {checkpoint_id})");
 
     AttitudeMemoryDraft {
         memory_type,
@@ -2196,6 +2200,34 @@ impl Database {
         target_type: &str,
         deltas: &[crate::attitude_engine::DimensionDelta],
     ) -> Result<Option<(CompanionAttitude, CompanionAttitude)>> {
+        Self::apply_attitude_deltas_computed(companion_id, target_id, target_type, |_previous| {
+            deltas.to_vec()
+        })
+    }
+
+    /// Like `apply_attitude_deltas`, but `compute` derives the deltas from
+    /// `previous` *after* it is read inside this function's own `Immediate`
+    /// transaction, rather than a caller handing in numbers already fixed
+    /// against an earlier, separately-read snapshot.
+    ///
+    /// A caller that reads the current attitude on one connection, computes
+    /// deltas from it, then applies them on another (or on this same
+    /// function, but after its own transaction has already opened) leaves a
+    /// window where a concurrent writer's change lands in between: the
+    /// applied numbers end up relative to a value that is no longer current
+    /// by write time, silently breaking whatever semantics produced them
+    /// (e.g. `compaction::attitude::blend`'s "blend weight of the way toward
+    /// the rating" — the same read-then-write shape #175's `commit`/
+    /// `discard` closed by re-checking status inside the transaction that
+    /// writes it). Passing `compute` instead of a precomputed slice makes
+    /// that race structurally impossible: `compute` only ever sees the
+    /// `previous` this same transaction is about to write against.
+    pub fn apply_attitude_deltas_computed(
+        companion_id: i32,
+        target_id: i32,
+        target_type: &str,
+        compute: impl FnOnce(&CompanionAttitude) -> Vec<crate::attitude_engine::DimensionDelta>,
+    ) -> Result<Option<(CompanionAttitude, CompanionAttitude)>> {
         let mut con = Self::open()?;
         let current_time = get_current_date();
 
@@ -2211,11 +2243,12 @@ impl Database {
             None => return Ok(None),
         };
 
+        let deltas = compute(&previous);
         if deltas.is_empty() {
             return Ok(Some((previous.clone(), previous)));
         }
 
-        for delta in deltas {
+        for delta in &deltas {
             let column = delta.dimension.column();
             let query = format!(
                 "UPDATE companion_attitudes

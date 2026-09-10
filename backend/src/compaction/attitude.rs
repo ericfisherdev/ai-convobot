@@ -10,10 +10,16 @@
 //! [`crate::attitude_engine::AttitudeDimension::set_value`] (this issue's
 //! addition, the mutable counterpart of `value_of`). [`AttitudeSink`] is the
 //! persistence seam `AttitudeRecalibrator` runs the blend through:
-//! `SqliteAttitudeSink` forwards to the same `Database` associated functions
-//! `chat_turn::finish_turn` uses for the lexicon-scored path, so the two
-//! paths converge on one attitude row and one `attitude_memories` writer
-//! (`Database::insert_attitude_memory`).
+//! `SqliteAttitudeSink::apply_blend` forwards to
+//! `Database::apply_attitude_deltas_computed`, which reads the current
+//! attitude row and calls back into [`blend`] *inside* its own write
+//! transaction — never a separate read-then-blend-then-write across two
+//! connections, which would let a concurrent writer's change land in the
+//! gap and blend the rating against a value that is no longer current by
+//! write time. `SqliteAttitudeSink::remember` shares
+//! `Database::insert_attitude_memory` with the lexicon-scored path, so the
+//! two paths converge on one attitude row and one `attitude_memories`
+//! writer.
 
 use crate::attitude_engine::{AttitudeDimension, DimensionDelta};
 use crate::attitude_formatter::AttitudeFormatter;
@@ -94,10 +100,12 @@ pub fn blended(
 /// The deltas [`blended`] implies, one per rated dimension whose movement is
 /// non-negligible (`f32::EPSILON`, not `AttitudeFormatter::CHANGE_THRESHOLD`
 /// — that threshold is for what's worth *reporting*, not for what's worth
-/// *applying*). `weight == 0.0` returns an empty vector, so a caller like
-/// `AttitudeRecalibrator` that feeds this straight into
-/// `Database::apply_attitude_deltas` takes that function's early-return path
-/// and never opens a write transaction it doesn't need.
+/// *applying*). `weight == 0.0` returns an empty vector. `current` should be
+/// the value the caller is about to write against — `SqliteAttitudeSink`
+/// calls this back from inside `Database::apply_attitude_deltas_computed`'s
+/// own transaction, with the row that same transaction just read, so the
+/// blend is never computed against a snapshot that could go stale before
+/// the write lands.
 pub fn blend(
     current: &CompanionAttitude,
     ratings: &AttitudeRatings,
@@ -121,17 +129,20 @@ pub fn blend(
 /// mirroring `chat_turn::TurnStore`: lets the observer's commit-time logic
 /// be unit-tested against an in-memory fake instead of
 /// `companion_database.db`.
+///
+/// `apply_blend` takes `ratings`/`weight` rather than a precomputed
+/// `Vec<DimensionDelta>` on purpose: the deltas must be derived from the
+/// attitude row's value at write time, not from an earlier read on a
+/// separate connection, so only an implementation that owns the write
+/// transaction can compute them safely. `SqliteAttitudeSink` does that via
+/// `Database::apply_attitude_deltas_computed`.
 pub trait AttitudeSink {
-    fn current(
+    fn apply_blend(
         &self,
         companion_id: i32,
         user_id: i32,
-    ) -> rusqlite::Result<Option<CompanionAttitude>>;
-    fn apply(
-        &self,
-        companion_id: i32,
-        user_id: i32,
-        deltas: &[DimensionDelta],
+        ratings: &AttitudeRatings,
+        weight: f32,
     ) -> rusqlite::Result<Option<(CompanionAttitude, CompanionAttitude)>>;
     fn remember(
         &self,
@@ -141,29 +152,27 @@ pub trait AttitudeSink {
     ) -> rusqlite::Result<()>;
 }
 
-/// The production [`AttitudeSink`]: forwards to the same `Database`
-/// associated functions `chat_turn::finish_turn` uses for the lexicon-scored
-/// path, always against `target_type = "user"` — ratings are the
-/// companion's feelings toward the user only, matching `finish_turn`, never
-/// a third-party target.
+/// The production [`AttitudeSink`]: forwards to `Database` associated
+/// functions, always against `target_type = "user"` — ratings are the
+/// companion's feelings toward the user only, matching `chat_turn::finish_turn`,
+/// never a third-party target.
 pub struct SqliteAttitudeSink;
 
 impl AttitudeSink for SqliteAttitudeSink {
-    fn current(
+    fn apply_blend(
         &self,
         companion_id: i32,
         user_id: i32,
-    ) -> rusqlite::Result<Option<CompanionAttitude>> {
-        Database::get_attitude(companion_id, user_id, "user")
-    }
-
-    fn apply(
-        &self,
-        companion_id: i32,
-        user_id: i32,
-        deltas: &[DimensionDelta],
+        ratings: &AttitudeRatings,
+        weight: f32,
     ) -> rusqlite::Result<Option<(CompanionAttitude, CompanionAttitude)>> {
-        Database::apply_attitude_deltas(companion_id, user_id, "user", deltas)
+        // `compute` only runs after `apply_attitude_deltas_computed` has
+        // read the row inside its own `Immediate` transaction, so `blend`
+        // always sees the value it is about to write against — no window
+        // for a concurrent writer to invalidate the numbers in between.
+        Database::apply_attitude_deltas_computed(companion_id, user_id, "user", |current| {
+            blend(current, ratings, weight)
+        })
     }
 
     fn remember(
@@ -253,38 +262,20 @@ impl<S: AttitudeSink> CommitObserver for AttitudeRecalibrator<S> {
             }
         };
 
-        let current = match self.sink.current(checkpoint.companion_id, self.user_id) {
-            Ok(Some(attitude)) => attitude,
-            Ok(None) => {
-                // No seeding here: `chat_turn::finish_turn` seeds the row on
-                // the first turn, and a commit with no prior turn has
-                // nothing to recalibrate.
-                eprintln!(
-                    "compaction attitude recalibration: no attitude row yet for companion {}, skipping",
-                    checkpoint.companion_id
-                );
-                return Ok(());
-            }
-            Err(e) => {
-                eprintln!(
-                    "compaction attitude recalibration: failed to load current attitude: {e}"
-                );
-                return Ok(());
-            }
-        };
-
-        let deltas = blend(&current, &ratings, self.weight);
-        if deltas.is_empty() {
-            return Ok(());
-        }
-
         match self
             .sink
-            .apply(checkpoint.companion_id, self.user_id, &deltas)
+            .apply_blend(checkpoint.companion_id, self.user_id, &ratings, self.weight)
         {
             Ok(Some((previous, updated))) => {
-                let changes = AttitudeFormatter::new()
-                    .format_attitude_changes_for_console(&previous, &updated);
+                let formatter = AttitudeFormatter::new();
+                if formatter.diff_attitudes(&previous, &updated).is_empty() {
+                    // The blend, computed against the row's value at write
+                    // time, moved nothing worth reporting (weight `0`, or
+                    // the row already matched the rating) — nothing to log
+                    // or remember.
+                    return Ok(());
+                }
+                let changes = formatter.format_attitude_changes_for_console(&previous, &updated);
                 if !changes.is_empty() {
                     println!("{changes}");
                 }
@@ -298,13 +289,16 @@ impl<S: AttitudeSink> CommitObserver for AttitudeRecalibrator<S> {
                 }
             }
             Ok(None) => {
+                // No seeding here: `chat_turn::finish_turn` seeds the row on
+                // the first turn, and a commit with no prior turn has
+                // nothing to recalibrate.
                 eprintln!(
-                    "compaction attitude recalibration: attitude row for companion {} vanished between read and apply",
+                    "compaction attitude recalibration: no attitude row yet for companion {}, skipping",
                     checkpoint.companion_id
                 );
             }
             Err(e) => {
-                eprintln!("compaction attitude recalibration: failed to apply deltas: {e}");
+                eprintln!("compaction attitude recalibration: failed to apply blend: {e}");
             }
         }
 
@@ -341,37 +335,31 @@ impl RecordingSink {
 
 #[cfg(test)]
 impl AttitudeSink for RecordingSink {
-    fn current(
+    fn apply_blend(
         &self,
         _companion_id: i32,
         _user_id: i32,
-    ) -> rusqlite::Result<Option<CompanionAttitude>> {
-        Ok(self.current.lock().unwrap().clone())
-    }
-
-    fn apply(
-        &self,
-        _companion_id: i32,
-        _user_id: i32,
-        deltas: &[DimensionDelta],
+        ratings: &AttitudeRatings,
+        weight: f32,
     ) -> rusqlite::Result<Option<(CompanionAttitude, CompanionAttitude)>> {
         if self.apply_fails {
             return Err(rusqlite::Error::QueryReturnedNoRows);
         }
-        let previous = self
-            .current
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("RecordingSink::apply called with no current attitude seeded");
+        // Mirrors `Database::apply_attitude_deltas_computed`'s shape: read
+        // `previous`, then derive the deltas from that same value, so the
+        // fake behaves like the production seam it stands in for.
+        let Some(previous) = self.current.lock().unwrap().clone() else {
+            return Ok(None);
+        };
+        let deltas = blend(&previous, ratings, weight);
         let mut updated = previous.clone();
-        for delta in deltas {
+        for delta in &deltas {
             let value = (delta.dimension.value_of(&updated) + delta.delta).clamp(-100.0, 100.0);
             delta.dimension.set_value(&mut updated, value);
         }
         updated.relationship_score = Some(relationship_score_of(&updated));
         *self.current.lock().unwrap() = Some(updated.clone());
-        self.applied.lock().unwrap().push(deltas.to_vec());
+        self.applied.lock().unwrap().push(deltas);
         Ok(Some((previous, updated)))
     }
 
