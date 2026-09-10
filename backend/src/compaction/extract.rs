@@ -546,6 +546,12 @@ pub enum DraftError {
     /// not fit `overlay_budget_tokens`. The draft is flipped to
     /// [`CompactionStatus::Discarded`] before this is returned.
     OverlayBudget { needed: usize, budget: usize },
+    /// `range` was empty — every message it covered was deleted or edited
+    /// out from under a pending draft (#181), so there is nothing left to
+    /// extract. The draft is flipped to [`CompactionStatus::Discarded`]
+    /// before this is returned, the same terminal state every other
+    /// unrecoverable path here leaves it in.
+    EmptyRange(i64),
 }
 
 impl fmt::Display for DraftError {
@@ -563,6 +569,9 @@ impl fmt::Display for DraftError {
                 f,
                 "accepted overlay/rule items need {needed} tokens, over the {budget}-token budget"
             ),
+            DraftError::EmptyRange(id) => {
+                write!(f, "checkpoint {id}'s range is empty, nothing to extract")
+            }
         }
     }
 }
@@ -661,17 +670,20 @@ fn build_prior_notes(
     })
 }
 
-/// Discards `draft_id`, recording `raw` as its `raw_model_output` with no
-/// summary/attitude. Shared by both of [`fill_draft`]'s failure paths
-/// (unparseable output, overlay budget exceeded).
+/// Discards `draft_id`, recording `raw` as its `raw_model_output` (`None`
+/// when there was nothing to run the model over, e.g. an empty range) with
+/// no summary/attitude. Shared by every one of [`fill_draft`]'s failure
+/// paths (empty range, unparseable output, overlay budget exceeded), so a
+/// discarded draft is always left in the same shape for #175's commit and
+/// #181's stale-retirement logic to reason about.
 fn discard_draft(
     store: &impl CompactionStore,
     draft_id: i64,
-    raw: String,
+    raw: Option<String>,
     reason: &str,
 ) -> Result<(), DraftError> {
     store
-        .set_extraction_result(draft_id, Some(raw), None, None)
+        .set_extraction_result(draft_id, raw, None, None)
         .map_err(DraftError::Store)?;
     store
         .update_status(draft_id, CompactionStatus::Discarded)
@@ -697,6 +709,15 @@ pub fn fill_draft(
     if draft.status != CompactionStatus::Draft || draft.raw_model_output.is_some() {
         return Err(DraftError::DraftNotPending(draft.id));
     }
+    if range.is_empty() {
+        discard_draft(
+            store,
+            draft.id,
+            None,
+            "range is empty (its messages were likely deleted or edited out from under it)",
+        )?;
+        return Err(DraftError::EmptyRange(draft.id));
+    }
 
     let prior = build_prior_notes(store, draft.companion_id)?;
     let scaffold_tokens =
@@ -716,7 +737,7 @@ pub fn fill_draft(
                 discard_draft(
                     store,
                     draft.id,
-                    format!("{first}\n---\n{second}"),
+                    Some(format!("{first}\n---\n{second}")),
                     "extraction output was unparseable twice",
                 )?;
                 return Err(DraftError::Unparseable { first, second });
@@ -741,7 +762,7 @@ pub fn fill_draft(
         discard_draft(
             store,
             draft.id,
-            raw_outputs.join("\n---\n"),
+            Some(raw_outputs.join("\n---\n")),
             &format!(
                 "overlay/rule items need {needed} tokens, over the {overlay_budget_tokens}-token budget"
             ),
@@ -1270,6 +1291,29 @@ mod tests {
             .expect_err("a draft with raw_model_output already set must be rejected");
         assert!(matches!(err, DraftError::DraftNotPending(id) if id == draft_id));
         assert!(store.facts_for(draft_id).unwrap().is_empty());
+        assert_eq!(extractor.prompts.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn an_empty_range_discards_the_draft_instead_of_panicking() {
+        // Regression test: a draft whose messages were all deleted or
+        // edited out from under it (#181) leaves `range` empty by the time
+        // `fill_draft` runs. `chunk_range` then returns no chunks, so
+        // `merge_outputs`'s "at least one chunk" precondition would panic
+        // without the guard at the top of `fill_draft`.
+        let store = RecordingStore::new();
+        let draft = a_pending_draft(&store, &synthetic_range());
+        let speakers = solo_speakers();
+        let extractor = FakeExtractor::returning(Vec::<std::io::Result<String>>::new());
+
+        let err = fill_draft(&store, &extractor, &draft, &[], &speakers, usize::MAX)
+            .expect_err("an empty range should be discarded, not extracted");
+        assert!(matches!(err, DraftError::EmptyRange(id) if id == draft.id));
+
+        let updated = store.get_checkpoint(draft.id).unwrap().unwrap();
+        assert_eq!(updated.status, CompactionStatus::Discarded);
+        assert!(updated.raw_model_output.is_none());
+        assert!(store.facts_for(draft.id).unwrap().is_empty());
         assert_eq!(extractor.prompts.lock().unwrap().len(), 0);
     }
 
