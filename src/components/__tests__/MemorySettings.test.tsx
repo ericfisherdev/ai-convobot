@@ -6,6 +6,15 @@ import { MessagesProvider } from '../context/messageContext'
 import { CompactionProvider } from '../context/compactionContext'
 import { ConfigInterface, Device, MultiplayerMode, PromptTemplate } from '../interfaces/Config'
 import { CheckpointSummary } from '../interfaces/Compaction'
+import { toast } from 'sonner'
+
+vi.mock('sonner', () => ({
+  toast: {
+    success: vi.fn(),
+    error: vi.fn(),
+    info: vi.fn(),
+  },
+}))
 
 // `MemorySettings` reads `useCompaction()`, which itself reads
 // `useMessages()` for `refreshMessages` on a successful pin/unpin, matching
@@ -152,9 +161,9 @@ describe('MemorySettings', () => {
     )
   })
 
-  it('posts to the long-term index rebuild endpoint and toasts the result', async () => {
+  it('posts to the long-term index rebuild endpoint and toasts the backend result', async () => {
     stubFetch({
-      '/api/memory/longTerm/rebuild': () => Promise.resolve({ ok: true, text: () => Promise.resolve('Rebuilt 42 entries') }),
+      '/api/memory/longTerm/rebuild': () => Promise.resolve({ ok: true, text: () => Promise.resolve('Long term memory rebuilt from 42 facts') }),
     })
     const user = userEvent.setup()
     renderMemorySettings(<MemorySettings config={baseConfig} onChange={vi.fn()} />)
@@ -165,6 +174,27 @@ describe('MemorySettings', () => {
     await waitFor(() => {
       expect(mockFetch.mock.calls.some(call => call[0] === '/api/memory/longTerm/rebuild' && call[1]?.method === 'POST')).toBe(true)
     })
+
+    const mockSuccess = toast.success as unknown as ReturnType<typeof vi.fn>
+    await waitFor(() => expect(mockSuccess).toHaveBeenCalledWith('Long term memory rebuilt from 42 facts'))
+  })
+
+  it('toasts the backend error text when the rebuild fails', async () => {
+    stubFetch({
+      '/api/memory/longTerm/rebuild': () => Promise.resolve({
+        ok: false,
+        text: () => Promise.resolve('A reply is still being generated; wait for it to finish before rebuilding long term memory'),
+      }),
+    })
+    const user = userEvent.setup()
+    renderMemorySettings(<MemorySettings config={baseConfig} onChange={vi.fn()} />)
+
+    await user.click(screen.getByRole('button', { name: 'Rebuild long-term index' }))
+
+    const mockError = toast.error as unknown as ReturnType<typeof vi.fn>
+    await waitFor(() =>
+      expect(mockError).toHaveBeenCalledWith('A reply is still being generated; wait for it to finish before rebuilding long term memory')
+    )
   })
 
   it('hides non-instruct models until "Show all models" is toggled', async () => {
