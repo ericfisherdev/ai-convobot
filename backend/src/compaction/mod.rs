@@ -70,6 +70,14 @@
 //! every registered observer together for #179's handler; `main.rs` never
 //! assembles this inline.
 //!
+//! `attitude.rs` (#176) is the first registered `CommitObserver`:
+//! `AttitudeRecalibrator` blends a checkpoint's `attitude_ratings` (the
+//! extraction model's narrative rating, #173/#185's `AttitudeRatings`) into
+//! the companion's running attitude toward the user via the pure
+//! `blend`/`blended`, through the `AttitudeSink` persistence seam
+//! (`SqliteAttitudeSink` in production). See [`production_commit_deps`]'s
+//! doc comment for how #177/#178 register alongside it.
+//!
 //! `registry_speakers.rs` (#182) adds [`SpeakerInfo`]'s multiplayer impl:
 //! `RegistrySpeakers`, backed by a live `ParticipantRegistry` snapshot
 //! instead of the fixed `user`/`char` pair `SoloSpeakers` covers — only
@@ -97,6 +105,7 @@
 //! extra context (attitude, phase) a single domain struct does not carry.
 #![allow(dead_code)]
 
+pub mod attitude;
 pub mod commit;
 pub mod context;
 pub mod extract;
@@ -121,10 +130,23 @@ use crate::llm::Extractor;
 /// Builds the real [`commit::CommitDeps`] used in production: an
 /// [`merge::LlmSummaryMerger`] wrapping `extractor`, plus every registered
 /// [`commit::CommitObserver`], each pushed onto `observers` in its own
-/// paragraph below. #176 (attitude) and #178 (tantivy) register alongside
-/// #177 (persons) here too; `main.rs` never assembles `CommitDeps` inline —
-/// #179's handler is the one caller, via this function.
-pub fn production_commit_deps(extractor: &dyn Extractor) -> commit::CommitDeps<'_> {
+/// paragraph below. `user_id` is the caller's — every `main.rs` handler
+/// passes the constant `1`, the same way handlers pass it to
+/// `PendingTurn::begin`; it flows through to each observer's constructor
+/// rather than being read back out of `ConfigView` or a request, since
+/// nothing here is user-specific yet.
+///
+/// # Adding another observer (#178 tantivy, ...)
+///
+/// Load whatever the observer's constructor needs, build it, and `push` it,
+/// the way the #176/#177 paragraphs below do. A constructor that can fail
+/// (like #176's, which reads `ConfigView`, or #177's, which reads the
+/// user/companion names) should log and skip the `push` on error rather
+/// than propagating: a missing observer degrades to "that side effect
+/// doesn't run this session," which is strictly better than failing every
+/// future commit. `main.rs` never assembles `CommitDeps` inline — #179's
+/// handler is the one caller, via this function.
+pub fn production_commit_deps(extractor: &dyn Extractor, user_id: i32) -> commit::CommitDeps<'_> {
     let mut observers: Vec<Box<dyn commit::CommitObserver>> = Vec::new();
 
     // #177: creates/updates `third_party_individuals` rows from a
@@ -135,6 +157,20 @@ pub fn production_commit_deps(extractor: &dyn Extractor) -> commit::CommitDeps<'
     // move on" rule.
     if let Some(observer) = persons::PersonsObserver::from_database() {
         observers.push(Box::new(observer));
+    }
+
+    // #176: recalibrates the companion's attitude toward the user from the
+    // checkpoint's narrative ratings. Needs `ConfigView` for the blend
+    // weight; a config read failure here is logged and skipped rather than
+    // failing the whole commit-deps build, matching every other observer
+    // failure's "log and move on" rule.
+    match database::Database::get_config() {
+        Ok(config) => observers.push(Box::new(attitude::AttitudeRecalibrator::from_config(
+            &config, user_id,
+        ))),
+        Err(e) => eprintln!(
+            "compaction: failed to load config for attitude recalibration, skipping this session: {e}"
+        ),
     }
 
     commit::CommitDeps {

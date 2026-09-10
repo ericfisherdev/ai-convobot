@@ -44,6 +44,9 @@ export interface ConfigInterface {
     /** `null` means "use llm_model_path". */
     compaction_model_path: string | null;
     heuristic_person_detection: boolean;
+    /** How far a compaction commit blends the running attitude toward the
+     * narrative rating: 0 keeps the running values, 1 adopts the rating. */
+    compaction_attitude_weight: number;
 }
 
 export interface ModelInfo {

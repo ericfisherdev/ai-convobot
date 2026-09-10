@@ -2372,7 +2372,8 @@ async fn compaction_commit(
             user_name: user_view.name,
             companion_name: companion_view.name,
         };
-        let deps = crate::compaction::production_commit_deps(&llm::ResidentExtractor);
+        let user_id = 1; // Default user ID
+        let deps = crate::compaction::production_commit_deps(&llm::ResidentExtractor, user_id);
         let committed = crate::compaction::commit::commit(&store, reviewed, &deps, &budget)?;
         Ok(committed)
     })
