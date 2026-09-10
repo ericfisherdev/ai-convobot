@@ -2100,7 +2100,7 @@ impl CompactionDraftError {
             }
             CompactionDraftError::NotEnoughMessages { have, need } => HttpResponse::Conflict()
                 .body(format!(
-                    "chat has {have} uncompacted messages; compaction needs at least {need}"
+                    "chat has {have} compactable messages outside the short-term window; compaction needs at least {need}"
                 )),
             CompactionDraftError::Storage(e) => {
                 eprintln!("Failed to queue a compaction draft: {}", e);
@@ -2137,7 +2137,14 @@ async fn compaction_draft(
     // policy `RegistrySpeakers` runs against.
     let registry_snapshot = snapshot_speakers(&registry).registry;
 
-    let result = web::block(move || -> Result<i64, CompactionDraftError> {
+    let result = web::block(move || -> Result<(i64, TurnGuard), CompactionDraftError> {
+        // `guard` is moved into this closure (not held on the async side)
+        // and handed back out with the result: a dropped request (client
+        // disconnect) must not free the turn slot while this blocking work
+        // is still running, the same reasoning `compaction_commit` uses for
+        // its own guard. Returning it (rather than moving it straight into
+        // `spawn_extraction` here) keeps `spawn_extraction` on the async
+        // side, where the registry snapshot already lives.
         let store = SqliteCompactionStore;
         let companion_id = Database::get_companion_id()?;
         if let Some(pending) = store.pending_draft(companion_id)? {
@@ -2164,12 +2171,12 @@ async fn compaction_draft(
             range,
             CompactionTrigger::Manual,
         )?;
-        Ok(draft_id)
+        Ok((draft_id, guard))
     })
     .await;
 
     match result {
-        Ok(Ok(draft_id)) => {
+        Ok(Ok((draft_id, guard))) => {
             crate::compaction::extract::spawn_extraction(guard, draft_id, registry_snapshot);
             HttpResponse::Accepted().json(DraftQueued { draft_id })
         }
