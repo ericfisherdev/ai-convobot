@@ -252,6 +252,45 @@ pub(crate) fn update_status_on(con: &Connection, id: i64, status: CompactionStat
     Ok(())
 }
 
+/// Flips `id` from `from` to `to` in one statement (also stamping
+/// `committed_at` when `to` is `Committed`), so the transition's premise is
+/// enforced by the write itself rather than by an earlier read on a
+/// possibly different connection — closing the TOCTOU window
+/// [`update_status_on`] leaves open between a caller's status check and its
+/// later write. `QueryReturnedNoRows` if `id` is unknown *or* its status is
+/// no longer `from` (checked via `changes() == 0`, same rule every other
+/// status-changing helper here uses). [`CompactionStore::commit_checkpoint`]
+/// and [`crate::compaction::commit::discard`] both use this instead of
+/// [`update_status_on`]/[`CompactionStore::update_status`] for exactly that
+/// reason.
+pub(crate) fn transition_status_on(
+    con: &Connection,
+    id: i64,
+    from: CompactionStatus,
+    to: CompactionStatus,
+) -> Result<()> {
+    let changed = if to == CompactionStatus::Committed {
+        con.execute(
+            "UPDATE compactions SET status = ?, committed_at = ? WHERE id = ? AND status = ?",
+            params![
+                &to as &dyn ToSql,
+                get_current_date(),
+                id,
+                &from as &dyn ToSql
+            ],
+        )?
+    } else {
+        con.execute(
+            "UPDATE compactions SET status = ? WHERE id = ? AND status = ?",
+            params![&to as &dyn ToSql, id, &from as &dyn ToSql],
+        )?
+    };
+    if changed == 0 {
+        return Err(Error::QueryReturnedNoRows);
+    }
+    Ok(())
+}
+
 /// Fills in `raw_model_output`/`summary`/`attitude_ratings` on an existing
 /// checkpoint row. `QueryReturnedNoRows` if `id` does not exist (checked via
 /// `changes() == 0`, matching `update_status_on`).
@@ -548,6 +587,20 @@ pub trait CompactionStore {
     /// `QueryReturnedNoRows` when `id` does not exist.
     fn update_status(&self, id: i64, status: CompactionStatus) -> Result<()>;
 
+    /// Flips `id` from `from` to `to`, failing with `QueryReturnedNoRows` if
+    /// `id` is unknown or its status is no longer `from` — the write itself
+    /// enforces the transition's premise, closing the TOCTOU window between
+    /// a caller's earlier status read (on a possibly different connection)
+    /// and this call. [`Self::commit_checkpoint`] and
+    /// [`crate::compaction::commit::discard`] use this instead of
+    /// [`Self::update_status`] for exactly that reason.
+    fn transition_status(
+        &self,
+        id: i64,
+        from: CompactionStatus,
+        to: CompactionStatus,
+    ) -> Result<()>;
+
     /// Fills in a draft's extraction result: the model's raw output,
     /// summary, and attitude ratings (raw JSON; #176 gives this a typed
     /// shape). #185's `fill_draft` calls this once on success (all three
@@ -658,6 +711,16 @@ impl CompactionStore for SqliteCompactionStore {
         update_status_on(&con, id, status)
     }
 
+    fn transition_status(
+        &self,
+        id: i64,
+        from: CompactionStatus,
+        to: CompactionStatus,
+    ) -> Result<()> {
+        let con = Database::open()?;
+        transition_status_on(&con, id, from, to)
+    }
+
     fn set_extraction_result(
         &self,
         id: i64,
@@ -720,6 +783,16 @@ impl CompactionStore for SqliteCompactionStore {
     fn commit_checkpoint(&self, record: CommitRecord) -> Result<Checkpoint> {
         let con = Database::open()?;
         let tx = Transaction::new_unchecked(&con, TransactionBehavior::Immediate)?;
+        // Re-assert the `Draft` premise `commit` decided on, on this
+        // transaction's own connection: a discard or a second commit that
+        // landed between that read and here fails right here, before any
+        // fact row is rewritten, instead of being silently overwritten.
+        transition_status_on(
+            &tx,
+            record.draft_id,
+            CompactionStatus::Draft,
+            CompactionStatus::Committed,
+        )?;
         for promotion in &record.promote {
             promote_fact_on(&tx, record.draft_id, promotion)?;
         }
@@ -730,7 +803,6 @@ impl CompactionStore for SqliteCompactionStore {
             merge_sources_on(&tx, *existing_id, sources)?;
             supersede_on(&tx, *duplicate_fact_id, *existing_id)?;
         }
-        update_status_on(&tx, record.draft_id, CompactionStatus::Committed)?;
         tx.execute(
             "UPDATE compactions SET summary = ?, rolling_summary = ?, needs_merge = ? WHERE id = ?",
             params![
@@ -870,6 +942,27 @@ impl CompactionStore for RecordingStore {
         Ok(())
     }
 
+    fn transition_status(
+        &self,
+        id: i64,
+        from: CompactionStatus,
+        to: CompactionStatus,
+    ) -> Result<()> {
+        let mut checkpoints = self.checkpoints.lock().unwrap();
+        let checkpoint = checkpoints
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or(Error::QueryReturnedNoRows)?;
+        if checkpoint.status != from {
+            return Err(Error::QueryReturnedNoRows);
+        }
+        checkpoint.status = to;
+        if to == CompactionStatus::Committed {
+            checkpoint.committed_at = Some(get_current_date());
+        }
+        Ok(())
+    }
+
     fn set_extraction_result(
         &self,
         id: i64,
@@ -1003,6 +1096,27 @@ impl CompactionStore for RecordingStore {
     }
 
     fn commit_checkpoint(&self, record: CommitRecord) -> Result<Checkpoint> {
+        // Re-assert the `Draft` premise `commit` decided on: a concurrent
+        // discard or second commit that flipped this checkpoint's status
+        // since that read fails right here, before any fact row is
+        // rewritten, mirroring `transition_status_on`'s conditional `UPDATE`
+        // on the SQLite side.
+        {
+            let mut checkpoints = self.checkpoints.lock().unwrap();
+            let checkpoint = checkpoints
+                .iter_mut()
+                .find(|c| c.id == record.draft_id)
+                .ok_or(Error::QueryReturnedNoRows)?;
+            if checkpoint.status != CompactionStatus::Draft {
+                return Err(Error::QueryReturnedNoRows);
+            }
+            checkpoint.status = CompactionStatus::Committed;
+            checkpoint.committed_at = Some(get_current_date());
+            checkpoint.summary = Some(record.summary.clone());
+            checkpoint.rolling_summary = Some(record.rolling_summary.clone());
+            checkpoint.needs_merge = record.needs_merge;
+        }
+
         {
             let mut facts = self.facts.lock().unwrap();
             for promotion in &record.promote {
@@ -1041,19 +1155,6 @@ impl CompactionStore for RecordingStore {
                 duplicate.active = false;
                 duplicate.superseded_by = Some(*existing_id);
             }
-        }
-
-        {
-            let mut checkpoints = self.checkpoints.lock().unwrap();
-            let checkpoint = checkpoints
-                .iter_mut()
-                .find(|c| c.id == record.draft_id)
-                .ok_or(Error::QueryReturnedNoRows)?;
-            checkpoint.status = CompactionStatus::Committed;
-            checkpoint.committed_at = Some(get_current_date());
-            checkpoint.summary = Some(record.summary.clone());
-            checkpoint.rolling_summary = Some(record.rolling_summary.clone());
-            checkpoint.needs_merge = record.needs_merge;
         }
 
         self.compacted_through
@@ -1482,6 +1583,12 @@ mod tests {
     /// like every other trait method's `_on` helper above.
     fn commit_via_on(con: &Connection, record: &CommitRecord) -> Result<()> {
         let tx = Transaction::new_unchecked(con, TransactionBehavior::Immediate)?;
+        transition_status_on(
+            &tx,
+            record.draft_id,
+            CompactionStatus::Draft,
+            CompactionStatus::Committed,
+        )?;
         for promotion in &record.promote {
             promote_fact_on(&tx, record.draft_id, promotion)?;
         }
@@ -1492,7 +1599,6 @@ mod tests {
             merge_sources_on(&tx, *existing_id, sources)?;
             supersede_on(&tx, *duplicate_fact_id, *existing_id)?;
         }
-        update_status_on(&tx, record.draft_id, CompactionStatus::Committed)?;
         tx.execute(
             "UPDATE compactions SET summary = ?, rolling_summary = ?, needs_merge = ? WHERE id = ?",
             params![
@@ -1673,5 +1779,66 @@ mod tests {
             .unwrap();
         assert!(!superseded.active);
         assert_eq!(superseded.superseded_by, Some(ids[0]));
+    }
+
+    /// Simulates a concurrent discard landing between `commit`'s initial
+    /// `Draft` read (on its own connection) and this transaction: flips the
+    /// draft to `Discarded` directly, then runs `commit_via_on` with a
+    /// record built as if the earlier read had still seen `Draft`. The
+    /// `transition_status_on` gate at the top of the transaction must catch
+    /// the mismatch and roll back the whole thing, closing the TOCTOU
+    /// window `update_status_on`'s unconditional `WHERE id = ?` left open.
+    #[test]
+    fn commit_via_on_fails_and_rolls_back_when_the_draft_was_discarded_first() {
+        let (_dir, con) = fresh_db();
+        let draft_id = insert_draft_on(&con, &a_draft()).unwrap();
+        let accepted = FactDraft {
+            category: FactCategory::Milestone,
+            subject: None,
+            text: "original text".to_string(),
+            quote_speaker: None,
+            sources: vec![1],
+            replaces: vec![],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        };
+        let ids = insert_facts_on(&con, draft_id, std::slice::from_ref(&accepted)).unwrap();
+
+        // The "concurrent" discard: lands after commit()'s own read of this
+        // draft as `Draft`, before commit_via_on's transaction runs.
+        update_status_on(&con, draft_id, CompactionStatus::Discarded).unwrap();
+
+        let record = CommitRecord {
+            draft_id,
+            companion_id: 1,
+            through_message_id: 3,
+            summary: "new summary".to_string(),
+            rolling_summary: "".to_string(),
+            needs_merge: false,
+            promote: vec![FactPromotion {
+                fact_id: ids[0],
+                draft: FactDraft {
+                    text: "edited text".to_string(),
+                    ..accepted
+                },
+            }],
+            supersede: vec![],
+            merge_into: vec![],
+        };
+
+        let err = commit_via_on(&con, &record).unwrap_err();
+        assert!(matches!(err, Error::QueryReturnedNoRows));
+
+        let checkpoint = get_checkpoint_on(&con, draft_id).unwrap().unwrap();
+        assert_eq!(checkpoint.status, CompactionStatus::Discarded);
+        assert!(checkpoint.summary.is_none());
+
+        let stored = facts_for_on(&con, draft_id).unwrap();
+        assert_eq!(stored[0].text, "original text");
+        assert!(stored[0].active);
+
+        assert_eq!(compacted_through_on(&con, 1).unwrap(), None);
     }
 }
