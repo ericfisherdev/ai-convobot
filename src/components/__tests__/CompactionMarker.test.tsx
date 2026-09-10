@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import { CompactionProvider } from '../context/compactionContext';
 import { MessagesProvider } from '../context/messageContext';
 import { CompactionMarker } from '../message/CompactionMarker';
@@ -29,7 +29,7 @@ const aCheckpoint = (overrides: Partial<CheckpointSummary> = {}): CheckpointSumm
   ...overrides,
 });
 
-const renderMarker = (checkpoints: CheckpointSummary[]) => {
+const renderMarker = (checkpoints: CheckpointSummary[], messageIds: number[] = [10]) => {
   const fetchMock = vi.fn((input: RequestInfo | URL) => {
     const url = typeof input === 'string' ? input : input.toString();
     if (url.startsWith('/api/message')) return Promise.resolve(jsonResponse(emptyMessagePage));
@@ -43,7 +43,9 @@ const renderMarker = (checkpoints: CheckpointSummary[]) => {
   render(
     <MessagesProvider>
       <CompactionProvider>
-        <CompactionMarker messageId={10} />
+        {messageIds.map((id) => (
+          <CompactionMarker key={id} messageId={id} />
+        ))}
       </CompactionProvider>
     </MessagesProvider>
   );
@@ -58,12 +60,24 @@ describe('CompactionMarker', () => {
   });
 
   it('does not render a notice for a discarded checkpoint at this message', async () => {
-    const fetchMock = renderMarker([aCheckpoint({ status: 'discarded' })]);
-
-    await waitFor(() =>
-      expect(fetchMock).toHaveBeenCalledWith(expect.stringMatching(/^\/api\/compaction($|\?)/))
+    // `waitFor`ing only the fetch call is not enough: it resolves as soon
+    // as the provider's mount effect issues the request, before `await
+    // response.json()` and the resulting `setCheckpoints` have had a
+    // chance to render anything -- the negative assertion would then pass
+    // whether or not the checkpoint lookup is filtered by status at all.
+    // A committed sibling checkpoint in the same listing gives a positive
+    // signal that the listing has actually rendered; only once that notice
+    // is on screen does the discarded row's absence mean anything.
+    renderMarker(
+      [
+        aCheckpoint({ id: 1, status: 'discarded', through_message_id: 10 }),
+        aCheckpoint({ id: 2, status: 'committed', through_message_id: 20 }),
+      ],
+      [10, 20]
     );
-    expect(screen.queryByText('Continuity notes cover messages up to here')).not.toBeInTheDocument();
+
+    await screen.findByText('Continuity notes cover messages up to here');
+    expect(screen.getAllByText('Continuity notes cover messages up to here')).toHaveLength(1);
   });
 
   it('renders the notice for a committed checkpoint at this message', async () => {
