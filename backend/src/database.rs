@@ -1083,10 +1083,24 @@ fn get_companion_id_on(con: &Connection) -> Result<i32> {
 }
 
 /// Flips `message_id`'s containing checkpoint to `Stale` if it falls inside
-/// one (#181), on the caller's own connection/transaction so it composes
-/// with `edit_message_on`/`delete_message_on`'s own statement. Skips the
-/// compaction check entirely when the companion has never been compacted
-/// (`compacted_through IS NULL`), so a chat that never triggered compaction
+/// a `Committed` one, and discards a pending `Draft` checkpoint containing
+/// it outright (#181), on the caller's own connection/transaction so it
+/// composes with `edit_message_on`/`delete_message_on`/
+/// `pop_latest_bot_reply_on`'s own statement.
+///
+/// The draft check runs *before* the `compacted_through IS NULL`
+/// short-circuit below: a chat's very first draft is pending while
+/// `compacted_through` is still `NULL` (nothing has committed yet), so
+/// short-circuiting on that would let an edit/delete under a pending draft's
+/// nose go unnoticed. Discarding it here — rather than merely marking it
+/// stale, which only `Committed` rows support — closes both windows a
+/// draft's content can go wrong under: extraction still in flight over the
+/// old text fails `DraftNotPending` when it tries to write its result
+/// (`fill_draft`/`commit` both re-check the status), and a pending review
+/// card simply disappears (the hook re-queues on the next round).
+///
+/// The `Committed`-checkpoint check *does* skip entirely once
+/// `compacted_through` is `NULL`, so a chat that never triggered compaction
 /// pays one cheap `SELECT` per edit/delete and nothing else — the
 /// `id <= compacted_through` bound the original plan also checked here is
 /// redundant with `mark_stale_containing_on`'s own `from_message_id <= id
@@ -1094,6 +1108,7 @@ fn get_companion_id_on(con: &Connection) -> Result<i32> {
 /// kept.
 fn mark_stale_for_message_on(con: &Connection, message_id: i32) -> Result<()> {
     let companion_id = get_companion_id_on(con)?;
+    crate::compaction::store::discard_draft_containing_on(con, companion_id, message_id)?;
     if crate::compaction::store::compacted_through_on(con, companion_id)?.is_none() {
         return Ok(());
     }
@@ -1774,11 +1789,16 @@ impl Database {
     /// instead of the hardwired `paths::db_path()`.
     ///
     /// Runs the "is the newest row a bot reply with a preceding user turn"
-    /// check, `owner_ready` and the delete inside one `IMMEDIATE`
-    /// transaction, so a concurrent `DELETE /api/message/{id}` or
-    /// `POST /api/message` (neither of which is covered by the turn slot)
-    /// cannot interleave between the check and the delete, and a remote bot
-    /// cannot go offline between "checked ready" and "deleted".
+    /// check, `owner_ready`, the delete, and #181's stale-checkpoint check
+    /// inside one `IMMEDIATE` transaction, so a concurrent
+    /// `DELETE /api/message/{id}` or `POST /api/message` (neither of which
+    /// is covered by the turn slot) cannot interleave between the check and
+    /// the delete, and a remote bot cannot go offline between "checked
+    /// ready" and "deleted". The stale check matters here too, not just in
+    /// `edit_message_on`/`delete_message_on`: with `short_term_mem: 0` (not
+    /// validated by `edit_companion`) `select_range` can include the
+    /// newest message in a committed checkpoint's range, and this is the
+    /// only path that deletes that specific row.
     fn pop_latest_bot_reply_on(
         con: &mut Connection,
         owner_ready: impl FnOnce(&str) -> bool,
@@ -1833,6 +1853,7 @@ impl Database {
 
         let message_id = reply.id;
         tx.execute("DELETE FROM messages WHERE id = ?", [message_id])?;
+        mark_stale_for_message_on(&tx, message_id)?;
         tx.commit()?;
 
         // Cleared after commit (not inside `open()`) so the invalidation is
@@ -5389,6 +5410,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
+        create_companion_table(&con);
+        create_compaction_tables(&con);
         insert_message_row(&con, USER_SPEAKER_ID, "hi");
         insert_message_row(&con, CHAR_SPEAKER_ID, "hello");
         insert_message_row(&con, "bot1", "hi from bot1");
@@ -5421,6 +5444,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
+        create_companion_table(&con);
+        create_compaction_tables(&con);
         insert_message_row(&con, USER_SPEAKER_ID, "hi @bot1");
         insert_message_row(&con, CHAR_SPEAKER_ID, "sure, @bot1 go ahead");
         insert_message_row(&con, "bot1", "hi from bot1");
@@ -5521,6 +5546,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
+        create_companion_table(&con);
+        create_compaction_tables(&con);
         insert_message_row(&con, USER_SPEAKER_ID, "hi");
         insert_message_row(&con, CHAR_SPEAKER_ID, "first reply");
         insert_message_row(&con, CHAR_SPEAKER_ID, "second reply, inserted directly");
@@ -5613,6 +5640,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
+        create_companion_table(&con);
+        create_compaction_tables(&con);
         insert_message_row(&con, USER_SPEAKER_ID, "hi");
         insert_message_row(&con, CHAR_SPEAKER_ID, "hello");
 
@@ -5628,12 +5657,44 @@ mod tests {
         assert!(!cache.contains_key(&cache_key));
     }
 
+    /// #181 review finding: `pop_latest_bot_reply_on` is a third
+    /// message-delete path (alongside `edit_message_on`/`delete_message_on`)
+    /// that can remove a message inside a committed checkpoint's range —
+    /// with `short_term_mem: 0` (not validated by `edit_companion`), the
+    /// range `select_range` returns can include the very row a regenerate
+    /// then pops. It must mark that checkpoint `Stale` exactly like the
+    /// other two paths do.
+    #[test]
+    fn pop_latest_bot_reply_marks_a_covering_committed_checkpoint_stale() {
+        use crate::compaction::types::CompactionStatus;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        create_companion_table(&con);
+        create_compaction_tables(&con);
+        insert_message_row(&con, USER_SPEAKER_ID, "hi");
+        insert_message_row(&con, CHAR_SPEAKER_ID, "hello");
+        let checkpoint = insert_checkpoint_row(&con, 1, 2, CompactionStatus::Committed);
+        con.execute(
+            "UPDATE companion SET compacted_through = 2 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        let result = Database::pop_latest_bot_reply_on(&mut con, always_ready).unwrap();
+        assert!(matches!(result, PoppedReply::Removed { message_id: 2, .. }));
+
+        assert_eq!(checkpoint_status(&con, checkpoint), CompactionStatus::Stale);
+    }
+
     #[test]
     fn edit_message_keeps_an_ai_reply_marked_as_ai() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
         create_companion_table(&con);
+        create_compaction_tables(&con);
         insert_message_row(&con, CHAR_SPEAKER_ID, "hello");
 
         Database::edit_message_on(
@@ -5660,6 +5721,7 @@ mod tests {
         let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
         create_companion_table(&con);
+        create_compaction_tables(&con);
         insert_message_row(&con, "bot1", "hi from bot1");
 
         Database::edit_message_on(
@@ -5688,6 +5750,7 @@ mod tests {
         let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
         create_companion_table(&con);
+        create_compaction_tables(&con);
         insert_message_row(&con, USER_SPEAKER_ID, "hi");
 
         Database::edit_message_on(
@@ -5714,6 +5777,7 @@ mod tests {
         let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
         create_companion_table(&con);
+        create_compaction_tables(&con);
         insert_message_row(&con, USER_SPEAKER_ID, "hi");
         insert_message_row(&con, CHAR_SPEAKER_ID, "hello");
 
@@ -5741,6 +5805,7 @@ mod tests {
         let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
         create_companion_table(&con);
+        create_compaction_tables(&con);
         insert_message_row(&con, CHAR_SPEAKER_ID, "hello");
 
         // Unique to this test (not "messages:50:0", which the
@@ -5853,9 +5918,12 @@ mod tests {
         create_companion_table(&con);
         create_compaction_tables(&con);
         insert_message_row(&con, USER_SPEAKER_ID, "hi");
-        // A checkpoint row exists but `compacted_through` is still NULL, as
-        // if seeded out of band: the NULL short-circuit means
-        // `edit_message_on` must never even query it, let alone flip it.
+        // A `Committed` checkpoint row exists but `compacted_through` is
+        // still NULL, as if seeded out of band: `discard_draft_containing_on`
+        // runs unconditionally (it only ever matches `Draft` rows, so it is
+        // a no-op here) but the NULL short-circuit means
+        // `mark_stale_containing_on` must never even query this row, let
+        // alone flip it.
         let checkpoint = insert_checkpoint_row(&con, 1, 1, CompactionStatus::Committed);
 
         Database::edit_message_on(
@@ -5902,6 +5970,105 @@ mod tests {
             .unwrap();
         assert_eq!(pin_count, 0);
         assert_eq!(checkpoint_status(&con, checkpoint), CompactionStatus::Stale);
+    }
+
+    /// #181 review finding: `mark_stale_containing_on` only ever matches
+    /// `Committed` rows, so a pending `Draft` checkpoint whose range an edit
+    /// falls inside was left completely untouched — committing it later
+    /// would produce a `Committed` checkpoint describing pre-edit content.
+    /// `discard_draft_containing_on` closes that gap.
+    #[test]
+    fn edit_inside_a_pending_drafts_range_discards_it_and_leaves_a_committed_sibling_untouched() {
+        use crate::compaction::types::CompactionStatus;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        create_companion_table(&con);
+        create_compaction_tables(&con);
+        for i in 1..=15 {
+            insert_message_row(&con, USER_SPEAKER_ID, &format!("msg {i}"));
+        }
+        let committed = insert_checkpoint_row(&con, 1, 10, CompactionStatus::Committed);
+        con.execute(
+            "UPDATE companion SET compacted_through = 10 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        let pending_draft = insert_checkpoint_row(&con, 11, 15, CompactionStatus::Draft);
+
+        Database::edit_message_on(
+            &mut con,
+            13,
+            MessageEdit {
+                content: "edited".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            checkpoint_status(&con, pending_draft),
+            CompactionStatus::Discarded
+        );
+        assert_eq!(
+            checkpoint_status(&con, committed),
+            CompactionStatus::Committed
+        );
+    }
+
+    #[test]
+    fn delete_inside_a_pending_drafts_range_discards_it() {
+        use crate::compaction::types::CompactionStatus;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        create_companion_table(&con);
+        create_compaction_tables(&con);
+        for i in 1..=15 {
+            insert_message_row(&con, USER_SPEAKER_ID, &format!("msg {i}"));
+        }
+        let pending_draft = insert_checkpoint_row(&con, 11, 15, CompactionStatus::Draft);
+
+        Database::delete_message_on(&mut con, 13).unwrap();
+
+        assert_eq!(
+            checkpoint_status(&con, pending_draft),
+            CompactionStatus::Discarded
+        );
+    }
+
+    /// The draft check must run *before* the `compacted_through IS NULL`
+    /// short-circuit: a chat's very first draft is pending while
+    /// `compacted_through` is still `NULL` (nothing has committed yet).
+    #[test]
+    fn edit_inside_the_chats_very_first_pending_draft_discards_it_even_though_compacted_through_is_still_null(
+    ) {
+        use crate::compaction::types::CompactionStatus;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        create_companion_table(&con);
+        create_compaction_tables(&con);
+        for i in 1..=5 {
+            insert_message_row(&con, USER_SPEAKER_ID, &format!("msg {i}"));
+        }
+        let pending_draft = insert_checkpoint_row(&con, 1, 5, CompactionStatus::Draft);
+
+        Database::edit_message_on(
+            &mut con,
+            3,
+            MessageEdit {
+                content: "edited".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            checkpoint_status(&con, pending_draft),
+            CompactionStatus::Discarded
+        );
     }
 
     #[test]

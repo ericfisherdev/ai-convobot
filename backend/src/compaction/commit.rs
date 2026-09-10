@@ -336,7 +336,14 @@ pub fn commit(
 
     let stored_facts = store.facts_for(review.draft_id)?;
     let active_facts = store.active_facts(draft.companion_id)?;
-    let prev_committed = store.latest_committed(draft.companion_id)?;
+    // The newest committed checkpoint ending *before* this draft's own
+    // range, not simply the newest one overall (#181): a re-compaction can
+    // start earlier than `compacted_through`, so the highest-id committed
+    // checkpoint can lie inside the range this draft is about to re-cover
+    // and retire. Folding its summary forward would preserve exactly the
+    // stale narrative the re-compaction exists to replace.
+    let prev_committed =
+        store.latest_committed_before(draft.companion_id, draft.from_message_id)?;
 
     let record = plan_commit(
         &draft,
@@ -540,11 +547,29 @@ mod tests {
         companion_id: i32,
         drafts: &[FactDraft],
     ) -> (i64, Vec<i64>) {
+        seed_draft_with_range(store, companion_id, 1, 10, drafts)
+    }
+
+    /// Like [`seed_draft`], with an explicit range. Tests that seed and
+    /// commit a *second* draft for the same companion need this instead of
+    /// the [1,10] default: in production a draft's range never overlaps an
+    /// already-committed one ([`crate::compaction::range::select_range`]
+    /// only ever starts after `compacted_through`, and a re-compaction's own
+    /// overlap gets retired by `commit_checkpoint` rather than left as a
+    /// second live checkpoint over the same messages) — reusing [1,10] for
+    /// both would give `latest_committed_before` (#181) nothing to find.
+    fn seed_draft_with_range(
+        store: &RecordingStore,
+        companion_id: i32,
+        from_message_id: i32,
+        through_message_id: i32,
+        drafts: &[FactDraft],
+    ) -> (i64, Vec<i64>) {
         let draft_id = store
             .insert_draft(NewDraft {
                 companion_id,
-                from_message_id: 1,
-                through_message_id: 10,
+                from_message_id,
+                through_message_id,
                 trigger: CompactionTrigger::Threshold,
                 raw_model_output: Some("raw".to_string()),
             })
@@ -639,7 +664,8 @@ mod tests {
             canon: true,
             rejected_reason: None,
         };
-        let (second_id, second_ids) = seed_draft(&store, 1, std::slice::from_ref(&second_draft));
+        let (second_id, second_ids) =
+            seed_draft_with_range(&store, 1, 11, 20, std::slice::from_ref(&second_draft));
         let checkpoint = commit(
             &store,
             ReviewedDraft {
@@ -783,7 +809,8 @@ mod tests {
             canon: true,
             rejected_reason: None,
         };
-        let (new_draft_id, new_ids) = seed_draft(&store, 1, std::slice::from_ref(&new_draft));
+        let (new_draft_id, new_ids) =
+            seed_draft_with_range(&store, 1, 11, 20, std::slice::from_ref(&new_draft));
         commit(
             &store,
             ReviewedDraft {
@@ -859,7 +886,8 @@ mod tests {
             canon: true,
             rejected_reason: None,
         };
-        let (second_draft_id, second_ids) = seed_draft(&store, 1, std::slice::from_ref(&duplicate));
+        let (second_draft_id, second_ids) =
+            seed_draft_with_range(&store, 1, 11, 20, std::slice::from_ref(&duplicate));
         commit(
             &store,
             ReviewedDraft {
@@ -975,6 +1003,64 @@ mod tests {
         ));
     }
 
+    /// #181 review finding: `Database::mark_stale_for_message_on` discards
+    /// a pending draft an edit/delete falls inside
+    /// (`discard_draft_containing_on`); `commit` must report that the same
+    /// way it reports any other non-`Draft` checkpoint.
+    #[test]
+    fn commit_on_a_draft_discarded_by_an_in_range_edit_is_not_pending() {
+        let store = RecordingStore::new();
+        let draft = FactDraft {
+            category: FactCategory::Milestone,
+            subject: None,
+            text: "a milestone".to_string(),
+            quote_speaker: None,
+            sources: vec![1],
+            replaces: vec![],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        };
+        let (draft_id, ids) = seed_draft(&store, 1, std::slice::from_ref(&draft));
+
+        // Simulates `database.rs::mark_stale_for_message_on`'s
+        // `discard_draft_containing_on` call: an edit inside the draft's
+        // [1,10] range discards it before it is ever reviewed.
+        store
+            .transition_status(
+                draft_id,
+                CompactionStatus::Draft,
+                CompactionStatus::Discarded,
+            )
+            .unwrap();
+
+        let deps = deps_with(IdentityMerger::new());
+        let err = commit(
+            &store,
+            ReviewedDraft {
+                draft_id,
+                items: vec![accepted_item(
+                    ids[0],
+                    FactCategory::Milestone,
+                    "a milestone",
+                )],
+                summary: "summary".to_string(),
+            },
+            &deps,
+            &budget(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CommitError::DraftNotPending {
+                status: CompactionStatus::Discarded,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn an_already_committed_draft_is_not_pending() {
         let store = RecordingStore::new();
@@ -1080,7 +1166,8 @@ mod tests {
         )
         .unwrap();
 
-        let (second_id, second_ids) = seed_draft(&store, 1, std::slice::from_ref(&first_draft));
+        let (second_id, second_ids) =
+            seed_draft_with_range(&store, 1, 11, 20, std::slice::from_ref(&first_draft));
         commit(
             &store,
             ReviewedDraft {
@@ -1151,7 +1238,8 @@ mod tests {
         )
         .unwrap();
 
-        let (second_id, second_ids) = seed_draft(&store, 1, std::slice::from_ref(&first_draft));
+        let (second_id, second_ids) =
+            seed_draft_with_range(&store, 1, 11, 20, std::slice::from_ref(&first_draft));
         let failing_deps = deps_with(FailingMerger);
         let checkpoint = commit(
             &store,
@@ -1270,6 +1358,14 @@ mod tests {
         }
         fn latest_committed(&self, companion_id: i32) -> rusqlite::Result<Option<Checkpoint>> {
             self.inner.latest_committed(companion_id)
+        }
+        fn latest_committed_before(
+            &self,
+            companion_id: i32,
+            from_message_id: i32,
+        ) -> rusqlite::Result<Option<Checkpoint>> {
+            self.inner
+                .latest_committed_before(companion_id, from_message_id)
         }
         fn context_snapshot(
             &self,
@@ -1641,5 +1737,142 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].id, new_ids[0]);
         assert_eq!(active[0].text, "re-compacted summary of 1-10");
+    }
+
+    /// #181 review finding: a re-compaction's range can re-cover more than
+    /// just the stale checkpoint it was queued for — here it also re-covers
+    /// B, an ordinary `Committed` checkpoint that was never marked stale.
+    /// Both must retire, and the new checkpoint must not fold either one's
+    /// summary forward: `prev_committed` is chosen by range
+    /// (`latest_committed_before`), not by "highest id", so a checkpoint the
+    /// new draft's own range re-covers is never treated as its predecessor.
+    #[test]
+    fn recompaction_over_a_stale_and_a_later_committed_checkpoint_retires_both_and_does_not_fold_the_stale_summary_forward(
+    ) {
+        let store = RecordingStore::new();
+        let deps = deps_with(IdentityMerger::new());
+
+        // A = [1,10], committed first.
+        let fact_a = FactDraft {
+            category: FactCategory::Milestone,
+            subject: None,
+            text: "fact from A".to_string(),
+            quote_speaker: None,
+            sources: vec![1],
+            replaces: vec![],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        };
+        let (a_id, a_ids) = seed_draft_with_range(&store, 1, 1, 10, std::slice::from_ref(&fact_a));
+        commit(
+            &store,
+            ReviewedDraft {
+                draft_id: a_id,
+                items: vec![accepted_item(
+                    a_ids[0],
+                    FactCategory::Milestone,
+                    "fact from A",
+                )],
+                summary: "summary A".to_string(),
+            },
+            &deps,
+            &budget(),
+        )
+        .unwrap();
+
+        // B = [11,20], committed second; its rolling_summary folds A's
+        // summary forward, exactly as #175 always did before re-compaction
+        // could start earlier than `compacted_through`.
+        let fact_b = FactDraft {
+            category: FactCategory::Milestone,
+            subject: None,
+            text: "fact from B".to_string(),
+            quote_speaker: None,
+            sources: vec![11],
+            replaces: vec![],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        };
+        let (b_id, b_ids) = seed_draft_with_range(&store, 1, 11, 20, std::slice::from_ref(&fact_b));
+        commit(
+            &store,
+            ReviewedDraft {
+                draft_id: b_id,
+                items: vec![accepted_item(
+                    b_ids[0],
+                    FactCategory::Milestone,
+                    "fact from B",
+                )],
+                summary: "summary B".to_string(),
+            },
+            &deps,
+            &budget(),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .get_checkpoint(b_id)
+                .unwrap()
+                .unwrap()
+                .rolling_summary
+                .as_deref(),
+            Some("summary A")
+        );
+
+        // An edit inside A's range marks it Stale.
+        assert_eq!(store.mark_stale_containing(1, 5).unwrap(), 1);
+
+        // A re-compaction spanning both A and B: C = [1, 20].
+        let fact_c = FactDraft {
+            category: FactCategory::Milestone,
+            subject: None,
+            text: "fact from C".to_string(),
+            quote_speaker: None,
+            sources: vec![1],
+            replaces: vec![],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        };
+        let (c_id, c_ids) = seed_draft_with_range(&store, 1, 1, 20, std::slice::from_ref(&fact_c));
+        let checkpoint_c = commit(
+            &store,
+            ReviewedDraft {
+                draft_id: c_id,
+                items: vec![accepted_item(
+                    c_ids[0],
+                    FactCategory::Milestone,
+                    "fact from C",
+                )],
+                summary: "summary C".to_string(),
+            },
+            &deps,
+            &budget(),
+        )
+        .unwrap();
+
+        // C does not fold either A's or B's summary forward: nothing
+        // precedes it — `latest_committed_before(company, from=1)` finds no
+        // committed checkpoint ending before message 1.
+        assert_eq!(checkpoint_c.rolling_summary.as_deref(), Some(""));
+
+        assert_eq!(
+            store.get_checkpoint(a_id).unwrap().unwrap().status,
+            CompactionStatus::Discarded
+        );
+        assert_eq!(
+            store.get_checkpoint(b_id).unwrap().unwrap().status,
+            CompactionStatus::Discarded
+        );
+
+        let active = store.active_facts(1).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, c_ids[0]);
+        assert_eq!(active[0].text, "fact from C");
     }
 }
