@@ -162,6 +162,7 @@ export function VirtualMessageList({
                     content={message.content}
                     created_at={message.created_at}
                     speakerId={message.speaker_id}
+                    pinned={message.pinned ?? false}
                   />
                 </div>
               );

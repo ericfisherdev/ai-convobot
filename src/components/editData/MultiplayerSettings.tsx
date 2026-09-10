@@ -1,5 +1,3 @@
-import { Info } from "lucide-react"
-
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import {
@@ -9,16 +7,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip"
 
 import { ConfigInterface, MultiplayerMode } from "../interfaces/Config"
 import { ConnectionStatus } from "../multiplayer/ConnectionStatus"
 import { useParticipants } from "../context/participantsContext"
+import { FieldLabel } from "./FieldLabel"
 
 interface MultiplayerSettingsProps {
   config: ConfigInterface;
@@ -30,24 +23,6 @@ const MODE_DESCRIPTIONS: Record<MultiplayerMode, string> = {
   [MultiplayerMode.Host]: "Other instances can join this chat as joiner bots, authenticating with the shared password below.",
   [MultiplayerMode.Joiner]: "This instance connects out to a host instance and joins its chat as a bot.",
 };
-
-function FieldLabel({ htmlFor, children, tooltip }: { htmlFor: string; children: React.ReactNode; tooltip: string }) {
-  return (
-    <Label htmlFor={htmlFor} className="flex flex-row gap-2">
-      <div className="flex items-center gap-2">
-        {children}
-        <TooltipProvider delayDuration={0}>
-          <Tooltip>
-            <TooltipTrigger className="cursor-default"> <Info /></TooltipTrigger>
-            <TooltipContent>
-              <p>{tooltip}</p>
-            </TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
-      </div>
-    </Label>
-  );
-}
 
 export function MultiplayerSettings({ config, onChange }: MultiplayerSettingsProps) {
   const mode = config.multiplayer_mode ?? MultiplayerMode.Solo;
