@@ -945,6 +945,7 @@ mod tests {
             importance_score: importance,
             created_at: get_current_date(),
             updated_at: get_current_date(),
+            source: crate::database::PersonSource::Heuristic,
         }
     }
 }

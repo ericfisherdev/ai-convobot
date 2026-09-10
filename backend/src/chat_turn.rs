@@ -36,9 +36,15 @@ use crate::turn_slot::TurnGuard;
 /// parameter).
 pub trait TurnStore {
     /// Pre-processing shared by both prompting handlers: third-party mention
-    /// tracking, new-person detection and interaction detection. Returns the
-    /// prompt to generate from when an interaction with a recorded outcome
-    /// matched, so the caller can generate with that added context.
+    /// tracking, new-person detection and interaction detection — all three
+    /// are heuristic string matching over the turn, the pre-#177 path
+    /// `compaction::persons::PersonsObserver` now supersedes as the trusted
+    /// source of third-party people. `SqliteTurnStore` only runs this whole
+    /// pipeline when `ConfigView::heuristic_person_detection` is turned back
+    /// on (default `false` as of #177); with it off, this returns `None`
+    /// without touching `Database` at all. Returns the prompt to generate
+    /// from when an interaction with a recorded outcome matched, so the
+    /// caller can generate with that added context.
     fn preprocess(&self, user_message: &str, companion_id: i32) -> Option<String>;
 
     /// Persists the user's half of the turn and returns the new message's
@@ -119,7 +125,17 @@ impl SqliteTurnStore {
 
 impl TurnStore for SqliteTurnStore {
     fn preprocess(&self, user_message: &str, companion_id: i32) -> Option<String> {
-        preprocess_user_message(user_message, companion_id, &self.participant_names)
+        // A config read failure degrades to the flag's default (`false`)
+        // rather than falling back to the pre-#177 "always on" behaviour.
+        let heuristic_person_detection = Database::get_config()
+            .map(|config| config.heuristic_person_detection)
+            .unwrap_or(false);
+        preprocess_user_message(
+            user_message,
+            companion_id,
+            &self.participant_names,
+            heuristic_person_detection,
+        )
     }
 
     fn insert_user_turn(&self, content: &str) -> rusqlite::Result<i32> {
@@ -189,13 +205,25 @@ impl TurnStore for SqliteTurnStore {
 /// host companion, any joined bots), so none of them is ever mistaken for a
 /// newly mentioned third party.
 ///
+/// `heuristic_person_detection` gates the whole pipeline (#177): all three
+/// calls below are heuristic string matching over the turn (`track_third_party_mentions`
+/// also runs `extract_potential_names`, the source of the capitalised-pronoun
+/// rows — `Her`, `You`, `His` — the detector used to leave behind), so
+/// `false` returns `None` immediately without touching `Database` at all,
+/// rather than gating only new-person detection.
+///
 /// Returns the prompt to generate from when an interaction with a recorded
 /// outcome matched, so the caller can generate with that added context.
 fn preprocess_user_message(
     user_message: &str,
     companion_id: i32,
     excluded_names: &[String],
+    heuristic_person_detection: bool,
 ) -> Option<String> {
+    if !heuristic_person_detection {
+        return None;
+    }
+
     // Track third-party mentions and display console output
     match Database::track_third_party_mentions(user_message, excluded_names) {
         Ok(mention_output) => {
@@ -663,6 +691,16 @@ mod tests {
     /// Implementation Plan for #132's normalisation tests specifies.
     fn solo_registry() -> ParticipantRegistry {
         ParticipantRegistry::solo("TestUser", "TestCompanion", None)
+    }
+
+    /// With the flag off, `preprocess_user_message` must return `None`
+    /// before ever calling into `Database` — no `companion_database.db`
+    /// exists in a unit test process (see `paths::data_dir`'s doc comment),
+    /// so this also proves none of the three heuristic calls run.
+    #[test]
+    fn preprocess_user_message_short_circuits_when_heuristic_detection_is_disabled() {
+        let result = preprocess_user_message("Alice said hi", 1, &[], false);
+        assert_eq!(result, None);
     }
 
     #[test]

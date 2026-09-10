@@ -201,14 +201,16 @@ fn fresh_database_has_default_compaction_config_and_persists_updates() {
     assert_eq!(config["compact_threshold_tokens"], Value::Null);
     assert_eq!(config["compact_min_messages"], json!(8));
     assert_eq!(config["compaction_model_path"], Value::Null);
-    assert_eq!(config["heuristic_person_detection"], json!(true));
+    // Defaults to `false` as of #177: compaction's `PersonsObserver` is the
+    // trusted source of third-party people now, not the heuristic detector.
+    assert_eq!(config["heuristic_person_detection"], json!(false));
 
     let mut updated = config;
     updated["compact_min_messages"] = json!(12);
-    updated["heuristic_person_detection"] = json!(false);
+    updated["heuristic_person_detection"] = json!(true);
     assert_eq!(put_config(&agent, &config_url, &updated), 200);
 
     let config = get_json(&agent, &config_url);
     assert_eq!(config["compact_min_messages"], json!(12));
-    assert_eq!(config["heuristic_person_detection"], json!(false));
+    assert_eq!(config["heuristic_person_detection"], json!(true));
 }

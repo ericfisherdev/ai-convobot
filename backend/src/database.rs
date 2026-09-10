@@ -312,6 +312,24 @@ pub struct ThirdPartyIndividual {
     pub importance_score: f32,
     pub created_at: String,
     pub updated_at: String,
+    /// Whether the heuristic detector or compaction's `PersonsObserver`
+    /// (#177) created/last trusted this row.
+    pub source: PersonSource,
+}
+
+/// What [`Database::upsert_compaction_person`] takes: one canon-validated
+/// `Person` fact (or several merged by `compaction::persons::plan_upserts`),
+/// ready to become or update a `third_party_individuals` row with
+/// `source = 'compaction'`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersonUpsert {
+    pub name: String,
+    pub relationship_to_user: Option<String>,
+    pub relationship_to_companion: Option<String>,
+    /// How many message sources this upsert accounts for; added onto the
+    /// row's existing `mention_count` on an update, or used as the initial
+    /// `mention_count` on insert.
+    pub mentions: i32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -422,6 +440,44 @@ impl ToSql for PromptTemplate {
             PromptTemplate::Default => Ok(ToSqlOutput::from("Default")),
             PromptTemplate::Llama2 => Ok(ToSqlOutput::from("Llama2")),
             PromptTemplate::Mistral => Ok(ToSqlOutput::from("Mistral")),
+        }
+    }
+}
+
+/// Where a `third_party_individuals` row came from (#177): `Heuristic` is
+/// the pre-compaction pronoun/capitalised-word detector
+/// (`detect_new_persons_in_message`), `Compaction` is a canon-validated
+/// `Person` fact promoted at commit time
+/// (`compaction::persons::PersonsObserver`). Same `FromSql`/`ToSql` shape as
+/// [`PromptTemplate`] above: an unknown stored value is an error, never a
+/// silent default.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersonSource {
+    Heuristic,
+    Compaction,
+}
+
+impl FromSql for PersonSource {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> Result<Self, FromSqlError> {
+        match value {
+            ValueRef::Text(i) => match std::str::from_utf8(i) {
+                Ok(s) => match s {
+                    "heuristic" => Ok(PersonSource::Heuristic),
+                    "compaction" => Ok(PersonSource::Compaction),
+                    _ => Err(FromSqlError::OutOfRange(0)),
+                },
+                Err(e) => Err(FromSqlError::Other(Box::new(e))),
+            },
+            _ => Err(FromSqlError::InvalidType),
+        }
+    }
+}
+
+impl ToSql for PersonSource {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        match self {
+            PersonSource::Heuristic => Ok(ToSqlOutput::from("heuristic")),
+            PersonSource::Compaction => Ok(ToSqlOutput::from("compaction")),
         }
     }
 }
@@ -546,7 +602,7 @@ fn default_compact_min_messages() -> usize {
 }
 
 fn default_heuristic_person_detection() -> bool {
-    true
+    false
 }
 
 /// The one way `Database::write_config` (#128) can reject a `PUT
@@ -1053,7 +1109,7 @@ impl Database {
                 compact_threshold_tokens INTEGER,
                 compact_min_messages INTEGER DEFAULT 8,
                 compaction_model_path TEXT,
-                heuristic_person_detection BOOLEAN DEFAULT true
+                heuristic_person_detection BOOLEAN DEFAULT false
             )",
             [],
         )?;
@@ -1141,7 +1197,8 @@ impl Database {
                 mention_count INTEGER DEFAULT 1,
                 importance_score REAL DEFAULT 0.5 CHECK(importance_score >= 0 AND importance_score <= 1),
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'heuristic'
             )", []
         )?;
         con.execute(
@@ -1223,6 +1280,12 @@ impl Database {
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_third_party_relationships ON third_party_relationships(from_party_id, to_party_id)", []
         )?;
+
+        // A row created before #177 predates the `source` column; the
+        // migration backfills it to `'heuristic'`, which is correct since
+        // nothing but this feature writes `'compaction'`.
+        Database::migrate_third_party_individuals_table(&con)?;
+
         if Database::is_table_empty("companion", &con)? {
             con.execute(
                 "INSERT INTO companion (name, persona, example_dialogue, first_message, long_term_mem, short_term_mem, roleplay, dialogue_tuning, avatar_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1692,6 +1755,11 @@ impl Database {
         let con = Self::open()?;
         con.execute("DELETE FROM messages", [])?;
 
+        // Compaction-sourced people (#177) belong to the story just
+        // deleted; a heuristic row is left alone (the cleanup endpoint owns
+        // those).
+        Self::delete_compaction_persons_in(&con)?;
+
         // Clear message cache when all messages are erased
         Database::clear_message_cache();
         insert_companion_greeting(&con)?;
@@ -1803,7 +1871,7 @@ impl Database {
                 compact_min_messages: row.get::<_, Option<usize>>(22)?.unwrap_or(8),
                 // Empty string and NULL both read as "use llm_model_path".
                 compaction_model_path: compaction_model_path.filter(|s| !s.is_empty()),
-                heuristic_person_detection: row.get::<_, Option<bool>>(24)?.unwrap_or(true),
+                heuristic_person_detection: row.get::<_, Option<bool>>(24)?.unwrap_or(false),
             })
         })?;
         Ok(row)
@@ -2462,6 +2530,7 @@ impl Database {
                 importance_score: 0.5,
                 created_at: current_time.clone(),
                 updated_at: current_time.clone(),
+                source: PersonSource::Heuristic,
             });
 
             con.execute(
@@ -2490,6 +2559,128 @@ impl Database {
             )?;
             Ok(con.last_insert_rowid() as i32)
         }
+    }
+
+    /// Creates or updates a `third_party_individuals` row from a
+    /// canon-validated `Person` fact (#177), always leaving `source =
+    /// 'compaction'` — a canon-validated fact overrides a heuristic origin,
+    /// so the row becomes trusted even if a heuristic row already existed
+    /// under a different case (`alice` vs `Alice`; the lookup below is
+    /// `COLLATE NOCASE`, unlike the `UNIQUE` index on `name`, which is
+    /// case-sensitive and would not have merged the two on its own).
+    pub fn upsert_compaction_person(p: &PersonUpsert) -> Result<i32> {
+        let con = Self::open()?;
+        Self::upsert_compaction_person_in(&con, p)
+    }
+
+    /// The connection-taking half of [`Database::upsert_compaction_person`],
+    /// split out so tests can run it against `Database::open_at(tempdir)`.
+    pub(crate) fn upsert_compaction_person_in(con: &Connection, p: &PersonUpsert) -> Result<i32> {
+        let current_time = get_current_date();
+
+        let existing: Option<(i32, i32)> = con
+            .query_row(
+                "SELECT id, mention_count FROM third_party_individuals WHERE name = ? COLLATE NOCASE",
+                [&p.name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        if let Some((id, existing_mentions)) = existing {
+            let total_mentions = existing_mentions + p.mentions;
+            let importance = crate::compaction::persons::importance_from_mentions(total_mentions);
+            con.execute(
+                "UPDATE third_party_individuals SET
+                    relationship_to_user = COALESCE(?, relationship_to_user),
+                    relationship_to_companion = COALESCE(?, relationship_to_companion),
+                    mention_count = mention_count + ?,
+                    importance_score = ?,
+                    last_mentioned = ?,
+                    updated_at = ?,
+                    source = 'compaction'
+                WHERE id = ?",
+                params![
+                    p.relationship_to_user,
+                    p.relationship_to_companion,
+                    p.mentions,
+                    importance,
+                    current_time,
+                    current_time,
+                    id
+                ],
+            )?;
+            Ok(id)
+        } else {
+            let importance = crate::compaction::persons::importance_from_mentions(p.mentions);
+            con.execute(
+                "INSERT INTO third_party_individuals (
+                    name, relationship_to_user, relationship_to_companion,
+                    first_mentioned, mention_count, importance_score,
+                    created_at, updated_at, source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'compaction')",
+                params![
+                    p.name,
+                    p.relationship_to_user.as_deref().unwrap_or(""),
+                    p.relationship_to_companion.as_deref().unwrap_or(""),
+                    current_time,
+                    p.mentions,
+                    importance,
+                    current_time,
+                    current_time,
+                ],
+            )?;
+            Ok(con.last_insert_rowid() as i32)
+        }
+    }
+
+    /// Deletes one `third_party_individuals` row and everything that
+    /// references it (attitude, memories), shared by
+    /// [`Database::cleanup_invalid_third_parties_in`] (which used to repeat
+    /// this three-statement delete twice) and
+    /// [`Database::delete_compaction_persons_in`].
+    fn delete_third_party_in(con: &Connection, id: i32) -> Result<()> {
+        con.execute(
+            "DELETE FROM companion_attitudes WHERE target_id = ? AND target_type = 'third_party'",
+            params![id],
+        )?;
+        con.execute(
+            "DELETE FROM third_party_memories WHERE third_party_id = ?",
+            params![id],
+        )?;
+        con.execute(
+            "DELETE FROM third_party_individuals WHERE id = ?",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    /// Removes every compaction-sourced person. [`Database::erase_messages`]
+    /// calls [`Database::delete_compaction_persons_in`] directly (on its own
+    /// already-open connection) rather than this wrapper; kept `pub` for API
+    /// symmetry with every other `Database` associated function, the same
+    /// reason `get_third_party_memories` below keeps `#[allow(dead_code)]`
+    /// rather than being removed.
+    #[allow(dead_code)]
+    pub fn delete_compaction_persons() -> Result<usize> {
+        let con = Self::open()?;
+        Self::delete_compaction_persons_in(&con)
+    }
+
+    /// The connection-taking half of [`Database::delete_compaction_persons`],
+    /// split out so tests can run it against `Database::open_at(tempdir)`
+    /// and so [`Database::erase_messages`] can call it on the same
+    /// connection as the rest of a clear-chat operation.
+    pub(crate) fn delete_compaction_persons_in(con: &Connection) -> Result<usize> {
+        let ids: Vec<i32> = con
+            .prepare("SELECT id FROM third_party_individuals WHERE source = 'compaction'")?
+            .query_map([], |row| row.get::<_, i32>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        for id in &ids {
+            Self::delete_third_party_in(con, *id)?;
+        }
+
+        Ok(ids.len())
     }
 
     pub fn add_third_party_memory(
@@ -2656,7 +2847,7 @@ impl Database {
         let mut stmt = con.prepare(
             "SELECT id, name, relationship_to_user, relationship_to_companion, occupation,
                     personality_traits, physical_description, first_mentioned, last_mentioned,
-                    mention_count, importance_score, created_at, updated_at
+                    mention_count, importance_score, created_at, updated_at, source
              FROM third_party_individuals WHERE name = ?",
         )?;
 
@@ -2676,6 +2867,7 @@ impl Database {
                     importance_score: row.get(10)?,
                     created_at: row.get(11)?,
                     updated_at: row.get(12)?,
+                    source: row.get(13)?,
                 })
             })
             .ok();
@@ -2688,7 +2880,7 @@ impl Database {
         let mut stmt = con.prepare(
             "SELECT id, name, relationship_to_user, relationship_to_companion, occupation,
                     personality_traits, physical_description, first_mentioned, last_mentioned,
-                    mention_count, importance_score, created_at, updated_at
+                    mention_count, importance_score, created_at, updated_at, source
              FROM third_party_individuals
              ORDER BY importance_score DESC, mention_count DESC",
         )?;
@@ -2708,6 +2900,7 @@ impl Database {
                 importance_score: row.get(10)?,
                 created_at: row.get(11)?,
                 updated_at: row.get(12)?,
+                source: row.get(13)?,
             })
         })?;
 
@@ -3094,7 +3287,7 @@ impl Database {
                 "
                 SELECT id, name, relationship_to_user, relationship_to_companion, occupation,
                        personality_traits, physical_description, first_mentioned, last_mentioned,
-                       mention_count, importance_score, created_at, updated_at
+                       mention_count, importance_score, created_at, updated_at, source
                 FROM third_party_individuals
                 WHERE LOWER(name) = ?
                 ORDER BY created_at ASC
@@ -3117,6 +3310,7 @@ impl Database {
                         importance_score: row.get(10)?,
                         created_at: row.get(11)?,
                         updated_at: row.get(12)?,
+                        source: row.get(13)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3204,6 +3398,18 @@ impl Database {
 
     pub fn cleanup_invalid_third_parties() -> Result<i32> {
         let con = Self::open()?;
+        Self::cleanup_invalid_third_parties_in(&con)
+    }
+
+    /// The connection-taking half of [`Database::cleanup_invalid_third_parties`],
+    /// split out so tests can run it against `Database::open_at(tempdir)`.
+    ///
+    /// Every candidate is restricted to `source = 'heuristic'`: a
+    /// compaction-sourced row (#177) is canon-validated at extraction time
+    /// and is never a candidate here, whatever its name — clearing those out
+    /// is `Database::delete_compaction_persons`'s job, run from
+    /// `erase_messages` instead.
+    fn cleanup_invalid_third_parties_in(con: &Connection) -> Result<i32> {
         let mut cleaned_count = 0;
 
         // List of invalid names that should be removed
@@ -3309,7 +3515,7 @@ impl Database {
             let mut stmt = con.prepare(
                 "
                 SELECT id FROM third_party_individuals
-                WHERE LOWER(name) = LOWER(?)
+                WHERE LOWER(name) = LOWER(?) AND source = 'heuristic'
             ",
             )?;
 
@@ -3318,67 +3524,76 @@ impl Database {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
             for id in ids {
-                // Delete associated attitudes
-                con.execute(
-                    "DELETE FROM companion_attitudes WHERE target_id = ? AND target_type = 'third_party'",
-                    params![id]
-                )?;
-
-                // Delete associated memories
-                con.execute(
-                    "DELETE FROM third_party_memories WHERE third_party_id = ?",
-                    params![id],
-                )?;
-
-                // Delete the third party record
-                con.execute(
-                    "DELETE FROM third_party_individuals WHERE id = ?",
-                    params![id],
-                )?;
-
+                Self::delete_third_party_in(con, id)?;
                 cleaned_count += 1;
                 println!("Removed invalid third party: {} (id: {})", invalid_name, id);
             }
         }
 
-        // Also check for entries that don't look like proper names
+        // Also check for entries that don't look like proper names, are
+        // junk (a pronoun, a stop word, or too short), or are a heuristic
+        // row with nothing but the auto-fill (#177: a bare `newly_mentioned`
+        // guess the detector never fleshed out with anything else).
+        //
+        // A local struct rather than a `Vec<(i32, String, Option<String>, ...)>`
+        // tuple: clippy's `type_complexity` lint rejects a seven-field tuple
+        // type, and named fields read better at each of the three checks
+        // below anyway.
+        struct HeuristicCandidate {
+            id: i32,
+            name: String,
+            relationship_to_user: Option<String>,
+            relationship_to_companion: Option<String>,
+            occupation: Option<String>,
+            personality_traits: Option<String>,
+            physical_description: Option<String>,
+        }
+
         let mut stmt = con.prepare(
             "
-            SELECT id, name FROM third_party_individuals
+            SELECT id, name, relationship_to_user, relationship_to_companion,
+                   occupation, personality_traits, physical_description
+            FROM third_party_individuals
+            WHERE source = 'heuristic'
         ",
         )?;
 
-        let entries: Vec<(i32, String)> = stmt
+        let entries: Vec<HeuristicCandidate> = stmt
             .query_map([], |row| {
-                Ok((row.get::<_, i32>(0)?, row.get::<_, String>(1)?))
+                Ok(HeuristicCandidate {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    relationship_to_user: row.get(2)?,
+                    relationship_to_companion: row.get(3)?,
+                    occupation: row.get(4)?,
+                    personality_traits: row.get(5)?,
+                    physical_description: row.get(6)?,
+                })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        for (id, name) in entries {
-            // Check if this is likely NOT a person name
-            if !Database::is_likely_person_name(&name)
-                || !name.chars().next().unwrap_or('a').is_uppercase()
-            {
-                // Delete associated attitudes
-                con.execute(
-                    "DELETE FROM companion_attitudes WHERE target_id = ? AND target_type = 'third_party'",
-                    params![id]
-                )?;
+        for candidate in entries {
+            let looks_wrong = !Database::is_likely_person_name(&candidate.name)
+                || !candidate.name.chars().next().unwrap_or('a').is_uppercase();
+            let is_junk = crate::compaction::persons::is_junk_person_name(&candidate.name);
+            let bare_auto_fill = candidate.relationship_to_companion.as_deref()
+                == Some("newly_mentioned")
+                && candidate
+                    .relationship_to_user
+                    .as_deref()
+                    .unwrap_or("")
+                    .is_empty()
+                && candidate.occupation.is_none()
+                && candidate.personality_traits.is_none()
+                && candidate.physical_description.is_none();
 
-                // Delete associated memories
-                con.execute(
-                    "DELETE FROM third_party_memories WHERE third_party_id = ?",
-                    params![id],
-                )?;
-
-                // Delete the third party record
-                con.execute(
-                    "DELETE FROM third_party_individuals WHERE id = ?",
-                    params![id],
-                )?;
-
+            if looks_wrong || is_junk || bare_auto_fill {
+                Self::delete_third_party_in(con, candidate.id)?;
                 cleaned_count += 1;
-                println!("Removed invalid third party: {} (id: {})", name, id);
+                println!(
+                    "Removed invalid third party: {} (id: {})",
+                    candidate.name, candidate.id
+                );
             }
         }
 
@@ -3482,262 +3697,10 @@ impl Database {
     fn is_likely_person_name(name: &str) -> bool {
         let name_lower = name.to_lowercase();
 
-        // Filter out common non-name words
-        let non_names = [
-            // Original words
-            "the",
-            "and",
-            "or",
-            "but",
-            "if",
-            "when",
-            "where",
-            "what",
-            "who",
-            "how",
-            "why",
-            "this",
-            "that",
-            "these",
-            "those",
-            "here",
-            "there",
-            "now",
-            "then",
-            "today",
-            "tomorrow",
-            "yesterday",
-            "said",
-            "told",
-            "asked",
-            "mentioned",
-            "think",
-            "know",
-            // Body parts
-            "hand",
-            "hands",
-            "shoulder",
-            "shoulders",
-            "head",
-            "heads",
-            "arm",
-            "arms",
-            "leg",
-            "legs",
-            "foot",
-            "feet",
-            "eye",
-            "eyes",
-            "ear",
-            "ears",
-            "nose",
-            "mouth",
-            "face",
-            "hair",
-            "neck",
-            "back",
-            "chest",
-            "stomach",
-            "knee",
-            "knees",
-            "elbow",
-            "elbows",
-            "finger",
-            "fingers",
-            "thumb",
-            "thumbs",
-            "toe",
-            "toes",
-            "ankle",
-            "ankles",
-            "wrist",
-            "wrists",
-            "hip",
-            "hips",
-            "body",
-            "skin",
-            "bone",
-            "bones",
-            "muscle",
-            "muscles",
-            // Common objects
-            "class",
-            "classes",
-            "book",
-            "books",
-            "table",
-            "tables",
-            "chair",
-            "chairs",
-            "door",
-            "doors",
-            "window",
-            "windows",
-            "desk",
-            "desks",
-            "computer",
-            "computers",
-            "phone",
-            "phones",
-            "car",
-            "cars",
-            "house",
-            "houses",
-            "room",
-            "rooms",
-            "wall",
-            "walls",
-            "floor",
-            "floors",
-            "ceiling",
-            "ceilings",
-            "roof",
-            "roofs",
-            "street",
-            "streets",
-            "road",
-            "roads",
-            "building",
-            "buildings",
-            "office",
-            "offices",
-            // Abstract concepts and common words
-            "should",
-            "could",
-            "would",
-            "must",
-            "might",
-            "may",
-            "can",
-            "will",
-            "shall",
-            "thing",
-            "things",
-            "stuff",
-            "matter",
-            "matters",
-            "way",
-            "ways",
-            "time",
-            "times",
-            "place",
-            "places",
-            "work",
-            "works",
-            "play",
-            "plays",
-            "run",
-            "runs",
-            "walk",
-            "walks",
-            "talk",
-            "talks",
-            "look",
-            "looks",
-            "feel",
-            "feels",
-            "want",
-            "wants",
-            "need",
-            "needs",
-            "use",
-            "uses",
-            "make",
-            "makes",
-            "take",
-            "takes",
-            "give",
-            "gives",
-            "get",
-            "gets",
-            "keep",
-            "keeps",
-            "let",
-            "lets",
-            "help",
-            "helps",
-            "show",
-            "shows",
-            "try",
-            "tries",
-            // Nature and environment
-            "tree",
-            "trees",
-            "plant",
-            "plants",
-            "flower",
-            "flowers",
-            "grass",
-            "ground",
-            "sky",
-            "sun",
-            "moon",
-            "star",
-            "stars",
-            "cloud",
-            "clouds",
-            "rain",
-            "snow",
-            "wind",
-            "air",
-            "water",
-            "fire",
-            "earth",
-            "stone",
-            "stones",
-            "rock",
-            "rocks",
-            // Common activities/states
-            "sleep",
-            "wake",
-            "eat",
-            "drink",
-            "sit",
-            "stand",
-            "lie",
-            "move",
-            "stop",
-            "start",
-            "end",
-            "begin",
-            "open",
-            "close",
-            "break",
-            "fix",
-            "clean",
-            "wash",
-            "dry",
-            "cut",
-            // Pronouns and determiners
-            "it",
-            "its",
-            "them",
-            "their",
-            "theirs",
-            "some",
-            "any",
-            "all",
-            "each",
-            "every",
-            "few",
-            "many",
-            "much",
-            "more",
-            "most",
-            "less",
-            "least",
-            "other",
-            "another",
-            "such",
-            "own",
-            "same",
-            "different",
-            "various",
-            "several",
-            "both",
-            "either",
-            "neither",
-        ];
+        // Filter out common non-name words (shared with #177's
+        // `compaction::persons::is_junk_person_name`, so the two lists can
+        // never drift apart).
+        let non_names = crate::compaction::persons::NON_NAME_WORDS;
 
         // Check if in non-names list
         if non_names.contains(&name_lower.as_str()) {
@@ -3914,6 +3877,7 @@ impl Database {
             importance_score,
             created_at: current_time.clone(),
             updated_at: current_time,
+            source: PersonSource::Heuristic,
         }
     }
 
@@ -4454,7 +4418,7 @@ impl Database {
         let mut stmt = con.prepare(
             "SELECT id, name, relationship_to_user, relationship_to_companion, occupation,
                     personality_traits, physical_description, first_mentioned, last_mentioned,
-                    mention_count, importance_score, created_at, updated_at
+                    mention_count, importance_score, created_at, updated_at, source
              FROM third_party_individuals WHERE id = ?",
         )?;
 
@@ -4474,6 +4438,7 @@ impl Database {
                     importance_score: row.get(10)?,
                     created_at: row.get(11)?,
                     updated_at: row.get(12)?,
+                    source: row.get(13)?,
                 })
             })
             .ok();
@@ -4764,6 +4729,27 @@ impl Database {
     /// which the previous per-bool version omitted entirely (a database
     /// missing those three columns could migrate "successfully" and then
     /// fail `read_config`/`write_config` with a "no such column" error).
+    /// Backfills `third_party_individuals.source` on a database created
+    /// before #177, matching the `PRAGMA table_info` guard `migrate_config_table`
+    /// already uses. Existing rows read back as `'heuristic'` (the column's
+    /// own `DEFAULT`), which is correct: nothing but `upsert_compaction_person`
+    /// ever writes `'compaction'`.
+    pub fn migrate_third_party_individuals_table(con: &Connection) -> Result<()> {
+        let mut stmt = con.prepare("PRAGMA table_info(third_party_individuals)")?;
+        let existing: HashSet<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_>>()?;
+        drop(stmt);
+
+        if !existing.contains("source") {
+            con.execute(
+                "ALTER TABLE third_party_individuals ADD COLUMN source TEXT NOT NULL DEFAULT 'heuristic'",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn migrate_config_table(con: &Connection) -> Result<()> {
         const COLUMNS: &[(&str, &str)] = &[
             (
@@ -4848,7 +4834,7 @@ impl Database {
             ),
             (
                 "heuristic_person_detection",
-                "ALTER TABLE config ADD COLUMN heuristic_person_detection BOOLEAN DEFAULT true",
+                "ALTER TABLE config ADD COLUMN heuristic_person_detection BOOLEAN DEFAULT false",
             ),
         ];
 
@@ -6299,7 +6285,7 @@ mod tests {
                 compact_threshold_tokens INTEGER,
                 compact_min_messages INTEGER DEFAULT 8,
                 compaction_model_path TEXT,
-                heuristic_person_detection BOOLEAN DEFAULT true
+                heuristic_person_detection BOOLEAN DEFAULT false
             )",
             [],
         )
@@ -6618,5 +6604,289 @@ mod tests {
             )
             .unwrap();
         assert_eq!(compacted_through, None);
+    }
+
+    // --- #177: `source` column, compaction person upsert/delete, cleanup ---
+
+    /// The `third_party_individuals`/`third_party_memories`/`companion_attitudes`
+    /// DDL these tests need, trimmed to the columns #177's functions touch.
+    /// Mirrors how `compaction::store`'s own `fresh_db` builds a minimal
+    /// schema by hand rather than calling `Database::init`'s hardwired path.
+    fn create_third_party_tables(con: &Connection) {
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS third_party_individuals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                relationship_to_user TEXT,
+                relationship_to_companion TEXT,
+                occupation TEXT,
+                personality_traits TEXT,
+                physical_description TEXT,
+                first_mentioned TEXT NOT NULL,
+                last_mentioned TEXT,
+                mention_count INTEGER DEFAULT 1,
+                importance_score REAL DEFAULT 0.5,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'heuristic'
+            )",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS third_party_memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                third_party_id INTEGER NOT NULL,
+                companion_id INTEGER NOT NULL,
+                memory_type TEXT,
+                content TEXT NOT NULL,
+                importance REAL DEFAULT 0.5,
+                emotional_valence REAL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                context_message_id INTEGER
+            )",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS companion_attitudes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                companion_id INTEGER NOT NULL,
+                target_id INTEGER NOT NULL,
+                target_type TEXT NOT NULL,
+                last_updated TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn insert_heuristic_third_party(con: &Connection, name: &str) -> i32 {
+        con.execute(
+            "INSERT INTO third_party_individuals (
+                name, relationship_to_user, relationship_to_companion, first_mentioned,
+                mention_count, importance_score, created_at, updated_at, source
+            ) VALUES (?, '', '', ?, 1, 0.5, ?, ?, 'heuristic')",
+            params![
+                name,
+                get_current_date(),
+                get_current_date(),
+                get_current_date()
+            ],
+        )
+        .unwrap();
+        con.last_insert_rowid() as i32
+    }
+
+    #[test]
+    fn migrate_third_party_individuals_table_backfills_source_as_heuristic() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        // Legacy shape: no `source` column at all.
+        con.execute(
+            "CREATE TABLE third_party_individuals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                relationship_to_user TEXT,
+                relationship_to_companion TEXT,
+                occupation TEXT,
+                personality_traits TEXT,
+                physical_description TEXT,
+                first_mentioned TEXT NOT NULL,
+                last_mentioned TEXT,
+                mention_count INTEGER DEFAULT 1,
+                importance_score REAL DEFAULT 0.5,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO third_party_individuals (name, first_mentioned, created_at, updated_at) VALUES ('Old', 'now', 'now', 'now')",
+            [],
+        )
+        .unwrap();
+
+        Database::migrate_third_party_individuals_table(&con).unwrap();
+        // Idempotent.
+        Database::migrate_third_party_individuals_table(&con).unwrap();
+
+        let source: String = con
+            .query_row(
+                "SELECT source FROM third_party_individuals WHERE name = 'Old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source, "heuristic");
+    }
+
+    #[test]
+    fn upsert_compaction_person_inserts_a_new_row_with_compaction_source() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_third_party_tables(&con);
+
+        let id = Database::upsert_compaction_person_in(
+            &con,
+            &PersonUpsert {
+                name: "Alice".to_string(),
+                relationship_to_user: Some("sister".to_string()),
+                relationship_to_companion: None,
+                mentions: 2,
+            },
+        )
+        .unwrap();
+
+        let (name, relationship_to_user, mention_count, source): (String, String, i32, PersonSource) = con
+            .query_row(
+                "SELECT name, relationship_to_user, mention_count, source FROM third_party_individuals WHERE id = ?",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "Alice");
+        assert_eq!(relationship_to_user, "sister");
+        assert_eq!(mention_count, 2);
+        assert_eq!(source, PersonSource::Compaction);
+    }
+
+    #[test]
+    fn upsert_compaction_person_merges_case_insensitively_and_flips_a_heuristic_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_third_party_tables(&con);
+        let id = insert_heuristic_third_party(&con, "alice");
+
+        let returned_id = Database::upsert_compaction_person_in(
+            &con,
+            &PersonUpsert {
+                name: "Alice".to_string(),
+                relationship_to_user: Some("sister".to_string()),
+                relationship_to_companion: None,
+                mentions: 3,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(returned_id, id);
+        let (mention_count, source): (i32, PersonSource) = con
+            .query_row(
+                "SELECT mention_count, source FROM third_party_individuals WHERE id = ?",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        // 1 (seeded) + 3 (this upsert).
+        assert_eq!(mention_count, 4);
+        assert_eq!(source, PersonSource::Compaction);
+
+        // Only one row exists for the two different-case names.
+        let count: i64 = con
+            .query_row("SELECT COUNT(*) FROM third_party_individuals", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn delete_compaction_persons_in_removes_only_compaction_rows_and_their_attitudes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_third_party_tables(&con);
+        let heuristic_id = insert_heuristic_third_party(&con, "Heuristic");
+        let compaction_id = Database::upsert_compaction_person_in(
+            &con,
+            &PersonUpsert {
+                name: "Compacted".to_string(),
+                relationship_to_user: None,
+                relationship_to_companion: None,
+                mentions: 1,
+            },
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO companion_attitudes (companion_id, target_id, target_type, last_updated, created_at) VALUES (1, ?, 'third_party', 'now', 'now')",
+            [compaction_id],
+        )
+        .unwrap();
+
+        let removed = Database::delete_compaction_persons_in(&con).unwrap();
+
+        assert_eq!(removed, 1);
+        let remaining: Vec<i32> = con
+            .prepare("SELECT id FROM third_party_individuals")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(remaining, vec![heuristic_id]);
+        let attitude_count: i64 = con
+            .query_row(
+                "SELECT COUNT(*) FROM companion_attitudes WHERE target_id = ?",
+                [compaction_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attitude_count, 0);
+    }
+
+    #[test]
+    fn cleanup_invalid_third_parties_removes_pronoun_stopword_and_bare_rows_but_keeps_compaction() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_third_party_tables(&con);
+
+        // A different pronoun than the compaction row below uses, so the
+        // two never collide on the `name` unique index / the
+        // `COLLATE NOCASE` upsert lookup.
+        let pronoun_id = insert_heuristic_third_party(&con, "You");
+        let stopword_id = insert_heuristic_third_party(&con, "Table");
+        let short_id = insert_heuristic_third_party(&con, "Ab");
+        con.execute(
+            "UPDATE third_party_individuals SET relationship_to_companion = 'newly_mentioned' WHERE id IN (?, ?, ?)",
+            params![pronoun_id, stopword_id, short_id],
+        )
+        .unwrap();
+
+        let real_id = insert_heuristic_third_party(&con, "Alice");
+        con.execute(
+            "UPDATE third_party_individuals SET relationship_to_companion = 'newly_mentioned', occupation = 'teacher' WHERE id = ?",
+            [real_id],
+        )
+        .unwrap();
+
+        // A compaction-sourced row that happens to be named after a
+        // pronoun: cleanup must keep it, since it is canon-validated, not a
+        // heuristic guess.
+        let compaction_id = Database::upsert_compaction_person_in(
+            &con,
+            &PersonUpsert {
+                name: "Her".to_string(),
+                relationship_to_user: None,
+                relationship_to_companion: None,
+                mentions: 1,
+            },
+        )
+        .unwrap();
+
+        let cleaned = Database::cleanup_invalid_third_parties_in(&con).unwrap();
+
+        assert_eq!(cleaned, 3);
+        let mut remaining: Vec<i32> = con
+            .prepare("SELECT id FROM third_party_individuals")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        remaining.sort();
+        let mut expected = vec![real_id, compaction_id];
+        expected.sort();
+        assert_eq!(remaining, expected);
     }
 }

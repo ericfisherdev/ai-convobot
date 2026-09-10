@@ -66,14 +66,28 @@
 //! #177 persons, #178 tantivy) with only the newly active facts.
 //! `discard` is the trivial counterpart. `merge.rs` (#175) is the
 //! production `SummaryMerger`, `LlmSummaryMerger`, built on #183's
-//! `Extractor` seam. [`production_commit_deps`] below wires the two
-//! together for #179's handler; `main.rs` never assembles this inline.
+//! `Extractor` seam. [`production_commit_deps`] below wires the merger and
+//! every registered observer together for #179's handler; `main.rs` never
+//! assembles this inline.
 //!
 //! `registry_speakers.rs` (#182) adds [`SpeakerInfo`]'s multiplayer impl:
 //! `RegistrySpeakers`, backed by a live `ParticipantRegistry` snapshot
 //! instead of the fixed `user`/`char` pair `SoloSpeakers` covers — only
 //! `ParticipantKind::Human` counts as canon, matching the epic's canon
 //! rule across host, host-bot and remote-bot turns.
+//!
+//! `persons.rs` (#177) is a registered `CommitObserver`: `PersonsObserver`
+//! turns a checkpoint's newly active `Person` facts into
+//! `third_party_individuals` rows (`source = 'compaction'`) via the pure
+//! `plan_upserts`, through the `PersonSink` persistence seam
+//! (`SqlitePersonSink` in production, forwarding to
+//! `Database::upsert_compaction_person`). This is meant to retire the old
+//! heuristic person detector (`Database::detect_new_persons_in_message`),
+//! which `chat_turn::preprocess_user_message` runs only when
+//! `ConfigView::heuristic_person_detection` is on — still the default as of
+//! #177, since nothing reaches `production_commit_deps`/`commit::commit` in
+//! production until #179's route lands; flipping the default is deferred to
+//! a follow-up issue once that path is live.
 #![allow(dead_code)]
 
 pub mod commit;
@@ -81,6 +95,7 @@ pub mod context;
 pub mod extract;
 pub mod hook;
 pub mod merge;
+pub mod persons;
 pub mod range;
 pub mod registry_speakers;
 pub mod render;
@@ -95,15 +110,27 @@ use crate::database::{self, Message};
 use crate::llm::Extractor;
 
 /// Builds the real [`commit::CommitDeps`] used in production: an
-/// [`merge::LlmSummaryMerger`] wrapping `extractor`, and an initially
-/// empty observer list. #176 (attitude), #177 (persons), and #178
-/// (tantivy) each push their own [`commit::CommitObserver`] into the
-/// returned value, so `main.rs` never assembles this wiring inline.
-/// #179's handler calls this with `&llm::ResidentExtractor`.
+/// [`merge::LlmSummaryMerger`] wrapping `extractor`, plus every registered
+/// [`commit::CommitObserver`], each pushed onto `observers` in its own
+/// paragraph below. #176 (attitude) and #178 (tantivy) register alongside
+/// #177 (persons) here too; `main.rs` never assembles `CommitDeps` inline —
+/// #179's handler is the one caller, via this function.
 pub fn production_commit_deps(extractor: &dyn Extractor) -> commit::CommitDeps<'_> {
+    let mut observers: Vec<Box<dyn commit::CommitObserver>> = Vec::new();
+
+    // #177: creates/updates `third_party_individuals` rows from a
+    // checkpoint's newly active `Person` facts. `PersonsObserver::from_database`
+    // reads the user/companion names once; a read failure is logged and
+    // this observer is simply skipped this session rather than failing the
+    // whole commit-deps build, matching every other observer's "log and
+    // move on" rule.
+    if let Some(observer) = persons::PersonsObserver::from_database() {
+        observers.push(Box::new(observer));
+    }
+
     commit::CommitDeps {
         merger: Box::new(merge::LlmSummaryMerger { extractor }),
-        observers: Vec::new(),
+        observers,
     }
 }
 
