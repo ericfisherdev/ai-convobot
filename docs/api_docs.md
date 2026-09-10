@@ -579,6 +579,25 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   - No model is loaded, so for `PromptTemplate::Auto` the response holds the pre-template system text plus the role-tagged `chat_history` rather than the final rendered string. Every other template returns the finished prompt in `system_prompt`.
   - `docs/attitude_verification.md` records a comparison run made with this route and `backend/scripts/attitude_comparison.sh`.
 
+### Unload resident models
+
+- **URL:** `/llm/unload`
+- **Method:** `POST`
+- **Description:** Frees the resident model slot(s) `backend/src/llm.rs` keeps loaded between turns (the chat model) and, since #183, between compaction extraction jobs (the extraction model configured via `compaction_model_path`). The next turn or extraction call reloads whatever it needs from disk.
+- **Query Parameters:**
+  - `slot` (string, optional): `chat` frees only the chat model, `extractor` frees only the extraction model, `all` (the default when omitted) frees both.
+- **Response:**
+  - Status: 200 OK
+  - Body: `{ "unloaded": bool, "model_path": string | null, "extractor_model_path": string | null }`. `unloaded` is `true` if either requested slot was occupied. `model_path` is the chat model's path if that slot was freed, `null` if it was not requested or was already empty; `extractor_model_path` is the same for the extraction slot.
+- **Example Request:**
+  ```http
+  POST /llm/unload?slot=extractor
+  ```
+- **Example Response:**
+  ```json
+  { "unloaded": true, "model_path": null, "extractor_model_path": "/models/qwen3-4b-instruct-q4_k_m.gguf" }
+  ```
+
 ### 7. Multiplayer
 
 #### 7.1 Get this instance's multiplayer status

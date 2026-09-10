@@ -342,7 +342,7 @@ pub struct ThirdPartyInteraction {
     pub updated_at: String,
 }
 
-#[derive(PartialEq, Serialize, Deserialize, Clone)]
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum Device {
     CPU,

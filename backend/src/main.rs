@@ -1917,12 +1917,26 @@ async fn remove_llm_directory(id: web::Path<i32>) -> HttpResponse {
     }
 }
 
-/// Frees the model kept resident between turns (see `llm::unload_model`).
-/// The next turn reloads it from disk.
+/// Query for `POST /api/llm/unload`.
+#[derive(Deserialize)]
+struct UnloadParams {
+    /// `chat`, `extractor`, or omitted/`all` for both slots.
+    slot: Option<llm::UnloadSlot>,
+}
+
+/// Frees the requested resident model slot(s) (see `llm::unload_model`):
+/// `?slot=chat` frees the chat model, `?slot=extractor` frees the extraction
+/// model, and omitting `slot` (or passing `?slot=all`) frees both. The next
+/// turn or extraction call reloads whatever it needs.
 #[post("/api/llm/unload")]
-async fn unload_llm_model() -> HttpResponse {
-    let (unloaded, model_path) = llm::unload_model();
-    HttpResponse::Ok().json(serde_json::json!({ "unloaded": unloaded, "model_path": model_path }))
+async fn unload_llm_model(params: web::Query<UnloadParams>) -> HttpResponse {
+    let report = llm::unload_model(params.slot.unwrap_or(llm::UnloadSlot::All));
+    let unloaded = report.chat_model_path.is_some() || report.extractor_model_path.is_some();
+    HttpResponse::Ok().json(serde_json::json!({
+        "unloaded": unloaded,
+        "model_path": report.chat_model_path,
+        "extractor_model_path": report.extractor_model_path,
+    }))
 }
 
 //              Attitude Tracking
