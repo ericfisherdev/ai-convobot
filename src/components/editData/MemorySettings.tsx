@@ -26,11 +26,6 @@ interface MemorySettingsProps {
   onChange: (next: ConfigInterface) => void;
 }
 
-// `compaction_attitude_weight` is optional on `ConfigInterface` until #176
-// lands on `main` (see that field's doc comment); the backend's own default
-// once it exists is 0.5.
-const DEFAULT_ATTITUDE_WEIGHT = 0.5;
-
 // Extraction models are small instruct-tuned checkpoints, not the (often
 // larger, base or roleplay-tuned) chat model. Matches filenames like
 // "Qwen3-4B-Instruct...", "llama-3.2-3b-it...", or "...-chat...".
@@ -86,10 +81,13 @@ export function MemorySettings({ config, onChange }: MemorySettingsProps) {
     setRebuilding(true);
     try {
       const response = await fetch('/api/memory/longTerm/rebuild', { method: 'POST' });
+      const text = await response.text();
       if (response.ok) {
-        toast.success('Long-term index rebuilt successfully');
+        // The body carries the re-indexed fact count (e.g. "Long term
+        // memory rebuilt from 12 facts") — show it verbatim rather than a
+        // generic message.
+        toast.success(text || 'Long-term index rebuilt successfully');
       } else {
-        const text = await response.text();
         toast.error(text || 'Failed to rebuild long-term index');
       }
     } catch (error) {
@@ -160,7 +158,7 @@ export function MemorySettings({ config, onChange }: MemorySettingsProps) {
           step={0.05}
           min={0}
           max={1}
-          value={config.compaction_attitude_weight ?? DEFAULT_ATTITUDE_WEIGHT}
+          value={config.compaction_attitude_weight}
           onChange={(e) => onChange({ ...config, compaction_attitude_weight: parseFloat(e.target.value) })}
         />
       </div>

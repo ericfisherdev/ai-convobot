@@ -65,7 +65,15 @@ export const LlmModelSelector: React.FC<LlmModelSelectorProps> = ({
         return `${mb.toFixed(2)} MB`;
     };
 
-    const visibleModels = filter ? models.filter(filter) : models;
+    const filteredModels = filter ? models.filter(filter) : models;
+    // A `filter` must never hide the currently selected model: that would
+    // leave the trigger showing a blank placeholder while the underlying
+    // config value is still set to a real (just filtered-out) path.
+    const selectedModelInfo = selectedModel ? models.find(model => model.path === selectedModel) : undefined;
+    const visibleModels =
+        selectedModelInfo && !filteredModels.includes(selectedModelInfo)
+            ? [selectedModelInfo, ...filteredModels]
+            : filteredModels;
 
     const groupModelsByDirectory = () => {
         const grouped: { [key: string]: ModelInfo[] } = {};
