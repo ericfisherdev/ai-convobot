@@ -146,17 +146,23 @@ fn spawn_joiner(
         password: password.to_string(),
         host_address: format!("127.0.0.1:{port}"),
     };
-    let handle: JoinerHandle = Arc::new(RwLock::new(JoinerShared::new(&identity)));
+    let handle: JoinerHandle = Arc::new(RwLock::new(JoinerShared::new(
+        &identity,
+        COMPANION_ID,
+        None,
+    )));
     let generation: Arc<dyn GenerateRequestHandler> = Arc::new(LocalModelGeneration::new(
         COMPANION_ID,
         identity.id.clone(),
         handle.clone(),
         generator,
     ));
+    let extraction = crate::multiplayer::joiner_compaction::noop_job();
     let task = tokio::spawn(crate::multiplayer::joiner::run(
         handle.clone(),
         identity,
         generation,
+        extraction,
     ));
     (handle, task)
 }

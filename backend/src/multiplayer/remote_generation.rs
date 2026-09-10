@@ -22,13 +22,104 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::chat_turn::{SqliteTurnStore, TurnStore};
-use crate::compaction::context::CompactionContext;
+use crate::compaction::context::{CompactionContext, QuoteLine};
+use crate::compaction::store::SqliteCompactionStore;
 use crate::database::{Message, USER_SPEAKER_ID};
-use crate::llm::{self, FixedCompaction, InMemoryTranscript, PromptSpeakers};
+use crate::llm::{self, CompactionSource, InMemoryTranscript, PromptSpeakers};
 use crate::multiplayer::joiner::{GenerateRequestHandler, JoinerHandle};
-use crate::multiplayer::protocol::{ClientFrame, ParticipantSummary};
+use crate::multiplayer::joiner_compaction::local_overlay;
+use crate::multiplayer::protocol::{ClientFrame, ContinuityPayload, ParticipantSummary};
 use crate::participants::{AvatarRef, Participant, ParticipantId, ParticipantRegistry};
 use crate::turn_slot::ACTIVE_TURN;
+
+/// The joiner-side [`CompactionSource`] (#186): renders the host's
+/// committed summaries/rules (`payload`, #182's [`ContinuityPayload`])
+/// together with this joiner's own locally-kept companion overlay and
+/// rules (`local_overlay`), so a joiner's own reply is grounded in the same
+/// story the host renders for itself, plus whatever this joiner alone has
+/// learned about its own character. Replaces #174's placeholder (a fixed,
+/// never-compacted `CompactionContext`) `LocalModelGeneration` was wired up
+/// with.
+pub struct HostContinuity {
+    payload: Option<ContinuityPayload>,
+    companion_state: Vec<String>,
+    rules: Vec<QuoteLine>,
+}
+
+impl HostContinuity {
+    pub fn new(
+        payload: Option<ContinuityPayload>,
+        companion_state: Vec<String>,
+        rules: Vec<QuoteLine>,
+    ) -> Self {
+        HostContinuity {
+            payload,
+            companion_state,
+            rules,
+        }
+    }
+}
+
+impl CompactionSource for HostContinuity {
+    /// `companion_id` is unused: `payload`/`companion_state`/`rules` are
+    /// already scoped to this one joiner's own companion by construction
+    /// (there is only ever one, and `local_overlay` was already read
+    /// against it before this was built).
+    ///
+    /// `recalled_facts` is left empty, matching `SqliteCompaction`'s own
+    /// current behaviour (`CompactionContext::load` does not fill it in
+    /// either, until #178 lands tantivy-backed fact recall).
+    fn context(&self, _companion_id: i32) -> std::io::Result<CompactionContext> {
+        let mut ctx = match self.payload.clone() {
+            Some(payload) => payload.into_context(self.companion_state.clone(), Vec::new()),
+            None => CompactionContext {
+                companion_state: self.companion_state.clone(),
+                ..CompactionContext::default()
+            },
+        };
+        ctx.rules.extend(self.rules.iter().cloned());
+        Ok(ctx)
+    }
+}
+
+/// Everything `main.rs::inspect_prompt` needs to render a joiner's own
+/// prompt (#186): the speakers this joiner would generate as, the same
+/// [`HostContinuity`] a live reply would build (so a debug inspection can
+/// never drift from what a real turn renders), the transcript mirror a live
+/// reply generates from, and the raw payload so the endpoint can echo it
+/// back. Also [`with_local_model`]'s own [`HostContinuity`] build site, so
+/// the two can never disagree about what "this joiner's own overlay" means.
+pub fn joiner_prompt_inputs(
+    handle: &JoinerHandle,
+) -> (
+    i32,
+    PromptSpeakers,
+    HostContinuity,
+    Vec<Message>,
+    Option<ContinuityPayload>,
+) {
+    let (companion_id, participants, self_id, payload, transcript) = {
+        let shared = handle.read().unwrap_or_else(|p| p.into_inner());
+        (
+            shared.companion_id,
+            shared.participants.clone(),
+            shared.participant_id.clone(),
+            shared.last_continuity.clone(),
+            shared.transcript.snapshot(),
+        )
+    };
+    let speakers = PromptSpeakers {
+        registry: registry_from_participants(&participants),
+        self_id,
+    };
+    let (companion_state, rules) = local_overlay(&SqliteCompactionStore, companion_id)
+        .unwrap_or_else(|e| {
+            eprintln!("joiner: failed to read local compaction overlay: {e}");
+            (Vec::new(), Vec::new())
+        });
+    let source = HostContinuity::new(payload.clone(), companion_state, rules);
+    (companion_id, speakers, source, transcript, payload)
+}
 
 /// The fixed user id every turn is scored against — the same constant every
 /// `PendingTurn::begin`/`finish_turn` call site in `main.rs` uses
@@ -79,30 +170,44 @@ impl LocalModelGeneration {
     /// the transcript the host sent (never the joiner's own local
     /// `messages` table, which a remote reply never touches) and keyed by
     /// the newest user message in it, the same way a local turn's
-    /// long-term memory recall is keyed by what the user just said. Passes
-    /// a default (never-compacted) `CompactionContext` until #182 replaces
-    /// this with its own `HostContinuity` impl built from the host's
-    /// `ContinuityPayload`.
+    /// long-term memory recall is keyed by what the user just said. Builds
+    /// a fresh [`HostContinuity`] from `handle`'s current
+    /// `JoinerShared::last_continuity` plus this joiner's own local overlay
+    /// (`local_overlay`) on every call, so a reply always renders against
+    /// whatever the most recent `GenerateRequest` last carried, not a
+    /// snapshot taken when this generator was built.
     pub fn with_local_model(
         companion_id: i32,
         self_id: ParticipantId,
         handle: JoinerHandle,
     ) -> Self {
-        let generator: RemoteGenerator = Arc::new(
+        let generator: RemoteGenerator = Arc::new({
+            let handle = handle.clone();
             move |transcript: &[Message],
                   speakers: &PromptSpeakers,
                   on_token: &mut dyn FnMut(&str)| {
                 let prompt = newest_user_message(transcript);
+                let payload = handle
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .last_continuity
+                    .clone();
+                let (companion_state, rules) = local_overlay(&SqliteCompactionStore, companion_id)
+                    .unwrap_or_else(|e| {
+                        eprintln!("joiner: failed to read local compaction overlay: {e}");
+                        (Vec::new(), Vec::new())
+                    });
+                let source = HostContinuity::new(payload, companion_state, rules);
                 llm::prompt_streaming(
                     &prompt,
                     companion_id,
                     on_token,
                     &InMemoryTranscript(transcript.to_vec()),
                     speakers,
-                    &FixedCompaction(CompactionContext::default()),
+                    &source,
                 )
-            },
-        );
+            }
+        });
         LocalModelGeneration::new(companion_id, self_id, handle, generator)
     }
 
@@ -250,7 +355,9 @@ fn newest_user_message(transcript: &[Message]) -> String {
 /// joiner connected.
 ///
 /// [`JoinerShared`]: crate::multiplayer::joiner::JoinerShared
-fn registry_from_participants(participants: &[ParticipantSummary]) -> ParticipantRegistry {
+pub(crate) fn registry_from_participants(
+    participants: &[ParticipantSummary],
+) -> ParticipantRegistry {
     let user_name = participants
         .iter()
         .find(|p| p.id == ParticipantId::USER)
@@ -463,7 +570,7 @@ mod tests {
             password: "hunter2".to_string(),
             host_address: "127.0.0.1:0".to_string(),
         };
-        let mut shared = JoinerShared::new(&identity);
+        let mut shared = JoinerShared::new(&identity, 1, None);
         shared.participants = participants;
         Arc::new(RwLock::new(shared))
     }
