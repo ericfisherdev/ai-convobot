@@ -95,10 +95,14 @@ export const CompactionProvider: React.FC<CompactionProviderProps> = ({ children
   }, []);
 
   // Polls `GET /api/compaction/{id}` every `DRAFT_POLL_INTERVAL_MS` until the
-  // draft reaches `review` phase or disappears (a lookup failure -- e.g. it
-  // was discarded from under it), refreshing the listing either way so a
-  // review card (a later issue) picks up the change. Only one poll runs at
-  // a time: a second call replaces whatever was already running, matching
+  // draft leaves `extracting`, refreshing the listing either way so a
+  // review card (a later issue) picks up the change. `phase` is `null` for
+  // any non-`draft` status, not just `review`: a discarded draft (an empty
+  // range, unparseable model output, or an over-budget overlay are all
+  // normal extraction outcomes) reports `phase: null` too, so checking only
+  // for `'review'` would poll forever on a discard. A lookup failure (the
+  // row is gone entirely) also stops the poll. Only one poll runs at a
+  // time: a second call replaces whatever was already running, matching
   // the backend's "one pending draft" rule.
   const draftReady = useCallback(
     (id: number) => {
@@ -106,7 +110,7 @@ export const CompactionProvider: React.FC<CompactionProviderProps> = ({ children
       refresh();
       const poll = async () => {
         const detail = await fetchDetail(id);
-        if (!detail || detail.phase === 'review') {
+        if (!detail || detail.phase !== 'extracting') {
           stopDraftPoll();
           refresh();
         }

@@ -2118,7 +2118,10 @@ impl CompactionDraftError {
 /// [`crate::compaction::extract::spawn_extraction`] on success, so a chat
 /// turn cannot start while this draft's extraction is still running.
 #[post("/api/compaction/draft")]
-async fn compaction_draft(joiner: Option<web::Data<JoinerHandle>>) -> HttpResponse {
+async fn compaction_draft(
+    joiner: Option<web::Data<JoinerHandle>>,
+    registry: web::Data<RwLock<ParticipantRegistry>>,
+) -> HttpResponse {
     if let Some(response) = reject_if_joiner(&joiner) {
         return response;
     }
@@ -2128,6 +2131,11 @@ async fn compaction_draft(joiner: Option<web::Data<JoinerHandle>>) -> HttpRespon
             "A reply is still being generated; wait for it to finish before sending another message",
         );
     };
+    // Snapshotted here, not inside the extraction thread: the same
+    // registry a live round already snapshots (`snapshot_speakers`), so a
+    // bot joining or dropping mid-extraction cannot mutate the canon
+    // policy `RegistrySpeakers` runs against.
+    let registry_snapshot = snapshot_speakers(&registry).registry;
 
     let result = web::block(move || -> Result<i64, CompactionDraftError> {
         let store = SqliteCompactionStore;
@@ -2144,7 +2152,11 @@ async fn compaction_draft(joiner: Option<web::Data<JoinerHandle>>) -> HttpRespon
             CompactionTrigger::Manual,
         )
         .ok_or(CompactionDraftError::NotEnoughMessages {
-            have: tail.messages.len(),
+            // The same quantity `select_range` actually checks against
+            // `min_messages` (the tail after the last `short_term_mem`
+            // messages are set aside), not the raw tail length — otherwise
+            // this count would not match why the request was refused.
+            have: tail.messages.len().saturating_sub(tail.short_term_mem),
             need: tail.config.min_messages,
         })?;
         let draft_id = crate::compaction::hook::queue_compaction_draft_on(
@@ -2158,7 +2170,7 @@ async fn compaction_draft(joiner: Option<web::Data<JoinerHandle>>) -> HttpRespon
 
     match result {
         Ok(Ok(draft_id)) => {
-            crate::compaction::extract::spawn_extraction(guard, draft_id);
+            crate::compaction::extract::spawn_extraction(guard, draft_id, registry_snapshot);
             HttpResponse::Accepted().json(DraftQueued { draft_id })
         }
         Ok(Err(err)) => err.into_response(),
@@ -2312,6 +2324,12 @@ async fn compaction_commit(
     let draft_id = *id;
     let request = received.into_inner();
     let result = web::block(move || -> Result<Checkpoint, CompactionCommitError> {
+        // Held inside the blocking closure, not across the `.await` on the
+        // async side: a dropped request (client disconnect) must not
+        // release the turn slot while `commit` is still running on this
+        // thread, the same reasoning `prompt_message` documents for its
+        // own `_turn_guard`.
+        let _guard = guard;
         let store = SqliteCompactionStore;
         let checkpoint = store
             .get_checkpoint(draft_id)?
@@ -2353,7 +2371,6 @@ async fn compaction_commit(
     })
     .await;
 
-    drop(guard);
     match result {
         Ok(Ok(checkpoint)) => HttpResponse::Ok().json(CheckpointSummary::from(checkpoint)),
         Ok(Err(err)) => err.into_response(),

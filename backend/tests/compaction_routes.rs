@@ -121,6 +121,36 @@ fn manual_trigger_listing_and_pins_work_end_to_end_on_a_short_chat() {
         "pins block should contain the pinned message's content, got: {pins_block}"
     );
 
+    // Unpinning the same message clears `pinned` and drops it from the
+    // rendered prompt's `pins` block, so the round trip is exercised on
+    // both legs, not just the pin.
+    let unpin_status = agent
+        .delete(format!("http://{addr}/api/message/{last_id}/pin"))
+        .call()
+        .unwrap_or_else(|e| {
+            panic!("DELETE /api/message/{{id}}/pin failed at the transport level: {e}")
+        })
+        .status();
+    assert!(unpin_status.is_success(), "unpin returned {unpin_status}");
+
+    let messages_after_unpin = get_json(&agent, &format!("http://{addr}/api/message"));
+    let unpinned_message = messages_after_unpin["messages"]
+        .as_array()
+        .expect("messages should be a JSON array")
+        .iter()
+        .find(|m| m["id"].as_i64() == Some(last_id))
+        .expect("the unpinned message should still be in the page");
+    assert_eq!(unpinned_message["pinned"], json!(false));
+
+    let debug_prompt_after_unpin = get_json(&agent, &format!("http://{addr}/api/debug/prompt"));
+    let pins_block_after_unpin = debug_prompt_after_unpin["compaction"]["pins"]
+        .as_str()
+        .expect("compaction.pins should be a string");
+    assert!(
+        !pins_block_after_unpin.contains("message 3"),
+        "pins block should no longer contain the unpinned message's content, got: {pins_block_after_unpin}"
+    );
+
     // Pinning an id that names no message is `404`.
     let unknown_status = agent
         .post(format!("http://{addr}/api/message/999999/pin"))
@@ -130,4 +160,14 @@ fn manual_trigger_listing_and_pins_work_end_to_end_on_a_short_chat() {
         })
         .status();
     assert_eq!(unknown_status, 404);
+
+    // Unpinning an id that names no message is also `404`.
+    let unknown_unpin_status = agent
+        .delete(format!("http://{addr}/api/message/999999/pin"))
+        .call()
+        .unwrap_or_else(|e| {
+            panic!("DELETE /api/message/{{id}}/pin failed at the transport level: {e}")
+        })
+        .status();
+    assert_eq!(unknown_unpin_status, 404);
 }

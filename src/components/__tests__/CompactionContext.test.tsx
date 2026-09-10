@@ -95,6 +95,37 @@ describe('CompactionContext', () => {
     expect(detailCalls).toBe(1)
   })
 
+  it('draftReady stops polling once a discarded draft reports phase: null, not just review', async () => {
+    let detailCalls = 0
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.startsWith('/api/message')) return Promise.resolve(jsonResponse(emptyMessagePage))
+      if (url === '/api/compaction/3') {
+        detailCalls++
+        // A discarded checkpoint: status is no longer `draft`, so the
+        // backend's `phase_of` reports `null`, not `'review'`.
+        return Promise.resolve(jsonResponse({ id: 3, status: 'discarded', phase: null }))
+      }
+      if (url.startsWith('/api/compaction')) return Promise.resolve(jsonResponse(emptyListing))
+      return Promise.resolve(jsonResponse({}))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(
+      <MockProviders>
+        <Probe />
+      </MockProviders>
+    )
+
+    fireEvent.click(screen.getByText('watch draft 3'))
+
+    await vi.advanceTimersByTimeAsync(5_000)
+    await vi.waitFor(() => expect(detailCalls).toBe(1))
+
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(detailCalls).toBe(1)
+  })
+
   it('draftReady stops polling once the draft disappears (a failed lookup)', async () => {
     let detailCalls = 0
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
