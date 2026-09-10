@@ -103,6 +103,15 @@
 //! `view.rs` (#179) holds every response DTO the HTTP routes in `main.rs`
 //! serialise, `From`-built from this module's domain types plus whatever
 //! extra context (attitude, phase) a single domain struct does not carry.
+//!
+//! `ltm.rs` (#178) is the third registered `CommitObserver`: `fact_entry`
+//! renders a fact to the text the tantivy index stores (no date, ever —
+//! this is what replaced `llm.rs::generate`'s old `* at <date> *` turn-pair
+//! entries), and [`ltm::LtmObserver`] calls `LongTermMem::add_fact`/
+//! `remove_fact` with the commit's newly active and superseded facts.
+//! Recall at prompt-assembly time now fills `CompactionContext::
+//! recalled_facts` (`llm.rs::assemble_prompt`) instead of being appended
+//! after the persona.
 #![allow(dead_code)]
 
 pub mod attitude;
@@ -110,6 +119,7 @@ pub mod commit;
 pub mod context;
 pub mod extract;
 pub mod hook;
+pub mod ltm;
 pub mod merge;
 pub mod persons;
 pub mod range;
@@ -136,16 +146,17 @@ use crate::llm::Extractor;
 /// rather than being read back out of `ConfigView` or a request, since
 /// nothing here is user-specific yet.
 ///
-/// # Adding another observer (#178 tantivy, ...)
+/// # Adding another observer
 ///
 /// Load whatever the observer's constructor needs, build it, and `push` it,
-/// the way the #176/#177 paragraphs below do. A constructor that can fail
-/// (like #176's, which reads `ConfigView`, or #177's, which reads the
-/// user/companion names) should log and skip the `push` on error rather
-/// than propagating: a missing observer degrades to "that side effect
-/// doesn't run this session," which is strictly better than failing every
-/// future commit. `main.rs` never assembles `CommitDeps` inline — #179's
-/// handler is the one caller, via this function.
+/// the way the #176/#177/#178 paragraphs below do. A constructor that can
+/// fail (like #176's, which reads `ConfigView`, #177's, which reads the
+/// user/companion names, or #178's, which opens the tantivy index) should
+/// log and skip the `push` on error rather than propagating: a missing
+/// observer degrades to "that side effect doesn't run this session," which
+/// is strictly better than failing every future commit. `main.rs` never
+/// assembles `CommitDeps` inline — #179's handler is the one caller, via
+/// this function.
 pub fn production_commit_deps(extractor: &dyn Extractor, user_id: i32) -> commit::CommitDeps<'_> {
     let mut observers: Vec<Box<dyn commit::CommitObserver>> = Vec::new();
 
@@ -170,6 +181,18 @@ pub fn production_commit_deps(extractor: &dyn Extractor, user_id: i32) -> commit
         ))),
         Err(e) => eprintln!(
             "compaction: failed to load config for attitude recalibration, skipping this session: {e}"
+        ),
+    }
+
+    // #178: indexes newly active facts into (and removes superseded facts
+    // from) the tantivy long-term memory index. `LongTermMem::shared()` can
+    // fail to open the index; logged and skipped rather than failing the
+    // whole commit-deps build, matching every other observer's "log and
+    // move on" rule.
+    match crate::long_term_mem::LongTermMem::shared() {
+        Ok(index) => observers.push(Box::new(ltm::LtmObserver::new(index))),
+        Err(e) => eprintln!(
+            "compaction: failed to open long-term memory index for commit observer, skipping this session: {e}"
         ),
     }
 

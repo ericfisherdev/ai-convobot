@@ -1,4 +1,3 @@
-use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 
@@ -19,8 +18,7 @@ use crate::long_term_mem::LongTermMem;
 use crate::model_cache::{ModelKey, ResidentCache};
 use crate::model_metadata::{self, ModelFacts};
 use crate::participants::{
-    expand_placeholders, placeholder, render_mentions, Participant, ParticipantId,
-    ParticipantRegistry,
+    expand_placeholders, render_mentions, Participant, ParticipantId, ParticipantRegistry,
 };
 use crate::system_memory::SystemMemoryDetector;
 
@@ -844,12 +842,39 @@ pub fn assemble_prompt(
         );
     }
 
+    // Recall keyword-matched facts before rendering the compaction context,
+    // so they land in `recalled_facts` and get rendered (and trimmed, if
+    // the compaction slice is tight) by `render` alongside the other
+    // blocks, instead of being appended raw after the persona the way the
+    // old turn-pair recall was. `expand_placeholders` resolves the
+    // `{{user}}`/`{{char}}` tokens `compaction::ltm::fact_entry` wrote at
+    // index time, same as it does for persona text elsewhere in this
+    // function.
+    let mut compaction_with_recall = compaction.clone();
+    if companion.long_term_mem > 0 {
+        match long_term_memory.get_matches(user_message, companion.long_term_mem) {
+            Ok(entries) => {
+                compaction_with_recall.recalled_facts = entries
+                    .into_iter()
+                    .map(|entry| expand_placeholders(&entry, participants))
+                    .collect();
+            }
+            Err(e) => {
+                eprintln!("Error while getting long term memory entries: {}", e);
+                return Err(std::io::Error::other(
+                    "Error while getting long term memory entries",
+                ));
+            }
+        }
+    }
+
     // Render the compaction context (overlays, rules, story-so-far, recent
-    // detail, pins) against its own token slice, same as the attitude block
-    // above: built before `base_components` so it can be spliced into the
-    // system portion rather than after the conversation history.
+    // detail, pins, recalled facts) against its own token slice, same as
+    // the attitude block above: built before `base_components` so it can be
+    // spliced into the system portion rather than after the conversation
+    // history.
     let compaction_blocks = render(
-        compaction,
+        &compaction_with_recall,
         speakers.user_name(),
         speakers.self_name(),
         context_manager.compaction_token_budget,
@@ -876,29 +901,6 @@ pub fn assemble_prompt(
     );
 
     base_prompt = base_components.join("");
-
-    if companion.long_term_mem > 0 {
-        let long_term_memory_entries: Vec<String> =
-            match long_term_memory.get_matches(user_message, companion.long_term_mem) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    eprintln!("Error while getting long term memory entries: {}", e);
-                    return Err(std::io::Error::other(
-                        "Error while getting long term memory entries",
-                    ));
-                }
-            };
-        for entry in long_term_memory_entries {
-            let entry = expand_placeholders(&entry, participants);
-            if config.prompt_template == PromptTemplate::Llama2 {
-                base_prompt += &format!("[INST]{}[/INST]\n", entry);
-            } else if config.prompt_template == PromptTemplate::Mistral {
-                base_prompt += &format!("<s>[INST]{}[/INST]\n", entry);
-            } else {
-                base_prompt += &entry;
-            }
-        }
-    }
     // `TranscriptSource` impls log the cause of a read failure themselves.
     // History starts after `compacted_through`, so a compacted range never
     // resurfaces once it drops out of the prompt.
@@ -1397,8 +1399,6 @@ fn generate(
             return Err(std::io::Error::other("Error while connecting to tantivy"));
         }
     };
-    let local: DateTime<Local> = Local::now();
-    let formatted_date = local.format("* at %A %d.%m.%Y %H:%M *\n").to_string();
     let config: ConfigView = match Database::get_config() {
         Ok(config) => config,
         Err(e) => {
@@ -1629,17 +1629,6 @@ fn generate(
     let tokens_generated = tokens_generated as u32;
 
     let companion_text = trimmer.clean(&end_of_generation);
-    match long_term_memory.add_entry(&format!(
-        "{}{}: {}\n{}: {}\n",
-        formatted_date,
-        placeholder(&ParticipantId::USER),
-        prompt,
-        placeholder(&speakers.self_id),
-        companion_text
-    )) {
-        Ok(_) => {}
-        Err(e) => eprintln!("Error while adding message to long-term memory: {}", e),
-    };
 
     // Complete the performance tracking session
     if let Ok(mut tracker) = INFERENCE_TRACKER.lock() {

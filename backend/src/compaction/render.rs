@@ -476,6 +476,26 @@ mod tests {
         assert_eq!(blocks.over_budget_by, None);
     }
 
+    /// #178 dropped the old `* at <weekday> <dd>.<mm>.<yyyy>` turn-pair
+    /// prefix `llm.rs::generate` used to write into long-term memory;
+    /// `compaction::ltm::fact_entry` never produces it either, and this
+    /// checks `render` does not reintroduce a date through the
+    /// `recalled_facts` block.
+    #[test]
+    fn story_so_far_never_contains_a_date_or_clock_time_for_a_recalled_fact() {
+        let date_pattern = regex::Regex::new(r"\* at \w+ \d\d\.\d\d\.\d{4}").unwrap();
+        let ctx = CompactionContext {
+            recalled_facts: vec!["{{user}}: loves stargazing".to_string()],
+            ..Default::default()
+        };
+        let blocks = render(&ctx, USER, COMPANION, 1000);
+        assert!(
+            !date_pattern.is_match(&blocks.story_so_far),
+            "render produced a date-like string: {}",
+            blocks.story_so_far
+        );
+    }
+
     #[test]
     fn overlays_alone_exceeding_the_budget_reports_over_budget_by_and_keeps_them_intact() {
         let ctx = CompactionContext {
