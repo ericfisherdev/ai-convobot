@@ -14,7 +14,12 @@
 //! `JoinerShared` and any socket, so it is unit-testable with a stub
 //! generator and no model, no socket; [`LocalModelGeneration::try_handle`]
 //! is the only production caller, claiming the turn slot and spawning the
-//! thread [`run_remote_turn`] actually runs on.
+//! thread [`run_remote_turn`] actually runs on. That same spawned thread,
+//! once `run_remote_turn` returns and the reply's own claim on the turn
+//! slot has been explicitly released, makes one independent attempt at this
+//! joiner's own auto-extraction (#186, `joiner_compaction::maybe_queue_extraction`)
+//! — see [`LocalModelGeneration::try_handle`]'s own doc comment for why that
+//! ordering is load-bearing.
 
 use std::io;
 use std::sync::Arc;
@@ -27,7 +32,7 @@ use crate::compaction::store::SqliteCompactionStore;
 use crate::database::{Message, USER_SPEAKER_ID};
 use crate::llm::{self, CompactionSource, InMemoryTranscript, PromptSpeakers};
 use crate::multiplayer::joiner::{GenerateRequestHandler, JoinerHandle};
-use crate::multiplayer::joiner_compaction::local_overlay;
+use crate::multiplayer::joiner_compaction::{local_overlay, JoinerExtractionJob};
 use crate::multiplayer::protocol::{ClientFrame, ContinuityPayload, ParticipantSummary};
 use crate::participants::{AvatarRef, Participant, ParticipantId, ParticipantRegistry};
 use crate::turn_slot::ACTIVE_TURN;
@@ -82,13 +87,15 @@ impl CompactionSource for HostContinuity {
     }
 }
 
-/// Everything `main.rs::inspect_prompt` needs to render a joiner's own
-/// prompt (#186): the speakers this joiner would generate as, the same
-/// [`HostContinuity`] a live reply would build (so a debug inspection can
-/// never drift from what a real turn renders), the transcript mirror a live
-/// reply generates from, and the raw payload so the endpoint can echo it
-/// back. Also [`with_local_model`]'s own [`HostContinuity`] build site, so
-/// the two can never disagree about what "this joiner's own overlay" means.
+/// Builds everything a joiner's own prompt needs from `HostContinuity`
+/// onward: the speakers this joiner would generate as, a fresh
+/// [`HostContinuity`] read from `handle`'s current state, the transcript
+/// mirror a live reply generates from, and the raw payload so a caller can
+/// echo it back. The single build site for [`HostContinuity`] — both
+/// [`with_local_model`]'s generator (a live reply) and
+/// `main.rs::inspect_prompt`'s joiner branch (`GET /api/debug/prompt`) call
+/// this rather than rebuilding it inline, so the two can never disagree
+/// about what "this joiner's own overlay" means.
 pub fn joiner_prompt_inputs(
     handle: &JoinerHandle,
 ) -> (
@@ -145,37 +152,44 @@ pub struct LocalModelGeneration {
     self_id: ParticipantId,
     handle: JoinerHandle,
     generator: RemoteGenerator,
+    extraction: JoinerExtractionJob,
 }
 
 impl LocalModelGeneration {
-    /// Takes any generator. Used directly by this module's own tests (a
-    /// stub that emits fixed tokens with no model loaded) and by #136's
-    /// two-instance test.
+    /// Takes any generator and extraction job. Used directly by this
+    /// module's own tests (a stub generator that emits fixed tokens with no
+    /// model loaded, and `joiner_compaction::noop_job()` when a test has no
+    /// interest in compaction) and by #136's two-instance test.
     pub fn new(
         companion_id: i32,
         self_id: ParticipantId,
         handle: JoinerHandle,
         generator: RemoteGenerator,
+        extraction: JoinerExtractionJob,
     ) -> Self {
         LocalModelGeneration {
             companion_id,
             self_id,
             handle,
             generator,
+            extraction,
         }
     }
 
-    /// Wraps the production generator: the joiner's own model over
-    /// `llm::prompt_streaming`, generating from an `InMemoryTranscript` of
-    /// the transcript the host sent (never the joiner's own local
+    /// Wraps the production generator and the production
+    /// [`JoinerExtractionJob`]. The generator runs the joiner's own model
+    /// over `llm::prompt_streaming`, generating from an `InMemoryTranscript`
+    /// of the transcript the host sent (never the joiner's own local
     /// `messages` table, which a remote reply never touches) and keyed by
     /// the newest user message in it, the same way a local turn's
     /// long-term memory recall is keyed by what the user just said. Builds
-    /// a fresh [`HostContinuity`] from `handle`'s current
-    /// `JoinerShared::last_continuity` plus this joiner's own local overlay
-    /// (`local_overlay`) on every call, so a reply always renders against
-    /// whatever the most recent `GenerateRequest` last carried, not a
-    /// snapshot taken when this generator was built.
+    /// its [`HostContinuity`] through [`joiner_prompt_inputs`] on every
+    /// call (discarding the tuple's other elements, already known here) so
+    /// a reply and `GET /api/debug/prompt` can never render from two
+    /// different builds of "this joiner's own overlay". The extraction job
+    /// is [`joiner_compaction::run_joiner_extraction`], run by
+    /// [`Self::try_handle`] only after a reply's own turn-slot claim has
+    /// already been released (see its doc comment).
     pub fn with_local_model(
         companion_id: i32,
         self_id: ParticipantId,
@@ -187,17 +201,7 @@ impl LocalModelGeneration {
                   speakers: &PromptSpeakers,
                   on_token: &mut dyn FnMut(&str)| {
                 let prompt = newest_user_message(transcript);
-                let payload = handle
-                    .read()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .last_continuity
-                    .clone();
-                let (companion_state, rules) = local_overlay(&SqliteCompactionStore, companion_id)
-                    .unwrap_or_else(|e| {
-                        eprintln!("joiner: failed to read local compaction overlay: {e}");
-                        (Vec::new(), Vec::new())
-                    });
-                let source = HostContinuity::new(payload, companion_state, rules);
+                let (_, _, source, _, _) = joiner_prompt_inputs(&handle);
                 llm::prompt_streaming(
                     &prompt,
                     companion_id,
@@ -208,7 +212,13 @@ impl LocalModelGeneration {
                 )
             }
         });
-        LocalModelGeneration::new(companion_id, self_id, handle, generator)
+        let extraction: JoinerExtractionJob = {
+            let handle = handle.clone();
+            Arc::new(move |request| {
+                crate::multiplayer::joiner_compaction::run_joiner_extraction(&handle, request);
+            })
+        };
+        LocalModelGeneration::new(companion_id, self_id, handle, generator, extraction)
     }
 
     /// The body of [`GenerateRequestHandler::handle`], returning the
@@ -216,6 +226,18 @@ impl LocalModelGeneration {
     /// before asserting the turn slot is free again. `None` when nothing
     /// was spawned (the slot was already claimed, or the spawn itself
     /// failed) — both cases already sent their own `ReplyFailed`.
+    ///
+    /// After the reply is generated (and *only* after: `turn_guard` is
+    /// explicitly dropped first), the spawned thread makes one independent
+    /// attempt at this joiner's own auto-extraction
+    /// (`joiner_compaction::maybe_queue_extraction`). This ordering is
+    /// load-bearing: extraction must never contend with the reply for the
+    /// same `GenerateRequest`'s turn-slot claim, or every reply on a frame
+    /// that advances `compacted_through` would lose that race and come back
+    /// as `ReplyFailed` (PR #204 review finding) — extraction gets its own,
+    /// later, independent claim instead, falling back to
+    /// `JoinerShared::pending_extraction` if something else has it in that
+    /// (very small) window.
     fn try_handle(
         &self,
         round_id: u64,
@@ -241,6 +263,8 @@ impl LocalModelGeneration {
             }
         };
         let generator = Arc::clone(&self.generator);
+        let extraction = Arc::clone(&self.extraction);
+        let extraction_handle = self.handle.clone();
         let companion_id = self.companion_id;
         // Kept outside the closure below so a failed spawn (which drops the
         // closure, and with it the `tx` moved into it, without running it)
@@ -250,7 +274,6 @@ impl LocalModelGeneration {
         let spawn_result = std::thread::Builder::new()
             .name("remote-generation".into())
             .spawn(move || {
-                let _turn_guard = turn_guard;
                 run_remote_turn(
                     round_id,
                     transcript,
@@ -260,6 +283,11 @@ impl LocalModelGeneration {
                         let store = SqliteTurnStore::new(Vec::new());
                         score_attitude(&store, companion_id, transcript, reply);
                     },
+                );
+                drop(turn_guard);
+                crate::multiplayer::joiner_compaction::maybe_queue_extraction(
+                    &extraction_handle,
+                    &extraction,
                 );
             });
 
@@ -575,7 +603,7 @@ mod tests {
         Arc::new(RwLock::new(shared))
     }
 
-    // Both cases below share the process-wide `ACTIVE_TURN`, so they run as
+    // Every case below shares the process-wide `ACTIVE_TURN`, so they run as
     // one test function: two separate `#[test]`s touching the same global
     // would race under cargo's default parallel test execution.
     #[test]
@@ -590,6 +618,7 @@ mod tests {
             Arc::new(|_transcript, _speakers, _on_token| {
                 panic!("must never generate while the slot is claimed")
             }),
+            crate::multiplayer::joiner_compaction::noop_job(),
         );
         let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -615,6 +644,7 @@ mod tests {
                 on_token("hi");
                 Ok("hi".to_string())
             }),
+            crate::multiplayer::joiner_compaction::noop_job(),
         );
         let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -641,6 +671,83 @@ mod tests {
         assert!(
             ACTIVE_TURN.try_claim().is_some(),
             "the slot should be free again once the thread has joined"
+        );
+
+        // PR #204 review finding: extraction used to claim `ACTIVE_TURN` on
+        // the same `GenerateRequest` the reply itself needed it for, so
+        // every continuity-advancing frame lost that race and got
+        // `ReplyFailed` instead of a reply. `try_handle` must always
+        // produce the reply first, only attempting extraction afterward,
+        // independently, once the reply's own claim has actually been
+        // released.
+        let handle = joiner_handle_with(vec![]);
+        {
+            let mut shared = handle.write().unwrap_or_else(|p| p.into_inner());
+            shared.last_continuity = Some(crate::multiplayer::protocol::ContinuityPayload {
+                compacted_through: 5,
+                ..Default::default()
+            });
+        }
+
+        let extraction_calls: Arc<Mutex<Vec<(i32, i32)>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&extraction_calls);
+        let extraction: crate::multiplayer::joiner_compaction::JoinerExtractionJob =
+            Arc::new(move |request| {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((request.from, request.through));
+            });
+
+        let generation = LocalModelGeneration::new(
+            1,
+            ParticipantId::parse("bot1").unwrap(),
+            handle.clone(),
+            Arc::new(|_transcript, _speakers, on_token| {
+                on_token("hi");
+                Ok("hi".to_string())
+            }),
+            extraction,
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let join_handle = generation
+            .try_handle(9, vec![sample_message(1, USER_SPEAKER_ID, "hello")], tx)
+            .expect("the slot was free, so a thread should have been spawned");
+        join_handle
+            .join()
+            .expect("generation thread should not panic");
+
+        assert_eq!(
+            drain(&mut rx),
+            vec![
+                ClientFrame::Token {
+                    round_id: 9,
+                    text: "hi".to_string()
+                },
+                ClientFrame::ReplyComplete {
+                    round_id: 9,
+                    text: "hi".to_string()
+                },
+            ],
+            "a continuity-advancing GenerateRequest must still produce its reply, not ReplyFailed"
+        );
+
+        // Extraction runs on a further spawned thread of its own
+        // (`joiner_compaction::spawn_holding`); wait for it to release the
+        // slot it claims before asserting it ran, the same polling pattern
+        // `local_model_generation_claims_and_releases_the_shared_turn_slot`
+        // and `joiner_compaction`'s own tests use for the same reason.
+        for _ in 0..100 {
+            if ACTIVE_TURN.try_claim().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            *extraction_calls.lock().unwrap(),
+            vec![(1, 5)],
+            "extraction should still run, independently, after the reply"
         );
     }
 }

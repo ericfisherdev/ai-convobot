@@ -156,13 +156,12 @@ fn spawn_joiner(
         identity.id.clone(),
         handle.clone(),
         generator,
+        crate::multiplayer::joiner_compaction::noop_job(),
     ));
-    let extraction = crate::multiplayer::joiner_compaction::noop_job();
     let task = tokio::spawn(crate::multiplayer::joiner::run(
         handle.clone(),
         identity,
         generation,
-        extraction,
     ));
     (handle, task)
 }

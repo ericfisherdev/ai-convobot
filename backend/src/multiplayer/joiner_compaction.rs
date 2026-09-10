@@ -6,20 +6,27 @@
 //!
 //! [`extraction_range`] and [`is_own_fact`] are the pure decision core, unit
 //! tested with no model and no store. [`maybe_queue_extraction`] is the
-//! impure dispatch `multiplayer::joiner::serve` calls on every
-//! `GenerateRequest`: it claims [`ACTIVE_TURN`] itself and hands the actual
-//! work to an injected [`JoinerExtractionJob`] (mirroring
-//! `remote_generation::RemoteGenerator`'s injectable seam), so `serve`'s own
-//! tests can observe "a job was queued" with a recording stub instead of
+//! impure dispatch [`remote_generation::LocalModelGeneration::try_handle`]
+//! calls *after* a reply it generated has already released its own claim on
+//! [`ACTIVE_TURN`] — never on the same claim a reply needed, and never
+//! before that reply has been sent, so a `GenerateRequest` that advances
+//! `compacted_through` still always gets its reply. It then claims
+//! `ACTIVE_TURN` itself, independently, and hands the actual work to an
+//! injected [`JoinerExtractionJob`] (mirroring
+//! `remote_generation::RemoteGenerator`'s injectable seam), so this module's
+//! own tests can observe "a job was queued" with a recording stub instead of
 //! touching SQLite or a model. [`run_joiner_extraction`] is the production
-//! job `main.rs`'s startup wiring builds: insert a draft over the mirrored
-//! range, run `compaction::extract::fill_draft`, then commit under
-//! [`is_own_fact`]'s policy — `companion_state` and rules/key-quotes
-//! attributed to the non-canon ("companion") voice, the closest the binary
-//! `user`/`companion` extraction schema gets to "this joiner said it" (see
-//! [`is_own_fact`]'s own doc comment for the multi-bot caveat). Every other
-//! item is stored inactive with a reason, so nothing about the shared
-//! user/world ever activates on a joiner without the host reviewing it.
+//! job `remote_generation::LocalModelGeneration::with_local_model` builds:
+//! insert a draft over the mirrored range, run
+//! `compaction::extract::fill_draft`, then commit under [`is_own_fact`]'s
+//! policy — `companion_state` and rules/key-quotes attributed to the
+//! non-canon ("companion") voice, the closest the binary `user`/`companion`
+//! extraction schema gets to "this joiner said it" (see [`is_own_fact`]'s
+//! own doc comment for the multi-bot caveat). Every other item is stored
+//! inactive with a reason, so nothing about the shared user/world ever
+//! activates on a joiner without the host reviewing it.
+//!
+//! [`remote_generation`]: crate::multiplayer::remote_generation
 
 use std::sync::Arc;
 
@@ -121,26 +128,29 @@ pub(crate) struct JoinerExtractionRequest {
 /// is.
 pub type JoinerExtractionJob = Arc<dyn Fn(JoinerExtractionRequest) + Send + Sync>;
 
-/// Decides whether `incoming` (this frame's `ContinuityPayload`, if any) or
-/// a previously-queued retry (`JoinerShared::pending_extraction`) advances
-/// this joiner's own compacted-through cursor, and if so either spawns
-/// `job` under a freshly claimed [`ACTIVE_TURN`] slot or — if the slot is
-/// already held by an in-flight reply — remembers the target `through` on
-/// `pending_extraction` for the next call to retry. Called from
-/// `joiner::serve` on every `GenerateRequest`, so it never runs on the reply
-/// thread itself: a still-running extraction never rejects the next
-/// `GenerateRequest` with `ReplyFailed`, since generation and extraction are
-/// two independent claimants of the same slot, never the same one.
-pub(crate) fn maybe_queue_extraction(
-    handle: &JoinerHandle,
-    job: &JoinerExtractionJob,
-    incoming: Option<&ContinuityPayload>,
-) {
-    let (local, pending, snapshot, participants, companion_id, self_id) = {
+/// Decides whether the most recent `GenerateRequest`'s payload
+/// (`JoinerShared::last_continuity`, already mirrored there by
+/// `joiner::serve` before a reply is even attempted) or a previously-queued
+/// retry (`JoinerShared::pending_extraction`) advances this joiner's own
+/// compacted-through cursor, and if so either spawns `job` under a freshly
+/// claimed [`ACTIVE_TURN`] slot or — if the slot is already held elsewhere —
+/// remembers the target `through` on `pending_extraction` for the next call
+/// to retry.
+///
+/// Callers must never call this while still holding the reply's own claim
+/// on [`ACTIVE_TURN`] for the same `GenerateRequest`: the sole production
+/// caller, `remote_generation::LocalModelGeneration::try_handle`, calls it
+/// from the reply-generation thread only *after* explicitly dropping that
+/// thread's own [`crate::turn_slot::TurnGuard`], so extraction's claim here
+/// is always independent of, and never racing, the reply this same frame
+/// needed the slot for.
+pub(crate) fn maybe_queue_extraction(handle: &JoinerHandle, job: &JoinerExtractionJob) {
+    let (local, pending, last_continuity_through, snapshot, participants, companion_id, self_id) = {
         let shared = handle.read().unwrap_or_else(|p| p.into_inner());
         (
             shared.local_compacted_through,
             shared.pending_extraction,
+            shared.last_continuity.as_ref().map(|p| p.compacted_through),
             shared.transcript.snapshot(),
             shared.participants.clone(),
             shared.companion_id,
@@ -148,7 +158,7 @@ pub(crate) fn maybe_queue_extraction(
         )
     };
 
-    let target_through = match (incoming.map(|p| p.compacted_through), pending) {
+    let target_through = match (last_continuity_through, pending) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (Some(a), None) => Some(a),
         (None, Some(b)) => Some(b),
@@ -246,14 +256,44 @@ fn joiner_commit_deps(extractor: &dyn crate::llm::Extractor) -> CommitDeps<'_> {
     }
 }
 
+/// Discards `draft_id` (flips it from `Draft` to `Discarded`) and logs why,
+/// used by every [`run_joiner_extraction`] failure branch that ran after
+/// `insert_draft` already created the row. Without this, a failure here
+/// would leave the row stuck in `Draft` status forever, and the *next*
+/// retry over the same (still-uncaught-up) range would insert another draft
+/// on top of it rather than replacing it — the row never becomes visible
+/// anywhere (compaction routes 409 on a joiner), but it does accumulate,
+/// unbounded, in this joiner's own database on every failed retry.
+fn discard_or_log(
+    store: &SqliteCompactionStore,
+    draft_id: i64,
+    self_id: &ParticipantId,
+    why: &str,
+) {
+    match crate::compaction::commit::discard(store, draft_id) {
+        Ok(()) => {}
+        // Already past `Draft` status -- `fill_draft` itself already
+        // discarded it for one of its own distinguishable error variants;
+        // nothing further to do or report.
+        Err(crate::compaction::commit::CommitError::DraftNotPending { .. }) => {}
+        Err(e) => {
+            eprintln!(
+                "joiner compaction ({self_id}): failed to discard draft {draft_id} after {why}: {e}"
+            );
+        }
+    }
+}
+
 /// The production [`JoinerExtractionJob`]: runs on the thread
 /// [`maybe_queue_extraction`] spawned, holding [`crate::turn_slot::TurnGuard`]
 /// for its whole duration. An empty `request.range` (a late joiner whose
 /// mirror does not go back far enough — #170's known limitation) only
-/// advances the local cursor, since there is nothing to extract; any other
-/// failure is logged and swallowed, like every other background job in this
-/// codebase, leaving the local cursor exactly where it was so the next
-/// `GenerateRequest` retries the same range.
+/// advances the local cursor, since there is nothing to extract. Every other
+/// failure after `insert_draft` discards the draft it created
+/// ([`discard_or_log`]) before returning, so a retry over the same range
+/// never piles a second `Draft` row on top of one a prior attempt already
+/// abandoned; the local cursor itself is left exactly where it was, so the
+/// next `GenerateRequest` retries the same range from scratch.
 pub(crate) fn run_joiner_extraction(handle: &JoinerHandle, request: JoinerExtractionRequest) {
     let JoinerExtractionRequest {
         companion_id,
@@ -298,6 +338,7 @@ pub(crate) fn run_joiner_extraction(handle: &JoinerHandle, request: JoinerExtrac
         Ok(config) => config,
         Err(e) => {
             eprintln!("joiner compaction ({self_id}): failed to read config: {e}");
+            discard_or_log(&store, draft_id, &self_id, "a config read failure");
             return;
         }
     };
@@ -317,6 +358,7 @@ pub(crate) fn run_joiner_extraction(handle: &JoinerHandle, request: JoinerExtrac
         }
         Err(e) => {
             eprintln!("joiner compaction ({self_id}): failed to read draft {draft_id}: {e}");
+            discard_or_log(&store, draft_id, &self_id, "a checkpoint read failure");
             return;
         }
     };
@@ -331,6 +373,13 @@ pub(crate) fn run_joiner_extraction(handle: &JoinerHandle, request: JoinerExtrac
         overlay_budget_tokens,
     ) {
         eprintln!("joiner compaction ({self_id}): extraction failed for draft {draft_id}: {e}");
+        // `fill_draft` already discards the draft itself for the error
+        // variants it can distinguish (unparseable output, over-budget
+        // overlays, an empty range); this is a defensive catch-all for any
+        // other variant (e.g. the extractor model itself erroring) that
+        // would otherwise leave the row stuck in `Draft` — `discard_or_log`
+        // is a silent no-op when `fill_draft` already discarded it.
+        discard_or_log(&store, draft_id, &self_id, "an extraction failure");
         return;
     }
 
@@ -340,6 +389,7 @@ pub(crate) fn run_joiner_extraction(handle: &JoinerHandle, request: JoinerExtrac
             eprintln!(
                 "joiner compaction ({self_id}): failed to read draft {draft_id}'s facts: {e}"
             );
+            discard_or_log(&store, draft_id, &self_id, "a facts read failure");
             return;
         }
     };
@@ -371,6 +421,12 @@ pub(crate) fn run_joiner_extraction(handle: &JoinerHandle, request: JoinerExtrac
         }
         Err(e) => {
             eprintln!("joiner compaction ({self_id}): failed to re-read draft {draft_id}: {e}");
+            discard_or_log(
+                &store,
+                draft_id,
+                &self_id,
+                "a post-extraction checkpoint read failure",
+            );
             return;
         }
     };
@@ -384,6 +440,7 @@ pub(crate) fn run_joiner_extraction(handle: &JoinerHandle, request: JoinerExtrac
         Ok(user) => user,
         Err(e) => {
             eprintln!("joiner compaction ({self_id}): failed to read user data: {e}");
+            discard_or_log(&store, draft_id, &self_id, "a user-data read failure");
             return;
         }
     };
@@ -391,6 +448,7 @@ pub(crate) fn run_joiner_extraction(handle: &JoinerHandle, request: JoinerExtrac
         Ok(companion) => companion,
         Err(e) => {
             eprintln!("joiner compaction ({self_id}): failed to read companion data: {e}");
+            discard_or_log(&store, draft_id, &self_id, "a companion-data read failure");
             return;
         }
     };
@@ -410,6 +468,11 @@ pub(crate) fn run_joiner_extraction(handle: &JoinerHandle, request: JoinerExtrac
         }
         Err(e) => {
             eprintln!("joiner compaction ({self_id}): failed to commit draft {draft_id}: {e}");
+            // Without this, a failed commit leaves the draft stuck in
+            // `Draft` status forever, and every retry over the same
+            // (still-uncaught-up) range inserts another one on top of it
+            // (PR #204 review finding).
+            discard_or_log(&store, draft_id, &self_id, "a commit failure");
         }
     }
 }
@@ -535,6 +598,13 @@ mod tests {
         (job, calls)
     }
 
+    fn set_last_continuity(handle: &JoinerHandle, payload: Option<ContinuityPayload>) {
+        handle
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .last_continuity = payload;
+    }
+
     // Shares the process-wide `ACTIVE_TURN`, so every case below runs as one
     // `#[test]` function — the same convention
     // `remote_generation::tests::local_model_generation_claims_and_releases_the_shared_turn_slot`
@@ -546,7 +616,8 @@ mod tests {
 
         // A higher `compacted_through` than the local cursor (`None`, i.e.
         // 0): claims the slot and queues exactly one job over [1, 5].
-        maybe_queue_extraction(&handle, &job, Some(&payload(5)));
+        set_last_continuity(&handle, Some(payload(5)));
+        maybe_queue_extraction(&handle, &job);
         // `spawn_holding` runs on its own thread; give it a moment, then
         // join by re-claiming the slot once it releases the guard.
         for _ in 0..100 {
@@ -562,23 +633,34 @@ mod tests {
             "pending_extraction should have been cleared once the job was spawned"
         );
 
-        // A lower `compacted_through` than the (still 0, since the stub job
-        // never updates it) local cursor queues nothing further... instead
-        // simulate the job having advanced the cursor, the way the real
-        // production job does on success.
+        // A lower `compacted_through` than the local cursor (simulating the
+        // job having advanced it, the way the real production job does on
+        // success) queues nothing further. Sleeps first so a wrongly-spawned
+        // job — the regression this test exists to catch — has every chance
+        // to run and record itself on its own thread before the assertion
+        // below runs: checking immediately after `maybe_queue_extraction`
+        // returns could observe the "nothing happened yet" state even for
+        // buggy code that did wrongly spawn one (PR #204 review finding).
         handle.write().unwrap().local_compacted_through = Some(5);
-        maybe_queue_extraction(&handle, &job, Some(&payload(3)));
+        set_last_continuity(&handle, Some(payload(3)));
+        maybe_queue_extraction(&handle, &job);
+        std::thread::sleep(std::time::Duration::from_millis(200));
         assert_eq!(
             *calls.lock().unwrap(),
             vec![(1, 5)],
             "a payload at or behind the local cursor must queue no job"
+        );
+        assert!(
+            ACTIVE_TURN.try_claim().is_some(),
+            "nothing should hold the turn slot when no job was queued"
         );
 
         // The slot claimed by someone else: the target is remembered as
         // `pending_extraction` instead of spawning, and retried once the
         // slot frees up.
         let outer_guard = ACTIVE_TURN.try_claim().expect("slot should be free");
-        maybe_queue_extraction(&handle, &job, Some(&payload(8)));
+        set_last_continuity(&handle, Some(payload(8)));
+        maybe_queue_extraction(&handle, &job);
         assert_eq!(
             *calls.lock().unwrap(),
             vec![(1, 5)],
@@ -587,7 +669,10 @@ mod tests {
         assert_eq!(handle.read().unwrap().pending_extraction, Some(8));
         drop(outer_guard);
 
-        maybe_queue_extraction(&handle, &job, None);
+        // No fresh payload this time: `pending_extraction` alone drives the
+        // retry.
+        set_last_continuity(&handle, None);
+        maybe_queue_extraction(&handle, &job);
         for _ in 0..100 {
             if ACTIVE_TURN.try_claim().is_some() {
                 break;
