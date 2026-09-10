@@ -17,7 +17,7 @@ use crate::database::{ConfigView, Device};
 /// changes, the model reloads with fewer layers, free VRAM goes back up, and
 /// so on. GPU detection therefore only runs when a (re)load actually
 /// happens, not on every turn.
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelKey {
     pub model_path: String,
     pub device: Device,
@@ -39,6 +39,31 @@ impl ModelKey {
             gpu_safety_margin: config.gpu_safety_margin,
             min_free_vram_mb: config.min_free_vram_mb,
         }
+    }
+
+    /// The key for the extraction model slot: `None` when
+    /// `compaction_model_path` is unset or blank, so callers know to fall
+    /// back to the chat model. CPU-only by construction, regardless of the
+    /// chat model's own device — this is what keeps `llm.rs`'s
+    /// `RESIDENT_EXTRACTOR` slot from ever asking the GPU allocator for
+    /// layers. If the same GGUF is ever configured as both the chat model
+    /// (GPU) and the extractor (CPU), the two keys still differ and each
+    /// slot loads its own copy.
+    #[allow(dead_code)] // wired up by #183's own llm.rs seam, reached once compaction calls into it
+    pub fn extractor(config: &ConfigView) -> Option<Self> {
+        let model_path = config.compaction_model_path.as_ref()?.trim();
+        if model_path.is_empty() {
+            return None;
+        }
+        Some(Self {
+            model_path: model_path.to_string(),
+            device: Device::CPU,
+            gpu_layers: 0,
+            dynamic_gpu_allocation: false,
+            vram_limit_gb: 0,
+            gpu_safety_margin: 0.0,
+            min_free_vram_mb: 0,
+        })
     }
 }
 
@@ -99,6 +124,18 @@ impl<K: Clone + PartialEq, V> ResidentCache<K, V> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         slot.take().map(|(key, _)| key)
+    }
+
+    /// The key currently resident, if any, without disturbing it. Used by
+    /// tests to check which model a slot holds without loading or evicting
+    /// anything.
+    #[allow(dead_code)] // used by tests today; #173/#175 also read this for diagnostics
+    pub fn resident_key(&self) -> Option<K> {
+        let slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        slot.as_ref().map(|(key, _)| key.clone())
     }
 }
 
@@ -204,5 +241,77 @@ mod tests {
             .unwrap();
         assert_eq!(*value, 1);
         assert!(!reused);
+    }
+
+    /// Two independent `ResidentCache`s (as `RESIDENT_MODEL` and
+    /// `RESIDENT_EXTRACTOR` are in `llm.rs`) never evict each other: loading
+    /// into one leaves the other's slot untouched.
+    #[test]
+    fn two_caches_do_not_evict_each_other() {
+        let chat: ResidentCache<String, u32> = ResidentCache::new();
+        let extractor: ResidentCache<String, u32> = ResidentCache::new();
+        let counter = AtomicU32::new(0);
+        let load = |_: &String| -> Result<u32, ()> {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(1)
+        };
+
+        chat.get_or_load("chat".to_string(), load).unwrap();
+        extractor
+            .get_or_load("extractor".to_string(), load)
+            .unwrap();
+
+        assert_eq!(chat.resident_key(), Some("chat".to_string()));
+        assert_eq!(extractor.resident_key(), Some("extractor".to_string()));
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    /// A `ConfigView` with just enough set to exercise `ModelKey::from_config`
+    /// and `ModelKey::extractor`; every other field is a harmless default.
+    fn test_config(llm_model_path: &str, compaction_model_path: Option<&str>) -> ConfigView {
+        ConfigView {
+            device: Device::GPU,
+            llm_model_path: llm_model_path.to_string(),
+            gpu_layers: 20,
+            prompt_template: crate::database::PromptTemplate::Auto,
+            context_window_size: 2048,
+            max_response_tokens: 512,
+            enable_dynamic_context: true,
+            vram_limit_gb: 4,
+            dynamic_gpu_allocation: true,
+            gpu_safety_margin: 0.8,
+            min_free_vram_mb: 512,
+            enable_hybrid_context: true,
+            max_system_ram_usage_gb: 8,
+            context_expansion_strategy: "balanced".to_string(),
+            ram_safety_margin_gb: 2,
+            multiplayer_mode: crate::multiplayer::config::MultiplayerMode::Solo,
+            multiplayer_host_address: String::new(),
+            multiplayer_participant_id: String::new(),
+            mention_followup_depth: 1,
+            remote_generation_timeout_secs: 120,
+            multiplayer_password_set: false,
+            multiplayer_password: String::new(),
+            compact_threshold_tokens: None,
+            compact_min_messages: 8,
+            compaction_model_path: compaction_model_path.map(str::to_string),
+            heuristic_person_detection: true,
+        }
+    }
+
+    #[test]
+    fn extractor_key_is_cpu_and_differs_from_chat_key_for_the_same_path() {
+        let config = test_config("shared.gguf", Some("shared.gguf"));
+        let chat_key = ModelKey::from_config(&config);
+        let extractor_key = ModelKey::extractor(&config).unwrap();
+
+        assert_ne!(chat_key, extractor_key);
+        assert_eq!(extractor_key.device, Device::CPU);
+        assert_eq!(extractor_key.gpu_layers, 0);
+        assert_eq!(extractor_key.model_path, "shared.gguf");
+
+        assert!(ModelKey::extractor(&test_config("chat.gguf", None)).is_none());
+        assert!(ModelKey::extractor(&test_config("chat.gguf", Some(""))).is_none());
+        assert!(ModelKey::extractor(&test_config("chat.gguf", Some("   "))).is_none());
     }
 }
