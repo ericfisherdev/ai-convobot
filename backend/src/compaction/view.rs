@@ -48,8 +48,12 @@ fn phase_of(checkpoint: &Checkpoint) -> Option<DraftPhase> {
     })
 }
 
-/// One committed/discarded/stale checkpoint (or a pending draft, which also
-/// gets one of these) as `GET /api/compaction` lists it.
+/// One committed/discarded/stale/failed checkpoint (or a pending draft,
+/// which also gets one of these) as `GET /api/compaction` lists it.
+/// `extraction_error` (#208) is `Some` only when `status == Failed`, so the
+/// UI can explain a failed draft without a second request — carried here
+/// (not only on [`CheckpointDetail`]) so it also shows up in the plain
+/// listing, not just the detail view.
 #[derive(Debug, Clone, Serialize)]
 pub struct CheckpointSummary {
     pub id: i64,
@@ -59,6 +63,7 @@ pub struct CheckpointSummary {
     pub trigger: CompactionTrigger,
     pub committed_at: Option<String>,
     pub needs_merge: bool,
+    pub extraction_error: Option<String>,
 }
 
 impl From<&Checkpoint> for CheckpointSummary {
@@ -71,6 +76,7 @@ impl From<&Checkpoint> for CheckpointSummary {
             trigger: checkpoint.trigger,
             committed_at: checkpoint.committed_at.clone(),
             needs_merge: checkpoint.needs_merge,
+            extraction_error: checkpoint.extraction_error.clone(),
         }
     }
 }
@@ -247,6 +253,7 @@ mod tests {
             needs_merge: false,
             created_at: "now".to_string(),
             committed_at: None,
+            extraction_error: None,
         }
     }
 
@@ -266,6 +273,37 @@ mod tests {
     fn a_committed_checkpoint_has_no_phase() {
         let checkpoint = a_checkpoint(CompactionStatus::Committed, Some("raw"));
         assert_eq!(phase_of(&checkpoint), None);
+    }
+
+    #[test]
+    fn a_failed_checkpoint_has_no_phase() {
+        // A failed draft (#208) is never `Draft`, so it must stop reporting
+        // `extracting`/`review` exactly like `Committed` does above -- the
+        // frontend poll (`compactionContext.tsx`'s `draftReady`) relies on
+        // a non-`extracting` phase to stop, and a `Some(Extracting)` here
+        // would leave it polling a dead draft forever.
+        let checkpoint = a_checkpoint(CompactionStatus::Failed, None);
+        assert_eq!(phase_of(&checkpoint), None);
+    }
+
+    #[test]
+    fn a_failed_checkpoints_extraction_error_reaches_the_summary_view() {
+        let mut checkpoint = a_checkpoint(CompactionStatus::Failed, None);
+        checkpoint.extraction_error = Some("model load failed".to_string());
+
+        let summary = CheckpointSummary::from(&checkpoint);
+        assert_eq!(summary.status, CompactionStatus::Failed);
+        assert_eq!(
+            summary.extraction_error.as_deref(),
+            Some("model load failed")
+        );
+    }
+
+    #[test]
+    fn a_non_failed_checkpoint_carries_no_extraction_error() {
+        let checkpoint = a_checkpoint(CompactionStatus::Committed, Some("raw"));
+        let summary = CheckpointSummary::from(&checkpoint);
+        assert_eq!(summary.extraction_error, None);
     }
 
     #[test]

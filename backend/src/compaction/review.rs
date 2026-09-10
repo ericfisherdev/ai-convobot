@@ -233,6 +233,7 @@ mod tests {
             needs_merge: false,
             created_at: "now".to_string(),
             committed_at: None,
+            extraction_error: None,
         }
     }
 

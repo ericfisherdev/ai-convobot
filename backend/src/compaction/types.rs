@@ -27,8 +27,19 @@ use std::str::FromStr;
 
 /// A checkpoint's lifecycle. `Draft` is pending review; `Committed` facts
 /// and summary are live and rendered into the prompt; `Discarded` is a
-/// draft the user rejected; `Stale` is reserved for a later issue (a
-/// committed checkpoint superseded by a re-run).
+/// draft the user rejected (or one `extract.rs`'s `fill_draft` rejected on
+/// its own — an empty range, unparseable model output twice in a row, or an
+/// over-budget overlay: all extraction ran to completion and produced a
+/// definitive negative outcome); `Stale` is a committed checkpoint
+/// superseded by a re-run. `Failed` (#208) is different from all of those:
+/// the extraction pipeline itself never finished evaluating the draft's
+/// content — a model/store I/O error (load failure, OOM, a truncated
+/// completion, a lost database write) — so nothing about the draft's
+/// content was ever judged. Kept distinct from `Discarded` so the API/UI
+/// can tell "extraction ran and rejected everything" apart from "extraction
+/// crashed", and so a "Retry" affordance stays meaningful (retrying an
+/// infrastructure fault makes sense; retrying a fully-evaluated-and-
+/// rejected draft would just reproduce the same rejection).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionStatus {
@@ -36,6 +47,7 @@ pub enum CompactionStatus {
     Committed,
     Discarded,
     Stale,
+    Failed,
 }
 
 impl fmt::Display for CompactionStatus {
@@ -45,6 +57,7 @@ impl fmt::Display for CompactionStatus {
             CompactionStatus::Committed => "committed",
             CompactionStatus::Discarded => "discarded",
             CompactionStatus::Stale => "stale",
+            CompactionStatus::Failed => "failed",
         };
         write!(f, "{s}")
     }
@@ -59,6 +72,7 @@ impl FromStr for CompactionStatus {
             "committed" => Ok(CompactionStatus::Committed),
             "discarded" => Ok(CompactionStatus::Discarded),
             "stale" => Ok(CompactionStatus::Stale),
+            "failed" => Ok(CompactionStatus::Failed),
             _ => Err(s.to_string()),
         }
     }
@@ -321,6 +335,11 @@ pub struct Checkpoint {
     pub needs_merge: bool,
     pub created_at: String,
     pub committed_at: Option<String>,
+    /// Why extraction failed, set only when `status == Failed` (#208).
+    /// `Display`-formatted text from the `DraftError`/store error that
+    /// `extract::fail_pending_draft` recorded, surfaced verbatim through
+    /// `GET /api/compaction/{id}` so the UI can explain itself.
+    pub extraction_error: Option<String>,
 }
 
 /// What [`crate::compaction::store::CompactionStore::insert_draft`] takes:
@@ -441,6 +460,7 @@ mod tests {
             CompactionStatus::Committed,
             CompactionStatus::Discarded,
             CompactionStatus::Stale,
+            CompactionStatus::Failed,
         ] {
             assert_sql_round_trips(variant);
             assert_json_round_trips(variant);

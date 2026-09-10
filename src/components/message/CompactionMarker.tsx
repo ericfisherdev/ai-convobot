@@ -6,6 +6,7 @@ import { useMobile } from '../../hooks/useMobile';
 import { CheckpointDetail, CompactionDraftReview, DraftPhase, RejectedItem } from '../interfaces/Compaction';
 import { CompactionDraftCard } from './CompactionDraftCard';
 import { CompactionNotice } from './CompactionNotice';
+import { CompactionFailedNotice } from './CompactionFailedNotice';
 import { applyServerRejection, initialReviewState, ReviewState } from './compactionReview';
 import { scrollToMessage } from '../../lib/messageAnchors';
 import { Button } from '../ui/button';
@@ -172,12 +173,21 @@ export function CompactionMarker({ messageId, compact: compactProp = false }: Co
 
   // The listing carries every status; only a committed (or stale) checkpoint
   // leaves a notice behind. A discarded row ends at the same message its
-  // draft did and must not read as coverage.
+  // draft did and must not read as coverage. A failed row (#208) is neither
+  // -- it never produced anything to render -- so it gets its own notice
+  // instead of `CompactionNotice`'s "Show notes" dialog, which assumes
+  // there are facts to look at.
   const checkpoint = checkpoints.find(
-    (c) => c.through_message_id === messageId && (c.status === 'committed' || c.status === 'stale')
+    (c) =>
+      c.through_message_id === messageId &&
+      (c.status === 'committed' || c.status === 'stale' || c.status === 'failed')
   );
   if (checkpoint) {
-    return <CompactionNotice checkpoint={checkpoint} />;
+    return checkpoint.status === 'failed' ? (
+      <CompactionFailedNotice checkpoint={checkpoint} />
+    ) : (
+      <CompactionNotice checkpoint={checkpoint} />
+    );
   }
 
   return null;

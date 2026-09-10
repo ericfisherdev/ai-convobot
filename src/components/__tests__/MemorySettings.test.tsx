@@ -59,8 +59,8 @@ const MODELS = [
 ]
 
 const CHECKPOINTS: CheckpointSummary[] = [
-  { id: 1, from_message_id: 1, through_message_id: 20, status: 'committed', trigger: 'threshold', committed_at: '2024-01-15 10:30', needs_merge: false },
-  { id: 2, from_message_id: 21, through_message_id: 40, status: 'stale', trigger: 'threshold', committed_at: '2024-01-16 10:30', needs_merge: true },
+  { id: 1, from_message_id: 1, through_message_id: 20, status: 'committed', trigger: 'threshold', committed_at: '2024-01-15 10:30', needs_merge: false, extraction_error: null },
+  { id: 2, from_message_id: 21, through_message_id: 40, status: 'stale', trigger: 'threshold', committed_at: '2024-01-16 10:30', needs_merge: true, extraction_error: null },
 ]
 
 const stubFetch = (overrides: Record<string, () => Promise<unknown>> = {}) => {

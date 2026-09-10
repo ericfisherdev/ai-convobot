@@ -1432,6 +1432,9 @@ impl Database {
         // Compaction tables (#171): facts reference `companion` and
         // `messages`, both already created above.
         crate::compaction::store::create_tables(&con)?;
+        // extraction_error column (#208) on a compactions table that
+        // predates it.
+        crate::compaction::store::migrate_add_extraction_error(&con)?;
 
         // Migrate companion_attitudes table to add new attitude dimensions if they don't exist
         Database::migrate_companion_attitudes_table(&con)?;

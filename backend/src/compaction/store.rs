@@ -63,7 +63,8 @@ pub(crate) fn create_tables(con: &Connection) -> Result<()> {
             attitude_ratings TEXT,
             needs_merge INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
-            committed_at TEXT
+            committed_at TEXT,
+            extraction_error TEXT
         )",
         [],
     )?;
@@ -104,9 +105,39 @@ pub(crate) fn create_tables(con: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Adds the `extraction_error` column (#208) to a `compactions` table that
+/// predates it: `create_tables`'s `CREATE TABLE IF NOT EXISTS` only shapes a
+/// brand-new table, so a database that already has the `compactions` table
+/// (every one that has run #171 or later) needs this `ALTER TABLE` to pick
+/// up the new column. `NULL` is the correct initial state for every
+/// existing row (none of them failed under this column's watch), so unlike
+/// `migrate_messages_speaker_id` there is no backfill. Idempotent via the
+/// same `PRAGMA table_info` guard `migrate_third_party_individuals_table`
+/// uses. Called from `Database::init` right after `create_tables`, matching
+/// where that function itself runs.
+pub(crate) fn migrate_add_extraction_error(con: &Connection) -> Result<()> {
+    let mut stmt = con.prepare("PRAGMA table_info(compactions)")?;
+    let has_extraction_error = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "extraction_error");
+    drop(stmt);
+
+    if has_extraction_error {
+        return Ok(());
+    }
+
+    con.execute(
+        "ALTER TABLE compactions ADD COLUMN extraction_error TEXT",
+        [],
+    )?;
+    Ok(())
+}
+
 /// Column list shared by every query that reads a full `compactions` row,
 /// in the order [`checkpoint_from_row`] expects.
-const CHECKPOINT_COLUMNS: &str = "id, companion_id, from_message_id, through_message_id, status, trigger, raw_model_output, summary, rolling_summary, attitude_ratings, needs_merge, created_at, committed_at";
+const CHECKPOINT_COLUMNS: &str = "id, companion_id, from_message_id, through_message_id, status, trigger, raw_model_output, summary, rolling_summary, attitude_ratings, needs_merge, created_at, committed_at, extraction_error";
 
 fn checkpoint_from_row(row: &Row) -> Result<Checkpoint> {
     Ok(Checkpoint {
@@ -123,6 +154,7 @@ fn checkpoint_from_row(row: &Row) -> Result<Checkpoint> {
         needs_merge: row.get(10)?,
         created_at: row.get(11)?,
         committed_at: row.get(12)?,
+        extraction_error: row.get(13)?,
     })
 }
 
@@ -340,6 +372,34 @@ pub(crate) fn transition_status_on(
             params![&to as &dyn ToSql, id, &from as &dyn ToSql],
         )?
     };
+    if changed == 0 {
+        return Err(Error::QueryReturnedNoRows);
+    }
+    Ok(())
+}
+
+/// Flips `id` from `Draft` to `Failed` and records `error` on it in one
+/// statement (#208): a failed extraction otherwise leaves the checkpoint
+/// stuck in `Draft`/`extracting` forever, since `run_extraction_job`
+/// swallows its error and the trigger treats any pending draft as a reason
+/// not to queue another. `QueryReturnedNoRows` if `id` is unknown *or* its
+/// status is no longer `Draft` (checked via `changes() == 0`, the same
+/// conditional-update pattern [`transition_status_on`] uses) — a lost race
+/// against a concurrent commit or discard, or against `fill_draft`'s own
+/// discard of the same row for a content reason (empty range, unparseable
+/// output, over-budget overlay), all of which already left the row
+/// terminal. Callers treat that case as a no-op, not an error: the row
+/// reached *some* terminal state either way.
+pub(crate) fn fail_draft_on(con: &Connection, id: i64, error: &str) -> Result<()> {
+    let changed = con.execute(
+        "UPDATE compactions SET status = ?, extraction_error = ? WHERE id = ? AND status = ?",
+        params![
+            &CompactionStatus::Failed as &dyn ToSql,
+            error,
+            id,
+            &CompactionStatus::Draft as &dyn ToSql
+        ],
+    )?;
     if changed == 0 {
         return Err(Error::QueryReturnedNoRows);
     }
@@ -843,6 +903,14 @@ pub trait CompactionStore {
         attitude_ratings: Option<String>,
     ) -> Result<()>;
 
+    /// Flips `id` from `Draft` to `Failed`, recording `error` (#208):
+    /// `extract::fail_pending_draft` calls this for every extraction
+    /// failure that did not already leave the row in some other terminal
+    /// state itself. `QueryReturnedNoRows` if `id` is unknown or its status
+    /// is no longer `Draft` — see [`fail_draft_on`] for why that is treated
+    /// as a lost race, not an error.
+    fn fail_draft(&self, id: i64, error: &str) -> Result<()>;
+
     /// One transaction, ids in input order; `SqliteFailure(ConstraintViolation)`
     /// if the checkpoint does not exist. Writes `replaces`, `relation_to`,
     /// and `relation` exactly as given; it does not touch the rows named
@@ -983,6 +1051,11 @@ impl CompactionStore for SqliteCompactionStore {
     ) -> Result<()> {
         let con = Database::open()?;
         set_extraction_result_on(&con, id, raw_model_output, summary, attitude_ratings)
+    }
+
+    fn fail_draft(&self, id: i64, error: &str) -> Result<()> {
+        let con = Database::open()?;
+        fail_draft_on(&con, id, error)
     }
 
     fn insert_facts(&self, compaction_id: i64, facts: &[FactDraft]) -> Result<Vec<i64>> {
@@ -1143,6 +1216,7 @@ impl CompactionStore for RecordingStore {
             needs_merge: false,
             created_at: get_current_date(),
             committed_at: None,
+            extraction_error: None,
         });
         Ok(id)
     }
@@ -1286,6 +1360,20 @@ impl CompactionStore for RecordingStore {
         checkpoint.raw_model_output = raw_model_output;
         checkpoint.summary = summary;
         checkpoint.attitude_ratings = attitude_ratings;
+        Ok(())
+    }
+
+    fn fail_draft(&self, id: i64, error: &str) -> Result<()> {
+        let mut checkpoints = self.checkpoints.lock().unwrap();
+        let checkpoint = checkpoints
+            .iter_mut()
+            .find(|c| c.id == id)
+            .ok_or(Error::QueryReturnedNoRows)?;
+        if checkpoint.status != CompactionStatus::Draft {
+            return Err(Error::QueryReturnedNoRows);
+        }
+        checkpoint.status = CompactionStatus::Failed;
+        checkpoint.extraction_error = Some(error.to_string());
         Ok(())
     }
 
@@ -1655,6 +1743,130 @@ mod tests {
 
         let err = set_extraction_result_on(&con, 999, None, None, None).unwrap_err();
         assert!(matches!(err, Error::QueryReturnedNoRows));
+    }
+
+    #[test]
+    fn fail_draft_on_flips_a_pending_draft_to_failed_with_its_reason() {
+        let (_dir, con) = fresh_db();
+        let id = insert_draft_on(&con, &a_draft()).unwrap();
+
+        fail_draft_on(&con, id, "model load failed").unwrap();
+
+        let checkpoint = get_checkpoint_on(&con, id).unwrap().unwrap();
+        assert_eq!(checkpoint.status, CompactionStatus::Failed);
+        assert_eq!(
+            checkpoint.extraction_error.as_deref(),
+            Some("model load failed")
+        );
+        // A failed draft must not still read as pending, or the trigger
+        // stays wedged (#208's actual bug).
+        assert!(pending_draft_on(&con, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn fail_draft_on_an_unknown_id_is_query_returned_no_rows() {
+        let (_dir, con) = fresh_db();
+        let err = fail_draft_on(&con, 999, "boom").unwrap_err();
+        assert!(matches!(err, Error::QueryReturnedNoRows));
+    }
+
+    #[test]
+    fn fail_draft_on_loses_the_race_against_a_draft_already_moved_on() {
+        // Simulates a concurrent commit/discard (or `fill_draft`'s own
+        // content-reason discard) landing before this call: the conditional
+        // `WHERE status = 'draft'` must reject the write instead of
+        // clobbering whatever terminal state the row already reached.
+        let (_dir, con) = fresh_db();
+        let id = insert_draft_on(&con, &a_draft()).unwrap();
+        update_status_on(&con, id, CompactionStatus::Discarded).unwrap();
+
+        let err = fail_draft_on(&con, id, "too late").unwrap_err();
+        assert!(matches!(err, Error::QueryReturnedNoRows));
+
+        // The row must be left exactly as the concurrent write left it --
+        // still `Discarded`, no `extraction_error` written.
+        let checkpoint = get_checkpoint_on(&con, id).unwrap().unwrap();
+        assert_eq!(checkpoint.status, CompactionStatus::Discarded);
+        assert_eq!(checkpoint.extraction_error, None);
+    }
+
+    #[test]
+    fn migrate_add_extraction_error_adds_the_column_to_a_table_that_predates_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        con.execute(crate::database::messages_ddl(), []).unwrap();
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS companion (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                persona TEXT,
+                example_dialogue TEXT,
+                first_message TEXT,
+                long_term_mem INTEGER,
+                short_term_mem INTEGER,
+                roleplay BOOLEAN,
+                dialogue_tuning BOOLEAN,
+                avatar_path TEXT,
+                compacted_through INTEGER
+            )",
+            [],
+        )
+        .unwrap();
+        // The pre-#208 shape: every `create_tables` column except
+        // `extraction_error`.
+        con.execute(
+            "CREATE TABLE compactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                companion_id INTEGER NOT NULL REFERENCES companion(id) ON DELETE CASCADE,
+                from_message_id INTEGER NOT NULL,
+                through_message_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                trigger TEXT NOT NULL,
+                raw_model_output TEXT,
+                summary TEXT,
+                rolling_summary TEXT,
+                attitude_ratings TEXT,
+                needs_merge INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                committed_at TEXT
+            )",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO companion (id, name, persona, example_dialogue, first_message, long_term_mem, short_term_mem, roleplay, dialogue_tuning, avatar_path) VALUES (1, 'Test', '', '', '', 0, 0, 0, 0, '')",
+            [],
+        )
+        .unwrap();
+
+        let old_shape_id = insert_draft_on(&con, &a_draft()).unwrap();
+
+        migrate_add_extraction_error(&con).unwrap();
+
+        // Pre-existing rows read back with `extraction_error = NULL`, not
+        // an error -- the column addition must not disturb them.
+        let checkpoint = get_checkpoint_on(&con, old_shape_id).unwrap().unwrap();
+        assert_eq!(checkpoint.extraction_error, None);
+
+        // `fail_draft_on` -- which needs the column -- now works.
+        fail_draft_on(&con, old_shape_id, "boom").unwrap();
+        let checkpoint = get_checkpoint_on(&con, old_shape_id).unwrap().unwrap();
+        assert_eq!(checkpoint.status, CompactionStatus::Failed);
+        assert_eq!(checkpoint.extraction_error.as_deref(), Some("boom"));
+
+        // Idempotent: running it again against a table that already has
+        // the column must not error.
+        migrate_add_extraction_error(&con).unwrap();
+    }
+
+    #[test]
+    fn migrate_add_extraction_error_on_a_fresh_table_is_a_no_op() {
+        // `create_tables` already includes the column on a brand-new
+        // database; the migration must recognise that and do nothing.
+        let (_dir, con) = fresh_db();
+        migrate_add_extraction_error(&con).unwrap();
+        let id = insert_draft_on(&con, &a_draft()).unwrap();
+        fail_draft_on(&con, id, "boom").unwrap();
     }
 
     #[test]

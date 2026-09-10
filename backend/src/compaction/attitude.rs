@@ -442,6 +442,7 @@ mod tests {
             needs_merge: false,
             created_at: "now".to_string(),
             committed_at: Some("now".to_string()),
+            extraction_error: None,
         }
     }
 
