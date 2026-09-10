@@ -1454,6 +1454,37 @@ impl Database {
         Ok(row)
     }
 
+    /// Every message with `from_message_id <= id <= through_message_id`,
+    /// ordered by id. What a `compactions` row's range actually covers;
+    /// callers convert each row to `compaction::MessageRef` via `From`,
+    /// which drops `created_at` before it reaches the pure compaction
+    /// modules.
+    #[allow(dead_code)] // wired up by #172's range.rs
+    pub fn get_messages_between(
+        from_message_id: i32,
+        through_message_id: i32,
+    ) -> Result<Vec<Message>> {
+        let con = Self::open()?;
+        Self::get_messages_between_on(&con, from_message_id, through_message_id)
+    }
+
+    /// Testable half of `get_messages_between`, taking a caller-provided
+    /// connection so tests can point it at a `TempDir`-backed database
+    /// instead of the hardwired `paths::db_path()`, mirroring
+    /// `insert_message_on`.
+    #[allow(dead_code)] // wired up by #172's range.rs
+    fn get_messages_between_on(
+        con: &Connection,
+        from_message_id: i32,
+        through_message_id: i32,
+    ) -> Result<Vec<Message>> {
+        let mut stmt = con.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE id >= ? AND id <= ? ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([from_message_id, through_message_id], message_from_row)?;
+        rows.collect()
+    }
+
     /// Inserts `message` and returns the new row's id — what #131's
     /// `TurnStore::insert_reply` puts on `PersistedReply::message_id`.
     pub fn insert_message(message: NewMessage) -> Result<i32, Error> {
@@ -6006,6 +6037,32 @@ mod tests {
             rows,
             vec![(false, "user".to_string()), (true, "bot1".to_string())]
         );
+    }
+
+    #[test]
+    fn get_messages_between_on_is_inclusive_and_ordered_by_id() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        for i in 1..=5 {
+            insert_message_row(&con, USER_SPEAKER_ID, &format!("message {i}"));
+        }
+
+        let messages = Database::get_messages_between_on(&con, 2, 4).unwrap();
+        let ids: Vec<i32> = messages.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn get_messages_between_on_an_empty_range_is_an_empty_vec() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        insert_message_row(&con, USER_SPEAKER_ID, "hi");
+
+        assert!(Database::get_messages_between_on(&con, 100, 200)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
