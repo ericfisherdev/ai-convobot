@@ -3,6 +3,7 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { Message } from '../message/Message'
 import { MessagesProvider } from '../context/messageContext'
+import { CompactionProvider } from '../context/compactionContext'
 import { UserDataProvider } from '../context/userContext'
 import { CompanionDataProvider } from '../context/companionContext'
 import { ConfigProvider } from '../context/configContext'
@@ -19,17 +20,22 @@ vi.mock('sonner', () => ({
   },
 }))
 
+// `PinButton` reads `useCompaction()`, which reads `useMessages()` (for
+// `refreshMessages` on a successful pin/unpin), so `CompactionProvider` must
+// sit inside `MessagesProvider`, matching `App.tsx`'s nesting order.
 const MockProviders: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   <MessagesProvider>
-    <UserDataProvider>
-      <CompanionDataProvider>
-        <ConfigProvider>
-          <ParticipantsProvider>
-            {children}
-          </ParticipantsProvider>
-        </ConfigProvider>
-      </CompanionDataProvider>
-    </UserDataProvider>
+    <CompactionProvider>
+      <UserDataProvider>
+        <CompanionDataProvider>
+          <ConfigProvider>
+            <ParticipantsProvider>
+              {children}
+            </ParticipantsProvider>
+          </ConfigProvider>
+        </CompanionDataProvider>
+      </UserDataProvider>
+    </CompactionProvider>
   </MessagesProvider>
 )
 
@@ -51,7 +57,7 @@ describe('Message Component', () => {
   it('renders user message correctly', async () => {
     render(
       <MockProviders>
-        <Message received={false} regenerate={false} id={1} content="Hello, this is a test message" created_at="2024-01-15 10:30" speakerId="user" />
+        <Message received={false} regenerate={false} id={1} content="Hello, this is a test message" created_at="2024-01-15 10:30" speakerId="user" pinned={false} />
       </MockProviders>
     )
 
@@ -62,7 +68,7 @@ describe('Message Component', () => {
   it('renders AI message correctly', async () => {
     render(
       <MockProviders>
-        <Message received={true} regenerate={false} id={2} content="Hello! How can I help you today?" created_at="2024-01-15 10:31" speakerId="char" />
+        <Message received={true} regenerate={false} id={2} content="Hello! How can I help you today?" created_at="2024-01-15 10:31" speakerId="char" pinned={false} />
       </MockProviders>
     )
 
@@ -72,7 +78,7 @@ describe('Message Component', () => {
   it('displays edit and delete buttons for messages', async () => {
     render(
       <MockProviders>
-        <Message received={false} regenerate={false} id={1} content="Hello, this is a test message" created_at="2024-01-15 10:30" speakerId="user" />
+        <Message received={false} regenerate={false} id={1} content="Hello, this is a test message" created_at="2024-01-15 10:30" speakerId="user" pinned={false} />
       </MockProviders>
     )
 
@@ -85,7 +91,7 @@ describe('Message Component', () => {
   it('shows markdown content correctly', async () => {
     render(
       <MockProviders>
-        <Message received={true} regenerate={false} id={3} content="**Bold text** and *italic text*" created_at="2024-01-15 10:32" speakerId="char" />
+        <Message received={true} regenerate={false} id={3} content="**Bold text** and *italic text*" created_at="2024-01-15 10:32" speakerId="char" pinned={false} />
       </MockProviders>
     )
 
@@ -96,7 +102,7 @@ describe('Message Component', () => {
   it('renders the regenerate control on a trailing AI message', async () => {
     render(
       <MockProviders>
-        <Message received={true} regenerate={true} id={4} content="Hello! How can I help you today?" created_at="2024-01-15 10:33" speakerId="char" />
+        <Message received={true} regenerate={true} id={4} content="Hello! How can I help you today?" created_at="2024-01-15 10:33" speakerId="char" pinned={false} />
       </MockProviders>
     )
 
@@ -107,7 +113,7 @@ describe('Message Component', () => {
   it('never renders the regenerate control on a user message', async () => {
     render(
       <MockProviders>
-        <Message received={false} regenerate={true} id={5} content="Hello, this is a test message" created_at="2024-01-15 10:34" speakerId="user" />
+        <Message received={false} regenerate={true} id={5} content="Hello, this is a test message" created_at="2024-01-15 10:34" speakerId="user" pinned={false} />
       </MockProviders>
     )
 
@@ -120,7 +126,7 @@ describe('Message Component', () => {
 
     render(
       <MockProviders>
-        <Message received={true} regenerate={false} id={2} content="Hello! How can I help you today?" created_at="2024-01-15 10:31" speakerId="char" />
+        <Message received={true} regenerate={false} id={2} content="Hello! How can I help you today?" created_at="2024-01-15 10:31" speakerId="char" pinned={false} />
       </MockProviders>
     )
 
@@ -143,7 +149,7 @@ describe('Message Component', () => {
 
     render(
       <MockProviders>
-        <Message received={false} regenerate={false} id={1} content="Hello, this is a test message" created_at="2024-01-15 10:30" speakerId="user" />
+        <Message received={false} regenerate={false} id={1} content="Hello, this is a test message" created_at="2024-01-15 10:30" speakerId="user" pinned={false} />
       </MockProviders>
     )
 
@@ -180,7 +186,7 @@ describe('Message Component', () => {
 
     render(
       <MockProviders>
-        <Message received={true} regenerate={false} id={6} content="hi from bot1" created_at="2024-01-15 10:35" speakerId="bot1" />
+        <Message received={true} regenerate={false} id={6} content="hi from bot1" created_at="2024-01-15 10:35" speakerId="bot1" pinned={false} />
       </MockProviders>
     )
 
@@ -191,7 +197,7 @@ describe('Message Component', () => {
   it('renders a system message as a centred notice with no action buttons', async () => {
     render(
       <MockProviders>
-        <Message received={true} regenerate={false} id={7} content="bot1 did not respond" created_at="2024-01-15 10:36" speakerId="system" />
+        <Message received={true} regenerate={false} id={7} content="bot1 did not respond" created_at="2024-01-15 10:36" speakerId="system" pinned={false} />
       </MockProviders>
     )
 
@@ -211,6 +217,7 @@ describe('Message Component', () => {
           content="hi from bot1"
           created_at="2024-01-15 10:37"
           speakerId="bot1"
+          pinned={false}
         />
       </MockProviders>
     )
@@ -230,7 +237,7 @@ describe('Message Component', () => {
 
     render(
       <MockProviders>
-        <Message received={true} regenerate={true} id={11} content="hi from bot1" created_at="2024-01-15 10:40" speakerId="bot1" />
+        <Message received={true} regenerate={true} id={11} content="hi from bot1" created_at="2024-01-15 10:40" speakerId="bot1" pinned={false} />
       </MockProviders>
     )
 
@@ -255,7 +262,7 @@ describe('Message Component', () => {
 
     render(
       <MockProviders>
-        <Message received={true} regenerate={true} id={12} content="hi from bot1" created_at="2024-01-15 10:41" speakerId="bot1" />
+        <Message received={true} regenerate={true} id={12} content="hi from bot1" created_at="2024-01-15 10:41" speakerId="bot1" pinned={false} />
       </MockProviders>
     )
 
@@ -266,7 +273,7 @@ describe('Message Component', () => {
   it('never renders the regenerate control on a trailing system notice, even if the caller passes regenerate true', async () => {
     render(
       <MockProviders>
-        <Message received={true} regenerate={true} id={9} content="bot1 did not respond" created_at="2024-01-15 10:38" speakerId="system" />
+        <Message received={true} regenerate={true} id={9} content="bot1 did not respond" created_at="2024-01-15 10:38" speakerId="system" pinned={false} />
       </MockProviders>
     )
 
@@ -289,7 +296,7 @@ describe('Message Component', () => {
     const user = userEvent.setup()
     render(
       <MockProviders>
-        <Message received={true} regenerate={true} id={10} content="hi from bot1" created_at="2024-01-15 10:39" speakerId="bot1" />
+        <Message received={true} regenerate={true} id={10} content="hi from bot1" created_at="2024-01-15 10:39" speakerId="bot1" pinned={false} />
       </MockProviders>
     )
 
@@ -300,5 +307,77 @@ describe('Message Component', () => {
     await waitFor(() => expect(mockError).toHaveBeenCalled())
     const lastCall = mockError.mock.calls[mockError.mock.calls.length - 1]
     expect(lastCall[0]).toBe('bot1 is not connected, so its reply cannot be regenerated')
+  })
+
+  it('pinning a message POSTs to its pin endpoint', async () => {
+    const user = userEvent.setup()
+    render(
+      <MockProviders>
+        <Message received={false} regenerate={false} id={1} content="Hello, this is a test message" created_at="2024-01-15 10:30" speakerId="user" pinned={false} />
+      </MockProviders>
+    )
+
+    await screen.findByText('Hello, this is a test message')
+    await user.click(screen.getByRole('button', { name: 'Pin message' }))
+
+    const mockFetch = fetch as unknown as ReturnType<typeof vi.fn>
+    await waitFor(() => {
+      const postCalls = mockFetch.mock.calls.filter(call => call[1]?.method === 'POST')
+      expect(postCalls.length).toBeGreaterThan(0)
+    })
+    const postCalls = mockFetch.mock.calls.filter(call => call[1]?.method === 'POST')
+    const lastPostCall = postCalls[postCalls.length - 1]
+    expect(lastPostCall[0]).toBe('/api/message/1/pin')
+  })
+
+  it('unpinning a message DELETEs its pin endpoint', async () => {
+    const user = userEvent.setup()
+    render(
+      <MockProviders>
+        <Message received={false} regenerate={false} id={1} content="Hello, this is a test message" created_at="2024-01-15 10:30" speakerId="user" pinned={true} />
+      </MockProviders>
+    )
+
+    await screen.findByText('Hello, this is a test message')
+    await user.click(screen.getByRole('button', { name: 'Unpin message' }))
+
+    const mockFetch = fetch as unknown as ReturnType<typeof vi.fn>
+    await waitFor(() => {
+      const deleteCalls = mockFetch.mock.calls.filter(call => call[1]?.method === 'DELETE' && call[0] === '/api/message/1/pin')
+      expect(deleteCalls.length).toBeGreaterThan(0)
+    })
+  })
+
+  it('renders a pin marker in the header when the message is pinned', async () => {
+    render(
+      <MockProviders>
+        <Message received={true} regenerate={false} id={2} content="Hello! How can I help you today?" created_at="2024-01-15 10:31" speakerId="char" pinned={true} />
+      </MockProviders>
+    )
+
+    await screen.findByText('Hello! How can I help you today?')
+    expect(screen.getByLabelText('Pinned')).toBeInTheDocument()
+  })
+
+  it('does not render a pin marker when the message is not pinned', async () => {
+    render(
+      <MockProviders>
+        <Message received={true} regenerate={false} id={2} content="Hello! How can I help you today?" created_at="2024-01-15 10:31" speakerId="char" pinned={false} />
+      </MockProviders>
+    )
+
+    await screen.findByText('Hello! How can I help you today?')
+    expect(screen.queryByLabelText('Pinned')).not.toBeInTheDocument()
+  })
+
+  it('renders a system message with no pin button', async () => {
+    render(
+      <MockProviders>
+        <Message received={true} regenerate={false} id={7} content="bot1 did not respond" created_at="2024-01-15 10:36" speakerId="system" pinned={false} />
+      </MockProviders>
+    )
+
+    await screen.findByText('bot1 did not respond')
+    expect(screen.queryByRole('button', { name: 'Pin message' })).not.toBeInTheDocument()
   })
 })

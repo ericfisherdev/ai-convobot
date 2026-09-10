@@ -1,5 +1,5 @@
 import { Avatar, AvatarFallback, AvatarImage } from "../ui/avatar";
-import { Pencil, RotateCw, ThumbsUp, Trash2, Smile, Check, CheckCheck } from "lucide-react";
+import { Pencil, RotateCw, ThumbsUp, Trash2, Smile, Check, CheckCheck, Pin } from "lucide-react";
 import { useUserData } from "../context/userContext";
 import { useCompanionData } from "../context/companionContext";
 import { useParticipants } from "../context/participantsContext";
@@ -16,6 +16,7 @@ import { toast } from "sonner";
 import { MessageEdit } from "../interfaces/MessageEdit";
 import { MessageMarkdown } from "./MessageMarkdown";
 import { resolveSpeaker } from "./speakerResolution";
+import { PinButton } from "./PinButton";
 
 /// Shared by `UserMessage.handleSave` and `AiMessage.handleSave`: an edit
 /// only ever changes text, so the request body carries no role flag and
@@ -34,6 +35,9 @@ interface MessageProps {
   regenerate: boolean;
   content: string;
   created_at: string;
+  // Whether this message is exempt from compaction (#179's
+  // `MessageInterface.pinned`).
+  pinned: boolean;
 }
 
 interface MessageScrollProps extends MessageProps {
@@ -44,7 +48,7 @@ interface MessageScrollProps extends MessageProps {
   speakerId: string;
 }
 
-const UserMessage = ({ id, content, created_at }: MessageProps) => {
+const UserMessage = ({ id, content, created_at, pinned }: MessageProps) => {
   const userDataContext = useUserData();
   const userData: UserData = userDataContext?.userData ?? {} as UserData;
 
@@ -112,6 +116,7 @@ const UserMessage = ({ id, content, created_at }: MessageProps) => {
         <div className="message-info flex items-center gap-2">
           <span className="font-medium text-sm">{userData.name || "User"}</span>
           <span className="text-xs opacity-50">{formatMessageDate(created_at)}</span>
+          {pinned && <Pin className="w-3 h-3 opacity-70" aria-label="Pinned" />}
         </div>
         <div className="message-actions flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
           {editing ? (
@@ -136,6 +141,7 @@ const UserMessage = ({ id, content, created_at }: MessageProps) => {
                   </TooltipContent>
                 </Tooltip>
               </TooltipProvider>
+              <PinButton messageId={id} pinned={pinned} />
               <TooltipProvider delayDuration={250}>
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -252,7 +258,7 @@ interface AiMessageProps extends MessageProps {
   avatarUrl: string;
 }
 
-const AiMessage = ({ id, content, created_at, regenerate: regenerateProp, displayName, avatarUrl }: AiMessageProps) => {
+const AiMessage = ({ id, content, created_at, regenerate: regenerateProp, displayName, avatarUrl, pinned }: AiMessageProps) => {
   const { refreshMessages } = useMessages();
   const configDataContext = useConfigData();
   // `ConfigProvider` starts with `config: null` until its fetch resolves;
@@ -393,6 +399,7 @@ const AiMessage = ({ id, content, created_at, regenerate: regenerateProp, displa
           </Avatar>
           <span className="font-medium text-sm">{displayName}</span>
           <span className="text-xs opacity-50">{formatMessageDate(created_at)}</span>
+          {pinned && <Pin className="w-3 h-3 opacity-70" aria-label="Pinned" />}
           {isTyping && (
             <span className="text-xs text-muted-foreground italic animate-pulse">
               is typing...
@@ -438,6 +445,7 @@ const AiMessage = ({ id, content, created_at, regenerate: regenerateProp, displa
                   </TooltipContent>
                 </Tooltip>
               </TooltipProvider>
+              <PinButton messageId={id} pinned={pinned} />
               {regenerate &&
                 <TooltipProvider delayDuration={250}>
                   <Tooltip>
@@ -598,7 +606,7 @@ const SystemNotice = ({ content, created_at }: { content: string; created_at: st
   </div>
 );
 
-export function Message({ regenerate, id, content, created_at, speakerId }: MessageScrollProps) {
+export function Message({ regenerate, id, content, created_at, speakerId, pinned }: MessageScrollProps) {
   const { participants } = useParticipants();
   const userDataContext = useUserData();
   const companionDataContext = useCompanionData();
@@ -611,7 +619,7 @@ export function Message({ regenerate, id, content, created_at, speakerId }: Mess
 
   switch (resolved.kind) {
     case 'user':
-      return <UserMessage key={id} content={content} id={id} created_at={created_at} regenerate={false} />;
+      return <UserMessage key={id} content={content} id={id} created_at={created_at} regenerate={false} pinned={pinned} />;
     case 'system':
       return <SystemNotice key={id} content={content} created_at={created_at} />;
     default:
@@ -624,6 +632,7 @@ export function Message({ regenerate, id, content, created_at, speakerId }: Mess
           regenerate={regenerate}
           displayName={resolved.displayName}
           avatarUrl={resolved.avatarUrl ?? ''}
+          pinned={pinned}
         />
       );
   }

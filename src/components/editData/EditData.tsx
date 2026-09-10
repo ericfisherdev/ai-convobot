@@ -48,6 +48,7 @@ import { DirectoryManager } from "../llm/DirectoryManager"
 import { LlmModelSelector } from "../llm/LlmModelSelector"
 import { ModelList } from "../llm/ModelList"
 import { MultiplayerSettings } from "./MultiplayerSettings"
+import { MemorySettings } from "./MemorySettings"
 
 export function EditData() {
   const companionDataContext = useCompanionData();
@@ -364,12 +365,13 @@ export function EditData() {
 
   return (
     <Tabs defaultValue="companion" className="w-full max-h-[65vh] overflow-y-auto">
-      <TabsList className="grid w-full grid-cols-6">
+      <TabsList className="grid w-full grid-cols-7">
         <TabsTrigger value="companion">Companion</TabsTrigger>
         <TabsTrigger value="user">User</TabsTrigger>
         <TabsTrigger value="attitudes">Attitudes</TabsTrigger>
         <TabsTrigger value="theme">Theme</TabsTrigger>
         <TabsTrigger value="config">Config</TabsTrigger>
+        <TabsTrigger value="memory">Memory</TabsTrigger>
         <TabsTrigger value="multiplayer">Multiplayer</TabsTrigger>
       </TabsList>
       <TabsContent value="companion">
@@ -1037,6 +1039,27 @@ export function EditData() {
                 </div>
               </div>
             </div>
+          </CardContent>
+          <CardFooter className="flex justify-center">
+            <Button onClick={async () => {
+                const saved = await handleConfigSave();
+                if (saved) {
+                  configContext?.refreshConfigData();
+                }
+              }}>Save changes</Button>
+          </CardFooter>
+        </Card>
+      </TabsContent>
+      <TabsContent value="memory">
+        <Card className="bg-background border-none shadow-none">
+          <CardHeader>
+            <CardTitle>Memory</CardTitle>
+            <CardDescription>
+              Configure how the conversation is compacted into long-term memory
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-6">
+            <MemorySettings config={configFormData} onChange={setConfigFormData} />
           </CardContent>
           <CardFooter className="flex justify-center">
             <Button onClick={async () => {

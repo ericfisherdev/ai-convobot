@@ -3,16 +3,34 @@ import { ModelInfo } from '../interfaces/Config';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../ui/select';
 import { Label } from '../ui/label';
 
+// The `Select`'s internal value for "no model chosen" when `allowNone` is
+// set — Radix `Select.Item` rejects an empty-string value, so this stands in
+// for it and `onModelSelect` receives `''` instead (the same "blank means
+// unset" convention `MemorySettings` uses for `compact_threshold_tokens`).
+const NONE_VALUE = '__none__';
+
 interface LlmModelSelectorProps {
     selectedModel: string | undefined;
     onModelSelect: (modelPath: string) => void;
     refreshTrigger?: number;
+    /** Defaults to `"model-select"`; set to disambiguate multiple pickers on one page. */
+    id?: string;
+    /** Defaults to `"Select LLM Model"`. */
+    label?: string;
+    /** When set, only models matching this predicate are listed. */
+    filter?: (model: ModelInfo) => boolean;
+    /** Adds a leading "Same as chat model" option; selecting it calls `onModelSelect('')`. */
+    allowNone?: boolean;
 }
 
 export const LlmModelSelector: React.FC<LlmModelSelectorProps> = ({
     selectedModel,
     onModelSelect,
-    refreshTrigger
+    refreshTrigger,
+    id = 'model-select',
+    label = 'Select LLM Model',
+    filter,
+    allowNone = false,
 }) => {
     const [models, setModels] = useState<ModelInfo[]>([]);
     const [loading, setLoading] = useState(false);
@@ -47,9 +65,11 @@ export const LlmModelSelector: React.FC<LlmModelSelectorProps> = ({
         return `${mb.toFixed(2)} MB`;
     };
 
+    const visibleModels = filter ? models.filter(filter) : models;
+
     const groupModelsByDirectory = () => {
         const grouped: { [key: string]: ModelInfo[] } = {};
-        models.forEach(model => {
+        visibleModels.forEach(model => {
             if (!grouped[model.directory]) {
                 grouped[model.directory] = [];
             }
@@ -60,19 +80,26 @@ export const LlmModelSelector: React.FC<LlmModelSelectorProps> = ({
 
     const groupedModels = groupModelsByDirectory();
 
+    const handleValueChange = (value: string) => {
+        onModelSelect(value === NONE_VALUE ? '' : value);
+    };
+
     return (
         <div className="space-y-2">
-            <Label htmlFor="model-select">Select LLM Model</Label>
+            <Label htmlFor={id}>{label}</Label>
             <Select
-                value={selectedModel || ''}
-                onValueChange={onModelSelect}
+                value={selectedModel || (allowNone ? NONE_VALUE : '')}
+                onValueChange={handleValueChange}
                 disabled={loading}
             >
-                <SelectTrigger id="model-select">
+                <SelectTrigger id={id}>
                     <SelectValue placeholder={loading ? "Loading models..." : "Select a model"} />
                 </SelectTrigger>
                 <SelectContent>
-                    {models.length === 0 && !loading ? (
+                    {allowNone && (
+                        <SelectItem value={NONE_VALUE}>Same as chat model</SelectItem>
+                    )}
+                    {visibleModels.length === 0 && !loading ? (
                         <div className="px-2 py-1.5 text-sm text-muted-foreground">
                             No models found
                         </div>
