@@ -4145,14 +4145,6 @@ async fn main() -> std::io::Result<()> {
                 companion_id,
                 initial_compacted_through,
             )));
-            let extraction_handle = handle.clone();
-            let extraction_job: crate::multiplayer::joiner_compaction::JoinerExtractionJob =
-                Arc::new(move |request| {
-                    crate::multiplayer::joiner_compaction::run_joiner_extraction(
-                        &extraction_handle,
-                        request,
-                    );
-                });
             actix_web::rt::spawn(crate::multiplayer::joiner::run(
                 handle.clone(),
                 identity,
@@ -4161,7 +4153,6 @@ async fn main() -> std::io::Result<()> {
                     self_id,
                     handle.clone(),
                 )),
-                extraction_job,
             ));
             Some(web::Data::new(handle))
         } else {

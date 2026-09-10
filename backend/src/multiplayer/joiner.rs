@@ -20,7 +20,6 @@ use tokio_tungstenite::{connect_async, tungstenite};
 use crate::database::{CompanionView, ConfigView, Message};
 use crate::multiplayer::backoff::ReconnectBackoff;
 use crate::multiplayer::handshake;
-use crate::multiplayer::joiner_compaction::{maybe_queue_extraction, JoinerExtractionJob};
 use crate::multiplayer::protocol::{
     AvatarUpload, ClientFrame, ContinuityPayload, ParticipantSummary, RejectReason, ServerFrame,
     PROTOCOL_VERSION,
@@ -259,7 +258,6 @@ pub async fn run(
     handle: JoinerHandle,
     identity: JoinerIdentity,
     generation: Arc<dyn GenerateRequestHandler>,
-    extraction: JoinerExtractionJob,
 ) {
     let mut backoff = ReconnectBackoff::new();
     loop {
@@ -269,7 +267,7 @@ pub async fn run(
             shared.attempts += 1;
         }
 
-        match connect_and_serve(&handle, &identity, &generation, &extraction, &mut backoff).await {
+        match connect_and_serve(&handle, &identity, &generation, &mut backoff).await {
             Err(ConnectError::Rejected(reason)) => {
                 let mut shared = handle.write().unwrap_or_else(|p| p.into_inner());
                 shared.state = JoinerState::Rejected {
@@ -300,7 +298,6 @@ async fn connect_and_serve(
     handle: &JoinerHandle,
     identity: &JoinerIdentity,
     generation: &Arc<dyn GenerateRequestHandler>,
-    extraction: &JoinerExtractionJob,
     backoff: &mut ReconnectBackoff,
 ) -> Result<(), ConnectError> {
     let url = format!("ws://{}/api/multiplayer/ws", identity.host_address);
@@ -364,7 +361,7 @@ async fn connect_and_serve(
     }
     backoff.reset();
 
-    let result = serve(handle, &mut read, generation, extraction, &tx).await;
+    let result = serve(handle, &mut read, generation, &tx).await;
 
     drop(tx);
     let _ = writer_task.await;
@@ -470,7 +467,6 @@ async fn serve(
     handle: &JoinerHandle,
     read: &mut (impl Stream<Item = Result<WsMessage, tungstenite::Error>> + Unpin),
     generation: &Arc<dyn GenerateRequestHandler>,
-    extraction: &JoinerExtractionJob,
     tx: &UnboundedSender<ClientFrame>,
 ) -> Result<(), ConnectError> {
     loop {
@@ -509,11 +505,16 @@ async fn serve(
                     // `Some` on every request (`ContinuityPayload`'s own
                     // doc comment); a stray `None` would only ever be a
                     // protocol anomaly, not a real "compaction was undone".
+                    // `generation.handle` (#186's `LocalModelGeneration`)
+                    // reads this back off `handle` itself, once its own
+                    // reply is done, to decide whether to also run this
+                    // joiner's own auto-extraction — never here, and never
+                    // before the reply: see its own doc comment for why
+                    // that ordering matters.
                     if continuity.is_some() {
                         let mut shared = handle.write().unwrap_or_else(|p| p.into_inner());
                         shared.last_continuity = continuity.clone();
                     }
-                    maybe_queue_extraction(handle, extraction, continuity.as_ref());
                     generation.handle(round_id, transcript, tx.clone());
                 }
                 Ok(other) => {
@@ -652,13 +653,12 @@ mod tests {
 
         let mut backoff = ReconnectBackoff::new();
         let generation: Arc<dyn GenerateRequestHandler> = Arc::new(NoopGeneration);
-        let extraction = crate::multiplayer::joiner_compaction::noop_job();
         // The server closes right after `Joined`, so `connect_and_serve`
         // returns as soon as the serve loop sees the close. Only `run`'s
         // outer loop moves the state back to `Disconnected` on that `Ok`
         // return; called directly like this, `connect_and_serve` leaves the
         // state at whatever the handshake last set it to (`Connected`).
-        let _ = connect_and_serve(&handle, &identity, &generation, &extraction, &mut backoff).await;
+        let _ = connect_and_serve(&handle, &identity, &generation, &mut backoff).await;
         server.await.unwrap();
 
         let shared = handle.read().unwrap();
@@ -699,12 +699,11 @@ mod tests {
         });
 
         let generation: Arc<dyn GenerateRequestHandler> = Arc::new(NoopGeneration);
-        let extraction = crate::multiplayer::joiner_compaction::noop_job();
         // Bounded so a retry regression fails this test (`run` never
         // returning) instead of hanging the suite.
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            run(handle.clone(), identity, generation, extraction),
+            run(handle.clone(), identity, generation),
         )
         .await;
         server.abort();
@@ -759,9 +758,8 @@ mod tests {
         });
 
         let generation: Arc<dyn GenerateRequestHandler> = Arc::new(NoopGeneration);
-        let extraction = crate::multiplayer::joiner_compaction::noop_job();
         let run_handle = handle.clone();
-        tokio::spawn(run(run_handle, identity, generation, extraction));
+        tokio::spawn(run(run_handle, identity, generation));
 
         // `ReconnectBackoff::INITIAL` (1s) delays the second attempt, so
         // this polls rather than sleeping a single fixed duration up
@@ -860,8 +858,7 @@ mod tests {
 
         let mut backoff = ReconnectBackoff::new();
         let generation: Arc<dyn GenerateRequestHandler> = Arc::new(FixedReplyGeneration);
-        let extraction = crate::multiplayer::joiner_compaction::noop_job();
-        let _ = connect_and_serve(&handle, &identity, &generation, &extraction, &mut backoff).await;
+        let _ = connect_and_serve(&handle, &identity, &generation, &mut backoff).await;
         server.await.unwrap();
     }
 
@@ -924,8 +921,7 @@ mod tests {
 
         let mut backoff = ReconnectBackoff::new();
         let generation: Arc<dyn GenerateRequestHandler> = Arc::new(NoopGeneration);
-        let extraction = crate::multiplayer::joiner_compaction::noop_job();
-        let _ = connect_and_serve(&handle, &identity, &generation, &extraction, &mut backoff).await;
+        let _ = connect_and_serve(&handle, &identity, &generation, &mut backoff).await;
         server.await.unwrap();
 
         assert_eq!(
@@ -976,8 +972,7 @@ mod tests {
 
         let mut backoff = ReconnectBackoff::new();
         let generation: Arc<dyn GenerateRequestHandler> = Arc::new(NoopGeneration);
-        let extraction = crate::multiplayer::joiner_compaction::noop_job();
-        let _ = connect_and_serve(&handle, &identity, &generation, &extraction, &mut backoff).await;
+        let _ = connect_and_serve(&handle, &identity, &generation, &mut backoff).await;
         server.await.unwrap();
 
         let shared = handle.read().unwrap();
