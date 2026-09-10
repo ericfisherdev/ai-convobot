@@ -1007,20 +1007,45 @@ pub fn spawn_extraction(
 /// inside `run_extraction` starts a fresh connection per call regardless.
 fn run_extraction_job(draft_id: i64, registry: ParticipantRegistry) -> Result<(), String> {
     let store = SqliteCompactionStore;
-    let draft = store
-        .get_checkpoint(draft_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("draft {draft_id} not found"))?;
+    let draft = load_draft_for_extraction(&store, draft_id)?;
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_extraction(&store, &draft, registry)
     }))
-    .unwrap_or_else(|payload| Err(panic_message(&payload)));
+    .unwrap_or_else(|payload| Err(panic_message(payload.as_ref())));
 
     if let Err(err) = &outcome {
         fail_pending_draft(&store, draft.id, err);
     }
     outcome
+}
+
+/// Loads `draft_id`, split out from [`run_extraction_job`] so its one
+/// review-caught edge case is unit-testable against [`RecordingStore`]
+/// rather than only reachable through the hardwired `Database`/
+/// `SqliteCompactionStore` globals `run_extraction_job` itself is glued to.
+///
+/// `Ok(None)` (`draft_id` genuinely does not exist) has nothing to
+/// transition and returns its error as-is, same as before #208. A `Err`
+/// read (#208 review, CodeRabbit) is different: `fail_draft` opens its own
+/// store connection and only needs `draft_id`, so it can still succeed even
+/// though *this* read failed -- a transient error here (lock contention, a
+/// blip) must not rule out the write right after it. Skipping that would
+/// leave exactly the wedge this issue exists to close, just triggered one
+/// step earlier than every other path in [`run_extraction_job`].
+fn load_draft_for_extraction(
+    store: &impl CompactionStore,
+    draft_id: i64,
+) -> Result<Checkpoint, String> {
+    match store.get_checkpoint(draft_id) {
+        Ok(Some(draft)) => Ok(draft),
+        Ok(None) => Err(format!("draft {draft_id} not found")),
+        Err(e) => {
+            let error = format!("failed to load draft {draft_id}: {e}");
+            fail_pending_draft(store, draft_id, &error);
+            Err(error)
+        }
+    }
 }
 
 /// Turns a caught panic payload into a readable message: `&str`/`String`
@@ -1037,17 +1062,24 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 }
 
 /// The `&str`/`String` payload every `panic!`/`.unwrap()`/`.expect()` call
-/// produces, unwrapped through one extra layer of `Box<dyn Any + Send>` if
-/// present. That extra layer is not hypothetical: confirmed empirically
-/// while building this fix -- the panic this guards against most directly
-/// (`llama-cpp-2`'s `debug_assert!` in `LlamaModel::load_from_file`, a
-/// plain formatted `String` at its own panic site) still arrives at
-/// [`run_extraction_job`]'s `catch_unwind` boxed a second time, most likely
-/// by something in the actix/tokio worker machinery between this thread and
-/// wherever the panic actually originates. Recursing (bounded by the
-/// payload no longer being a `Box<dyn Any + Send>`, which `String`/`&str`
-/// never are) means this keeps working regardless of exactly how many
-/// layers a given call stack adds.
+/// produces, with a defensive fallback that unwraps one extra layer of
+/// `Box<dyn Any + Send>` if the payload was itself re-boxed (e.g. a
+/// `resume_unwind(Box::new(inner))` re-raise elsewhere in the call stack).
+///
+/// That extra layer is *not* what `catch_unwind` normally hands back here,
+/// and earlier revisions of this comment wrongly blamed it on the
+/// actix/tokio worker machinery: the real cause, caught in review, was this
+/// module's own call site passing `&payload` (`payload: Box<dyn Any +
+/// Send>`) into [`panic_message`] instead of `payload.as_ref()`. `&payload`
+/// unsizes the *`Box` itself* into the trait object -- `Box<dyn Any +
+/// Send>` is `Sized` and blanket-implements `Any`, so rustc's unsize
+/// coercion wins over deref coercion at that call site, for every panic,
+/// not just `llama-cpp-2`'s -- so `downcast_ref::<Box<dyn Any + Send>>()`
+/// matched first regardless of what was actually boxed. `run_extraction_job`
+/// now calls `panic_message(payload.as_ref())`, which derefs through the
+/// box first and lands on the real payload directly, so this recursive arm
+/// is not the shape production hits; it stays as a fallback in case
+/// something upstream ever does re-box a payload before it reaches here.
 fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> Option<String> {
     if let Some(s) = payload.downcast_ref::<&str>() {
         return Some((*s).to_string());
@@ -1132,7 +1164,7 @@ mod tests {
     use super::*;
     use crate::compaction::fixtures::{bad_draft, synthetic_range};
     use crate::compaction::store::RecordingStore;
-    use crate::compaction::types::{CompactionTrigger, NewDraft};
+    use crate::compaction::types::{CompactionTrigger, Fact, NewDraft};
     use crate::compaction::SoloSpeakers;
     use crate::llm::FakeExtractor;
 
@@ -1680,6 +1712,157 @@ mod tests {
         fail_pending_draft(&store, 999, "boom");
     }
 
+    // --- load_draft_for_extraction (#208 review: CodeRabbit) ---
+
+    /// Wraps a [`RecordingStore`] so `get_checkpoint` always fails, so
+    /// [`load_draft_for_extraction`]'s checkpoint-read-error branch can be
+    /// exercised without a real, breakable `Database` connection — every
+    /// other method just delegates, mirroring `commit.rs`'s own
+    /// `RacyDiscardStore` test double.
+    struct FailingCheckpointStore<'a> {
+        inner: &'a RecordingStore,
+    }
+
+    impl CompactionStore for FailingCheckpointStore<'_> {
+        fn insert_draft(&self, draft: NewDraft) -> rusqlite::Result<i64> {
+            self.inner.insert_draft(draft)
+        }
+        fn get_checkpoint(&self, _id: i64) -> rusqlite::Result<Option<Checkpoint>> {
+            Err(rusqlite::Error::SqliteSingleThreadedMode)
+        }
+        fn pending_draft(&self, companion_id: i32) -> rusqlite::Result<Option<Checkpoint>> {
+            self.inner.pending_draft(companion_id)
+        }
+        fn list_checkpoints(&self, companion_id: i32) -> rusqlite::Result<Vec<Checkpoint>> {
+            self.inner.list_checkpoints(companion_id)
+        }
+        fn latest_committed(&self, companion_id: i32) -> rusqlite::Result<Option<Checkpoint>> {
+            self.inner.latest_committed(companion_id)
+        }
+        fn latest_committed_before(
+            &self,
+            companion_id: i32,
+            from_message_id: i32,
+        ) -> rusqlite::Result<Option<Checkpoint>> {
+            self.inner
+                .latest_committed_before(companion_id, from_message_id)
+        }
+        fn context_snapshot(
+            &self,
+            companion_id: i32,
+        ) -> rusqlite::Result<(Vec<Fact>, Option<i32>, Option<Checkpoint>)> {
+            self.inner.context_snapshot(companion_id)
+        }
+        fn update_status(&self, id: i64, status: CompactionStatus) -> rusqlite::Result<()> {
+            self.inner.update_status(id, status)
+        }
+        fn transition_status(
+            &self,
+            id: i64,
+            from: CompactionStatus,
+            to: CompactionStatus,
+        ) -> rusqlite::Result<()> {
+            self.inner.transition_status(id, from, to)
+        }
+        fn set_extraction_result(
+            &self,
+            id: i64,
+            raw_model_output: Option<String>,
+            summary: Option<String>,
+            attitude_ratings: Option<String>,
+        ) -> rusqlite::Result<()> {
+            self.inner
+                .set_extraction_result(id, raw_model_output, summary, attitude_ratings)
+        }
+        fn fail_draft(&self, id: i64, error: &str) -> rusqlite::Result<()> {
+            self.inner.fail_draft(id, error)
+        }
+        fn insert_facts(
+            &self,
+            compaction_id: i64,
+            facts: &[FactDraft],
+        ) -> rusqlite::Result<Vec<i64>> {
+            self.inner.insert_facts(compaction_id, facts)
+        }
+        fn active_facts(&self, companion_id: i32) -> rusqlite::Result<Vec<Fact>> {
+            self.inner.active_facts(companion_id)
+        }
+        fn facts_for(&self, compaction_id: i64) -> rusqlite::Result<Vec<Fact>> {
+            self.inner.facts_for(compaction_id)
+        }
+        fn supersede(&self, fact_id: i64, by: i64) -> rusqlite::Result<()> {
+            self.inner.supersede(fact_id, by)
+        }
+        fn mark_stale_containing(
+            &self,
+            companion_id: i32,
+            message_id: i32,
+        ) -> rusqlite::Result<usize> {
+            self.inner.mark_stale_containing(companion_id, message_id)
+        }
+        fn oldest_stale_from(&self, companion_id: i32) -> rusqlite::Result<Option<i32>> {
+            self.inner.oldest_stale_from(companion_id)
+        }
+        fn compacted_through(&self, companion_id: i32) -> rusqlite::Result<Option<i32>> {
+            self.inner.compacted_through(companion_id)
+        }
+        fn set_compacted_through(
+            &self,
+            companion_id: i32,
+            through: Option<i32>,
+        ) -> rusqlite::Result<()> {
+            self.inner.set_compacted_through(companion_id, through)
+        }
+        fn pin(&self, message_id: i32) -> rusqlite::Result<()> {
+            self.inner.pin(message_id)
+        }
+        fn unpin(&self, message_id: i32) -> rusqlite::Result<()> {
+            self.inner.unpin(message_id)
+        }
+        fn pins(&self) -> rusqlite::Result<Vec<crate::compaction::types::Pin>> {
+            self.inner.pins()
+        }
+        fn commit_checkpoint(
+            &self,
+            record: crate::compaction::store::CommitRecord,
+        ) -> rusqlite::Result<Checkpoint> {
+            self.inner.commit_checkpoint(record)
+        }
+    }
+
+    #[test]
+    fn load_draft_for_extraction_still_fails_the_draft_when_the_read_itself_errors() {
+        // The bug CodeRabbit caught: before this fix, a `get_checkpoint`
+        // error propagated straight out of `run_extraction_job` without
+        // ever calling `fail_pending_draft`, so a transient read failure
+        // left the row wedged in `Draft` exactly like every other
+        // unhandled failure #208 exists to close -- just one step earlier.
+        let inner = RecordingStore::new();
+        let range = synthetic_range();
+        let draft = a_pending_draft(&inner, &range);
+        let store = FailingCheckpointStore { inner: &inner };
+
+        let err = load_draft_for_extraction(&store, draft.id).unwrap_err();
+        assert!(err.contains("failed to load draft"));
+
+        let updated = inner.get_checkpoint(draft.id).unwrap().unwrap();
+        assert_eq!(updated.status, CompactionStatus::Failed);
+        assert_eq!(updated.extraction_error.as_deref(), Some(err.as_str()));
+    }
+
+    #[test]
+    fn load_draft_for_extraction_on_a_genuinely_unknown_id_does_not_touch_the_store() {
+        // `Ok(None)` (no row at all) is not the same failure: nothing to
+        // transition, so this must not call `fail_draft` at all -- there is
+        // no `RecordingStore` checkpoint to assert against, so the
+        // assertion here is just that this returns cleanly rather than
+        // panicking on a `fail_draft` call against an id that was never
+        // inserted.
+        let store = RecordingStore::new();
+        let err = load_draft_for_extraction(&store, 999).unwrap_err();
+        assert_eq!(err, "draft 999 not found");
+    }
+
     // --- panic_message / panic_payload_text (#208) ---
     //
     // Exercises the exact failure mode discovered while building this fix:
@@ -1689,11 +1872,20 @@ mod tests {
     // unconfigured `llm_model_path`. Without `run_extraction_job`'s
     // `catch_unwind`, that panic unwinds straight past `fail_pending_draft`
     // and the checkpoint stays wedged in `Draft` exactly like the bug this
-    // issue fixes. The nested-payload case (`panic_payload_text` recursing
-    // through one `Box<dyn Any + Send>` layer) is not a hypothetical either:
-    // the payload `catch_unwind` actually receives for that panic is boxed
-    // a second time somewhere between this thread and the panic site, also
-    // confirmed by running the binary directly and inspecting it.
+    // issue fixes.
+    //
+    // The last test below is a second one, added in review: an earlier
+    // revision of `run_extraction_job` called `panic_message(&payload)`
+    // instead of `panic_message(payload.as_ref())`. That compiles
+    // (`&payload` unsizes the `Box<dyn Any + Send>` itself into the trait
+    // object, since `Box<T>` is `Sized` and blanket-implements `Any`) and
+    // still produces the correct message -- `panic_payload_text`'s
+    // defensive nested-`Box` fallback (kept deliberately) absorbs it -- but
+    // it does so by relying on a fallback meant for a different situation,
+    // and the doc comment on that fallback used to describe the wrong
+    // cause entirely (blamed the actix/tokio worker machinery instead of
+    // this call site's own coercion). `payload.as_ref()` reaches the same
+    // message directly, with no fallback involved.
 
     #[test]
     fn panic_message_formats_a_str_payload() {
@@ -1708,9 +1900,11 @@ mod tests {
     }
 
     #[test]
-    fn panic_message_unwraps_one_layer_of_boxed_any() {
-        // The shape actually observed for `debug_assert!`'s panic: the
-        // `String` payload arrives wrapped in an extra `Box<dyn Any + Send>`.
+    fn panic_message_unwraps_one_layer_of_boxed_any_as_a_defensive_fallback() {
+        // Not the shape production hits (see the group comment above) --
+        // this covers `panic_payload_text`'s recursive arm on its own
+        // terms, in case something upstream of `run_extraction_job` ever
+        // re-boxes a payload before it reaches here.
         let inner: Box<dyn std::any::Any + Send> = Box::new("nested boom".to_string());
         let payload: Box<dyn std::any::Any + Send> = Box::new(inner);
         assert_eq!(
@@ -1725,6 +1919,43 @@ mod tests {
         assert_eq!(
             panic_message(payload.as_ref()),
             "extraction panicked with a non-string payload"
+        );
+    }
+
+    #[test]
+    fn panic_message_reaches_the_real_text_either_way_but_as_ref_skips_the_fallback() {
+        // Runs against a real `catch_unwind`, not a hand-built `Box<dyn
+        // Any>` (like the two tests above), since only a real one
+        // reproduces the exact coercion `run_extraction_job`'s call site
+        // hits. `&payload` (`payload: Box<dyn Any + Send>`) unsizes the
+        // *`Box` itself* into the trait object -- `Box<T>` is `Sized` and
+        // blanket-implements `Any`, so `downcast_ref::<&str>()`/`<String>()`
+        // both miss and this only resolves through
+        // `panic_payload_text`'s one-layer fallback. `payload.as_ref()`
+        // derefs through the box first and resolves directly, on the first
+        // check, with no fallback involved.
+        //
+        // Both still land on the identical, correct message: the retained
+        // fallback (kept deliberately, see `panic_payload_text`'s doc
+        // comment) is exactly why an earlier revision's `panic_message(
+        // &payload)` call site (caught in review, since fixed to
+        // `payload.as_ref()`) never actually produced a *wrong* message --
+        // its bug was a misattributed doc comment about which path
+        // handled it, not an observable output difference. `.as_ref()` is
+        // still the right call: it is correct without leaning on a
+        // fallback meant for a payload boxed by something else upstream.
+        let payload = std::panic::catch_unwind(|| {
+            panic!("simulated model load panic");
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            panic_message(&payload),
+            "extraction panicked: simulated model load panic"
+        );
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            "extraction panicked: simulated model load panic"
         );
     }
 

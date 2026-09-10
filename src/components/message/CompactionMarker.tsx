@@ -177,11 +177,29 @@ export function CompactionMarker({ messageId, compact: compactProp = false }: Co
   // -- it never produced anything to render -- so it gets its own notice
   // instead of `CompactionNotice`'s "Show notes" dialog, which assumes
   // there are facts to look at.
-  const checkpoint = checkpoints.find(
-    (c) =>
-      c.through_message_id === messageId &&
-      (c.status === 'committed' || c.status === 'stale' || c.status === 'failed')
-  );
+  //
+  // A committed/stale checkpoint always wins over a failed one at the same
+  // `through_message_id`, checked first and regardless of id order (#208
+  // review, esfisher + coderabbitai): a failed draft never updates
+  // `compacted_through`, so `Retry`'s bodiless `triggerDraft()` re-selects
+  // the identical uncompacted-tail range when no new messages have arrived,
+  // and the resulting draft can land at the very same boundary once it
+  // commits. `checkpoints` is ordered by ascending `id`, so a plain `find`
+  // over all three statuses would permanently shadow that successful retry
+  // behind the older `failed` row's notice (and its own dead-end `Retry`
+  // button) instead of showing the commit. A bare "newest wins" reversal
+  // does not fully fix this either: a *failed* re-compaction over an
+  // existing `stale` checkpoint's range could still land a higher-id
+  // `failed` row at the same boundary as that still-valid `stale` one, and
+  // "newest wins" would hide the stale checkpoint's real (if outdated)
+  // content behind that failure. Preferring any committed/stale match
+  // first avoids both.
+  const atThisMessage = checkpoints.filter((c) => c.through_message_id === messageId);
+  const checkpoint =
+    atThisMessage.find((c) => c.status === 'committed' || c.status === 'stale') ??
+    // Among failed-only matches (repeated retries, all still failing),
+    // show the most recent attempt's reason rather than the first one's.
+    [...atThisMessage].reverse().find((c) => c.status === 'failed');
   if (checkpoint) {
     return checkpoint.status === 'failed' ? (
       <CompactionFailedNotice checkpoint={checkpoint} />

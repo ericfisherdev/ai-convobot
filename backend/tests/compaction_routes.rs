@@ -4,11 +4,10 @@
 //! pinned message's content showing up in `GET /api/debug/prompt`'s
 //! rendered `pins` block). A *successful* `202` extraction still needs a
 //! real GGUF and is verified manually, per this issue's plan — but #208's
-//! failure path needs no model at all: this binary's own default
-//! `llm_model_path` (the literal placeholder `path/to/your/gguf/model.gguf`)
-//! fails to load immediately, so `an_extraction_failure_...` below exercises
-//! the real `run_extraction_job`/`fail_pending_draft` wiring end to end
-//! without one.
+//! failure path needs no model at all: `set_invalid_model_path` points
+//! `llm_model_path` at a path that does not exist, so
+//! `an_extraction_failure_...` below exercises the real
+//! `run_extraction_job`/`fail_pending_draft` wiring end to end without one.
 
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -42,6 +41,29 @@ fn get_json(agent: &ureq::Agent, url: &str) -> Value {
         .body_mut()
         .read_json()
         .unwrap_or_else(|e| panic!("GET {url} did not return valid JSON: {e}"))
+}
+
+/// Sets `llm_model_path` to a path that does not exist, leaving
+/// `compaction_model_path` unset (#208 review, CodeRabbit): reads the
+/// current config via `GET /api/config` and writes it straight back through
+/// `PUT /api/config` with only `llm_model_path` overridden, rather than
+/// depending on `Database::init`'s own seed value (a literal placeholder
+/// that could change independently of this test). `ConfigModify` ignores
+/// unknown fields and treats an absent `multiplayer_password` as "leave
+/// unchanged", so round-tripping `GET`'s `ConfigView` JSON straight into a
+/// `PUT` body needs no field-by-field translation.
+fn set_invalid_model_path(agent: &ureq::Agent, addr: &str) {
+    let mut config = get_json(agent, &format!("http://{addr}/api/config"));
+    config["llm_model_path"] = json!("/definitely/does/not/exist.gguf");
+    let response = agent
+        .put(format!("http://{addr}/api/config"))
+        .send_json(config)
+        .unwrap_or_else(|e| panic!("PUT /api/config failed at the transport level: {e}"));
+    assert!(
+        response.status().is_success(),
+        "PUT /api/config returned {}",
+        response.status()
+    );
 }
 
 #[test]
@@ -305,13 +327,18 @@ fn from_stale_true_queues_a_recompaction_draft_over_the_stale_checkpoints_range(
 /// trigger — never stuck in `Draft`/`extracting` forever. Runs the real
 /// `POST /api/compaction/draft` -> background `spawn_extraction` ->
 /// `run_extraction_job` pipeline end to end, no mocks or seeded rows:
-/// this binary's default `llm_model_path` (`path/to/your/gguf/model.gguf`,
-/// see `database.rs`'s `Database::init` seeding) names a file that does not
-/// exist and `compaction_model_path` is unset, so `ResidentExtractor` falls
-/// back to it and `LlamaModel::load_from_file` fails immediately with a
-/// clean `std::io::Error` — the same `DraftError::Model` class of failure
-/// #207's grammar bug produced before it was fixed, reached here without
-/// needing a real GGUF.
+/// `set_invalid_model_path` points `llm_model_path` at a path that does not
+/// exist (`compaction_model_path` stays unset, so `ResidentExtractor` falls
+/// back to it), rather than depending on `Database::init`'s own seed value
+/// (#208 review, CodeRabbit — a changed default could make this load a real
+/// model, follow a different path, or exceed the deadline below). In a
+/// debug build, `LlamaModel::load_from_file` does not even return `Err` for
+/// a missing path -- it panics (`debug_assert!` inside `llama-cpp-2`,
+/// confirmed directly while building this fix), which is exactly why
+/// `run_extraction_job` wraps its call in `catch_unwind`: this test is the
+/// only place in the suite that exercises that path for real, the same
+/// `DraftError::Model`-class failure #207's grammar bug produced before it
+/// was fixed.
 ///
 /// Before #208, this test would time out waiting for the status to leave
 /// `draft` (the checkpoint was never touched again after the failed
@@ -340,6 +367,8 @@ fn an_extraction_failure_without_a_configured_model_reaches_failed_and_unblocks_
         .http_status_as_error(false)
         .build()
         .into();
+
+    set_invalid_model_path(&agent, &addr);
 
     // Default `short_term_mem` is 5, default `compact_min_messages` is 8
     // (see the `from_stale` test above for the same arithmetic): 20 user

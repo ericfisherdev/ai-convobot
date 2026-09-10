@@ -130,4 +130,46 @@ describe('CompactionMarker', () => {
       )
     );
   });
+
+  it('a committed checkpoint wins over an older failed row at the same message (#208 review)', async () => {
+    // Reproduces the exact shadowing bug: `Retry` re-triggers the same
+    // uncompacted-tail range when no new messages arrived, so a successful
+    // retry can commit at the identical `through_message_id` as the failed
+    // attempt it replaces. `checkpoints` is ordered by ascending `id`, so a
+    // plain `find` would permanently return the lower-id failed row.
+    renderMarker([
+      aCheckpoint({ id: 5, status: 'failed', extraction_error: 'boom', through_message_id: 10 }),
+      aCheckpoint({ id: 6, status: 'committed', through_message_id: 10 }),
+    ]);
+
+    expect(await screen.findByText('Continuity notes cover messages up to here')).toBeInTheDocument();
+    expect(screen.queryByText('Continuity notes failed to draft: boom')).not.toBeInTheDocument();
+  });
+
+  it('a stale checkpoint wins over a higher-id failed re-compaction at the same message', async () => {
+    // A failed *re-compaction* attempt over an existing stale checkpoint's
+    // range can land a higher-id `failed` row at the same boundary as that
+    // still-valid `stale` one. "Newest id wins" alone would hide the
+    // stale checkpoint's real (if outdated) content behind that failure;
+    // a committed/stale match must be preferred regardless of id order.
+    renderMarker([
+      aCheckpoint({ id: 5, status: 'stale', through_message_id: 10 }),
+      aCheckpoint({ id: 9, status: 'failed', extraction_error: 'boom', through_message_id: 10 }),
+    ]);
+
+    expect(await screen.findByText('Continuity notes cover messages up to here')).toBeInTheDocument();
+    expect(screen.queryByText('Continuity notes failed to draft: boom')).not.toBeInTheDocument();
+  });
+
+  it('among only-failed matches at the same message, shows the most recent attempts reason', async () => {
+    renderMarker([
+      aCheckpoint({ id: 5, status: 'failed', extraction_error: 'first failure', through_message_id: 10 }),
+      aCheckpoint({ id: 6, status: 'failed', extraction_error: 'second failure', through_message_id: 10 }),
+    ]);
+
+    expect(
+      await screen.findByText('Continuity notes failed to draft: second failure')
+    ).toBeInTheDocument();
+    expect(screen.queryByText('Continuity notes failed to draft: first failure')).not.toBeInTheDocument();
+  });
 });
