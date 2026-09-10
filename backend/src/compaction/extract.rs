@@ -9,15 +9,17 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use crate::compaction::registry_speakers::RegistrySpeakers;
 use crate::compaction::store::{CompactionStore, SqliteCompactionStore};
 use crate::compaction::types::{
     Checkpoint, CompactionStatus, FactCategory, FactDraft, FactSubject,
 };
 use crate::compaction::validate::{overlays_fit, validate};
-use crate::compaction::{CitedMessage, SoloSpeakers, SpeakerInfo};
+use crate::compaction::{CitedMessage, SpeakerInfo};
 use crate::context_manager::ContextManager;
 use crate::database::Database;
 use crate::llm::{Extractor, ResidentExtractor};
+use crate::participants::ParticipantRegistry;
 use crate::turn_slot::TurnGuard;
 
 /// The model's extraction output, one JSON object per compacted range.
@@ -807,36 +809,43 @@ pub fn spawn_holding(
 }
 
 /// The single production entry point for running extraction on a queued
-/// draft: loads the row and the range it covers, builds the solo-chat
-/// speaker policy, and calls [`fill_draft`] against the production
-/// [`SqliteCompactionStore`]/[`ResidentExtractor`]. Errors are logged and
-/// swallowed, like every other background job in this codebase; a missing
-/// row just ends the thread.
+/// draft: loads the row and the range it covers, builds the canon-aware
+/// speaker policy from `registry` (#182's `RegistrySpeakers` — equivalent
+/// to the old hard-coded `SoloSpeakers` in solo mode, since a solo registry
+/// is just `user` then `char`), and calls [`fill_draft`] against the
+/// production [`SqliteCompactionStore`]/[`ResidentExtractor`]. Errors are
+/// logged and swallowed, like every other background job in this codebase;
+/// a missing row just ends the thread.
+///
+/// `registry` is a snapshot (`Clone`, owned, `Send`), not a live handle: the
+/// caller takes it from the same shared registry a round already snapshots
+/// (`main.rs`'s `snapshot_speakers(&registry).registry`), so a joined or
+/// disconnected bot mid-extraction cannot mutate the policy this thread is
+/// running against.
 ///
 /// The overlay budget is a flat 15% of the chat model's token budget total
 /// until #174 lands its own `compaction` slice on `TokenBudget` for this to
 /// read instead.
-pub fn spawn_extraction(guard: TurnGuard, draft_id: i64) -> std::thread::JoinHandle<()> {
+pub fn spawn_extraction(
+    guard: TurnGuard,
+    draft_id: i64,
+    registry: ParticipantRegistry,
+) -> std::thread::JoinHandle<()> {
     spawn_holding(guard, move || {
-        if let Err(e) = run_extraction_job(draft_id) {
+        if let Err(e) = run_extraction_job(draft_id, registry) {
             eprintln!("compaction: extraction job for draft {draft_id} failed: {e}");
         }
     })
 }
 
-fn run_extraction_job(draft_id: i64) -> Result<(), String> {
+fn run_extraction_job(draft_id: i64, registry: ParticipantRegistry) -> Result<(), String> {
     let store = SqliteCompactionStore;
     let draft = store
         .get_checkpoint(draft_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("draft {draft_id} not found"))?;
 
-    let user = Database::get_user_data().map_err(|e| e.to_string())?;
-    let companion = Database::get_companion_data().map_err(|e| e.to_string())?;
-    let speakers = SoloSpeakers {
-        user_name: user.name,
-        companion_name: companion.name,
-    };
+    let speakers = RegistrySpeakers(registry);
 
     let messages = Database::get_messages_between(draft.from_message_id, draft.through_message_id)
         .map_err(|e| e.to_string())?;
@@ -865,6 +874,7 @@ mod tests {
     use crate::compaction::fixtures::{bad_draft, synthetic_range};
     use crate::compaction::store::RecordingStore;
     use crate::compaction::types::{CompactionTrigger, NewDraft};
+    use crate::compaction::SoloSpeakers;
     use crate::llm::FakeExtractor;
 
     #[test]

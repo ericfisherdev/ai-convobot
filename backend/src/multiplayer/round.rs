@@ -477,6 +477,50 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
+    fn tail_message(id: i32) -> Message {
+        Message {
+            id,
+            ai: false,
+            speaker_id: "user".to_string(),
+            content: format!("message {id}"),
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn transcript_after_passes_the_tail_through_unchanged_when_never_compacted() {
+        let tail = vec![tail_message(1), tail_message(2), tail_message(3)];
+
+        let result = transcript_after(tail.clone(), None);
+
+        assert_eq!(result, tail);
+    }
+
+    #[test]
+    fn transcript_after_drops_ids_at_or_below_the_marker() {
+        let tail = vec![tail_message(1), tail_message(2), tail_message(3)];
+
+        let result = transcript_after(tail, Some(2));
+
+        assert_eq!(
+            result.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![3],
+            "id 2 (at the marker) must be dropped along with everything below it"
+        );
+    }
+
+    #[test]
+    fn transcript_after_yields_an_empty_transcript_when_the_whole_tail_is_compacted() {
+        let tail = vec![tail_message(1), tail_message(2)];
+
+        let result = transcript_after(tail, Some(5));
+
+        assert!(
+            result.is_empty(),
+            "a tail entirely inside the compacted range is still a valid, empty request"
+        );
+    }
+
     fn bot(id: &str) -> ParticipantId {
         ParticipantId::parse(id).unwrap()
     }

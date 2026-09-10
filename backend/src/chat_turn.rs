@@ -23,7 +23,7 @@ use crate::attitude_engine::{LexiconScorer, ScorerConfig, TurnScorer};
 use crate::compaction::context::CompactionContext;
 use crate::compaction::hook::{compaction_tail_on, queue_compaction_draft_on, CompactionTailView};
 use crate::compaction::range::CompactionRange;
-use crate::compaction::store::{CompactionStore, SqliteCompactionStore};
+use crate::compaction::store::SqliteCompactionStore;
 use crate::compaction::types::CompactionTrigger;
 use crate::database::{CompanionAttitude, Database, Message, NewMessage};
 use crate::multiplayer::protocol::ContinuityPayload;
@@ -168,13 +168,17 @@ impl TurnStore for SqliteTurnStore {
         // of adding a `companion_id` parameter no caller could vary yet.
         const COMPANION_ID: i32 = 1;
         let store = SqliteCompactionStore;
-        match store.compacted_through(COMPANION_ID)? {
-            None => Ok(None),
-            Some(_) => {
-                let ctx = CompactionContext::load(&store, &Database::get_message, COMPANION_ID)?;
-                Ok(Some(ContinuityPayload::from(ctx)))
-            }
-        }
+        // A single `load` answers both "has this companion ever been
+        // compacted" (`ctx.compacted_through`) and "what should the payload
+        // contain": `context_snapshot` reads `compacted_through` on the same
+        // connection/transaction it reads facts and the latest checkpoint
+        // from, so there is no second, separate `compacted_through` read to
+        // race a commit landing in between.
+        let ctx = CompactionContext::load(&store, &Database::get_message, COMPANION_ID)?;
+        Ok(ctx
+            .compacted_through
+            .is_some()
+            .then(|| ContinuityPayload::from(ctx)))
     }
 }
 
