@@ -154,7 +154,12 @@ export function CompactionMarker({ messageId, compact: compactProp = false }: Co
     );
   }
 
-  const checkpoint = checkpoints.find((c) => c.through_message_id === messageId);
+  // The listing carries every status; only a committed (or stale) checkpoint
+  // leaves a notice behind. A discarded row ends at the same message its
+  // draft did and must not read as coverage.
+  const checkpoint = checkpoints.find(
+    (c) => c.through_message_id === messageId && (c.status === 'committed' || c.status === 'stale')
+  );
   if (checkpoint) {
     return <CompactionNotice checkpoint={checkpoint} />;
   }
