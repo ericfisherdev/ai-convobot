@@ -4,6 +4,8 @@ import { Message } from './Message';
 import { cn } from '../../lib/utils';
 import { isBotSpeaker } from '../../lib/speakers';
 import { useMobile } from '../../hooks/useMobile';
+import { messageAnchorId } from '../../lib/messageAnchors';
+import { CompactionMarker } from './CompactionMarker';
 
 interface VirtualMessageListProps {
   messages: MessageInterface[];
@@ -149,6 +151,7 @@ export function VirtualMessageList({
               return (
                 <div
                   key={message.id || messageIndex}
+                  id={messageAnchorId(message.id)}
                   className="animate-in fade-in-0 duration-300"
                   style={{
                     minHeight: ITEM_HEIGHT,
@@ -164,6 +167,9 @@ export function VirtualMessageList({
                     speakerId={message.speaker_id}
                     pinned={message.pinned ?? false}
                   />
+                  {/* Fixed `ITEM_HEIGHT` cannot fit the full card, so the
+                      marker always renders its compact (drawer) layout here. */}
+                  <CompactionMarker messageId={message.id} compact />
                 </div>
               );
             })}

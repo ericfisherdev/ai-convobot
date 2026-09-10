@@ -21,7 +21,7 @@ interface CompactionContextType {
   pinnedIds: Set<number>;
   refresh: () => Promise<void>;
   fetchDetail: (id: number) => Promise<CheckpointDetail | null>;
-  triggerDraft: () => Promise<void>;
+  triggerDraft: (options?: { fromStale?: boolean }) => Promise<void>;
   commit: (id: number, review: CompactionDraftReview) => Promise<CommitOutcome>;
   discard: (id: number) => Promise<void>;
   pin: (id: number) => Promise<void>;
@@ -120,9 +120,20 @@ export const CompactionProvider: React.FC<CompactionProviderProps> = ({ children
     [fetchDetail, refresh, stopDraftPoll]
   );
 
-  const triggerDraft = useCallback(async (): Promise<void> => {
+  // `fromStale` (#180/#181): re-compacts over a stale checkpoint's range
+  // instead of triggering a fresh manual draft. Sent as a JSON body only
+  // when set, so a plain `triggerDraft()` call still posts no body at all.
+  const triggerDraft = useCallback(async (options?: { fromStale?: boolean }): Promise<void> => {
     try {
-      const response = await fetch('/api/compaction/draft', { method: 'POST' });
+      const response = await fetch('/api/compaction/draft', {
+        method: 'POST',
+        ...(options?.fromStale
+          ? {
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ from_stale: true }),
+            }
+          : {}),
+      });
       if (response.status === 202) {
         const data: { draft_id: number } = await response.json();
         draftReady(data.draft_id);

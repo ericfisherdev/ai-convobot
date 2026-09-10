@@ -189,6 +189,61 @@ describe('ChatWindow Component', () => {
     expect(textarea).toHaveValue('Hello, this is a test message')
   })
 
+  it('feeds a compaction_draft_id stream chunk into draftReady, refreshing the compaction listing after the stream', async () => {
+    const user = userEvent.setup()
+    const streamChunks = [
+      { request_id: 'r1', event: 'reply_started', content: '', is_complete: false, speaker_id: 'char' },
+      { request_id: 'r1', event: 'reply_complete', content: 'hi', is_complete: false, speaker_id: 'char', message_id: 2 },
+      { request_id: 'r1', content: '', is_complete: false, speaker_id: '', compaction_draft_id: 7 },
+      { request_id: 'r1', event: 'round_complete', content: '', is_complete: true, speaker_id: '' },
+    ]
+
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.startsWith('/api/prompt/stream')) {
+        return Promise.resolve(streamResponse(streamChunks))
+      }
+      if (url.startsWith('/api/session')) {
+        return Promise.resolve(jsonResponse(session))
+      }
+      if (url.startsWith('/api/attitude/summary/')) {
+        return Promise.resolve(jsonResponse({ attitude, summary: 'neutral' }))
+      }
+      if (url.startsWith('/api/compaction')) {
+        return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+    global.fetch = fetchMock as unknown as typeof fetch
+
+    render(
+      <MockProviders>
+        <ChatWindow />
+      </MockProviders>
+    )
+
+    // `CompactionProvider` mounts and refreshes on its own; only count
+    // refreshes the send itself causes.
+    await screen.findByRole('main')
+    const compactionFetchesBeforeSend = fetchMock.mock.calls.filter(
+      ([input]) => String(input) === '/api/compaction'
+    ).length
+
+    const textarea = screen.getByRole('textbox')
+    await user.type(textarea, 'hello')
+    await user.click(screen.getByRole('button', { name: /^send message$/i }))
+
+    // `draftReady` calls `refresh()` immediately (the per-id detail poll
+    // only starts on the next tick), so `/api/compaction` is fetched again
+    // right after the stream closes -- proof the `compaction_draft_id`
+    // chunk reached `draftReady`.
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.filter(([input]) => String(input) === '/api/compaction').length
+      ).toBeGreaterThan(compactionFetchesBeforeSend)
+    })
+  })
+
   it('applies the stream attitude chunk without refetching the summary', async () => {
     const user = userEvent.setup()
     const streamChunks = [
