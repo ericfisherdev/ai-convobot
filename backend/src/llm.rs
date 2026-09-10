@@ -1,5 +1,5 @@
 use chrono::{DateTime, Local};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 
 use crate::attitude_formatter::AttitudeFormatter;
@@ -19,15 +19,18 @@ use crate::participants::{
     expand_placeholders, placeholder, render_mentions, Participant, ParticipantId,
     ParticipantRegistry,
 };
+use crate::system_memory::SystemMemoryDetector;
 
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 use std::num::NonZeroU32;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Maximum tokens submitted to llama.cpp in a single decode call.
 const N_BATCH: u32 = 512;
@@ -42,6 +45,14 @@ static GENERATION_LOCK: Mutex<()> = Mutex::new(());
 /// The currently loaded model, kept resident between turns. Reloaded only
 /// when `ModelKey::from_config` changes (model path or GPU-related config).
 static RESIDENT_MODEL: ResidentCache<ModelKey, LlamaModel> = ResidentCache::new();
+
+/// The extraction model, kept resident across compaction jobs (#173's
+/// extraction pass, #175's summary merge) independently of `RESIDENT_MODEL`.
+/// CPU-only by construction: `ModelKey::extractor` always sets `device =
+/// Device::CPU, gpu_layers = 0`. Only ever populated through
+/// `ResidentExtractor`/`run_extraction`; empty when `compaction_model_path`
+/// is unset.
+static RESIDENT_EXTRACTOR: ResidentCache<ModelKey, LlamaModel> = ResidentCache::new();
 
 /// llama.cpp keeps process-global state, so its backend must be initialised
 /// exactly once. Later calls reuse the handle stored here.
@@ -809,18 +820,14 @@ fn resolve_gpu_layers(config: &ConfigView, facts: &ModelFacts, layer_count_known
     }
 }
 
-/// Loads the GGUF file named by `config.llm_model_path`. Only runs when
-/// `RESIDENT_MODEL` needs a (re)load, i.e. on the first turn and whenever
-/// `ModelKey::from_config` changes.
-///
-/// Reads the model's real architecture, layer count, and size from its GGUF
-/// header before resolving GPU layers. That read is a pure function of
-/// `config.llm_model_path`, which is already part of `ModelKey`, so it
-/// cannot cause the resident model to reload on its own (see `ModelKey`'s
-/// no-thrash doc comment in `model_cache.rs`).
-fn load_model(backend: &LlamaBackend, config: &ConfigView) -> Result<LlamaModel, std::io::Error> {
-    let model_path = std::path::Path::new(&config.llm_model_path);
-    let (facts, layer_count_known) = match model_metadata::read_model_facts(model_path) {
+/// Reads a GGUF's architecture, layer count, and on-disk size from its
+/// header, falling back to a 32-layer guess (and the file's on-disk size)
+/// when the header cannot be read. The bool is whether the layer count is a
+/// real header read (`true`) or the fallback guess (`false`); callers use it
+/// to decide whether a layer-count-based clamp or truth check is safe to
+/// apply.
+fn read_facts_or_guess(path: &std::path::Path) -> (ModelFacts, bool) {
+    match model_metadata::read_model_facts(path) {
         Ok(facts) => {
             println!(
                 "📐 Model: {}, {} layers, {} MB",
@@ -835,18 +842,30 @@ fn load_model(backend: &LlamaBackend, config: &ConfigView) -> Result<LlamaModel,
                 "⚠️ Failed to read model metadata ({}), falling back to a 32-layer estimate",
                 e
             );
-            let file_size_bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
+            let file_size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             let facts = ModelFacts {
-                path: config.llm_model_path.clone(),
+                path: path.display().to_string(),
                 architecture: "unknown".to_string(),
                 layer_count: 32,
                 file_size_bytes,
             };
             (facts, false)
         }
-    };
+    }
+}
 
-    let gpu_layers = resolve_gpu_layers(config, &facts, layer_count_known);
+/// Loads a GGUF file from `path` with `gpu_layers` offloaded to the GPU,
+/// including the load-time console output and the post-load layer-count
+/// truth check (skipped when `layer_count_known` is `false`, since
+/// `facts.layer_count` is then a guess rather than a fact, and disagreeing
+/// with it is expected).
+fn load_gguf(
+    backend: &LlamaBackend,
+    path: &std::path::Path,
+    facts: &ModelFacts,
+    layer_count_known: bool,
+    gpu_layers: u32,
+) -> Result<LlamaModel, std::io::Error> {
     let model_params = LlamaModelParams::default()
         .with_n_gpu_layers(gpu_layers)
         .with_use_mmap(true); // Memory-mapped model loading reduces RAM usage
@@ -857,7 +876,7 @@ fn load_model(backend: &LlamaBackend, config: &ConfigView) -> Result<LlamaModel,
     // this thread.
     let _ = std::io::stdout().flush();
     let load_start = std::time::Instant::now();
-    let model = LlamaModel::load_from_file(backend, model_path, &model_params)
+    let model = LlamaModel::load_from_file(backend, path, &model_params)
         .map_err(|e| std::io::Error::other(format!("Failed to load llm model: {}", e)))?;
     println!(
         "✓ Model loaded in {:.2}s ({} GPU layers)",
@@ -865,9 +884,7 @@ fn load_model(backend: &LlamaBackend, config: &ConfigView) -> Result<LlamaModel,
         gpu_layers
     );
     // Post-load truth check: the header read above should always agree
-    // with what llama.cpp itself resolves. This should never fire. Skipped
-    // when the header read failed, since `facts.layer_count` is then a
-    // guess rather than a fact, and disagreeing with it is expected.
+    // with what llama.cpp itself resolves. This should never fire.
     if layer_count_known && model.n_layer() != facts.layer_count {
         eprintln!(
             "⚠️ Layer count mismatch: GGUF header reported {} but loaded model has {}",
@@ -878,14 +895,141 @@ fn load_model(backend: &LlamaBackend, config: &ConfigView) -> Result<LlamaModel,
     Ok(model)
 }
 
-/// Frees the resident model, if any, returning whether one was resident and
-/// the path it was loaded from. A generation in flight keeps its own `Arc`
-/// clone, so the model stays alive until that turn finishes; this only stops
-/// it from being handed out to new turns. The next turn reloads it.
-pub fn unload_model() -> (bool, Option<String>) {
-    match RESIDENT_MODEL.evict() {
-        Some(key) => (true, Some(key.model_path)),
-        None => (false, None),
+/// Loads the GGUF file named by `config.llm_model_path`. Only runs when
+/// `RESIDENT_MODEL` needs a (re)load, i.e. on the first turn and whenever
+/// `ModelKey::from_config` changes.
+///
+/// Reads the model's real architecture, layer count, and size from its GGUF
+/// header before resolving GPU layers. That read is a pure function of
+/// `config.llm_model_path`, which is already part of `ModelKey`, so it
+/// cannot cause the resident model to reload on its own (see `ModelKey`'s
+/// no-thrash doc comment in `model_cache.rs`).
+fn load_chat_model(
+    backend: &LlamaBackend,
+    config: &ConfigView,
+) -> Result<LlamaModel, std::io::Error> {
+    let model_path = std::path::Path::new(&config.llm_model_path);
+    let (facts, layer_count_known) = read_facts_or_guess(model_path);
+    let gpu_layers = resolve_gpu_layers(config, &facts, layer_count_known);
+    load_gguf(backend, model_path, &facts, layer_count_known, gpu_layers)
+}
+
+/// Rough KV-cache cost per context token for a 3B-4B model at f16 (36 layers
+/// x 2 x 8 KV heads x 128 dims x 2 bytes, rounded up).
+#[allow(dead_code)] // wired up by #173/#175: reached once ResidentExtractor is called in production
+const EXTRACTOR_KV_BYTES_PER_TOKEN: u64 = 160 * 1024;
+
+/// The largest context window the extraction slot will ever be sized to,
+/// regardless of what the configured model's own trained context is: a 3B
+/// model on CPU with a 32k-128k trained context must not be handed a
+/// 100k-token prompt. The free-RAM guard below budgets for this figure since
+/// it runs before the prompt is tokenised and does not yet know the real
+/// context size for the call.
+#[allow(dead_code)] // wired up by #173/#175: reached once ResidentExtractor is called in production
+pub(crate) const EXTRACTOR_MAX_CONTEXT: usize = 8192;
+
+/// The extraction model's weights plus a worst-case KV cache at
+/// `EXTRACTOR_MAX_CONTEXT`, in GB.
+#[allow(dead_code)] // wired up by #173/#175: reached once ResidentExtractor is called in production
+fn extractor_required_ram_gb(model_bytes: u64, context_tokens: usize) -> f64 {
+    let required_bytes = model_bytes + (context_tokens as u64 * EXTRACTOR_KV_BYTES_PER_TOKEN);
+    required_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+/// Whether the extractor model's weights plus a worst-case KV cache fit in
+/// available system RAM, after `safety_margin_gb` is reserved for the rest of
+/// the system. A detection error upstream is treated as "fits" by the caller
+/// (the OS will page a mmap'd model rather than crash; refusing every draft
+/// on a detection quirk is worse), so this only runs with a real reading.
+#[allow(dead_code)] // wired up by #173/#175: reached once ResidentExtractor is called in production
+fn extractor_fits_in_ram(
+    available_gb: f32,
+    model_bytes: u64,
+    context_tokens: usize,
+    safety_margin_gb: usize,
+) -> bool {
+    let required_gb = extractor_required_ram_gb(model_bytes, context_tokens);
+    let usable_gb = available_gb as f64 - safety_margin_gb as f64;
+    required_gb <= usable_gb
+}
+
+/// Loads the extraction model named by `path`, CPU-only. Only runs when
+/// `RESIDENT_EXTRACTOR` needs a (re)load, i.e. the first extraction call with
+/// `compaction_model_path` set, and whenever `ModelKey::extractor` changes.
+///
+/// Never calls `resolve_gpu_layers`, so no GPU detection runs for the
+/// extractor: `ModelKey::extractor` always resolves to 0 GPU layers.
+#[allow(dead_code)] // wired up by #173/#175: reached once ResidentExtractor is called in production
+fn load_extractor_model(
+    backend: &LlamaBackend,
+    path: &str,
+    config: &ConfigView,
+) -> Result<LlamaModel, ExtractError> {
+    let model_path = std::path::Path::new(path);
+    let (facts, layer_count_known) = read_facts_or_guess(model_path);
+
+    let available_ram_gb = match SystemMemoryDetector::new().detect_system_memory() {
+        Ok(info) => info.available_ram_gb,
+        Err(e) => {
+            eprintln!(
+                "⚠️ Could not detect system memory ({e}), assuming the extraction model fits"
+            );
+            f32::INFINITY
+        }
+    };
+    if !extractor_fits_in_ram(
+        available_ram_gb,
+        facts.file_size_bytes,
+        EXTRACTOR_MAX_CONTEXT,
+        config.ram_safety_margin_gb,
+    ) {
+        let required_gb = extractor_required_ram_gb(facts.file_size_bytes, EXTRACTOR_MAX_CONTEXT);
+        return Err(ExtractError::ModelLoad(format!(
+            "needs {:.1} GB, {:.1} GB free",
+            required_gb, available_ram_gb
+        )));
+    }
+
+    load_gguf(backend, model_path, &facts, layer_count_known, 0)
+        .map_err(|e| ExtractError::ModelLoad(e.to_string()))
+}
+
+/// Which resident model slot(s) `POST /api/llm/unload` should free.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnloadSlot {
+    All,
+    Chat,
+    Extractor,
+}
+
+/// Which models `unload_model` evicted, and the path each was loaded from.
+/// `chat_model_path`/`extractor_model_path` are `None` when that slot was not
+/// requested or was already empty.
+pub struct UnloadReport {
+    pub chat_model_path: Option<String>,
+    pub extractor_model_path: Option<String>,
+}
+
+/// Frees the requested resident model slot(s), returning the path(s) that
+/// were evicted (if any). A generation or extraction in flight keeps its own
+/// `Arc` clone, so the underlying model stays alive until that turn or job
+/// finishes; this only stops it from being handed out to new callers. The
+/// next call to `generate`/`run_extraction` reloads whatever it needs.
+pub fn unload_model(slot: UnloadSlot) -> UnloadReport {
+    let chat_model_path = if matches!(slot, UnloadSlot::All | UnloadSlot::Chat) {
+        RESIDENT_MODEL.evict().map(|key| key.model_path)
+    } else {
+        None
+    };
+    let extractor_model_path = if matches!(slot, UnloadSlot::All | UnloadSlot::Extractor) {
+        RESIDENT_EXTRACTOR.evict().map(|key| key.model_path)
+    } else {
+        None
+    };
+    UnloadReport {
+        chat_model_path,
+        extractor_model_path,
     }
 }
 
@@ -978,6 +1122,92 @@ impl ReplyTrimmer {
     }
 }
 
+/// Feeds `prompt_tokens` into `ctx` in `N_BATCH`-sized chunks, then repeatedly
+/// samples and decodes until `sampler` emits an end-of-generation token,
+/// `max_new_tokens` is reached, the context fills up, or `on_token` returns
+/// `false`. Shared by `generate` (whose closure keeps every existing side
+/// effect — tracker updates, stdout echo, `ReplyTrimmer`'s stop-string check
+/// against its own accumulated buffer, the caller's streaming callback — so
+/// its output is unchanged) and `run_extraction` (whose closure only counts).
+///
+/// Returns the concatenated generated text and the number of tokens produced.
+///
+/// # Errors
+/// Returns `std::io::ErrorKind::Other` if `prompt_tokens` is empty or a
+/// decode call fails.
+fn run_decode(
+    model: &LlamaModel,
+    ctx: &mut LlamaContext,
+    sampler: &mut LlamaSampler,
+    prompt_tokens: &[LlamaToken],
+    max_new_tokens: usize,
+    on_token: &mut dyn FnMut(&str) -> bool,
+) -> Result<(String, usize), std::io::Error> {
+    if prompt_tokens.is_empty() {
+        return Err(std::io::Error::other("prompt has no tokens"));
+    }
+
+    // Feed the prompt in n_batch-sized chunks; only the final token needs logits.
+    let last_prompt_index = prompt_tokens.len() - 1;
+    let mut batch = LlamaBatch::new(N_BATCH as usize, 1);
+    for (i, token) in prompt_tokens.iter().enumerate() {
+        let is_last = i == last_prompt_index;
+        batch
+            .add(*token, i as i32, &[0], is_last)
+            .map_err(|e| std::io::Error::other(format!("Failed to build prompt batch: {}", e)))?;
+        if batch.n_tokens() as u32 == N_BATCH || is_last {
+            ctx.decode(&mut batch)
+                .map_err(|e| std::io::Error::other(format!("Failed to evaluate prompt: {}", e)))?;
+            batch.clear();
+        }
+    }
+
+    let mut generated = String::new();
+    let mut tokens_generated = 0usize;
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    let mut n_cur = prompt_tokens.len() as i32;
+    let context_size = ctx.n_ctx();
+
+    while tokens_generated < max_new_tokens && (n_cur as u32) < context_size {
+        // `sample` already accepts the token into the chain, so calling
+        // `accept` here too would push it into the penalties ring buffer twice.
+        let token = sampler.sample(ctx, -1);
+
+        // Honour the model's own end-of-generation tokens, which a
+        // string-only halting check could not see.
+        if model.is_eog_token(token) {
+            break;
+        }
+
+        let piece = match model.token_to_piece(token, &mut decoder, false, None) {
+            Ok(piece) => piece,
+            Err(e) => {
+                eprintln!("Failed to decode token: {}", e);
+                break;
+            }
+        };
+
+        tokens_generated += 1;
+        generated.push_str(&piece);
+        if !on_token(&piece) {
+            break;
+        }
+
+        batch.clear();
+        if let Err(e) = batch.add(token, n_cur, &[0], true) {
+            eprintln!("Failed to queue generated token: {}", e);
+            break;
+        }
+        if let Err(e) = ctx.decode(&mut batch) {
+            eprintln!("Failed to decode generated token: {}", e);
+            break;
+        }
+        n_cur += 1;
+    }
+
+    Ok((generated, tokens_generated))
+}
+
 fn generate(
     prompt: &str,
     companion_id: i32,
@@ -1010,7 +1240,7 @@ fn generate(
 
     let (model, was_resident) = RESIDENT_MODEL
         .get_or_load(ModelKey::from_config(&config), |_| {
-            load_model(backend, &config)
+            load_chat_model(backend, &config)
         })?;
     if was_resident {
         println!("♻️ Reusing resident model");
@@ -1166,92 +1396,45 @@ fn generate(
         )));
     }
 
-    // Feed the prompt in n_batch-sized chunks; only the final token needs logits.
-    let last_prompt_index = prompt_tokens.len() - 1;
-    let mut batch = LlamaBatch::new(N_BATCH as usize, 1);
-    for (i, token) in prompt_tokens.iter().enumerate() {
-        let is_last = i == last_prompt_index;
-        if let Err(e) = batch.add(*token, i as i32, &[0], is_last) {
-            return Err(std::io::Error::other(format!(
-                "Failed to build prompt batch: {}",
-                e
-            )));
-        }
-        if batch.n_tokens() as u32 == N_BATCH || is_last {
-            if let Err(e) = llama_context.decode(&mut batch) {
-                return Err(std::io::Error::other(format!(
-                    "Failed to evaluate prompt: {}",
-                    e
-                )));
-            }
-            batch.clear();
-        }
-    }
-
-    let mut end_of_generation = String::new();
-    let mut tokens_generated = 0u32;
+    let trimmer = ReplyTrimmer::new(speakers);
     let mut first_token_recorded = false;
     let mut first_token_at: Option<std::time::Duration> = None;
-    let trimmer = ReplyTrimmer::new(speakers);
-    let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut n_cur = prompt_tokens.len() as i32;
+    let mut running_token_count = 0u32;
+    // `run_decode` hands this closure each piece as it is produced; the
+    // trimmer needs the whole buffer accumulated so far because a stop
+    // marker (e.g. "\nBob:") can span more than one piece.
+    let mut should_stop_buffer = String::new();
 
-    while (tokens_generated as usize) < response_token_limit && (n_cur as u32) < context_size {
-        // `sample` already accepts the token into the chain, so calling
-        // `accept` here too would push it into the penalties ring buffer twice.
-        let token = sampler.sample(&llama_context, -1);
-
-        // Honour the model's own end-of-generation tokens, which the previous
-        // string-only halting could not see.
-        if model.is_eog_token(token) {
-            break;
-        }
-
-        let piece = match model.token_to_piece(token, &mut decoder, false, None) {
-            Ok(piece) => piece,
-            Err(e) => {
-                eprintln!("Failed to decode token: {}", e);
-                break;
+    let (end_of_generation, tokens_generated) = run_decode(
+        &model,
+        &mut llama_context,
+        &mut sampler,
+        &prompt_tokens,
+        response_token_limit,
+        &mut |piece: &str| {
+            running_token_count += 1;
+            // Track first token for time-to-first-token metric
+            if !first_token_recorded {
+                if let Ok(mut tracker) = INFERENCE_TRACKER.lock() {
+                    tracker.record_first_token(&session_id);
+                }
+                first_token_recorded = true;
+                first_token_at = Some(start_time.elapsed());
             }
-        };
-
-        // Track first token for time-to-first-token metric
-        if !first_token_recorded {
+            should_stop_buffer.push_str(piece);
+            on_token(piece);
+            print!("{piece}");
+            // Best-effort, same rationale as the flush in `load_gguf` above.
+            let _ = std::io::stdout().flush();
+            // Update token count for progress tracking
             if let Ok(mut tracker) = INFERENCE_TRACKER.lock() {
-                tracker.record_first_token(&session_id);
+                tracker.update_token_count(&session_id, running_token_count);
             }
-            first_token_recorded = true;
-            first_token_at = Some(start_time.elapsed());
-        }
-
-        tokens_generated += 1;
-        end_of_generation.push_str(&piece);
-        on_token(&piece);
-        print!("{piece}");
-        // Best-effort, same rationale as the flush in `load_model` above.
-        let _ = std::io::stdout().flush();
-
-        // Update token count for progress tracking
-        if let Ok(mut tracker) = INFERENCE_TRACKER.lock() {
-            tracker.update_token_count(&session_id, tokens_generated);
-        }
-
-        if trimmer.should_stop(&end_of_generation) {
-            break;
-        }
-
-        batch.clear();
-        if let Err(e) = batch.add(token, n_cur, &[0], true) {
-            eprintln!("Failed to queue generated token: {}", e);
-            break;
-        }
-        if let Err(e) = llama_context.decode(&mut batch) {
-            eprintln!("Failed to decode generated token: {}", e);
-            break;
-        }
-        n_cur += 1;
-    }
+            !trimmer.should_stop(&should_stop_buffer)
+        },
+    )?;
     println!();
+    let tokens_generated = tokens_generated as u32;
 
     let companion_text = trimmer.clean(&end_of_generation);
     match long_term_memory.add_entry(&format!(
@@ -1312,6 +1495,373 @@ fn generate(
     }
 
     Ok(companion_text)
+}
+
+/// Failure modes for [`run_extraction`] and the model resolution it does
+/// before running. Surfaced through the [`Extractor`] trait only via
+/// `From<ExtractError> for std::io::Error`; richer detail than that stays in
+/// this module and the per-call console line `run_extraction` prints.
+#[derive(Debug)]
+#[allow(dead_code)] // wired up by #173/#175: reached once ResidentExtractor is called in production
+pub(crate) enum ExtractError {
+    /// The config row could not be read.
+    Config(String),
+    /// `llama_backend()` failed to initialise.
+    Backend(String),
+    /// Both the configured extractor and the chat-model fallback failed to
+    /// load (including the free-RAM guard refusing the extractor).
+    ModelLoad(String),
+    /// The GBNF grammar is malformed; not retried.
+    Grammar(String),
+    /// The prompt plus the requested `max_tokens` exceeds the model's
+    /// context window; the caller chunks and retries.
+    PromptTooLong {
+        prompt_tokens: usize,
+        context_tokens: usize,
+    },
+    /// Tokenisation or decode failed.
+    Decode(String),
+}
+
+impl std::fmt::Display for ExtractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExtractError::Config(e) => write!(f, "config unavailable: {}", e),
+            ExtractError::Backend(e) => write!(f, "llama.cpp backend unavailable: {}", e),
+            ExtractError::ModelLoad(e) => write!(f, "extraction model unavailable: {}", e),
+            ExtractError::Grammar(e) => write!(f, "invalid grammar: {}", e),
+            ExtractError::PromptTooLong {
+                prompt_tokens,
+                context_tokens,
+            } => write!(
+                f,
+                "prompt is {} tokens but the context window is only {}",
+                prompt_tokens, context_tokens
+            ),
+            ExtractError::Decode(e) => write!(f, "decode failed: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for ExtractError {}
+
+impl From<ExtractError> for std::io::Error {
+    fn from(e: ExtractError) -> Self {
+        std::io::Error::other(e.to_string())
+    }
+}
+
+/// One instruct completion on the local model, used by compaction (#173's
+/// extraction pass, #175's summary merge). Implementations decide which
+/// model: `ResidentExtractor` prefers the configured extraction model and
+/// falls back to the chat model. Compaction never touches `generate`.
+#[allow(dead_code)] // wired up by #173/#175: implemented by ResidentExtractor, called from compaction
+pub trait Extractor {
+    /// Largest prompt-plus-output size, in tokens, that `extract`/`complete`
+    /// will accept. Callers chunk against this (#173's `chunk_range`).
+    fn context_window(&self) -> usize;
+    /// Greedy plain-text completion, no grammar. Stops on EOG or `max_tokens`.
+    fn complete(&self, prompt: &str, max_tokens: usize) -> std::io::Result<String>;
+    /// Same runner with a GBNF grammar (must define `root`) in front of the
+    /// greedy sampler; the returned text is exactly what the grammar admitted.
+    fn extract(&self, prompt: &str, grammar: &str, max_tokens: usize) -> std::io::Result<String>;
+}
+
+/// The result of one `run_extraction` call.
+#[allow(dead_code)] // wired up by #173/#175: reached once ResidentExtractor is called in production
+pub(crate) struct Extraction {
+    pub text: String,
+    pub prompt_tokens: usize,
+    pub tokens_generated: usize,
+    pub used_extractor: bool,
+}
+
+/// Resolves which model an extraction call should run against: the
+/// configured extractor when `ModelKey::extractor` returns one and it loads
+/// successfully, otherwise the chat model. Shared between `run_extraction`
+/// and `ResidentExtractor::context_window` so both size against the model
+/// that will actually run.
+#[allow(dead_code)] // wired up by #173/#175: reached once ResidentExtractor is called in production
+fn resolve_extraction_model(
+    backend: &LlamaBackend,
+    config: &ConfigView,
+) -> Result<(Arc<LlamaModel>, bool), ExtractError> {
+    let load_chat = || {
+        RESIDENT_MODEL
+            .get_or_load(ModelKey::from_config(config), |_| {
+                load_chat_model(backend, config)
+            })
+            .map(|(model, _)| model)
+            .map_err(|e| ExtractError::ModelLoad(e.to_string()))
+    };
+
+    match ModelKey::extractor(config) {
+        None => Ok((load_chat()?, false)),
+        Some(key) => {
+            match RESIDENT_EXTRACTOR.get_or_load(key, |k| {
+                load_extractor_model(backend, &k.model_path, config)
+            }) {
+                Ok((model, _)) => Ok((model, true)),
+                Err(e) => {
+                    eprintln!(
+                        "⚠️ Extraction model unavailable ({e}), falling back to the chat model"
+                    );
+                    Ok((load_chat()?, false))
+                }
+            }
+        }
+    }
+}
+
+/// Pure arithmetic behind `extractor_context_window`, unit-tested without a
+/// GGUF model: for the extractor slot, the smaller of the model's own
+/// trained context and `EXTRACTOR_MAX_CONTEXT`; for the chat-model fallback,
+/// `budget_total` untouched.
+#[allow(dead_code)] // wired up by #173/#175: reached once ResidentExtractor is called in production
+fn context_window_from(n_ctx_train: usize, used_extractor: bool, budget_total: usize) -> usize {
+    if used_extractor {
+        n_ctx_train.min(EXTRACTOR_MAX_CONTEXT)
+    } else {
+        budget_total
+    }
+}
+
+/// The context window an extraction call should size itself against: for the
+/// extractor slot, the smaller of the model's own trained context and
+/// `EXTRACTOR_MAX_CONTEXT`; for the chat-model fallback, the same token
+/// budget `generate` sizes its own context from, so the fallback's VRAM/RAM
+/// footprint is the one the user already runs.
+#[allow(dead_code)] // wired up by #173/#175: reached once ResidentExtractor is called in production
+fn extractor_context_window(
+    model: &LlamaModel,
+    used_extractor: bool,
+    config: &ConfigView,
+) -> usize {
+    context_window_from(
+        model.n_ctx_train() as usize,
+        used_extractor,
+        ContextManager::new(config.clone()).token_budget.total,
+    )
+}
+
+/// Runs one instruct completion on the extractor slot (or the chat model when
+/// no extractor is configured or it cannot be loaded). `grammar` is GBNF with
+/// a `root` rule; `None` samples greedily without a grammar.
+///
+/// Not the API `Extractor` siblings call directly; `pub(crate)` only so the
+/// `#[cfg(test)]` GGUF test and `ResidentExtractor` can reach it.
+#[allow(dead_code)] // wired up by #173/#175: reached once ResidentExtractor is called in production
+pub(crate) fn run_extraction(
+    prompt: &str,
+    grammar: Option<&str>,
+    max_tokens: usize,
+) -> Result<Extraction, ExtractError> {
+    let _generation_guard = GENERATION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let config = Database::get_config().map_err(|e| ExtractError::Config(e.to_string()))?;
+    let backend = llama_backend().map_err(|e| ExtractError::Backend(e.to_string()))?;
+    let (model, used_extractor) = resolve_extraction_model(backend, &config)?;
+
+    // Rendered through the model's own template, not `config.prompt_template`:
+    // the roleplay transcript formats are never right for an instruct model.
+    let rendered = match apply_gguf_chat_template(&model, "", &[(false, prompt.to_string())]) {
+        Ok(rendered) => rendered,
+        Err(e) => {
+            eprintln!("⚠️ Extraction template unavailable ({e}), using the raw prompt");
+            prompt.to_string()
+        }
+    };
+
+    let window = extractor_context_window(&model, used_extractor, &config);
+    let prompt_tokens = model
+        .str_to_token(&rendered, AddBos::Always)
+        .map_err(|e| ExtractError::Decode(format!("failed to tokenize prompt: {}", e)))?;
+    let prompt_token_count = prompt_tokens.len();
+    if prompt_token_count + max_tokens > window {
+        return Err(ExtractError::PromptTooLong {
+            prompt_tokens: prompt_token_count,
+            context_tokens: window,
+        });
+    }
+    let n_ctx = (prompt_token_count + max_tokens)
+        .next_multiple_of(256)
+        .min(window);
+
+    // CPU threads are safe to max out: `ACTIVE_TURN` (the caller's
+    // responsibility, exactly as it is for `generate`) guarantees the chat
+    // model is idle for the duration of this call.
+    let cpu_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let context_params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(n_ctx as u32))
+        .with_n_batch(N_BATCH)
+        .with_n_threads(cpu_cores as i32)
+        .with_n_threads_batch(cpu_cores as i32);
+    let mut llama_context = model
+        .new_context(backend, context_params)
+        .map_err(|e| ExtractError::Decode(format!("failed to create llama context: {}", e)))?;
+
+    let mut sampler = match grammar {
+        Some(gbnf) => {
+            let grammar_sampler = LlamaSampler::grammar(&model, gbnf, "root")
+                .map_err(|e| ExtractError::Grammar(e.to_string()))?;
+            LlamaSampler::chain_simple([grammar_sampler, LlamaSampler::greedy()])
+        }
+        None => LlamaSampler::chain_simple([LlamaSampler::greedy()]),
+    };
+
+    // No stop strings: the grammar (when present) admits only EOG once
+    // `root` is closed, so `is_eog_token` ends generation; `max_tokens` is
+    // the safety net either way.
+    let (text, tokens_generated) = run_decode(
+        &model,
+        &mut llama_context,
+        &mut sampler,
+        &prompt_tokens,
+        max_tokens,
+        &mut |_piece| true,
+    )
+    .map_err(|e| ExtractError::Decode(e.to_string()))?;
+
+    let model_path = if used_extractor {
+        config
+            .compaction_model_path
+            .as_deref()
+            .unwrap_or(&config.llm_model_path)
+    } else {
+        &config.llm_model_path
+    };
+    println!(
+        "🧪 Extraction: {} ({}), {} prompt tokens, {} generated",
+        model_path,
+        if used_extractor {
+            "extractor"
+        } else {
+            "chat model"
+        },
+        prompt_token_count,
+        tokens_generated
+    );
+
+    Ok(Extraction {
+        text,
+        prompt_tokens: prompt_token_count,
+        tokens_generated,
+        used_extractor,
+    })
+}
+
+/// Production [`Extractor`]: prefers the model configured at
+/// `ConfigView.compaction_model_path`, falling back to the chat model when
+/// none is configured or the extractor cannot be loaded (memory guard or
+/// load failure).
+#[allow(dead_code)] // wired up by #173/#175: constructed once compaction calls into this module
+pub struct ResidentExtractor;
+
+impl Extractor for ResidentExtractor {
+    fn context_window(&self) -> usize {
+        let config = match Database::get_config() {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!(
+                    "⚠️ context_window: could not read config ({e}), using a conservative estimate"
+                );
+                return EXTRACTOR_MAX_CONTEXT;
+            }
+        };
+        let fallback =
+            EXTRACTOR_MAX_CONTEXT.min(ContextManager::new(config.clone()).token_budget.total);
+
+        let _generation_guard = GENERATION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let backend = match llama_backend() {
+            Ok(backend) => backend,
+            Err(e) => {
+                eprintln!(
+                    "⚠️ context_window: llama.cpp backend unavailable ({e}), using a conservative estimate"
+                );
+                return fallback;
+            }
+        };
+        match resolve_extraction_model(backend, &config) {
+            Ok((model, used_extractor)) => {
+                extractor_context_window(&model, used_extractor, &config)
+            }
+            Err(e) => {
+                eprintln!(
+                    "⚠️ context_window: model resolution failed ({e}), using a conservative estimate"
+                );
+                fallback
+            }
+        }
+    }
+
+    fn complete(&self, prompt: &str, max_tokens: usize) -> std::io::Result<String> {
+        run_extraction(prompt, None, max_tokens)
+            .map(|extraction| extraction.text)
+            .map_err(Into::into)
+    }
+
+    fn extract(&self, prompt: &str, grammar: &str, max_tokens: usize) -> std::io::Result<String> {
+        run_extraction(prompt, Some(grammar), max_tokens)
+            .map(|extraction| extraction.text)
+            .map_err(Into::into)
+    }
+}
+
+/// A canned [`Extractor`] for other modules' tests (#173's extraction pass,
+/// #175's summary merge): records every prompt and grammar it is asked to
+/// run, and pops pre-supplied outputs in call order. Never runs a model.
+#[cfg(test)]
+pub(crate) struct FakeExtractor {
+    outputs: Mutex<std::collections::VecDeque<std::io::Result<String>>>,
+    pub prompts: Mutex<Vec<String>>,
+    pub grammars: Mutex<Vec<Option<String>>>,
+    pub context_window: usize,
+}
+
+#[cfg(test)]
+impl FakeExtractor {
+    pub fn returning(outputs: impl IntoIterator<Item = std::io::Result<String>>) -> Self {
+        Self {
+            outputs: Mutex::new(outputs.into_iter().collect()),
+            prompts: Mutex::new(Vec::new()),
+            grammars: Mutex::new(Vec::new()),
+            context_window: EXTRACTOR_MAX_CONTEXT,
+        }
+    }
+
+    fn record(&self, prompt: &str, grammar: Option<&str>) -> std::io::Result<String> {
+        self.prompts.lock().unwrap().push(prompt.to_string());
+        self.grammars
+            .lock()
+            .unwrap()
+            .push(grammar.map(str::to_string));
+        self.outputs
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| Err(std::io::Error::other("FakeExtractor: no more outputs")))
+    }
+}
+
+#[cfg(test)]
+impl Extractor for FakeExtractor {
+    fn context_window(&self) -> usize {
+        self.context_window
+    }
+
+    fn complete(&self, prompt: &str, _max_tokens: usize) -> std::io::Result<String> {
+        self.record(prompt, None)
+    }
+
+    fn extract(&self, prompt: &str, grammar: &str, _max_tokens: usize) -> std::io::Result<String> {
+        self.record(prompt, Some(grammar))
+    }
 }
 
 #[cfg(test)]
@@ -1643,5 +2193,140 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["b", "c"]
         );
+    }
+
+    #[test]
+    fn fake_extractor_records_prompts_and_returns_canned_outputs() {
+        let fake =
+            FakeExtractor::returning(vec![Ok("first".to_string()), Ok("second".to_string())]);
+
+        assert_eq!(fake.complete("prompt one", 10).unwrap(), "first");
+        assert_eq!(
+            fake.extract("prompt two", "root ::= \"x\"", 10).unwrap(),
+            "second"
+        );
+        assert_eq!(
+            *fake.prompts.lock().unwrap(),
+            vec!["prompt one".to_string(), "prompt two".to_string()]
+        );
+        assert_eq!(
+            *fake.grammars.lock().unwrap(),
+            vec![None, Some("root ::= \"x\"".to_string())]
+        );
+
+        let err = fake.complete("prompt three", 10).unwrap_err();
+        assert_eq!(err.to_string(), "FakeExtractor: no more outputs");
+    }
+
+    #[test]
+    fn context_window_from_extractor_caps_at_extractor_max_context() {
+        assert_eq!(
+            context_window_from(100_000, true, 4096),
+            EXTRACTOR_MAX_CONTEXT
+        );
+    }
+
+    #[test]
+    fn context_window_from_extractor_uses_the_smaller_trained_context() {
+        assert_eq!(context_window_from(2048, true, 4096), 2048);
+    }
+
+    #[test]
+    fn context_window_from_chat_fallback_returns_the_budget_total() {
+        assert_eq!(context_window_from(100_000, false, 4096), 4096);
+    }
+
+    /// 2 GiB of weights plus an 8192-token KV cache at
+    /// `EXTRACTOR_KV_BYTES_PER_TOKEN` comes to exactly 3.25 GB, chosen so the
+    /// boundary tests below land on an exact value rather than a rounded one.
+    const TWO_GIB: u64 = 2 * 1024 * 1024 * 1024;
+
+    #[test]
+    fn extractor_fits_in_ram_exact_fit_boundary_passes() {
+        assert!(extractor_fits_in_ram(5.25, TWO_GIB, 8192, 2));
+    }
+
+    #[test]
+    fn extractor_fits_in_ram_margin_pushes_it_over() {
+        assert!(!extractor_fits_in_ram(5.25, TWO_GIB, 8192, 3));
+    }
+
+    #[test]
+    fn extractor_fits_in_ram_zero_margin_passes() {
+        assert!(extractor_fits_in_ram(3.25, TWO_GIB, 8192, 0));
+    }
+
+    /// A `ConfigModify` that passes every validation rule, mirroring
+    /// `database.rs`'s own `valid_config_modify` test fixture (not reusable
+    /// across modules since it is private there).
+    fn valid_config_modify() -> crate::database::ConfigModify {
+        crate::database::ConfigModify {
+            device: "CPU".to_string(),
+            llm_model_path: String::new(),
+            gpu_layers: 0,
+            prompt_template: "Auto".to_string(),
+            context_window_size: 2048,
+            max_response_tokens: 512,
+            enable_dynamic_context: true,
+            vram_limit_gb: 4,
+            dynamic_gpu_allocation: true,
+            gpu_safety_margin: 0.8,
+            min_free_vram_mb: 512,
+            enable_hybrid_context: true,
+            max_system_ram_usage_gb: 8,
+            context_expansion_strategy: "balanced".to_string(),
+            ram_safety_margin_gb: 2,
+            multiplayer_mode: "solo".to_string(),
+            multiplayer_host_address: String::new(),
+            multiplayer_participant_id: String::new(),
+            mention_followup_depth: 1,
+            remote_generation_timeout_secs: 120,
+            multiplayer_password: None,
+            compact_threshold_tokens: None,
+            compact_min_messages: 8,
+            compaction_model_path: None,
+            heuristic_person_detection: true,
+        }
+    }
+
+    /// Manual/CI-optional acceptance test: with `AI_COMPANION_TEST_GGUF` set
+    /// to a small instruct GGUF, exercises `ResidentExtractor::extract`
+    /// end to end against a real model. Unset (the default for `cargo test`,
+    /// including CI), it prints why it skipped and returns rather than using
+    /// `#[ignore]`, which would hide that reason from plain `cargo test`
+    /// output.
+    #[test]
+    fn extract_returns_grammar_valid_json_when_a_test_gguf_is_available() {
+        let gguf_path = match std::env::var("AI_COMPANION_TEST_GGUF") {
+            Ok(path) => path,
+            Err(_) => {
+                println!("skipped: set AI_COMPANION_TEST_GGUF to a small instruct GGUF");
+                return;
+            }
+        };
+
+        // `paths::init` is a process-wide `OnceLock` that can only be set
+        // once; safe here only because this test is the sole caller in the
+        // whole suite and only runs when explicitly opted into above.
+        let dir = tempfile::tempdir().unwrap();
+        crate::paths::init(dir.path().to_path_buf())
+            .expect("paths::init should not already be set in this process");
+        Database::init().expect("failed to initialise the test database");
+
+        let mut modify = valid_config_modify();
+        modify.compaction_model_path = Some(gguf_path);
+        Database::change_config(modify).expect("failed to save the extractor config");
+
+        let grammar = r#"root ::= "{" ws "\"ok\"" ws ":" ws ("true" | "false") ws "}"
+ws ::= [ \n]*"#;
+        let text = ResidentExtractor
+            .extract("Reply with a small JSON object.", grammar, 32)
+            .expect("extraction should succeed against a real GGUF");
+        let _: serde_json::Value =
+            serde_json::from_str(&text).expect("extractor output should be valid JSON");
+
+        assert!(RESIDENT_EXTRACTOR.resident_key().is_some());
+        assert!(RESIDENT_MODEL.resident_key().is_none());
+        assert!(ResidentExtractor.context_window() <= EXTRACTOR_MAX_CONTEXT);
     }
 }
