@@ -171,3 +171,111 @@ fn manual_trigger_listing_and_pins_work_end_to_end_on_a_short_chat() {
         .status();
     assert_eq!(unknown_unpin_status, 404);
 }
+
+/// #181's `{"from_stale": true}` body through the real
+/// `POST /api/compaction/draft` route (folded into #179's handler on
+/// rebase), not just `select_recompaction_range`/`oldest_stale_from` in
+/// isolation: the `409` when there is nothing stale to re-compact, and a
+/// `202` that queues a draft starting at the stale checkpoint's own
+/// `from_message_id` once one exists. Seeds the `Stale` checkpoint row
+/// directly against the server's own SQLite file — a real one requires a
+/// full extract-then-commit cycle, which needs a GGUF model, the same
+/// limitation the manual-trigger `202` path already has (see this file's
+/// header comment).
+#[test]
+fn from_stale_true_queues_a_recompaction_draft_over_the_stale_checkpoints_range() {
+    let data_dir = tempfile::tempdir().expect("failed to create the data-dir temp dir");
+
+    let (_port, addr, _guard) = spawn_on_a_free_port(
+        |port| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_ai-companion"));
+            command
+                .env("COMPANION_HOST", "127.0.0.1")
+                .env("COMPANION_PORT", port.to_string())
+                .env("COMPANION_DATA_DIR", data_dir.path())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            command
+        },
+        Duration::from_secs(10),
+    );
+    let addr = addr.to_string();
+
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+
+    // The default `short_term_mem` (5, seeded by `Database::init`) needs at
+    // least a few messages past the stale checkpoint's end for
+    // `select_recompaction_range` to find anything to re-compact.
+    for i in 1..=15 {
+        post_message(&agent, &addr, "user", &format!("message {i}"));
+    }
+
+    // No checkpoint exists at all yet, let alone a stale one: `409` through
+    // the real route, not just `oldest_stale_from` returning `None` in a
+    // unit test.
+    let no_stale_response = agent
+        .post(format!("http://{addr}/api/compaction/draft"))
+        .send_json(json!({ "from_stale": true }))
+        .unwrap_or_else(|e| {
+            panic!("POST /api/compaction/draft failed at the transport level: {e}")
+        });
+    assert_eq!(no_stale_response.status(), 409);
+    let no_stale_body = no_stale_response
+        .into_body()
+        .read_to_string()
+        .expect("409 body should be readable text");
+    assert!(
+        no_stale_body.contains("no stale checkpoint"),
+        "409 body should say there is no stale checkpoint, got: {no_stale_body}"
+    );
+
+    // Seed a `Stale` checkpoint directly against the server's own database
+    // file: a real one requires a committed checkpoint plus an edit inside
+    // its range, which this binary cannot reach without a loaded model.
+    let db_path = data_dir.path().join("companion_database.db");
+    {
+        let con = rusqlite::Connection::open(&db_path)
+            .expect("failed to open the server's own database file");
+        let companion_id: i32 = con
+            .query_row("SELECT id FROM companion LIMIT 1", [], |row| row.get(0))
+            .expect("the server should have seeded a companion row at startup");
+        con.execute(
+            "INSERT INTO compactions (companion_id, from_message_id, through_message_id, status, trigger, created_at) VALUES (?, 1, 5, 'stale', 'threshold', 'now')",
+            [companion_id],
+        )
+        .expect("failed to seed a stale checkpoint row");
+    }
+
+    let queued_response = agent
+        .post(format!("http://{addr}/api/compaction/draft"))
+        .send_json(json!({ "from_stale": true }))
+        .unwrap_or_else(|e| {
+            panic!("POST /api/compaction/draft failed at the transport level: {e}")
+        });
+    assert_eq!(
+        queued_response.status(),
+        202,
+        "expected the stale checkpoint's range to queue a draft"
+    );
+    let queued_body: Value = queued_response
+        .into_body()
+        .read_json()
+        .expect("202 body should be valid JSON");
+    let draft_id = queued_body["draft_id"]
+        .as_i64()
+        .expect("202 body should carry draft_id");
+
+    // Visible through the listing route too, starting at the stale
+    // checkpoint's own `from_message_id` (1) — not wherever a normal
+    // manual trigger would have started (past `compacted_through`, which
+    // is still `NULL` here).
+    let listing = get_json(&agent, &format!("http://{addr}/api/compaction"));
+    assert_eq!(listing["pending_draft"]["id"].as_i64(), Some(draft_id));
+    assert_eq!(
+        listing["pending_draft"]["from_message_id"].as_i64(),
+        Some(1)
+    );
+}
