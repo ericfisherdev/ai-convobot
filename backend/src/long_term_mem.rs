@@ -156,45 +156,16 @@ impl LongTermMem {
         self.commit_and_invalidate(&mut writer)
     }
 
-    /// The current generation counter. `POST /api/memory/longTerm/rebuild`
-    /// (`replace_facts_if_current` below) snapshots this alongside its
-    /// SQLite read of active facts, as its compare-and-swap evidence that
-    /// nothing else indexed a fact in between.
-    pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
-    }
-
-    /// Replaces the whole index with `facts` in one commit — the rebuild
-    /// primitive behind `POST /api/memory/longTerm/rebuild` — but only if
-    /// the generation is still `expected_generation`. Returns `Ok(false)`
-    /// without writing anything when it has moved, rather than clobbering
-    /// whatever a concurrent commit's `LtmObserver` already indexed.
-    ///
-    /// Why a generation check is enough: every commit's SQLite write is
-    /// durable before its `LtmObserver` ever runs (`compaction::commit::
-    /// commit` calls observers only after `store.commit_checkpoint`
-    /// returns `Ok`), so a caller that reads active facts, then calls this
-    /// with the generation it read *before* that SQLite read, is
-    /// guaranteed one of two outcomes: either no commit's index write
-    /// landed while it was reading (this call succeeds, and the snapshot
-    /// it read cannot have missed anything, since any commit whose SQLite
-    /// write preceded the caller's read had already finished, index write
-    /// included, before the generation was snapshotted — a `false` return
-    /// on a stale generation would have already ruled that commit's tantivy
-    /// write out), or one did (this call declines, so nothing is lost, and
-    /// the caller re-reads and retries against the now-current state). The
-    /// atomicity comes from checking under the same `writer` lock
-    /// `add_fact`/`remove_fact` take for their own writes, so no commit can
-    /// land between the check and the write below.
-    pub fn replace_facts_if_current<'a>(
+    /// Replaces the whole index with `facts` in one commit: the rebuild
+    /// primitive behind `POST /api/memory/longTerm/rebuild`. Deliberately
+    /// one `delete_all_documents` plus one `add_document` per fact under a
+    /// single commit, not a commit per fact — a rebuild can cover hundreds
+    /// of facts.
+    pub fn replace_facts<'a>(
         &self,
-        expected_generation: u64,
         facts: impl IntoIterator<Item = (i64, &'a str)>,
-    ) -> Result<bool, TantivyError> {
+    ) -> Result<(), TantivyError> {
         let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
-        if self.generation.load(Ordering::SeqCst) != expected_generation {
-            return Ok(false);
-        }
         writer.delete_all_documents()?;
         for (fact_id, text) in facts {
             writer.add_document(tantivy::doc!(
@@ -202,16 +173,15 @@ impl LongTermMem {
                 self.fact_id_field => fact_id as u64
             ))?;
         }
-        self.commit_and_invalidate(&mut writer)?;
-        Ok(true)
+        self.commit_and_invalidate(&mut writer)
     }
 
     /// Commits `writer`'s pending changes and reloads the reader, bumping
     /// the generation counter and clearing the query cache. Shared tail of
     /// every mutation method (`add_entry`/`add_fact`/`remove_fact`/
-    /// `replace_facts_if_current`/`erase_memory`) — see the comment this
-    /// carried forward from `add_entry` on why the generation bump happens
-    /// before the cache clear.
+    /// `replace_facts`/`erase_memory`) — see the comment this carried
+    /// forward from `add_entry` on why the generation bump happens before
+    /// the cache clear.
     fn commit_and_invalidate(&self, writer: &mut IndexWriter) -> Result<(), TantivyError> {
         writer.commit()?;
         self.reader.reload()?;
@@ -530,47 +500,19 @@ mod tests {
     }
 
     #[test]
-    fn replace_facts_if_current_leaves_only_the_new_set_after_one_commit() {
+    fn replace_facts_leaves_only_the_new_set_after_one_commit() {
         let dir = tempfile::TempDir::new().unwrap();
         let ltm = LongTermMem::open_at(dir.path()).unwrap();
         ltm.add_fact(1, "old fact about the moon").unwrap();
 
-        let generation = ltm.generation();
-        let applied = ltm
-            .replace_facts_if_current(generation, vec![(2, "new fact about the sun")])
+        ltm.replace_facts(vec![(2, "new fact about the sun")])
             .unwrap();
 
-        assert!(applied);
         assert!(ltm.get_matches("moon", 5).unwrap().is_empty());
         assert_eq!(
             ltm.get_matches("sun", 5).unwrap(),
             vec!["new fact about the sun".to_string()]
         );
-    }
-
-    #[test]
-    fn replace_facts_if_current_declines_and_writes_nothing_when_the_generation_has_moved() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let ltm = LongTermMem::open_at(dir.path()).unwrap();
-        let stale_generation = ltm.generation();
-        // Bumps the generation past `stale_generation`, simulating a
-        // concurrent commit's `LtmObserver` indexing a fact while a
-        // rebuild was still reading its own snapshot.
-        ltm.add_fact(1, "a fact added after the snapshot was read")
-            .unwrap();
-
-        let applied = ltm
-            .replace_facts_if_current(stale_generation, vec![(2, "a stale rebuild snapshot")])
-            .unwrap();
-
-        assert!(!applied);
-        // The concurrently indexed fact survives; the stale rebuild wrote
-        // nothing (not even its own document, let alone wiping this one).
-        assert_eq!(
-            ltm.get_matches("added", 5).unwrap(),
-            vec!["a fact added after the snapshot was read".to_string()]
-        );
-        assert!(ltm.get_matches("stale", 5).unwrap().is_empty());
     }
 
     #[test]

@@ -498,10 +498,11 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 
 - **URL:** `/memory/longTerm/rebuild`
 - **Method:** `POST`
-- **Description:** Repair path for the tantivy long-term memory index: replaces its contents with the companion's currently active compaction facts (any manual entries added via 5.1 are dropped). The index is kept current automatically as checkpoints commit; this endpoint is only needed if it drifts, or after a schema mismatch recreated it empty on startup.
+- **Description:** Repair path for the tantivy long-term memory index: replaces its contents with the companion's currently active compaction facts (any manual entries added via 5.1 are dropped). The index is kept current automatically as checkpoints commit; this endpoint is only needed if it drifts, or after a schema mismatch recreated it empty on startup. Claims the same turn slot a chat reply or a compaction commit does, so a rebuild while either is in progress is rejected rather than racing it.
 - **Response:**
   - Status: 200 OK
   - Body: `Long term memory rebuilt from {n} facts`
+  - Status: 409 Conflict (a reply is being generated or a compaction draft is being committed)
 - **Example Request:**
   ```http
   POST /memory/longTerm/rebuild
