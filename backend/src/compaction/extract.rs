@@ -1853,14 +1853,149 @@ mod tests {
     #[test]
     fn load_draft_for_extraction_on_a_genuinely_unknown_id_does_not_touch_the_store() {
         // `Ok(None)` (no row at all) is not the same failure: nothing to
-        // transition, so this must not call `fail_draft` at all -- there is
-        // no `RecordingStore` checkpoint to assert against, so the
-        // assertion here is just that this returns cleanly rather than
-        // panicking on a `fail_draft` call against an id that was never
-        // inserted.
-        let store = RecordingStore::new();
+        // transition, so this must not call `fail_draft` at all. A bare
+        // `RecordingStore` can't tell the difference on its own (#208
+        // review, CodeRabbit): `fail_draft` against an id that was never
+        // inserted is already a silent no-op (`QueryReturnedNoRows`), the
+        // same outcome whether or not `load_draft_for_extraction` mistakenly
+        // called it -- so `CountingFailDraftStore` below counts the call
+        // directly instead.
+        let inner = RecordingStore::new();
+        let store = CountingFailDraftStore::new(&inner);
         let err = load_draft_for_extraction(&store, 999).unwrap_err();
         assert_eq!(err, "draft 999 not found");
+        assert_eq!(store.fail_draft_calls(), 0);
+    }
+
+    /// Wraps a [`RecordingStore`] and counts `fail_draft` calls, so
+    /// [`load_draft_for_extraction`]'s "genuinely unknown id" test can
+    /// assert *zero* calls rather than rely on `fail_draft` against an
+    /// unknown id already being a silent no-op (#208 review, CodeRabbit) --
+    /// every other method just delegates.
+    struct CountingFailDraftStore<'a> {
+        inner: &'a RecordingStore,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl<'a> CountingFailDraftStore<'a> {
+        fn new(inner: &'a RecordingStore) -> Self {
+            Self {
+                inner,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn fail_draft_calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl CompactionStore for CountingFailDraftStore<'_> {
+        fn insert_draft(&self, draft: NewDraft) -> rusqlite::Result<i64> {
+            self.inner.insert_draft(draft)
+        }
+        fn get_checkpoint(&self, id: i64) -> rusqlite::Result<Option<Checkpoint>> {
+            self.inner.get_checkpoint(id)
+        }
+        fn pending_draft(&self, companion_id: i32) -> rusqlite::Result<Option<Checkpoint>> {
+            self.inner.pending_draft(companion_id)
+        }
+        fn list_checkpoints(&self, companion_id: i32) -> rusqlite::Result<Vec<Checkpoint>> {
+            self.inner.list_checkpoints(companion_id)
+        }
+        fn latest_committed(&self, companion_id: i32) -> rusqlite::Result<Option<Checkpoint>> {
+            self.inner.latest_committed(companion_id)
+        }
+        fn latest_committed_before(
+            &self,
+            companion_id: i32,
+            from_message_id: i32,
+        ) -> rusqlite::Result<Option<Checkpoint>> {
+            self.inner
+                .latest_committed_before(companion_id, from_message_id)
+        }
+        fn context_snapshot(
+            &self,
+            companion_id: i32,
+        ) -> rusqlite::Result<(Vec<Fact>, Option<i32>, Option<Checkpoint>)> {
+            self.inner.context_snapshot(companion_id)
+        }
+        fn update_status(&self, id: i64, status: CompactionStatus) -> rusqlite::Result<()> {
+            self.inner.update_status(id, status)
+        }
+        fn transition_status(
+            &self,
+            id: i64,
+            from: CompactionStatus,
+            to: CompactionStatus,
+        ) -> rusqlite::Result<()> {
+            self.inner.transition_status(id, from, to)
+        }
+        fn set_extraction_result(
+            &self,
+            id: i64,
+            raw_model_output: Option<String>,
+            summary: Option<String>,
+            attitude_ratings: Option<String>,
+        ) -> rusqlite::Result<()> {
+            self.inner
+                .set_extraction_result(id, raw_model_output, summary, attitude_ratings)
+        }
+        fn fail_draft(&self, id: i64, error: &str) -> rusqlite::Result<()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.fail_draft(id, error)
+        }
+        fn insert_facts(
+            &self,
+            compaction_id: i64,
+            facts: &[FactDraft],
+        ) -> rusqlite::Result<Vec<i64>> {
+            self.inner.insert_facts(compaction_id, facts)
+        }
+        fn active_facts(&self, companion_id: i32) -> rusqlite::Result<Vec<Fact>> {
+            self.inner.active_facts(companion_id)
+        }
+        fn facts_for(&self, compaction_id: i64) -> rusqlite::Result<Vec<Fact>> {
+            self.inner.facts_for(compaction_id)
+        }
+        fn supersede(&self, fact_id: i64, by: i64) -> rusqlite::Result<()> {
+            self.inner.supersede(fact_id, by)
+        }
+        fn mark_stale_containing(
+            &self,
+            companion_id: i32,
+            message_id: i32,
+        ) -> rusqlite::Result<usize> {
+            self.inner.mark_stale_containing(companion_id, message_id)
+        }
+        fn oldest_stale_from(&self, companion_id: i32) -> rusqlite::Result<Option<i32>> {
+            self.inner.oldest_stale_from(companion_id)
+        }
+        fn compacted_through(&self, companion_id: i32) -> rusqlite::Result<Option<i32>> {
+            self.inner.compacted_through(companion_id)
+        }
+        fn set_compacted_through(
+            &self,
+            companion_id: i32,
+            through: Option<i32>,
+        ) -> rusqlite::Result<()> {
+            self.inner.set_compacted_through(companion_id, through)
+        }
+        fn pin(&self, message_id: i32) -> rusqlite::Result<()> {
+            self.inner.pin(message_id)
+        }
+        fn unpin(&self, message_id: i32) -> rusqlite::Result<()> {
+            self.inner.unpin(message_id)
+        }
+        fn pins(&self) -> rusqlite::Result<Vec<crate::compaction::types::Pin>> {
+            self.inner.pins()
+        }
+        fn commit_checkpoint(
+            &self,
+            record: crate::compaction::store::CommitRecord,
+        ) -> rusqlite::Result<Checkpoint> {
+            self.inner.commit_checkpoint(record)
+        }
     }
 
     // --- panic_message / panic_payload_text (#208) ---
