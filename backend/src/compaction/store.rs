@@ -356,23 +356,32 @@ pub(crate) fn insert_facts_on(
     Ok(ids)
 }
 
-/// Every fact whose checkpoint is `committed`, ordered by insertion order.
-/// The `status = 'committed'` predicate is load-bearing: `insert_facts_on`
+/// Every fact whose checkpoint is `committed` or `stale`, ordered by
+/// insertion order. The status predicate is load-bearing: `insert_facts_on`
 /// derives `active = 1` for every un-rejected item at *draft* time, before
 /// the user has reviewed anything, so without it a pending draft's rows
 /// would render into the prompt and a discarded draft's rows would linger
 /// forever. Scoping to committed checkpoints means `discard` only needs
 /// `update_status(Discarded)` and `commit_checkpoint` needs no extra flag
 /// flip: the rows become visible the moment the checkpoint's status flips.
+/// `Stale` is included alongside `Committed` (#181) so a checkpoint whose
+/// range was edited/deleted out from under it keeps rendering — "better
+/// than nothing" — until [`retire_stale_within_on`] discards it as part of
+/// a fresh commit that re-covers its range; `Discarded` stays excluded, the
+/// same as before.
 pub(crate) fn active_facts_on(con: &Connection, companion_id: i32) -> Result<Vec<Fact>> {
     let mut stmt = con.prepare(&format!(
         "SELECT {FACT_COLUMNS} FROM compaction_facts
          JOIN compactions c ON c.id = compaction_facts.compaction_id
-         WHERE c.companion_id = ? AND c.status = ? AND compaction_facts.active = 1 AND compaction_facts.rejected_reason IS NULL
+         WHERE c.companion_id = ? AND c.status IN (?, ?) AND compaction_facts.active = 1 AND compaction_facts.rejected_reason IS NULL
          ORDER BY compaction_facts.id"
     ))?;
     let rows = stmt.query_map(
-        params![companion_id, &CompactionStatus::Committed as &dyn ToSql],
+        params![
+            companion_id,
+            &CompactionStatus::Committed as &dyn ToSql,
+            &CompactionStatus::Stale as &dyn ToSql
+        ],
         fact_from_row,
     )?;
     rows.collect()
@@ -402,6 +411,99 @@ pub(crate) fn supersede_on(con: &Connection, fact_id: i64, by: i64) -> Result<()
     Ok(())
 }
 
+/// Flips every `Committed` checkpoint containing `message_id` (`from_message_id
+/// <= message_id <= through_message_id`) to `Stale` (#181): editing or
+/// deleting a message inside a committed range means that checkpoint's
+/// summary/facts no longer accurately describe the messages they cite.
+/// `Draft`, `Discarded`, and already-`Stale` rows are left untouched.
+/// Returns the number of rows flipped — always 0 or 1 in practice, since a
+/// companion's committed checkpoint ranges never overlap.
+pub(crate) fn mark_stale_containing_on(
+    con: &Connection,
+    companion_id: i32,
+    message_id: i32,
+) -> Result<usize> {
+    con.execute(
+        "UPDATE compactions SET status = ? WHERE companion_id = ? AND status = ? AND from_message_id <= ? AND ? <= through_message_id",
+        params![
+            &CompactionStatus::Stale as &dyn ToSql,
+            companion_id,
+            &CompactionStatus::Committed as &dyn ToSql,
+            message_id,
+            message_id,
+        ],
+    )
+}
+
+/// The lowest `from_message_id` among `companion_id`'s `Stale` checkpoints,
+/// or `None` if it has none. `MIN` over zero matching rows is SQL `NULL`,
+/// not "no row", so this never needs `.optional()`.
+pub(crate) fn oldest_stale_from_on(con: &Connection, companion_id: i32) -> Result<Option<i32>> {
+    con.query_row(
+        "SELECT MIN(from_message_id) FROM compactions WHERE companion_id = ? AND status = ?",
+        params![companion_id, &CompactionStatus::Stale as &dyn ToSql],
+        |row| row.get(0),
+    )
+}
+
+/// Retires every `Stale` checkpoint for `companion_id` whose range lies
+/// inside `[from, through]` — flips it to `Discarded` and deactivates its
+/// facts — and returns the retired checkpoint ids (`Ok(vec![])` when none
+/// match). Called on the caller's own transaction, not its own: #175's
+/// `SqliteCompactionStore::commit_checkpoint` runs this as one more step of
+/// its existing `Immediate` transaction, right before it sets
+/// `compacted_through`, so a fresh checkpoint that re-covers a stale range
+/// heals it atomically with the rest of the commit.
+pub(crate) fn retire_stale_within_on(
+    con: &Connection,
+    companion_id: i32,
+    from: i32,
+    through: i32,
+) -> Result<Vec<i64>> {
+    let mut stmt = con.prepare(
+        "SELECT id FROM compactions WHERE companion_id = ? AND status = ? AND from_message_id >= ? AND through_message_id <= ?",
+    )?;
+    let ids: Vec<i64> = stmt
+        .query_map(
+            params![
+                companion_id,
+                &CompactionStatus::Stale as &dyn ToSql,
+                from,
+                through
+            ],
+            |row| row.get(0),
+        )?
+        .collect::<Result<_>>()?;
+    drop(stmt);
+
+    for id in &ids {
+        con.execute(
+            "UPDATE compactions SET status = ? WHERE id = ?",
+            params![&CompactionStatus::Discarded as &dyn ToSql, id],
+        )?;
+        con.execute(
+            "UPDATE compaction_facts SET active = 0 WHERE compaction_id = ?",
+            params![id],
+        )?;
+    }
+    Ok(ids)
+}
+
+/// Deletes every compaction fact, checkpoint, and pin, and resets
+/// `compacted_through` to `NULL` (#181's clear-chat reset). Facts before
+/// compactions and pins before messages, matching the foreign-key
+/// dependency order (`ON DELETE CASCADE` would clean these up on its own,
+/// but the explicit order keeps this correct independent of that). Takes
+/// the caller's connection, not its own, so `Database::erase_messages_on`
+/// can run it inside the same transaction as `DELETE FROM messages`.
+pub(crate) fn clear_all_on(con: &Connection) -> Result<()> {
+    con.execute("DELETE FROM compaction_facts", [])?;
+    con.execute("DELETE FROM compactions", [])?;
+    con.execute("DELETE FROM pinned_messages", [])?;
+    con.execute("UPDATE companion SET compacted_through = NULL", [])?;
+    Ok(())
+}
+
 /// One promoted fact: the stored row named by `fact_id` (one of #185's
 /// `fill_draft` rows) gets its reviewed content and verdict written back in
 /// place. #175's commit never inserts a new row here.
@@ -422,6 +524,10 @@ pub struct FactPromotion {
 pub struct CommitRecord {
     pub draft_id: i64,
     pub companion_id: i32,
+    /// The draft's own `from_message_id` (#181): `commit_checkpoint` uses it
+    /// together with `through_message_id` to retire any `Stale` checkpoint
+    /// this commit's range now re-covers.
+    pub from_message_id: i32,
     pub through_message_id: i32,
     pub summary: String,
     pub rolling_summary: String,
@@ -621,8 +727,8 @@ pub trait CompactionStore {
     /// in `replaces` (that is `supersede`, called by #175's commit).
     fn insert_facts(&self, compaction_id: i64, facts: &[FactDraft]) -> Result<Vec<i64>>;
 
-    /// Only rows whose checkpoint is `committed`; see [`active_facts_on`]
-    /// for why that predicate matters.
+    /// Rows whose checkpoint is `committed` or `stale`; see
+    /// [`active_facts_on`] for why that predicate matters.
     fn active_facts(&self, companion_id: i32) -> Result<Vec<Fact>>;
 
     /// All rows including rejected/inactive (the review card in #180 needs
@@ -633,6 +739,22 @@ pub trait CompactionStore {
     /// `fact_id` is unknown; `SqliteFailure(ConstraintViolation)` if `by`
     /// is unknown.
     fn supersede(&self, fact_id: i64, by: i64) -> Result<()>;
+
+    /// Flips every `Committed` checkpoint containing `message_id` to
+    /// `Stale` (#181). Returns how many rows changed — 0 or 1 in practice,
+    /// since a companion's committed ranges never overlap. Called directly
+    /// (via [`mark_stale_containing_on`]) by `Database::edit_message_on`/
+    /// `delete_message_on` inside their own transaction, so those callers
+    /// do not go through this trait method — it exists for parity with the
+    /// rest of the trait and for callers that do not need transaction
+    /// sharing (none yet).
+    fn mark_stale_containing(&self, companion_id: i32, message_id: i32) -> Result<usize>;
+
+    /// The lowest `from_message_id` among `companion_id`'s `Stale`
+    /// checkpoints, or `None` if it has none. What #181's re-compaction
+    /// entry point reads to build a [`crate::compaction::range::
+    /// select_recompaction_range`] call.
+    fn oldest_stale_from(&self, companion_id: i32) -> Result<Option<i32>>;
 
     /// `None` = never compacted / reset (what #181's clear-chat needs; #172
     /// and #174 read it every turn).
@@ -755,6 +877,16 @@ impl CompactionStore for SqliteCompactionStore {
         supersede_on(&con, fact_id, by)
     }
 
+    fn mark_stale_containing(&self, companion_id: i32, message_id: i32) -> Result<usize> {
+        let con = Database::open()?;
+        mark_stale_containing_on(&con, companion_id, message_id)
+    }
+
+    fn oldest_stale_from(&self, companion_id: i32) -> Result<Option<i32>> {
+        let con = Database::open()?;
+        oldest_stale_from_on(&con, companion_id)
+    }
+
     fn compacted_through(&self, companion_id: i32) -> Result<Option<i32>> {
         let con = Database::open()?;
         compacted_through_on(&con, companion_id)
@@ -811,6 +943,17 @@ impl CompactionStore for SqliteCompactionStore {
                 record.needs_merge,
                 record.draft_id,
             ],
+        )?;
+        // #181: heals any `Stale` checkpoint this commit's range now
+        // re-covers, on the same transaction as the rest of the commit.
+        // Runs on every commit, not only ones queued specifically to
+        // re-compact a stale range — a normal threshold commit that happens
+        // to span one heals it too.
+        retire_stale_within_on(
+            &tx,
+            record.companion_id,
+            record.from_message_id,
+            record.through_message_id,
         )?;
         set_compacted_through_on(&tx, record.companion_id, Some(record.through_message_id))?;
         tx.commit()?;
@@ -1012,12 +1155,20 @@ impl CompactionStore for RecordingStore {
     }
 
     fn active_facts(&self, companion_id: i32) -> Result<Vec<Fact>> {
-        let committed_ids: std::collections::HashSet<i64> = self
+        // Committed and Stale both render (#181); only Draft and Discarded
+        // are excluded, mirroring `active_facts_on`'s SQL predicate.
+        let visible_ids: std::collections::HashSet<i64> = self
             .checkpoints
             .lock()
             .unwrap()
             .iter()
-            .filter(|c| c.companion_id == companion_id && c.status == CompactionStatus::Committed)
+            .filter(|c| {
+                c.companion_id == companion_id
+                    && matches!(
+                        c.status,
+                        CompactionStatus::Committed | CompactionStatus::Stale
+                    )
+            })
             .map(|c| c.id)
             .collect();
         Ok(self
@@ -1026,7 +1177,7 @@ impl CompactionStore for RecordingStore {
             .unwrap()
             .iter()
             .filter(|f| {
-                committed_ids.contains(&f.compaction_id) && f.active && f.rejected_reason.is_none()
+                visible_ids.contains(&f.compaction_id) && f.active && f.rejected_reason.is_none()
             })
             .cloned()
             .collect())
@@ -1052,6 +1203,33 @@ impl CompactionStore for RecordingStore {
         fact.active = false;
         fact.superseded_by = Some(by);
         Ok(())
+    }
+
+    fn mark_stale_containing(&self, companion_id: i32, message_id: i32) -> Result<usize> {
+        let mut checkpoints = self.checkpoints.lock().unwrap();
+        let mut changed = 0;
+        for checkpoint in checkpoints.iter_mut() {
+            if checkpoint.companion_id == companion_id
+                && checkpoint.status == CompactionStatus::Committed
+                && checkpoint.from_message_id <= message_id
+                && message_id <= checkpoint.through_message_id
+            {
+                checkpoint.status = CompactionStatus::Stale;
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    }
+
+    fn oldest_stale_from(&self, companion_id: i32) -> Result<Option<i32>> {
+        Ok(self
+            .checkpoints
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.companion_id == companion_id && c.status == CompactionStatus::Stale)
+            .map(|c| c.from_message_id)
+            .min())
     }
 
     fn compacted_through(&self, companion_id: i32) -> Result<Option<i32>> {
@@ -1154,6 +1332,34 @@ impl CompactionStore for RecordingStore {
                     .ok_or(Error::QueryReturnedNoRows)?;
                 duplicate.active = false;
                 duplicate.superseded_by = Some(*existing_id);
+            }
+        }
+
+        // #181: heals any `Stale` checkpoint this commit's range now
+        // re-covers, mirroring `retire_stale_within_on`'s SQL side.
+        {
+            let mut checkpoints = self.checkpoints.lock().unwrap();
+            let retired: Vec<i64> = checkpoints
+                .iter()
+                .filter(|c| {
+                    c.companion_id == record.companion_id
+                        && c.status == CompactionStatus::Stale
+                        && c.from_message_id >= record.from_message_id
+                        && c.through_message_id <= record.through_message_id
+                })
+                .map(|c| c.id)
+                .collect();
+            for checkpoint in checkpoints.iter_mut() {
+                if retired.contains(&checkpoint.id) {
+                    checkpoint.status = CompactionStatus::Discarded;
+                }
+            }
+            drop(checkpoints);
+            let mut facts = self.facts.lock().unwrap();
+            for fact in facts.iter_mut() {
+                if retired.contains(&fact.compaction_id) {
+                    fact.active = false;
+                }
             }
         }
 
@@ -1662,6 +1868,7 @@ mod tests {
         let record = CommitRecord {
             draft_id,
             companion_id: 1,
+            from_message_id: 1,
             through_message_id: 3,
             summary: "new summary".to_string(),
             rolling_summary: "".to_string(),
@@ -1739,6 +1946,7 @@ mod tests {
         let record = CommitRecord {
             draft_id,
             companion_id: 1,
+            from_message_id: 1,
             through_message_id: 3,
             summary: "new summary".to_string(),
             rolling_summary: "rolling".to_string(),
@@ -1813,6 +2021,7 @@ mod tests {
         let record = CommitRecord {
             draft_id,
             companion_id: 1,
+            from_message_id: 1,
             through_message_id: 3,
             summary: "new summary".to_string(),
             rolling_summary: "".to_string(),
@@ -1840,5 +2049,221 @@ mod tests {
         assert!(stored[0].active);
 
         assert_eq!(compacted_through_on(&con, 1).unwrap(), None);
+    }
+
+    fn a_committed_checkpoint(con: &Connection, from: i32, through: i32) -> i64 {
+        let id = insert_draft_on(
+            con,
+            &NewDraft {
+                companion_id: 1,
+                from_message_id: from,
+                through_message_id: through,
+                trigger: CompactionTrigger::Threshold,
+                raw_model_output: None,
+            },
+        )
+        .unwrap();
+        update_status_on(con, id, CompactionStatus::Committed).unwrap();
+        id
+    }
+
+    #[test]
+    fn mark_stale_containing_on_flips_only_the_containing_committed_checkpoint() {
+        let (_dir, con) = fresh_db();
+        let first = a_committed_checkpoint(&con, 1, 3);
+        let second = a_committed_checkpoint(&con, 4, 6);
+
+        let changed = mark_stale_containing_on(&con, 1, 2).unwrap();
+
+        assert_eq!(changed, 1);
+        assert_eq!(
+            get_checkpoint_on(&con, first).unwrap().unwrap().status,
+            CompactionStatus::Stale
+        );
+        assert_eq!(
+            get_checkpoint_on(&con, second).unwrap().unwrap().status,
+            CompactionStatus::Committed
+        );
+    }
+
+    #[test]
+    fn mark_stale_containing_on_leaves_a_draft_checkpoint_untouched() {
+        let (_dir, con) = fresh_db();
+        let draft_id = insert_draft_on(&con, &a_draft()).unwrap();
+
+        let changed = mark_stale_containing_on(&con, 1, 2).unwrap();
+
+        assert_eq!(changed, 0);
+        assert_eq!(
+            get_checkpoint_on(&con, draft_id).unwrap().unwrap().status,
+            CompactionStatus::Draft
+        );
+    }
+
+    #[test]
+    fn mark_stale_containing_on_a_message_outside_every_range_changes_nothing() {
+        let (_dir, con) = fresh_db();
+        a_committed_checkpoint(&con, 1, 3);
+
+        assert_eq!(mark_stale_containing_on(&con, 1, 999).unwrap(), 0);
+    }
+
+    #[test]
+    fn oldest_stale_from_on_returns_the_lowest_from_message_id_among_stale_checkpoints() {
+        let (_dir, con) = fresh_db();
+        assert_eq!(oldest_stale_from_on(&con, 1).unwrap(), None);
+
+        a_committed_checkpoint(&con, 5, 8);
+        mark_stale_containing_on(&con, 1, 6).unwrap();
+        a_committed_checkpoint(&con, 9, 12);
+        mark_stale_containing_on(&con, 1, 10).unwrap();
+
+        assert_eq!(oldest_stale_from_on(&con, 1).unwrap(), Some(5));
+    }
+
+    #[test]
+    fn retire_stale_within_on_discards_a_stale_checkpoint_inside_the_range_and_deactivates_its_facts(
+    ) {
+        let (_dir, con) = fresh_db();
+        let stale_id = a_committed_checkpoint(&con, 2, 3);
+        let fact_draft = FactDraft {
+            category: FactCategory::Milestone,
+            subject: None,
+            text: "old".to_string(),
+            quote_speaker: None,
+            sources: vec![2],
+            replaces: vec![],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        };
+        let fact_ids = insert_facts_on(&con, stale_id, std::slice::from_ref(&fact_draft)).unwrap();
+        mark_stale_containing_on(&con, 1, 2).unwrap();
+
+        let retired = retire_stale_within_on(&con, 1, 1, 3).unwrap();
+
+        assert_eq!(retired, vec![stale_id]);
+        assert_eq!(
+            get_checkpoint_on(&con, stale_id).unwrap().unwrap().status,
+            CompactionStatus::Discarded
+        );
+        let fact = facts_for_on(&con, stale_id)
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == fact_ids[0])
+            .unwrap();
+        assert!(!fact.active);
+    }
+
+    #[test]
+    fn retire_stale_within_on_leaves_a_stale_checkpoint_outside_the_range_untouched() {
+        let (_dir, con) = fresh_db();
+        let stale_id = a_committed_checkpoint(&con, 10, 12);
+        mark_stale_containing_on(&con, 1, 11).unwrap();
+
+        let retired = retire_stale_within_on(&con, 1, 1, 3).unwrap();
+
+        assert!(retired.is_empty());
+        assert_eq!(
+            get_checkpoint_on(&con, stale_id).unwrap().unwrap().status,
+            CompactionStatus::Stale
+        );
+    }
+
+    #[test]
+    fn retire_stale_within_on_with_no_stale_checkpoints_is_a_no_op() {
+        let (_dir, con) = fresh_db();
+        assert_eq!(
+            retire_stale_within_on(&con, 1, 1, 3).unwrap(),
+            Vec::<i64>::new()
+        );
+    }
+
+    #[test]
+    fn active_facts_on_still_includes_a_stale_checkpoints_facts() {
+        let (_dir, con) = fresh_db();
+        let id = a_committed_checkpoint(&con, 1, 3);
+        let fact_draft = FactDraft {
+            category: FactCategory::Milestone,
+            subject: None,
+            text: "still here".to_string(),
+            quote_speaker: None,
+            sources: vec![1],
+            replaces: vec![],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        };
+        insert_facts_on(&con, id, std::slice::from_ref(&fact_draft)).unwrap();
+
+        mark_stale_containing_on(&con, 1, 2).unwrap();
+        assert_eq!(
+            get_checkpoint_on(&con, id).unwrap().unwrap().status,
+            CompactionStatus::Stale
+        );
+
+        let active = active_facts_on(&con, 1).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].text, "still here");
+    }
+
+    #[test]
+    fn clear_all_on_deletes_every_compaction_row_and_resets_compacted_through() {
+        let (_dir, con) = fresh_db();
+        let id = a_committed_checkpoint(&con, 1, 3);
+        let fact_draft = FactDraft {
+            category: FactCategory::Milestone,
+            subject: None,
+            text: "fact".to_string(),
+            quote_speaker: None,
+            sources: vec![1],
+            replaces: vec![],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        };
+        insert_facts_on(&con, id, std::slice::from_ref(&fact_draft)).unwrap();
+        pin_on(&con, 1).unwrap();
+        set_compacted_through_on(&con, 1, Some(3)).unwrap();
+
+        clear_all_on(&con).unwrap();
+
+        assert!(list_checkpoints_on(&con, 1).unwrap().is_empty());
+        assert!(pins_on(&con).unwrap().is_empty());
+        assert_eq!(compacted_through_on(&con, 1).unwrap(), None);
+        let fact_count: i64 = con
+            .query_row("SELECT COUNT(*) FROM compaction_facts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fact_count, 0);
+    }
+
+    #[test]
+    fn recording_store_mark_stale_containing_and_oldest_stale_from() {
+        let store = RecordingStore::new();
+        let id = store
+            .insert_draft(NewDraft {
+                companion_id: 1,
+                from_message_id: 1,
+                through_message_id: 3,
+                trigger: CompactionTrigger::Threshold,
+                raw_model_output: None,
+            })
+            .unwrap();
+        store
+            .update_status(id, CompactionStatus::Committed)
+            .unwrap();
+
+        assert_eq!(store.oldest_stale_from(1).unwrap(), None);
+        assert_eq!(store.mark_stale_containing(1, 2).unwrap(), 1);
+        assert_eq!(store.oldest_stale_from(1).unwrap(), Some(1));
+        assert_eq!(
+            store.get_checkpoint(id).unwrap().unwrap().status,
+            CompactionStatus::Stale
+        );
     }
 }

@@ -58,7 +58,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 #### 1.2 Erase messages
 - **URL:** `/message`
 - **Method:** `DELETE`
-- **Description:** Delete every message saved in short-term memory and chat log. Unlike editing, deleting, or regenerating a single message, this is **not** mirrored to a connected joiner in `host` mode — a joiner's own transcript keeps showing the pre-clear history until it reconnects (known gap).
+- **Description:** Delete every message saved in short-term memory and chat log. Unlike editing, deleting, or regenerating a single message, this is **not** mirrored to a connected joiner in `host` mode — a joiner's own transcript keeps showing the pre-clear history until it reconnects (known gap). Also resets conversation compaction: every checkpoint, extracted fact, and pinned message is deleted, and the compacted-through cutoff is cleared, so the next chat starts compaction from scratch.
 - **Response:**
   - Status: 200 OK
   - Body: Chat log cleared!
@@ -140,7 +140,11 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 - **Description:** Edit a message's text by its ID. The edit is content-only:
   it never changes which side (user or AI) the message is attributed to. Any
   `ai` field in the request body is ignored, so older clients that still send
-  it keep working without flipping the message's role.
+  it keep working without flipping the message's role. If the message falls
+  inside a committed compaction checkpoint's range, that checkpoint is marked
+  stale: its summary and facts still render (better than nothing), but the
+  chat should offer a re-compaction (`POST /api/compaction/draft` with
+  `{"from_stale": true}`).
 - **Path Parameters:**
   - `id` (integer): The ID of the message to edit
 - **Request Body:**
@@ -164,7 +168,9 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 
 - **URL:** `/message/{id}`
 - **Method:** `DELETE`
-- **Description:** Delete a message by its ID.
+- **Description:** Delete a message by its ID. If it was pinned, the pin is
+  removed along with it. If the message fell inside a committed compaction
+  checkpoint's range, that checkpoint is marked stale — see 1.5.
 - **Path Parameters:**
   - `id` (integer): The ID of the message to delete.
 - **Response:**
@@ -857,6 +863,7 @@ Endpoint sections above cover the core messaging, companion, user, configuration
 | `PUT` | `/api/attitude/dimension` |
 | `GET` | `/api/attitude/memories/{companion_id}` |
 | `GET` | `/api/attitude/summary/{companion_id}/{user_id}` |
+| `POST` | `/api/compaction/draft` |
 | `GET` | `/api/companion` |
 | `PUT` | `/api/companion` |
 | `POST` | `/api/companion/avatar` |
