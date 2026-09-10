@@ -19,25 +19,54 @@
 //!
 //! `range.rs` (#172) is pure and I/O-free: `CompactionRange` and
 //! `select_range`, which decide *which* messages a queued draft should
-//! span.
+//! span. Both work over [`MessageRef`], the lightweight `id`/`is_human`/
+//! `tokens` view of the *uncompacted tail* they scan every round.
 //!
 //! `hook.rs` (#172) is the one impure piece: `after_round`, called from
 //! `multiplayer::round::run_round` right after a turn finishes, which reads
 //! the uncompacted tail through `crate::chat_turn::TurnStore` and queues a
 //! draft when `trigger`/`range` say one is due.
+//!
+//! `extract.rs` (#173) is the pure half of the extraction pass: `serde`
+//! structs mirroring the model's JSON output schema, `parse_extraction`, and
+//! `to_fact_drafts`, which maps a parsed [`extract::ExtractionOutput`] to
+//! [`types::FactDraft`]s. No model, no grammar, no chunking — those are
+//! #185's `Extractor`-backed half, built on these same types.
+//!
+//! `validate.rs` (#173) is the canon validator: `validate` runs every draft
+//! through five rejection rules (missing/out-of-range sources, the canon
+//! rule, verbatim quotes, length, duplicates) plus a `replaces`-filtering
+//! step, never dropping an item — a rejected draft keeps its
+//! [`validate::RejectReason`] so #180's review card can show why. Pure, no
+//! `Database`, no I/O. It works over [`CitedMessage`], not [`MessageRef`]:
+//! the verbatim-quote and per-speaker canon checks need `content` and
+//! `speaker_id`, which `MessageRef` deliberately omits to stay cheap on
+//! `range.rs`'s every-round tail scan. `validate`/`extract` only ever see
+//! the small, already-selected checkpoint range (`Database::
+//! get_messages_between`), so carrying full content there costs nothing.
+//!
+//! [`SpeakerInfo`] is shared by `validate.rs` and `extract.rs`: what the
+//! extraction pass needs to know about a speaker, independent of either
+//! message view above.
+#![allow(dead_code)]
 
+pub mod extract;
 pub mod hook;
 pub mod range;
 pub mod store;
 pub mod trigger;
 pub mod types;
+pub mod validate;
 
-use crate::database::Message;
+use serde::Deserialize;
+
+use crate::database::{self, Message};
 
 /// One message's identity as the trigger/range logic in [`trigger`] and
 /// [`range`] needs it: no content, just enough to sum tokens and locate
-/// boundaries. #173's validator reuses this struct for source-id and canon
-/// checks.
+/// boundaries. Deliberately excludes `content`/`speaker_id` to stay cheap on
+/// `range.rs`'s every-round scan of the uncompacted tail; #173's
+/// `extract`/`validate` need those and use [`CitedMessage`] instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessageRef {
     pub id: i32,
@@ -55,5 +84,130 @@ impl From<&Message> for MessageRef {
             is_human: !message.ai,
             tokens: crate::context_manager::ContextManager::estimate_tokens(&message.content),
         }
+    }
+}
+
+/// A message as `extract.rs`/`validate.rs` need it: full `speaker_id` (for
+/// the per-speaker canon predicate) and `content` (for the verbatim-quote
+/// check). Only ever built over one checkpoint's already-selected range
+/// (`Database::get_messages_between`), never the whole uncompacted tail, so
+/// carrying full content is cheap here even though [`MessageRef`]
+/// deliberately avoids it. `Deserialize` is only used by the
+/// `#[cfg(test)] fixtures` module below, to load `synthetic_range.json`
+/// directly into this shape.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CitedMessage {
+    pub id: i32,
+    pub speaker_id: String,
+    pub content: String,
+}
+
+impl From<&Message> for CitedMessage {
+    fn from(message: &Message) -> Self {
+        CitedMessage {
+            id: message.id,
+            speaker_id: message.speaker_id.clone(),
+            content: message.content.clone(),
+        }
+    }
+}
+
+/// What the extraction pass needs to know about a speaker: a display name
+/// for prompts/rendering, and whether the speaker's turns count as canon.
+pub trait SpeakerInfo {
+    fn display_name(&self, speaker_id: &str) -> String;
+    fn is_canon(&self, speaker_id: &str) -> bool;
+}
+
+/// [`SpeakerInfo`] for the solo (non-multiplayer) case: exactly two
+/// speakers, `user` and `char`. #182 supplies a registry-backed impl for
+/// multiplayer (only `ParticipantKind::Human` is canon; `system` never is).
+pub struct SoloSpeakers {
+    pub user_name: String,
+    pub companion_name: String,
+}
+
+impl SpeakerInfo for SoloSpeakers {
+    fn display_name(&self, speaker_id: &str) -> String {
+        if speaker_id == database::USER_SPEAKER_ID {
+            self.user_name.clone()
+        } else {
+            self.companion_name.clone()
+        }
+    }
+
+    fn is_canon(&self, speaker_id: &str) -> bool {
+        speaker_id == database::USER_SPEAKER_ID
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a_message(id: i32, speaker_id: &str, content: &str) -> Message {
+        Message {
+            id,
+            ai: speaker_id != database::USER_SPEAKER_ID,
+            speaker_id: speaker_id.to_string(),
+            content: content.to_string(),
+            created_at: "now".to_string(),
+        }
+    }
+
+    #[test]
+    fn cited_message_from_message_carries_id_speaker_and_content_but_not_created_at() {
+        let message = a_message(46, "user", "hello there");
+        let cited = CitedMessage::from(&message);
+        assert_eq!(cited.id, 46);
+        assert_eq!(cited.speaker_id, "user");
+        assert_eq!(cited.content, "hello there");
+    }
+
+    #[test]
+    fn solo_speakers_maps_user_and_char_to_the_two_names() {
+        let speakers = SoloSpeakers {
+            user_name: "Eric".to_string(),
+            companion_name: "Vi".to_string(),
+        };
+        assert_eq!(speakers.display_name("user"), "Eric");
+        assert_eq!(speakers.display_name("char"), "Vi");
+        assert!(speakers.is_canon("user"));
+        assert!(!speakers.is_canon("char"));
+    }
+}
+
+/// Synthetic fixtures shared by every compaction test in this crate
+/// (`validate.rs`, `extract.rs`, and #175/#180's tests once they land):
+/// `synthetic_range` is a 20-message two-character scene plus a
+/// multiplayer-style third speaker; `bad_draft` is an `ExtractionOutput`
+/// over that range with four deliberate defects, one per rejection rule
+/// `validate.rs` doesn't already cover with a synthetic example. No real
+/// chat text.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::CitedMessage;
+    use crate::compaction::extract::{parse_extraction, ExtractionOutput};
+
+    /// Ids 46-65 (non-zero-based on purpose): a human turn stating a world
+    /// fact (46, 48), a bot turn inventing a world fact (49), a bot turn
+    /// introducing a person from a pronoun with no name given (51-52, "Wren"
+    /// from "He"), a human line later used as a verbatim rule (53), a bot
+    /// line a bad draft misquotes (55), and two lines from a third speaker
+    /// `vex` (58, 60) for the multiplayer-shaped canon predicate test.
+    pub(crate) fn synthetic_range() -> Vec<CitedMessage> {
+        serde_json::from_str(include_str!("fixtures/synthetic_range.json"))
+            .expect("synthetic_range.json is well-formed")
+    }
+
+    /// An `ExtractionOutput` over [`synthetic_range`] with four deliberate
+    /// defects: a `key_quotes` item citing an out-of-range source id, a
+    /// `rules` item that misquotes message 53, a `people` item sourced only
+    /// from a bot turn (52), and an over-length `milestones` item. Every
+    /// other item is valid, so `validate` on this fixture accepts some and
+    /// rejects some.
+    pub(crate) fn bad_draft() -> ExtractionOutput {
+        parse_extraction(include_str!("fixtures/bad_draft.json"))
+            .expect("bad_draft.json is well-formed JSON matching the extraction schema")
     }
 }

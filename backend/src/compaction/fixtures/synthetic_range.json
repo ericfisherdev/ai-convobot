@@ -1,0 +1,22 @@
+[
+  {"id": 46, "speaker_id": "user", "content": "We just moved into the old lighthouse on the coast, and I miss my sister Rina already."},
+  {"id": 47, "speaker_id": "char", "content": "The lighthouse must be beautiful at night. Does Rina visit often?"},
+  {"id": 48, "speaker_id": "user", "content": "Not really, she lives three towns over and works nights at the hospital."},
+  {"id": 49, "speaker_id": "char", "content": "I remember when the sea spirits still guided every fishing boat safely home."},
+  {"id": 50, "speaker_id": "user", "content": "Ha, no sea spirits here, just gulls and fog and my bad sense of direction."},
+  {"id": 51, "speaker_id": "user", "content": "He left his old journal on the porch again last night."},
+  {"id": 52, "speaker_id": "char", "content": "Sounds like Wren stopped by. He always forgets that journal."},
+  {"id": 53, "speaker_id": "user", "content": "I promise I will never lie to you, no matter what happens."},
+  {"id": 54, "speaker_id": "char", "content": "I will remember that promise always, for as long as we are together."},
+  {"id": 55, "speaker_id": "char", "content": "The old lighthouse keeper's ghost still walks these halls every midnight."},
+  {"id": 56, "speaker_id": "user", "content": "I don't believe in ghosts, but the wind through the tower does sound like footsteps."},
+  {"id": 57, "speaker_id": "char", "content": "Maybe it is just the wind. Or maybe the keeper is still watching over the light."},
+  {"id": 58, "speaker_id": "vex", "content": "Hey, this is Vex checking in from the other room, everything okay over there?"},
+  {"id": 59, "speaker_id": "user", "content": "We're fine, Vex, just talking about the lighthouse and old stories."},
+  {"id": 60, "speaker_id": "vex", "content": "Let me know if you two need anything, I will be down the hall."},
+  {"id": 61, "speaker_id": "char", "content": "Thanks, Vex. We're just settling in for the night."},
+  {"id": 62, "speaker_id": "user", "content": "Today felt like the first day this place actually started to feel like home."},
+  {"id": 63, "speaker_id": "char", "content": "I'm glad. I want this to feel like home for you too."},
+  {"id": 64, "speaker_id": "user", "content": "Rina says she might visit next month if her shifts line up."},
+  {"id": 65, "speaker_id": "char", "content": "I would love to finally meet her in person."}
+]
