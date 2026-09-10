@@ -79,9 +79,11 @@ pub enum Party {
 
 /// The eight `attitude_engine::AttitudeDimension` ratings the model emits
 /// alongside the extracted facts, on a 0-100 scale (the grammar in #185
-/// already restricts each to three digits; [`parse_extraction`] clamps
-/// anyway so a malformed value can never escape this module).
+/// already restricts each to three digits; deserializing through
+/// [`RawAttitudeRatings`] clamps anyway so a malformed value, positive or
+/// negative, can never escape this module).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(from = "RawAttitudeRatings")]
 pub struct AttitudeRatings {
     pub trust: u8,
     pub love: u8,
@@ -93,29 +95,51 @@ pub struct AttitudeRatings {
     pub gratitude: u8,
 }
 
-/// Largest value an [`AttitudeRatings`] field may hold after
-/// [`parse_extraction`] clamps it.
-const MAX_ATTITUDE_RATING: u8 = 100;
+/// Largest value an [`AttitudeRatings`] field may hold after clamping.
+const MAX_ATTITUDE_RATING: i32 = 100;
 
-impl AttitudeRatings {
-    fn clamp_to_valid_range(&mut self) {
-        self.trust = self.trust.min(MAX_ATTITUDE_RATING);
-        self.love = self.love.min(MAX_ATTITUDE_RATING);
-        self.fear = self.fear.min(MAX_ATTITUDE_RATING);
-        self.anger = self.anger.min(MAX_ATTITUDE_RATING);
-        self.joy = self.joy.min(MAX_ATTITUDE_RATING);
-        self.sorrow = self.sorrow.min(MAX_ATTITUDE_RATING);
-        self.suspicion = self.suspicion.min(MAX_ATTITUDE_RATING);
-        self.gratitude = self.gratitude.min(MAX_ATTITUDE_RATING);
+/// The wire shape `AttitudeRatings` actually deserializes through: signed,
+/// so an out-of-grammar value (a hallucinated `999`, or a stray `-1`) still
+/// parses instead of `serde_json` rejecting it outright the way it would
+/// for a `u8` field — `clamp_to_valid_range` (via `From`) is what brings it
+/// back into `0..=100` before it becomes an `AttitudeRatings`.
+#[derive(Debug, Deserialize)]
+struct RawAttitudeRatings {
+    trust: i32,
+    love: i32,
+    fear: i32,
+    anger: i32,
+    joy: i32,
+    sorrow: i32,
+    suspicion: i32,
+    gratitude: i32,
+}
+
+/// Clamps one raw signed rating to `0..=100` before narrowing to `u8`.
+fn clamp_rating(value: i32) -> u8 {
+    value.clamp(0, MAX_ATTITUDE_RATING) as u8
+}
+
+impl From<RawAttitudeRatings> for AttitudeRatings {
+    fn from(raw: RawAttitudeRatings) -> Self {
+        AttitudeRatings {
+            trust: clamp_rating(raw.trust),
+            love: clamp_rating(raw.love),
+            fear: clamp_rating(raw.fear),
+            anger: clamp_rating(raw.anger),
+            joy: clamp_rating(raw.joy),
+            sorrow: clamp_rating(raw.sorrow),
+            suspicion: clamp_rating(raw.suspicion),
+            gratitude: clamp_rating(raw.gratitude),
+        }
     }
 }
 
-/// Parses one model completion into an [`ExtractionOutput`], clamping every
-/// [`AttitudeRatings`] field to `0..=100` afterward.
+/// Parses one model completion into an [`ExtractionOutput`]. Every
+/// [`AttitudeRatings`] field is already clamped to `0..=100` by the time
+/// this returns — see [`RawAttitudeRatings`].
 pub fn parse_extraction(raw: &str) -> Result<ExtractionOutput, serde_json::Error> {
-    let mut output: ExtractionOutput = serde_json::from_str(raw)?;
-    output.attitude.clamp_to_valid_range();
-    Ok(output)
+    serde_json::from_str(raw)
 }
 
 /// Maps a `Party` to the [`FactSubject`] it stands for. `Party` can only
@@ -176,7 +200,11 @@ pub fn to_fact_drafts(output: &ExtractionOutput) -> Vec<FactDraft> {
         drafts.push(FactDraft {
             category: FactCategory::Person,
             subject: Some(FactSubject::Person(item.name.clone())),
-            text: item.relation.clone(),
+            // Carries the name, not just `relation`: `check_duplicate`
+            // keys on `(category, normalised text)` alone, so two distinct
+            // people sharing a relation string (e.g. two different "a
+            // neighbor"s) would otherwise collide as the same duplicate.
+            text: format!("{}: {}", item.name, item.relation),
             quote_speaker: None,
             sources: item.sources.clone(),
             replaces: Vec::new(),
@@ -281,6 +309,33 @@ mod tests {
     }
 
     #[test]
+    fn a_rating_of_999_parses_and_clamps_to_100_instead_of_failing_to_deserialize() {
+        // 999 does not fit in a `u8` (max 255); deserializing straight into
+        // a `u8` field would make `serde_json` reject it before clamping
+        // ever ran. `RawAttitudeRatings` is signed precisely so this parses.
+        let raw = r#"{
+            "companion_state": [], "user_state": [], "milestones": [],
+            "backstory": [], "open_threads": [], "rules": [], "people": [],
+            "key_quotes": [], "summary": "s",
+            "attitude": {"trust":999,"love":0,"fear":0,"anger":0,"joy":0,"sorrow":0,"suspicion":0,"gratitude":0}
+        }"#;
+        let output = parse_extraction(raw).unwrap();
+        assert_eq!(output.attitude.trust, 100);
+    }
+
+    #[test]
+    fn a_negative_rating_parses_and_clamps_to_0() {
+        let raw = r#"{
+            "companion_state": [], "user_state": [], "milestones": [],
+            "backstory": [], "open_threads": [], "rules": [], "people": [],
+            "key_quotes": [], "summary": "s",
+            "attitude": {"trust":-1,"love":0,"fear":0,"anger":0,"joy":0,"sorrow":0,"suspicion":0,"gratitude":0}
+        }"#;
+        let output = parse_extraction(raw).unwrap();
+        assert_eq!(output.attitude.trust, 0);
+    }
+
+    #[test]
     fn to_fact_drafts_preserves_order_and_item_count() {
         let output = bad_draft();
         let total_items = output.companion_state.len()
@@ -313,6 +368,25 @@ mod tests {
         assert_eq!(person.relation_to, Some(FactSubject::User));
         assert_eq!(person.relation.as_deref(), Some("sister"));
         assert_eq!(person.quote_speaker, None);
+        assert_eq!(person.text, "Ann: sister");
+    }
+
+    #[test]
+    fn two_people_sharing_a_relation_string_get_distinct_text_from_their_names() {
+        let raw = r#"{
+            "companion_state": [], "user_state": [], "milestones": [],
+            "backstory": [], "open_threads": [],
+            "rules": [], "key_quotes": [],
+            "people": [
+                {"name":"Ann","relation_to":"user","relation":"a neighbor","sources":[46]},
+                {"name":"Bo","relation_to":"user","relation":"a neighbor","sources":[46]}
+            ],
+            "summary": "s",
+            "attitude": {"trust":0,"love":0,"fear":0,"anger":0,"joy":0,"sorrow":0,"suspicion":0,"gratitude":0}
+        }"#;
+        let output = parse_extraction(raw).unwrap();
+        let drafts = to_fact_drafts(&output);
+        assert_ne!(drafts[0].text, drafts[1].text);
     }
 
     #[test]
