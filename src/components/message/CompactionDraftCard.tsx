@@ -74,7 +74,7 @@ interface CompactionDraftCardProps {
   // moment the drawer closes). Falls back to an internal `useState` when
   // omitted -- `CompactionNotice`'s read-only dialog has no need to own it.
   state?: ReviewState;
-  onStateChange?: (state: ReviewState) => void;
+  onStateChange?: (update: (prev: ReviewState) => ReviewState) => void;
 }
 
 function ItemRow({
@@ -213,15 +213,18 @@ export function CompactionDraftCard({
 
   // Routes every update through whichever store owns the state: the
   // controlled `onStateChange` when the caller passed one, the internal
-  // `useState` otherwise. `updater` always sees the state actually being
-  // rendered (controlled or not), matching the `setState(prev => ...)`
-  // pattern the rest of this component uses.
+  // `useState` otherwise. Forwards `updater` itself rather than
+  // pre-computing `updater(state)` against this render's closed-over
+  // `state` -- two `applyUpdate` calls in the same handler (e.g.
+  // `ItemRow.handleSave` editing both text and quote) would otherwise both
+  // read the same stale `state` and the second call's result would clobber
+  // the first's, the same stale-closure bug `setState(prev => ...)` exists
+  // to avoid.
   const applyUpdate = (updater: (prev: ReviewState) => ReviewState) => {
-    const next = updater(state);
     if (onStateChange) {
-      onStateChange(next);
+      onStateChange(updater);
     } else {
-      setInternalState(next);
+      setInternalState(updater);
     }
   };
 
