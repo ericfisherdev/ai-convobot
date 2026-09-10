@@ -6081,6 +6081,9 @@ mod tests {
         create_companion_table(&con);
         create_user_table(&con);
         create_compaction_tables(&con);
+        // #177's `delete_compaction_persons_in` runs inside this same
+        // transaction now, so its table needs to exist here too.
+        create_third_party_tables(&con);
         insert_message_row(&con, USER_SPEAKER_ID, "hi");
         let checkpoint = insert_checkpoint_row(&con, 1, 1, CompactionStatus::Committed);
         con.execute(
