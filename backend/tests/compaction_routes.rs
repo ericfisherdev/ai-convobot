@@ -208,8 +208,11 @@ fn from_stale_true_queues_a_recompaction_draft_over_the_stale_checkpoints_range(
 
     // The default `short_term_mem` (5, seeded by `Database::init`) needs at
     // least a few messages past the stale checkpoint's end for
-    // `select_recompaction_range` to find anything to re-compact.
-    for i in 1..=15 {
+    // `select_recompaction_range` to find anything to re-compact. 20, not
+    // 15: the stale checkpoint below starts at message 6, not message 1,
+    // specifically so the two branches inside the handler cannot produce
+    // the same range by coincidence — see the comment there.
+    for i in 1..=20 {
         post_message(&agent, &addr, "user", &format!("message {i}"));
     }
 
@@ -235,6 +238,17 @@ fn from_stale_true_queues_a_recompaction_draft_over_the_stale_checkpoints_range(
     // Seed a `Stale` checkpoint directly against the server's own database
     // file: a real one requires a committed checkpoint plus an edit inside
     // its range, which this binary cannot reach without a loaded model.
+    //
+    // Its `from_message_id` is 6, deliberately not 1: on a fresh chat with
+    // `compacted_through` still `NULL`, the *ordinary* manual-trigger path
+    // (`select_range`) also starts at message 1 (the first eligible
+    // message), so a stale range starting at 1 would make the `202`
+    // assertions below pass identically whether or not the `from_stale`
+    // branch actually ran — a test that cannot fail when the feature is
+    // skipped is not coverage of it. Starting the stale range at 6 means
+    // only `select_recompaction_range` (which anchors on
+    // `oldest_stale_from`, not the first eligible message) can produce
+    // `from_message_id: 6`; the manual path can only ever produce `1` here.
     let db_path = data_dir.path().join("companion_database.db");
     {
         let con = rusqlite::Connection::open(&db_path)
@@ -243,7 +257,7 @@ fn from_stale_true_queues_a_recompaction_draft_over_the_stale_checkpoints_range(
             .query_row("SELECT id FROM companion LIMIT 1", [], |row| row.get(0))
             .expect("the server should have seeded a companion row at startup");
         con.execute(
-            "INSERT INTO compactions (companion_id, from_message_id, through_message_id, status, trigger, created_at) VALUES (?, 1, 5, 'stale', 'threshold', 'now')",
+            "INSERT INTO compactions (companion_id, from_message_id, through_message_id, status, trigger, created_at) VALUES (?, 6, 10, 'stale', 'threshold', 'now')",
             [companion_id],
         )
         .expect("failed to seed a stale checkpoint row");
@@ -269,13 +283,14 @@ fn from_stale_true_queues_a_recompaction_draft_over_the_stale_checkpoints_range(
         .expect("202 body should carry draft_id");
 
     // Visible through the listing route too, starting at the stale
-    // checkpoint's own `from_message_id` (1) — not wherever a normal
-    // manual trigger would have started (past `compacted_through`, which
-    // is still `NULL` here).
+    // checkpoint's own `from_message_id` (6) — not message 1, which is
+    // where the ordinary manual-trigger path would have started instead
+    // (see the seeding comment above for why that distinction is the
+    // whole point of this assertion).
     let listing = get_json(&agent, &format!("http://{addr}/api/compaction"));
     assert_eq!(listing["pending_draft"]["id"].as_i64(), Some(draft_id));
     assert_eq!(
         listing["pending_draft"]["from_message_id"].as_i64(),
-        Some(1)
+        Some(6)
     );
 }
