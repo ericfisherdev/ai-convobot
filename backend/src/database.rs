@@ -609,7 +609,7 @@ fn default_compact_min_messages() -> usize {
 }
 
 fn default_heuristic_person_detection() -> bool {
-    true
+    false
 }
 
 fn default_compaction_attitude_weight() -> f32 {
@@ -1200,7 +1200,7 @@ impl Database {
                 compact_threshold_tokens INTEGER,
                 compact_min_messages INTEGER DEFAULT 8,
                 compaction_model_path TEXT,
-                heuristic_person_detection BOOLEAN DEFAULT true,
+                heuristic_person_detection BOOLEAN DEFAULT false,
                 compaction_attitude_weight REAL DEFAULT 0.5
             )",
             [],
@@ -1997,7 +1997,7 @@ impl Database {
                 compact_min_messages: row.get::<_, Option<usize>>(22)?.unwrap_or(8),
                 // Empty string and NULL both read as "use llm_model_path".
                 compaction_model_path: compaction_model_path.filter(|s| !s.is_empty()),
-                heuristic_person_detection: row.get::<_, Option<bool>>(24)?.unwrap_or(true),
+                heuristic_person_detection: row.get::<_, Option<bool>>(24)?.unwrap_or(false),
                 compaction_attitude_weight: row.get::<_, Option<f32>>(25)?.unwrap_or(0.5),
             })
         })?;
@@ -5037,7 +5037,7 @@ impl Database {
             ),
             (
                 "heuristic_person_detection",
-                "ALTER TABLE config ADD COLUMN heuristic_person_detection BOOLEAN DEFAULT true",
+                "ALTER TABLE config ADD COLUMN heuristic_person_detection BOOLEAN DEFAULT false",
             ),
             (
                 "compaction_attitude_weight",
@@ -7062,7 +7062,7 @@ mod tests {
                 compact_threshold_tokens INTEGER,
                 compact_min_messages INTEGER DEFAULT 8,
                 compaction_model_path TEXT,
-                heuristic_person_detection BOOLEAN DEFAULT true,
+                heuristic_person_detection BOOLEAN DEFAULT false,
                 compaction_attitude_weight REAL DEFAULT 0.5
             )",
             [],

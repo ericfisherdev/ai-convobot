@@ -89,13 +89,13 @@
 //! `third_party_individuals` rows (`source = 'compaction'`) via the pure
 //! `plan_upserts`, through the `PersonSink` persistence seam
 //! (`SqlitePersonSink` in production, forwarding to
-//! `Database::upsert_compaction_person`). This is meant to retire the old
-//! heuristic person detector (`Database::detect_new_persons_in_message`),
-//! which `chat_turn::preprocess_user_message` runs only when
-//! `ConfigView::heuristic_person_detection` is on — still the default as of
-//! #177, since nothing reaches `production_commit_deps`/`commit::commit` in
-//! production until #179's route lands; flipping the default is deferred to
-//! follow-up issue #201 once that path is live.
+//! `Database::upsert_compaction_person`). This retires the old heuristic
+//! person detector (`Database::detect_new_persons_in_message`), which
+//! `chat_turn::preprocess_user_message` runs only when `ConfigView::
+//! heuristic_person_detection` is explicitly turned back on — the default
+//! is `false` as of #201, now that #179's route makes `production_commit_deps`/
+//! `commit::commit` production-reachable and `PersonsObserver` the trusted
+//! source of third-party people.
 //!
 //! `review.rs` (#179) is the request side of commit: `apply_review` turns
 //! a `POST /api/compaction/{id}/commit` body into the `commit::ReviewedDraft`
