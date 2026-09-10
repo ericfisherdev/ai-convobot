@@ -37,17 +37,16 @@ use crate::turn_slot::TurnGuard;
 pub trait TurnStore {
     /// Pre-processing shared by both prompting handlers: third-party mention
     /// tracking, new-person detection and interaction detection — all three
-    /// are the pre-#177 heuristic path
-    /// (`compaction::persons::PersonsObserver` is meant to supersede it as
-    /// the trusted source of third-party people, but nothing in production
-    /// reaches `compaction::production_commit_deps`/`commit::commit` until
-    /// #179's route lands, so `ConfigView::heuristic_person_detection`
-    /// still *defaults* to `true` for now — #177 only adds the gate here,
-    /// deferring the default flip to follow-up issue #201). `SqliteTurnStore`
-    /// only runs this whole pipeline when the flag is on; with it off, this
-    /// returns `None` without touching `Database` at all. Returns the
-    /// prompt to generate from when an interaction with a recorded outcome
-    /// matched, so the caller can generate with that added context.
+    /// are the pre-#177 heuristic path that `compaction::persons::
+    /// PersonsObserver` now supersedes as the trusted, production-reachable
+    /// source of third-party people (via #179's `/api/compaction/{id}/commit`
+    /// route into `compaction::production_commit_deps`/`commit::commit`), so
+    /// `ConfigView::heuristic_person_detection` defaults to `false`.
+    /// `SqliteTurnStore` only runs this whole pipeline when the flag is on;
+    /// with it off, this returns `None` without touching `Database` at all.
+    /// Returns the prompt to generate from when an interaction with a
+    /// recorded outcome matched, so the caller can generate with that added
+    /// context.
     fn preprocess(&self, user_message: &str, companion_id: i32) -> Option<String>;
 
     /// Persists the user's half of the turn and returns the new message's

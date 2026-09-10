@@ -407,7 +407,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
     "compact_threshold_tokens": null,
     "compact_min_messages": 8,
     "compaction_model_path": null,
-    "heuristic_person_detection": true
+    "heuristic_person_detection": false
   }
   ```
   Note: `multiplayer_password` is never returned; `multiplayer_password_set` reports whether a host password is currently stored.
@@ -431,7 +431,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   - `compact_threshold_tokens` (integer, optional, >= 256): Token budget a companion's recent-message window must exceed before conversation compaction drafts a checkpoint. `null` (the default) derives the threshold at runtime instead of using a fixed number.
   - `compact_min_messages` (integer, >= 2, default 8): Fewest uncompacted messages compaction will ever fire on, regardless of token count.
   - `compaction_model_path` (string, optional): Model used for compaction's summarisation/extraction passes. `null` (the default) uses `llm_model_path`.
-  - `heuristic_person_detection` (boolean, default true): Whether the pre-compaction heuristic person-detection/third-party-mention-tracking/interaction-detection pass runs on every user turn. #177 adds `compaction::persons::PersonsObserver` (creates `third_party_individuals` rows with `source: "compaction"` from canon-validated `Person` facts at commit time) and this gate, but the default stays `true` for now since nothing in production reaches compaction's commit path until #179's route lands; flipping the default to `false` is deferred to follow-up issue #201 once that path is live. `POST /api/persons/detect` and `POST /api/interactions/detect` remain available as manual triggers regardless of this flag.
+  - `heuristic_person_detection` (boolean, default false): Whether the pre-compaction heuristic person-detection/third-party-mention-tracking/interaction-detection pass runs on every user turn. `compaction::persons::PersonsObserver` (creates `third_party_individuals` rows with `source: "compaction"` from canon-validated `Person` facts at commit time), reached via the production `/api/compaction/{id}/commit` route, is the trusted source of third-party people, so this gate defaults off. `POST /api/persons/detect` and `POST /api/interactions/detect` remain available as manual triggers regardless of this flag.
 - **Response:**
   - Status: 200 OK
   - Body: Config updated!
@@ -455,7 +455,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
     "compact_threshold_tokens": null,
     "compact_min_messages": 8,
     "compaction_model_path": null,
-    "heuristic_person_detection": true
+    "heuristic_person_detection": false
   }
   ```
 
