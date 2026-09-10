@@ -242,6 +242,14 @@ fn plan_commit(
                     .merger
                     .merge(&concatenated, budget.rolling_summary_tokens)
                 {
+                    // Not re-checked against `rolling_summary_tokens` here:
+                    // an over-long completion is stored as-is, but
+                    // `render::render`'s trim order (#174) still shortens
+                    // `story_so_far`'s rolling-summary sentences from the
+                    // front at read time if the compaction slice is tight,
+                    // so a merger that overshoots the word budget it was
+                    // asked for degrades gracefully rather than blowing the
+                    // prompt's token budget.
                     Ok(text) => (review.summary.clone(), text, false),
                     Err(_) => (review.summary.clone(), concatenated, true),
                 }
@@ -342,7 +350,25 @@ pub fn commit(
     let superseded_ids: Vec<i64> = record.supersede.iter().map(|(old, _)| *old).collect();
     let draft_id = record.draft_id;
 
-    let checkpoint = store.commit_checkpoint(record)?;
+    // `commit_checkpoint` re-asserts the `Draft` premise decided above
+    // inside its own transaction (`transition_status_on`/its `RecordingStore`
+    // equivalent): a discard or a second commit that landed since the read
+    // above surfaces here as `QueryReturnedNoRows`, which we re-read and
+    // report as the same `DraftNotPending` the caller would have seen had
+    // the check run after that race instead of before it.
+    let checkpoint = match store.commit_checkpoint(record) {
+        Ok(checkpoint) => checkpoint,
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            let now = store
+                .get_checkpoint(draft_id)?
+                .ok_or(CommitError::DraftNotFound(draft_id))?;
+            return Err(CommitError::DraftNotPending {
+                id: now.id,
+                status: now.status,
+            });
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     Database::clear_message_cache();
 
@@ -367,6 +393,12 @@ pub fn commit(
 /// `committed`-eligible (see
 /// [`crate::compaction::store::active_facts_on`]). Checks only the status,
 /// not `raw_model_output`, so a still-extracting draft may be discarded.
+/// Uses [`CompactionStore::transition_status`] rather than `update_status`
+/// so a commit that landed between the read below and the write fails the
+/// write instead of silently undoing it (the interleaving the reviewed
+/// facts would otherwise vanish from `active_facts` while
+/// `compacted_through` and every observer had already treated them as
+/// live).
 pub fn discard(store: &dyn CompactionStore, draft_id: i64) -> Result<(), CommitError> {
     let draft = store
         .get_checkpoint(draft_id)?
@@ -377,8 +409,23 @@ pub fn discard(store: &dyn CompactionStore, draft_id: i64) -> Result<(), CommitE
             status: draft.status,
         });
     }
-    store.update_status(draft_id, CompactionStatus::Discarded)?;
-    Ok(())
+    match store.transition_status(
+        draft_id,
+        CompactionStatus::Draft,
+        CompactionStatus::Discarded,
+    ) {
+        Ok(()) => Ok(()),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            let now = store
+                .get_checkpoint(draft_id)?
+                .ok_or(CommitError::DraftNotFound(draft_id))?;
+            Err(CommitError::DraftNotPending {
+                id: now.id,
+                status: now.status,
+            })
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(test)]
@@ -1193,6 +1240,168 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(
+            store.get_checkpoint(draft_id).unwrap().unwrap().status,
+            CompactionStatus::Committed
+        );
+    }
+
+    /// Wraps a [`RecordingStore`] so `commit_checkpoint` simulates a
+    /// concurrent discard landing between `commit`'s initial `Draft` read
+    /// and the point where its own transactional gate would otherwise be
+    /// the first thing to notice — every other method just delegates.
+    struct RacyDiscardStore<'a> {
+        inner: &'a RecordingStore,
+    }
+
+    impl CompactionStore for RacyDiscardStore<'_> {
+        fn insert_draft(&self, draft: NewDraft) -> rusqlite::Result<i64> {
+            self.inner.insert_draft(draft)
+        }
+        fn get_checkpoint(&self, id: i64) -> rusqlite::Result<Option<Checkpoint>> {
+            self.inner.get_checkpoint(id)
+        }
+        fn pending_draft(&self, companion_id: i32) -> rusqlite::Result<Option<Checkpoint>> {
+            self.inner.pending_draft(companion_id)
+        }
+        fn list_checkpoints(&self, companion_id: i32) -> rusqlite::Result<Vec<Checkpoint>> {
+            self.inner.list_checkpoints(companion_id)
+        }
+        fn latest_committed(&self, companion_id: i32) -> rusqlite::Result<Option<Checkpoint>> {
+            self.inner.latest_committed(companion_id)
+        }
+        fn context_snapshot(
+            &self,
+            companion_id: i32,
+        ) -> rusqlite::Result<(Vec<Fact>, Option<i32>, Option<Checkpoint>)> {
+            self.inner.context_snapshot(companion_id)
+        }
+        fn update_status(&self, id: i64, status: CompactionStatus) -> rusqlite::Result<()> {
+            self.inner.update_status(id, status)
+        }
+        fn transition_status(
+            &self,
+            id: i64,
+            from: CompactionStatus,
+            to: CompactionStatus,
+        ) -> rusqlite::Result<()> {
+            self.inner.transition_status(id, from, to)
+        }
+        fn set_extraction_result(
+            &self,
+            id: i64,
+            raw_model_output: Option<String>,
+            summary: Option<String>,
+            attitude_ratings: Option<String>,
+        ) -> rusqlite::Result<()> {
+            self.inner
+                .set_extraction_result(id, raw_model_output, summary, attitude_ratings)
+        }
+        fn insert_facts(
+            &self,
+            compaction_id: i64,
+            facts: &[FactDraft],
+        ) -> rusqlite::Result<Vec<i64>> {
+            self.inner.insert_facts(compaction_id, facts)
+        }
+        fn active_facts(&self, companion_id: i32) -> rusqlite::Result<Vec<Fact>> {
+            self.inner.active_facts(companion_id)
+        }
+        fn facts_for(&self, compaction_id: i64) -> rusqlite::Result<Vec<Fact>> {
+            self.inner.facts_for(compaction_id)
+        }
+        fn supersede(&self, fact_id: i64, by: i64) -> rusqlite::Result<()> {
+            self.inner.supersede(fact_id, by)
+        }
+        fn compacted_through(&self, companion_id: i32) -> rusqlite::Result<Option<i32>> {
+            self.inner.compacted_through(companion_id)
+        }
+        fn set_compacted_through(
+            &self,
+            companion_id: i32,
+            through: Option<i32>,
+        ) -> rusqlite::Result<()> {
+            self.inner.set_compacted_through(companion_id, through)
+        }
+        fn pin(&self, message_id: i32) -> rusqlite::Result<()> {
+            self.inner.pin(message_id)
+        }
+        fn unpin(&self, message_id: i32) -> rusqlite::Result<()> {
+            self.inner.unpin(message_id)
+        }
+        fn pins(&self) -> rusqlite::Result<Vec<crate::compaction::types::Pin>> {
+            self.inner.pins()
+        }
+        fn commit_checkpoint(
+            &self,
+            record: crate::compaction::store::CommitRecord,
+        ) -> rusqlite::Result<Checkpoint> {
+            // The "concurrent" discard: lands after `commit`'s own read of
+            // this draft as `Draft` (already past by the time this method
+            // runs), before the transactional gate below would otherwise
+            // be the first thing to see the mismatch.
+            self.inner
+                .update_status(record.draft_id, CompactionStatus::Discarded)
+                .unwrap();
+            self.inner.commit_checkpoint(record)
+        }
+    }
+
+    #[test]
+    fn a_concurrent_discard_between_commits_read_and_write_is_reported_as_draft_not_pending() {
+        let inner = RecordingStore::new();
+        let draft = FactDraft {
+            category: FactCategory::Milestone,
+            subject: None,
+            text: "a milestone".to_string(),
+            quote_speaker: None,
+            sources: vec![1],
+            replaces: vec![],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        };
+        let (draft_id, ids) = seed_draft(&inner, 1, std::slice::from_ref(&draft));
+
+        let observer = std::sync::Arc::new(RecordingObserver::default());
+        let deps = CommitDeps {
+            merger: Box::new(IdentityMerger::new()),
+            observers: vec![Box::new(ArcObserver(observer.clone()))],
+        };
+
+        let store = RacyDiscardStore { inner: &inner };
+        let err = commit(
+            &store,
+            ReviewedDraft {
+                draft_id,
+                items: vec![accepted_item(
+                    ids[0],
+                    FactCategory::Milestone,
+                    "a milestone",
+                )],
+                summary: "s".to_string(),
+            },
+            &deps,
+            &budget(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CommitError::DraftNotPending {
+                status: CompactionStatus::Discarded,
+                ..
+            }
+        ));
+        assert_eq!(
+            inner.get_checkpoint(draft_id).unwrap().unwrap().status,
+            CompactionStatus::Discarded
+        );
+        assert!(observer.calls.lock().unwrap().is_empty());
+        let stored = inner.facts_for(draft_id).unwrap();
+        assert_eq!(stored[0].text, "a milestone");
+        assert!(stored[0].active);
     }
 
     #[test]
