@@ -299,6 +299,7 @@ fn plan_commit(
     Ok(CommitRecord {
         draft_id: draft.id,
         companion_id: draft.companion_id,
+        from_message_id: draft.from_message_id,
         through_message_id: draft.through_message_id,
         summary,
         rolling_summary,
@@ -1313,6 +1314,16 @@ mod tests {
         fn supersede(&self, fact_id: i64, by: i64) -> rusqlite::Result<()> {
             self.inner.supersede(fact_id, by)
         }
+        fn mark_stale_containing(
+            &self,
+            companion_id: i32,
+            message_id: i32,
+        ) -> rusqlite::Result<usize> {
+            self.inner.mark_stale_containing(companion_id, message_id)
+        }
+        fn oldest_stale_from(&self, companion_id: i32) -> rusqlite::Result<Option<i32>> {
+            self.inner.oldest_stale_from(companion_id)
+        }
         fn compacted_through(&self, companion_id: i32) -> rusqlite::Result<Option<i32>> {
             self.inner.compacted_through(companion_id)
         }
@@ -1536,5 +1547,99 @@ mod tests {
         );
 
         assert!(result.is_ok());
+    }
+
+    /// #181: a checkpoint whose range was marked `Stale` (an edit/delete
+    /// landed inside it) gets retired the moment a fresh commit's range
+    /// re-covers it — even though nothing here asked specifically for a
+    /// re-compaction; any commit spanning a stale range heals it.
+    #[test]
+    fn commit_over_a_stale_range_retires_it() {
+        let store = RecordingStore::new();
+        let old_fact = FactDraft {
+            category: FactCategory::Milestone,
+            subject: None,
+            text: "old summary of 1-10".to_string(),
+            quote_speaker: None,
+            sources: vec![1],
+            replaces: vec![],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        };
+        let (old_draft_id, old_ids) = seed_draft(&store, 1, std::slice::from_ref(&old_fact));
+        let deps = deps_with(IdentityMerger::new());
+        commit(
+            &store,
+            ReviewedDraft {
+                draft_id: old_draft_id,
+                items: vec![accepted_item(
+                    old_ids[0],
+                    FactCategory::Milestone,
+                    "old summary of 1-10",
+                )],
+                summary: "s1".to_string(),
+            },
+            &deps,
+            &budget(),
+        )
+        .unwrap();
+
+        // An edit inside the committed range marks it Stale, exactly like
+        // `database.rs::edit_message_on` does via `mark_stale_containing`.
+        assert_eq!(store.mark_stale_containing(1, 5).unwrap(), 1);
+        assert_eq!(
+            store.get_checkpoint(old_draft_id).unwrap().unwrap().status,
+            CompactionStatus::Stale
+        );
+        // Stale checkpoints still render until they are retired.
+        assert_eq!(store.active_facts(1).unwrap().len(), 1);
+
+        let new_fact = FactDraft {
+            category: FactCategory::Milestone,
+            subject: None,
+            text: "re-compacted summary of 1-10".to_string(),
+            quote_speaker: None,
+            sources: vec![1],
+            replaces: vec![],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        };
+        let (new_draft_id, new_ids) = seed_draft(&store, 1, std::slice::from_ref(&new_fact));
+        commit(
+            &store,
+            ReviewedDraft {
+                draft_id: new_draft_id,
+                items: vec![accepted_item(
+                    new_ids[0],
+                    FactCategory::Milestone,
+                    "re-compacted summary of 1-10",
+                )],
+                summary: "s2".to_string(),
+            },
+            &deps,
+            &budget(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.get_checkpoint(old_draft_id).unwrap().unwrap().status,
+            CompactionStatus::Discarded
+        );
+        let old_stored = store
+            .facts_for(old_draft_id)
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == old_ids[0])
+            .unwrap();
+        assert!(!old_stored.active);
+
+        let active = store.active_facts(1).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, new_ids[0]);
+        assert_eq!(active[0].text, "re-compacted summary of 1-10");
     }
 }

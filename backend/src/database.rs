@@ -1074,6 +1074,33 @@ fn insert_companion_greeting(con: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Testable half of `Database::get_companion_id`. Single-companion schema,
+/// so the only companion row is always the one being asked about.
+fn get_companion_id_on(con: &Connection) -> Result<i32> {
+    let mut stmt = con.prepare("SELECT id FROM companion LIMIT 1")?;
+    let row = stmt.query_row([], |row| row.get(0))?;
+    Ok(row)
+}
+
+/// Flips `message_id`'s containing checkpoint to `Stale` if it falls inside
+/// one (#181), on the caller's own connection/transaction so it composes
+/// with `edit_message_on`/`delete_message_on`'s own statement. Skips the
+/// compaction check entirely when the companion has never been compacted
+/// (`compacted_through IS NULL`), so a chat that never triggered compaction
+/// pays one cheap `SELECT` per edit/delete and nothing else — the
+/// `id <= compacted_through` bound the original plan also checked here is
+/// redundant with `mark_stale_containing_on`'s own `from_message_id <= id
+/// <= through_message_id` predicate, so only the `NULL` short-circuit is
+/// kept.
+fn mark_stale_for_message_on(con: &Connection, message_id: i32) -> Result<()> {
+    let companion_id = get_companion_id_on(con)?;
+    if crate::compaction::store::compacted_through_on(con, companion_id)?.is_none() {
+        return Ok(());
+    }
+    crate::compaction::store::mark_stale_containing_on(con, companion_id, message_id)?;
+    Ok(())
+}
+
 /// The `attitude_memories` DDL, shared by the table creation path and the
 /// rebuild migration below so the column list only exists once. `target_id`
 /// stays unconstrained: it is polymorphic on `target_type` (a `user` or
@@ -1574,9 +1601,7 @@ impl Database {
 
     pub fn get_companion_id() -> Result<i32> {
         let con = Self::open()?;
-        let mut stmt = con.prepare("SELECT id FROM companion LIMIT 1")?;
-        let row = stmt.query_row([], |row| row.get(0))?;
-        Ok(row)
+        get_companion_id_on(&con)
     }
 
     pub fn get_companion_card_data() -> Result<CharacterCard> {
@@ -1680,21 +1705,28 @@ impl Database {
     /// field, so there is nothing here that could flip a companion reply
     /// into a user message (or vice versa) through an edit.
     pub fn edit_message(id: i32, edit: MessageEdit) -> Result<(), Error> {
-        let con = Self::open()?;
-        Self::edit_message_on(&con, id, edit)
+        let mut con = Self::open()?;
+        Self::edit_message_on(&mut con, id, edit)
     }
 
     /// Testable half of `edit_message`, taking a caller-provided connection
     /// so tests can point it at a `TempDir`-backed database instead of the
-    /// hardwired `paths::db_path()`, mirroring `pop_latest_bot_reply_on`. Clears
-    /// the message cache here (rather than in the public wrapper) so the
-    /// cache-invalidation test can exercise it without touching the real
-    /// `paths::db_path()`.
-    fn edit_message_on(con: &Connection, id: i32, edit: MessageEdit) -> Result<(), Error> {
-        con.execute(
+    /// hardwired `paths::db_path()`, mirroring `pop_latest_bot_reply_on`.
+    /// Runs the edit and #181's stale-checkpoint check
+    /// (`mark_stale_for_message_on`) inside one `Immediate` transaction, so
+    /// editing history under a committed checkpoint can never leave that
+    /// checkpoint `Committed` while the edit itself is durable, or vice
+    /// versa. Clears the message cache after commit (not inside `open()`)
+    /// so the cache-invalidation test can exercise it without touching the
+    /// real `paths::db_path()`.
+    fn edit_message_on(con: &mut Connection, id: i32, edit: MessageEdit) -> Result<(), Error> {
+        let tx = con.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             "UPDATE messages SET content = ? WHERE id = ?",
             params![edit.content, id],
         )?;
+        mark_stale_for_message_on(&tx, id)?;
+        tx.commit()?;
 
         Database::clear_message_cache();
 
@@ -1702,10 +1734,23 @@ impl Database {
     }
 
     pub fn delete_message(id: i32) -> Result<(), Error> {
-        let con = Self::open()?;
-        con.execute("DELETE FROM messages WHERE id = ?", [id])?;
+        let mut con = Self::open()?;
+        Self::delete_message_on(&mut con, id)
+    }
 
-        // Clear message cache when message is deleted
+    /// Testable half of `delete_message`, mirroring `edit_message_on`:
+    /// deletes the message and runs #181's stale-checkpoint check in one
+    /// `Immediate` transaction. A pin on `id` cascades away with the
+    /// message row itself (`pinned_messages.message_id REFERENCES
+    /// messages(id) ON DELETE CASCADE`, and `foreign_keys = ON` on every
+    /// connection `Database::open_at` returns) rather than needing an
+    /// explicit `DELETE FROM pinned_messages` first.
+    fn delete_message_on(con: &mut Connection, id: i32) -> Result<(), Error> {
+        let tx = con.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM messages WHERE id = ?", [id])?;
+        mark_stale_for_message_on(&tx, id)?;
+        tx.commit()?;
+
         Database::clear_message_cache();
 
         Ok(())
@@ -1802,17 +1847,27 @@ impl Database {
     }
 
     pub fn erase_messages() -> Result<(), Error> {
-        let con = Self::open()?;
-        con.execute("DELETE FROM messages", [])?;
+        let mut con = Self::open()?;
+        Self::erase_messages_on(&mut con)
+    }
 
-        // Compaction-sourced people (#177) belong to the story just
-        // deleted; a heuristic row is left alone (the cleanup endpoint owns
-        // those).
-        Self::delete_compaction_persons_in(&con)?;
+    /// Testable half of `erase_messages`, mirroring `edit_message_on`:
+    /// resets every compaction table (#181's `clear_all_on` — every
+    /// checkpoint, fact, and pin, plus `compacted_through` back to `NULL`),
+    /// deletes every message and every compaction-sourced person (#177 —
+    /// they belong to the story just deleted; a heuristic row is left alone,
+    /// the cleanup endpoint owns those), and reseeds the greeting, all
+    /// inside one `Immediate` transaction.
+    fn erase_messages_on(con: &mut Connection) -> Result<(), Error> {
+        let tx = con.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        crate::compaction::store::clear_all_on(&tx)?;
+        tx.execute("DELETE FROM messages", [])?;
+        Self::delete_compaction_persons_in(&tx)?;
+        insert_companion_greeting(&tx)?;
+        tx.commit()?;
 
-        // Clear message cache when all messages are erased
         Database::clear_message_cache();
-        insert_companion_greeting(&con)?;
+
         Ok(())
     }
 
@@ -5232,6 +5287,81 @@ mod tests {
         con.execute(messages_ddl(), []).unwrap();
     }
 
+    /// The three compaction tables (#181's acceptance tests below need real
+    /// checkpoint/fact/pin rows, not just the `companion`/`messages` tables
+    /// `mark_stale_for_message_on` itself touches), reusing #171's own DDL
+    /// function rather than duplicating it.
+    fn create_compaction_tables(con: &Connection) {
+        crate::compaction::store::create_tables(con).unwrap();
+    }
+
+    /// Seeds one `compactions` row spanning `[from, through]` with the given
+    /// `status`, returning its id.
+    fn insert_checkpoint_row(
+        con: &Connection,
+        from: i32,
+        through: i32,
+        status: crate::compaction::types::CompactionStatus,
+    ) -> i64 {
+        con.execute(
+            "INSERT INTO compactions (companion_id, from_message_id, through_message_id, status, trigger, created_at) VALUES (1, ?, ?, ?, 'threshold', ?)",
+            params![from, through, &status as &dyn ToSql, get_current_date()],
+        )
+        .unwrap();
+        con.last_insert_rowid()
+    }
+
+    /// A minimal `companion` row (#181): `edit_message_on`/`delete_message_on`
+    /// look up the companion id and `compacted_through` on every call via
+    /// `mark_stale_for_message_on`, so any test exercising them needs this
+    /// table even when it has nothing to do with compaction itself.
+    /// `compacted_through` starts `NULL`, matching a companion that has
+    /// never been compacted.
+    fn create_companion_table(con: &Connection) {
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS companion (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                persona TEXT,
+                example_dialogue TEXT,
+                first_message TEXT,
+                long_term_mem INTEGER,
+                short_term_mem INTEGER,
+                roleplay BOOLEAN,
+                dialogue_tuning BOOLEAN,
+                avatar_path TEXT,
+                compacted_through INTEGER
+            )",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO companion (id, name, persona, example_dialogue, first_message, long_term_mem, short_term_mem, roleplay, dialogue_tuning, avatar_path) VALUES (1, 'Test', '', '', 'hi {{user}}', 0, 0, 0, 0, '')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// A minimal `user` row: `insert_companion_greeting` (called by
+    /// `erase_messages_on`) reads it to resolve `{{user}}` in the greeting.
+    fn create_user_table(con: &Connection) {
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS user (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                persona TEXT,
+                avatar_path TEXT
+            )",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO user (id, name, persona, avatar_path) VALUES (1, 'Eric', '', '')",
+            [],
+        )
+        .unwrap();
+    }
+
     /// Matches the post-#125 schema (a `speaker_id` column, `ai` derived
     /// from it): every test in this module inserts by `speaker_id` rather
     /// than a bare `ai` flag, so a bot id like `"bot1"` can be seeded too.
@@ -5501,12 +5631,13 @@ mod tests {
     #[test]
     fn edit_message_keeps_an_ai_reply_marked_as_ai() {
         let dir = tempfile::TempDir::new().unwrap();
-        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
+        create_companion_table(&con);
         insert_message_row(&con, CHAR_SPEAKER_ID, "hello");
 
         Database::edit_message_on(
-            &con,
+            &mut con,
             1,
             MessageEdit {
                 content: "hello, edited".to_string(),
@@ -5526,12 +5657,13 @@ mod tests {
     #[test]
     fn edit_message_keeps_a_remote_bot_reply_attributed_to_its_speaker() {
         let dir = tempfile::TempDir::new().unwrap();
-        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
+        create_companion_table(&con);
         insert_message_row(&con, "bot1", "hi from bot1");
 
         Database::edit_message_on(
-            &con,
+            &mut con,
             1,
             MessageEdit {
                 content: "hi from bot1, edited".to_string(),
@@ -5553,12 +5685,13 @@ mod tests {
     #[test]
     fn edit_message_keeps_a_user_message_marked_as_user() {
         let dir = tempfile::TempDir::new().unwrap();
-        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
+        create_companion_table(&con);
         insert_message_row(&con, USER_SPEAKER_ID, "hi");
 
         Database::edit_message_on(
-            &con,
+            &mut con,
             1,
             MessageEdit {
                 content: "hi, edited".to_string(),
@@ -5578,13 +5711,14 @@ mod tests {
     #[test]
     fn edit_message_leaves_other_rows_untouched() {
         let dir = tempfile::TempDir::new().unwrap();
-        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
+        create_companion_table(&con);
         insert_message_row(&con, USER_SPEAKER_ID, "hi");
         insert_message_row(&con, CHAR_SPEAKER_ID, "hello");
 
         Database::edit_message_on(
-            &con,
+            &mut con,
             1,
             MessageEdit {
                 content: "hi, edited".to_string(),
@@ -5604,8 +5738,9 @@ mod tests {
     #[test]
     fn edit_message_invalidates_the_message_cache() {
         let dir = tempfile::TempDir::new().unwrap();
-        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
+        create_companion_table(&con);
         insert_message_row(&con, CHAR_SPEAKER_ID, "hello");
 
         // Unique to this test (not "messages:50:0", which the
@@ -5620,7 +5755,7 @@ mod tests {
         }
 
         Database::edit_message_on(
-            &con,
+            &mut con,
             1,
             MessageEdit {
                 content: "hello, edited".to_string(),
@@ -5630,6 +5765,200 @@ mod tests {
 
         let cache = MESSAGE_CACHE.lock().unwrap();
         assert!(!cache.contains_key(&cache_key));
+    }
+
+    /// Reads back one `compactions` row's status, for the #181 tests below.
+    fn checkpoint_status(con: &Connection, id: i64) -> crate::compaction::types::CompactionStatus {
+        con.query_row("SELECT status FROM compactions WHERE id = ?", [id], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn edit_inside_committed_range_marks_only_that_checkpoint_stale() {
+        use crate::compaction::types::CompactionStatus;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        create_companion_table(&con);
+        create_compaction_tables(&con);
+        for i in 1..=20 {
+            insert_message_row(&con, USER_SPEAKER_ID, &format!("msg {i}"));
+        }
+        let first = insert_checkpoint_row(&con, 1, 10, CompactionStatus::Committed);
+        let second = insert_checkpoint_row(&con, 11, 20, CompactionStatus::Committed);
+        con.execute(
+            "UPDATE companion SET compacted_through = 20 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        Database::edit_message_on(
+            &mut con,
+            5,
+            MessageEdit {
+                content: "edited".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(checkpoint_status(&con, first), CompactionStatus::Stale);
+        assert_eq!(checkpoint_status(&con, second), CompactionStatus::Committed);
+    }
+
+    #[test]
+    fn edit_after_compacted_through_leaves_checkpoints_committed() {
+        use crate::compaction::types::CompactionStatus;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        create_companion_table(&con);
+        create_compaction_tables(&con);
+        for i in 1..=15 {
+            insert_message_row(&con, USER_SPEAKER_ID, &format!("msg {i}"));
+        }
+        let checkpoint = insert_checkpoint_row(&con, 1, 10, CompactionStatus::Committed);
+        con.execute(
+            "UPDATE companion SET compacted_through = 10 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        // Id 12 is in the uncompacted tail, past every checkpoint's range.
+        Database::edit_message_on(
+            &mut con,
+            12,
+            MessageEdit {
+                content: "edited".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            checkpoint_status(&con, checkpoint),
+            CompactionStatus::Committed
+        );
+    }
+
+    #[test]
+    fn edit_on_never_compacted_chat_touches_no_compaction_rows() {
+        use crate::compaction::types::CompactionStatus;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        create_companion_table(&con);
+        create_compaction_tables(&con);
+        insert_message_row(&con, USER_SPEAKER_ID, "hi");
+        // A checkpoint row exists but `compacted_through` is still NULL, as
+        // if seeded out of band: the NULL short-circuit means
+        // `edit_message_on` must never even query it, let alone flip it.
+        let checkpoint = insert_checkpoint_row(&con, 1, 1, CompactionStatus::Committed);
+
+        Database::edit_message_on(
+            &mut con,
+            1,
+            MessageEdit {
+                content: "edited".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            checkpoint_status(&con, checkpoint),
+            CompactionStatus::Committed
+        );
+    }
+
+    #[test]
+    fn delete_pinned_message_removes_the_pin_and_marks_stale() {
+        use crate::compaction::types::CompactionStatus;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        create_companion_table(&con);
+        create_compaction_tables(&con);
+        for i in 1..=5 {
+            insert_message_row(&con, USER_SPEAKER_ID, &format!("msg {i}"));
+        }
+        let checkpoint = insert_checkpoint_row(&con, 1, 5, CompactionStatus::Committed);
+        con.execute(
+            "UPDATE companion SET compacted_through = 5 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        crate::compaction::store::pin_on(&con, 3).unwrap();
+
+        // Must not fail with a foreign-key constraint error even though
+        // `foreign_keys = ON`: the pin cascades away with the message.
+        Database::delete_message_on(&mut con, 3).unwrap();
+
+        let pin_count: i64 = con
+            .query_row("SELECT COUNT(*) FROM pinned_messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pin_count, 0);
+        assert_eq!(checkpoint_status(&con, checkpoint), CompactionStatus::Stale);
+    }
+
+    #[test]
+    fn erase_messages_clears_every_compaction_table_and_resets_compacted_through() {
+        use crate::compaction::types::CompactionStatus;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        create_companion_table(&con);
+        create_user_table(&con);
+        create_compaction_tables(&con);
+        insert_message_row(&con, USER_SPEAKER_ID, "hi");
+        let checkpoint = insert_checkpoint_row(&con, 1, 1, CompactionStatus::Committed);
+        con.execute(
+            "INSERT INTO compaction_facts (compaction_id, category, subject, text, quote_speaker, sources, replaces, canon, active) VALUES (?, 'milestone', NULL, 'a fact', NULL, '[1]', '[]', 1, 1)",
+            [checkpoint],
+        )
+        .unwrap();
+        crate::compaction::store::pin_on(&con, 1).unwrap();
+        con.execute(
+            "UPDATE companion SET compacted_through = 1 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        Database::erase_messages_on(&mut con).unwrap();
+
+        let checkpoint_count: i64 = con
+            .query_row("SELECT COUNT(*) FROM compactions", [], |row| row.get(0))
+            .unwrap();
+        let fact_count: i64 = con
+            .query_row("SELECT COUNT(*) FROM compaction_facts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let pin_count: i64 = con
+            .query_row("SELECT COUNT(*) FROM pinned_messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(checkpoint_count, 0);
+        assert_eq!(fact_count, 0);
+        assert_eq!(pin_count, 0);
+
+        let compacted_through: Option<i32> = con
+            .query_row(
+                "SELECT compacted_through FROM companion WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(compacted_through, None);
+
+        // The greeting is still inserted.
+        let message_count: i64 = con
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(message_count, 1);
     }
 
     #[test]
