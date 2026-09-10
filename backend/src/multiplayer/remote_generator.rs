@@ -99,6 +99,7 @@ impl RemoteGenerator for SocketRemoteGenerator {
                 ServerFrame::GenerateRequest {
                     round_id: request.round_id,
                     transcript: request.transcript.to_vec(),
+                    continuity: request.continuity.cloned(),
                 },
             )
             .is_err()
@@ -157,7 +158,9 @@ impl RemoteGenerator for SocketRemoteGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compaction::context::{QuoteLine, QuoteSpeaker};
     use crate::database::Message;
+    use crate::multiplayer::protocol::ContinuityPayload;
     use crate::participants::ParticipantId;
     use std::time::Duration;
 
@@ -185,6 +188,7 @@ mod tests {
             speaker,
             transcript,
             timeout: Duration::from_millis(200),
+            continuity: None,
         }
     }
 
@@ -350,11 +354,68 @@ mod tests {
             ServerFrame::GenerateRequest {
                 round_id: 1,
                 transcript: vec![sample_message(1, "user", "hi")],
+                continuity: None,
             }
         );
 
         // Unblock the generation thread so the test does not leak it: any
         // terminal frame will do, this test only cares about the request.
+        bots.route_inbound(
+            &id("bot1"),
+            ClientFrame::ReplyFailed {
+                round_id: 1,
+                reason: "test cleanup".to_string(),
+            },
+        );
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn the_generate_request_frame_carries_the_continuity_payload_passed_in() {
+        let bots = web::Data::new(RemoteBots::new());
+        let mut rx = bots.register(id("bot1")).unwrap();
+        let generator = SocketRemoteGenerator::new(bots.clone());
+        let speaker = id("bot1");
+        let payload = ContinuityPayload {
+            compacted_through: 2,
+            rules: vec![QuoteLine {
+                speaker: QuoteSpeaker::User,
+                text: "never call me Bob".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let handle = std::thread::spawn(move || {
+            generator.generate(
+                RemoteRequest {
+                    round_id: 1,
+                    speaker: &speaker,
+                    transcript: &[],
+                    timeout: Duration::from_millis(200),
+                    continuity: Some(&payload),
+                },
+                &mut |_| {},
+            )
+        });
+
+        let frame = rx.blocking_recv().expect("GenerateRequest should be sent");
+        match frame {
+            ServerFrame::GenerateRequest { continuity, .. } => {
+                assert_eq!(
+                    continuity,
+                    Some(ContinuityPayload {
+                        compacted_through: 2,
+                        rules: vec![QuoteLine {
+                            speaker: QuoteSpeaker::User,
+                            text: "never call me Bob".to_string(),
+                        }],
+                        ..Default::default()
+                    })
+                );
+            }
+            other => panic!("expected a GenerateRequest, got {:?}", other),
+        }
+
         bots.route_inbound(
             &id("bot1"),
             ClientFrame::ReplyFailed {

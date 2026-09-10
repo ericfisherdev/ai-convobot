@@ -20,8 +20,21 @@
 //! constructs and sends both, streaming a reply back token by token then the
 //! final text. `RemoteBots::route_inbound` reading them on the host side is
 //! #154's job.
+//!
+//! `ServerFrame::GenerateRequest.continuity` is added by #182: once the
+//! host has ever compacted a companion's transcript, every request carries
+//! a [`ContinuityPayload`] alongside the (now-trimmed) transcript, so a
+//! joiner's own reply is grounded in the same committed summaries and
+//! rules the host renders for itself. `#[serde(default)]` keeps a
+//! pre-#182 `GenerateRequest` (no `continuity` key at all) deserialising
+//! as `None`, so `PROTOCOL_VERSION` does not need to change. #186 is what
+//! actually reads it on the joiner side (`HostContinuity`); this crate's
+//! own joiner code (`multiplayer::joiner`/`remote_generation`) does not
+//! look at the field yet.
 
 use serde::{Deserialize, Serialize};
+
+use crate::compaction::context::{CompactionContext, PinnedMessage, QuoteLine};
 
 use crate::database::Message as DbMessage;
 use crate::participants::{ParticipantId, ParticipantKind};
@@ -102,6 +115,74 @@ pub enum RejectReason {
     JoinTimeout,
 }
 
+/// The compaction summaries and rules the host ships to joiners once it has
+/// ever compacted a companion's transcript (#182), carried on every
+/// [`ServerFrame::GenerateRequest`]. Field names and types mirror
+/// [`CompactionContext`]'s exactly, minus `companion_state` (per-instance
+/// by design: every instance renders its own companion's state, never the
+/// host's) and `recalled_facts` (a joiner recalls from its own tantivy
+/// index, never the host's). Unlike `CompactionContext::compacted_through`,
+/// this field is a plain `i32`: a payload only ever exists once the host's
+/// own `compacted_through` is `Some`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ContinuityPayload {
+    pub compacted_through: i32,
+    pub user_state: Vec<String>,
+    pub rules: Vec<QuoteLine>,
+    pub backstory: Vec<String>,
+    pub open_threads: Vec<String>,
+    pub key_quotes: Vec<QuoteLine>,
+    pub rolling_summary: String,
+    pub recent_detail: String,
+    pub pins: Vec<PinnedMessage>,
+}
+
+impl From<CompactionContext> for ContinuityPayload {
+    /// `compacted_through.unwrap_or(0)` never actually falls back to `0` in
+    /// production: [`crate::chat_turn::TurnStore::continuity`] only builds a
+    /// payload at all when the host's `compacted_through` is `Some`.
+    fn from(ctx: CompactionContext) -> Self {
+        ContinuityPayload {
+            compacted_through: ctx.compacted_through.unwrap_or(0),
+            user_state: ctx.user_state,
+            rules: ctx.rules,
+            backstory: ctx.backstory,
+            open_threads: ctx.open_threads,
+            key_quotes: ctx.key_quotes,
+            rolling_summary: ctx.rolling_summary,
+            recent_detail: ctx.recent_detail,
+            pins: ctx.pins,
+        }
+    }
+}
+
+impl ContinuityPayload {
+    /// Rebuilds a full [`CompactionContext`] from this wire payload plus the
+    /// two per-instance fields it dropped. #186's `HostContinuity` is the
+    /// only production caller, once the joiner side renders this the same
+    /// way the host renders its own `CompactionContext`.
+    #[allow(dead_code)] // wired up by #186
+    pub fn into_context(
+        self,
+        companion_state: Vec<String>,
+        recalled_facts: Vec<String>,
+    ) -> CompactionContext {
+        CompactionContext {
+            compacted_through: Some(self.compacted_through),
+            user_state: self.user_state,
+            companion_state,
+            rules: self.rules,
+            backstory: self.backstory,
+            open_threads: self.open_threads,
+            key_quotes: self.key_quotes,
+            rolling_summary: self.rolling_summary,
+            recent_detail: self.recent_detail,
+            pins: self.pins,
+            recalled_facts,
+        }
+    }
+}
+
 /// One row of [`ServerFrame::Joined`]'s participant list, and the JSON row
 /// of `GET /api/multiplayer/participants`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,12 +243,21 @@ pub enum ServerFrame {
     GenerateRequest {
         round_id: u64,
         transcript: Vec<DbMessage>,
+        /// `Some` once the host has ever compacted this companion's
+        /// transcript (#182); `None` in solo mode and in host mode before
+        /// the first checkpoint commits. `#[serde(default)]` so a
+        /// pre-#182 frame (no `continuity` key at all) still deserialises;
+        /// `skip_serializing_if` keeps a `None` payload's wire shape
+        /// byte-identical to before this field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        continuity: Option<ContinuityPayload>,
     },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compaction::context::QuoteSpeaker;
 
     fn sample_avatar() -> AvatarUpload {
         AvatarUpload {
@@ -372,9 +462,155 @@ mod tests {
         let frame = ServerFrame::GenerateRequest {
             round_id: 3,
             transcript: vec![sample_message()],
+            continuity: None,
         };
         let json = serde_json::to_string(&frame).unwrap();
         assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
+    }
+
+    fn sample_continuity() -> ContinuityPayload {
+        ContinuityPayload {
+            compacted_through: 12,
+            user_state: vec!["loves the sea".to_string()],
+            rules: vec![QuoteLine {
+                speaker: QuoteSpeaker::User,
+                text: "never call me Bob".to_string(),
+            }],
+            backstory: vec!["grew up near a lighthouse".to_string()],
+            open_threads: vec!["waiting on Rina's visit".to_string()],
+            key_quotes: vec![QuoteLine {
+                speaker: QuoteSpeaker::Companion,
+                text: "I will remember that promise always".to_string(),
+            }],
+            rolling_summary: "settling into the new place".to_string(),
+            recent_detail: "moved into the lighthouse".to_string(),
+            pins: vec![PinnedMessage {
+                message_id: 5,
+                speaker_id: "user".to_string(),
+                content: "I promise I will never lie to you".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn generate_request_with_continuity_round_trips_through_json() {
+        let frame = ServerFrame::GenerateRequest {
+            round_id: 3,
+            transcript: vec![sample_message()],
+            continuity: Some(sample_continuity()),
+        };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert_eq!(serde_json::from_str::<ServerFrame>(&json).unwrap(), frame);
+    }
+
+    #[test]
+    fn a_pre_182_generate_request_with_no_continuity_key_still_deserialises() {
+        // Pinned so a pre-#182 host/joiner pair (neither side aware of
+        // `continuity`) stays interoperable with a #182 build on either
+        // end: `#[serde(default)]` is what makes a missing key parse as
+        // `None` rather than a deserialize error.
+        let json = serde_json::json!({
+            "type": "generate_request",
+            "round_id": 1,
+            "transcript": []
+        })
+        .to_string();
+        let frame: ServerFrame = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            frame,
+            ServerFrame::GenerateRequest {
+                round_id: 1,
+                transcript: vec![],
+                continuity: None,
+            }
+        );
+    }
+
+    #[test]
+    fn continuity_payload_from_compaction_context_drops_companion_state_and_recalled_facts() {
+        let ctx = CompactionContext {
+            compacted_through: Some(12),
+            user_state: vec!["loves the sea".to_string()],
+            companion_state: vec!["is protective of the lighthouse".to_string()],
+            rules: sample_continuity().rules,
+            backstory: vec!["grew up near a lighthouse".to_string()],
+            open_threads: vec!["waiting on Rina's visit".to_string()],
+            key_quotes: sample_continuity().key_quotes,
+            rolling_summary: "settling into the new place".to_string(),
+            recent_detail: "moved into the lighthouse".to_string(),
+            pins: sample_continuity().pins,
+            recalled_facts: vec!["the lighthouse was built in 1890".to_string()],
+        };
+
+        let payload = ContinuityPayload::from(ctx.clone());
+
+        assert_eq!(payload.compacted_through, 12);
+        assert_eq!(payload.user_state, ctx.user_state);
+        assert_eq!(payload.rules, ctx.rules);
+        assert_eq!(payload.backstory, ctx.backstory);
+        assert_eq!(payload.open_threads, ctx.open_threads);
+        assert_eq!(payload.key_quotes, ctx.key_quotes);
+        assert_eq!(payload.rolling_summary, ctx.rolling_summary);
+        assert_eq!(payload.recent_detail, ctx.recent_detail);
+        assert_eq!(payload.pins, ctx.pins);
+    }
+
+    #[test]
+    fn into_context_restores_the_two_per_instance_fields_the_conversion_dropped() {
+        let payload = sample_continuity();
+        let companion_state = vec!["is protective of the lighthouse".to_string()];
+        let recalled_facts = vec!["the lighthouse was built in 1890".to_string()];
+
+        let ctx = payload
+            .clone()
+            .into_context(companion_state.clone(), recalled_facts.clone());
+
+        assert_eq!(ctx.compacted_through, Some(payload.compacted_through));
+        assert_eq!(ctx.user_state, payload.user_state);
+        assert_eq!(ctx.companion_state, companion_state);
+        assert_eq!(ctx.rules, payload.rules);
+        assert_eq!(ctx.backstory, payload.backstory);
+        assert_eq!(ctx.open_threads, payload.open_threads);
+        assert_eq!(ctx.key_quotes, payload.key_quotes);
+        assert_eq!(ctx.rolling_summary, payload.rolling_summary);
+        assert_eq!(ctx.recent_detail, payload.recent_detail);
+        assert_eq!(ctx.pins, payload.pins);
+        assert_eq!(ctx.recalled_facts, recalled_facts);
+    }
+
+    #[test]
+    fn context_to_payload_and_back_round_trips_every_shared_field() {
+        let companion_state = vec!["is protective of the lighthouse".to_string()];
+        let recalled_facts = vec!["the lighthouse was built in 1890".to_string()];
+        let original = CompactionContext {
+            compacted_through: Some(12),
+            companion_state: companion_state.clone(),
+            recalled_facts: recalled_facts.clone(),
+            ..sample_continuity().into_context(Vec::new(), Vec::new())
+        };
+
+        let round_tripped =
+            ContinuityPayload::from(original.clone()).into_context(companion_state, recalled_facts);
+
+        assert_eq!(round_tripped, original);
+    }
+
+    #[test]
+    fn generate_request_with_no_continuity_serialises_with_no_continuity_key() {
+        let frame = ServerFrame::GenerateRequest {
+            round_id: 1,
+            transcript: vec![],
+            continuity: None,
+        };
+        let json: serde_json::Value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "generate_request",
+                "round_id": 1,
+                "transcript": []
+            })
+        );
     }
 
     #[test]

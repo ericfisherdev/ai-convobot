@@ -283,7 +283,11 @@ struct Admitted {
 }
 
 enum AdmitOutcome {
-    Admitted(Admitted),
+    // Boxed: `ServerFrame::GenerateRequest` carries an optional #182
+    // `ContinuityPayload`, which makes `ServerFrame` (and so `Admitted`,
+    // which embeds one) large enough that clippy's `large_enum_variant`
+    // flags the bare, unboxed form here.
+    Admitted(Box<Admitted>),
     Rejected(RejectReason),
 }
 
@@ -388,14 +392,14 @@ async fn admit(
         }
     };
 
-    AdmitOutcome::Admitted(Admitted {
+    AdmitOutcome::Admitted(Box::new(Admitted {
         outbound_rx,
         joined: ServerFrame::Joined {
             self_id: id.clone(),
             participants: participant_summaries,
             transcript,
         },
-    })
+    }))
 }
 
 /// Serialises `frame` and sends it, logging (rather than propagating) a

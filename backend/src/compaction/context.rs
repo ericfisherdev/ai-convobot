@@ -7,10 +7,14 @@
 //! that does, built from the seams #171 already exposes
 //! ([`CompactionStore`]) plus a message lookup the caller supplies.
 //!
-//! #182's joiner-side `HostContinuity` builds this same struct from a wire
-//! payload (`ContinuityPayload`) whose fields mirror it 1:1, so nothing here
-//! should be renamed without checking that plan; #178 fills in
-//! `recalled_facts`, still empty as of this issue.
+//! #182 mirrors this struct's fields 1:1 onto a wire type
+//! (`multiplayer::protocol::ContinuityPayload`), minus `companion_state`
+//! and `recalled_facts`; #186's joiner-side `HostContinuity` builds this
+//! same struct back from that payload, so nothing here should be renamed
+//! without checking both plans. #178 fills in `recalled_facts`, still
+//! empty as of this issue.
+
+use serde::{Deserialize, Serialize};
 
 use crate::compaction::store::CompactionStore;
 use crate::compaction::types::{Fact, FactCategory};
@@ -18,23 +22,27 @@ use crate::database::Message;
 
 /// Who is speaking in a [`QuoteLine`]: a `Rule` or `KeyQuote` fact's `text`,
 /// rendered verbatim and attributed to whichever of the two named
-/// participants said it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// participants said it. `Serialize`/`Deserialize` (additive, #182) so it
+/// can ride on `multiplayer::protocol::ContinuityPayload` unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuoteSpeaker {
     User,
     Companion,
 }
 
 /// One quoted line, ready to render as `"{name}: \"{text}\"\n"`.
-#[derive(Debug, Clone, PartialEq)]
+/// `Eq`/`Serialize`/`Deserialize` (additive, #182) for the same reason as
+/// [`QuoteSpeaker`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuoteLine {
     pub speaker: QuoteSpeaker,
     pub text: String,
 }
 
 /// One pinned message, with its text already resolved through
-/// `message_by_id` at load time.
-#[derive(Debug, Clone, PartialEq)]
+/// `message_by_id` at load time. `Eq`/`Serialize`/`Deserialize` (additive,
+/// #182) for the same reason as [`QuoteSpeaker`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PinnedMessage {
     pub message_id: i32,
     pub speaker_id: String,
