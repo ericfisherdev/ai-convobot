@@ -68,6 +68,13 @@ interface CompactionDraftCardProps {
   // Read-only view used by `CompactionNotice`'s "Show notes" dialog: no
   // checkboxes, no editing, no Commit/Discard footer.
   readOnly?: boolean;
+  // Controlled review state: `PendingDraftMarker` owns this so it survives
+  // the mobile drawer (`vaul`'s `DrawerContent` unmounts its children on
+  // close, which would otherwise discard every edit/strike/rejection the
+  // moment the drawer closes). Falls back to an internal `useState` when
+  // omitted -- `CompactionNotice`'s read-only dialog has no need to own it.
+  state?: ReviewState;
+  onStateChange?: (state: ReviewState) => void;
 }
 
 function ItemRow({
@@ -198,11 +205,32 @@ export function CompactionDraftCard({
   onJumpToMessage,
   serverRejections,
   readOnly = false,
+  state: controlledState,
+  onStateChange,
 }: CompactionDraftCardProps) {
-  const [state, setState] = useState<ReviewState>(() => initialReviewState(draft));
+  const [internalState, setInternalState] = useState<ReviewState>(() => initialReviewState(draft));
+  const state = controlledState ?? internalState;
+
+  // Routes every update through whichever store owns the state: the
+  // controlled `onStateChange` when the caller passed one, the internal
+  // `useState` otherwise. `updater` always sees the state actually being
+  // rendered (controlled or not), matching the `setState(prev => ...)`
+  // pattern the rest of this component uses.
+  const applyUpdate = (updater: (prev: ReviewState) => ReviewState) => {
+    const next = updater(state);
+    if (onStateChange) {
+      onStateChange(next);
+    } else {
+      setInternalState(next);
+    }
+  };
 
   useEffect(() => {
-    setState((prev) => applyServerRejection(prev, serverRejections));
+    applyUpdate((prev) => applyServerRejection(prev, serverRejections));
+    // Only re-run when the rejections themselves change -- `applyUpdate`
+    // closes over `state`, which changes on every edit and would otherwise
+    // reapply an already-applied (and by then stale) rejection list.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [serverRejections]);
 
   const grouped = groupByCategory(state.items);
@@ -236,9 +264,9 @@ export function CompactionDraftCard({
                 key={item.fact.id}
                 item={item}
                 readOnly={readOnly}
-                onToggle={() => setState((prev) => toggleAccepted(prev, item.fact.id))}
-                onEditText={(text) => setState((prev) => editItemText(prev, item.fact.id, text))}
-                onEditQuote={(quote) => setState((prev) => editItemQuote(prev, item.fact.id, quote))}
+                onToggle={() => applyUpdate((prev) => toggleAccepted(prev, item.fact.id))}
+                onEditText={(text) => applyUpdate((prev) => editItemText(prev, item.fact.id, text))}
+                onEditQuote={(quote) => applyUpdate((prev) => editItemQuote(prev, item.fact.id, quote))}
                 onJumpToMessage={onJumpToMessage}
               />
             ))}
@@ -251,7 +279,7 @@ export function CompactionDraftCard({
           </h4>
           <Textarea
             value={state.summary}
-            onChange={(e) => setState((prev) => editSummary(prev, e.target.value))}
+            onChange={(e) => applyUpdate((prev) => editSummary(prev, e.target.value))}
             disabled={readOnly}
             className="text-xs"
           />

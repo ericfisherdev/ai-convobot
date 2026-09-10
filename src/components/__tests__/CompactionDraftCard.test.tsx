@@ -165,6 +165,36 @@ describe('CompactionDraftCard', () => {
     expect(onJumpToMessage).toHaveBeenCalledWith(42);
   });
 
+  it('routes edits through a controlled state/onStateChange pair instead of its own useState', async () => {
+    // `PendingDraftMarker` lifts `ReviewState` out of this card so it
+    // survives the mobile drawer unmounting; this proves edits flow through
+    // the controlled pair rather than an internal state the parent cannot see.
+    const user = userEvent.setup();
+    const draft = aDraft([aFact({ id: 1, category: 'milestone' })]);
+    const onStateChange = vi.fn();
+
+    render(
+      <CompactionDraftCard
+        draft={draft}
+        messagesSinceDraft={0}
+        busy={false}
+        onCommit={noop}
+        onDiscard={noop}
+        onJumpToMessage={noop}
+        serverRejections={[]}
+        state={{ items: [{ fact: draft.facts[0], accepted: true, text: draft.facts[0].text, serverReason: null }], summary: 'a summary' }}
+        onStateChange={onStateChange}
+      />
+    );
+
+    await user.click(screen.getByRole('checkbox', { name: 'Accept Milestone item' }));
+
+    // The mount-time `applyServerRejection` effect (a no-op against an empty
+    // `serverRejections`) also runs through the controlled setter, so check
+    // the toggle's own (most recent) call rather than the call count.
+    expect(onStateChange.mock.calls[onStateChange.mock.calls.length - 1][0].items[0].accepted).toBe(false);
+  });
+
   it('renders no Commit/Discard controls in readOnly mode', () => {
     const draft = aDraft([aFact({ id: 1 })]);
 

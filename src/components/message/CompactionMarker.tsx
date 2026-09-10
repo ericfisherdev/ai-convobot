@@ -6,6 +6,7 @@ import { useMobile } from '../../hooks/useMobile';
 import { CheckpointDetail, CompactionDraftReview, DraftPhase, RejectedItem } from '../interfaces/Compaction';
 import { CompactionDraftCard } from './CompactionDraftCard';
 import { CompactionNotice } from './CompactionNotice';
+import { initialReviewState, ReviewState } from './compactionReview';
 import { scrollToMessage } from '../../lib/messageAnchors';
 import { Button } from '../ui/button';
 import { Drawer, DrawerContent, DrawerTrigger } from '../ui/drawer';
@@ -40,6 +41,10 @@ function PendingDraftMarker({
   const { fetchDetail, commit, discard, refresh } = useCompaction();
   const { messages, refreshMessages } = useMessages();
   const [detail, setDetail] = useState<CheckpointDetail | null>(null);
+  // Owned here, not inside `CompactionDraftCard`, so the mobile drawer
+  // (`vaul`'s `DrawerContent` unmounts its children when it closes) does not
+  // throw away every edit/strike the user made while reviewing.
+  const [review, setReview] = useState<ReviewState | null>(null);
   const [busy, setBusy] = useState(false);
   const [rejections, setRejections] = useState<RejectedItem[]>([]);
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -48,7 +53,9 @@ function PendingDraftMarker({
     let cancelled = false;
     if (phase === 'review') {
       fetchDetail(draftId).then((result) => {
-        if (!cancelled) setDetail(result);
+        if (cancelled) return;
+        setDetail(result);
+        setReview(result ? initialReviewState(result) : null);
       });
     }
     return () => {
@@ -81,7 +88,7 @@ function PendingDraftMarker({
     setBusy(false);
   };
 
-  if (phase === 'extracting' || !detail) {
+  if (phase === 'extracting' || !detail || !review) {
     return (
       <div className="message-container flex justify-center animate-in fade-in-0 duration-300">
         <div className="chat-bubble text-xs text-muted-foreground bg-muted/50 rounded-full px-3 py-1">
@@ -100,6 +107,8 @@ function PendingDraftMarker({
       onDiscard={handleDiscard}
       onJumpToMessage={scrollToMessage}
       serverRejections={rejections}
+      state={review}
+      onStateChange={setReview}
     />
   );
 
