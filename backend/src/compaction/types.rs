@@ -82,13 +82,18 @@ impl ToSql for CompactionStatus {
     }
 }
 
-/// What caused a checkpoint's draft to be created.
+/// What caused a checkpoint's draft to be created. `JoinerSync` (#186) is
+/// the one variant never queued by `hook.rs`/`main.rs::compaction_draft`:
+/// it marks a draft `multiplayer::joiner_compaction`'s own auto-extraction
+/// job queued locally on a joiner, following the host's `ContinuityPayload`
+/// forward rather than a local threshold/scene-break/manual trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionTrigger {
     Threshold,
     SceneBreak,
     Manual,
+    JoinerSync,
 }
 
 impl fmt::Display for CompactionTrigger {
@@ -97,6 +102,7 @@ impl fmt::Display for CompactionTrigger {
             CompactionTrigger::Threshold => "threshold",
             CompactionTrigger::SceneBreak => "scene_break",
             CompactionTrigger::Manual => "manual",
+            CompactionTrigger::JoinerSync => "joiner_sync",
         };
         write!(f, "{s}")
     }
@@ -110,6 +116,7 @@ impl FromStr for CompactionTrigger {
             "threshold" => Ok(CompactionTrigger::Threshold),
             "scene_break" => Ok(CompactionTrigger::SceneBreak),
             "manual" => Ok(CompactionTrigger::Manual),
+            "joiner_sync" => Ok(CompactionTrigger::JoinerSync),
             _ => Err(s.to_string()),
         }
     }
@@ -446,6 +453,7 @@ mod tests {
             CompactionTrigger::Threshold,
             CompactionTrigger::SceneBreak,
             CompactionTrigger::Manual,
+            CompactionTrigger::JoinerSync,
         ] {
             assert_sql_round_trips(variant);
             assert_json_round_trips(variant);

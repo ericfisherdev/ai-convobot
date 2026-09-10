@@ -16,8 +16,8 @@ mod llm;
 mod model_cache;
 mod model_metadata;
 use crate::llm::{
-    assemble_prompt, prompt, prompt_streaming, CompactionSource, PromptSpeakers, SqliteCompaction,
-    SqliteTranscript,
+    assemble_prompt, prompt, prompt_streaming, CompactionSource, InMemoryTranscript,
+    PromptSpeakers, SqliteCompaction, SqliteTranscript,
 };
 use uuid::Uuid;
 mod context_manager;
@@ -2789,6 +2789,7 @@ struct PromptInspectParams {
 async fn inspect_prompt(
     query: web::Query<PromptInspectParams>,
     registry: web::Data<RwLock<ParticipantRegistry>>,
+    joiner: Option<web::Data<JoinerHandle>>,
 ) -> HttpResponse {
     let long_term_memory = match LongTermMem::shared() {
         Ok(ltm) => ltm,
@@ -2809,6 +2810,46 @@ async fn inspect_prompt(
                 .body("Error while getting config, check logs for more information");
         }
     };
+
+    // A joiner has no local `messages`/compaction-review state of its own
+    // to answer this the solo/host way: it renders from the host's
+    // `ContinuityPayload` (#186's `HostContinuity`) plus its own local
+    // overlay, and from its transcript mirror rather than `SqliteTranscript`
+    // (empty on a joiner). Everything but this source selection lives in
+    // `remote_generation::joiner_prompt_inputs`.
+    if let Some(joiner) = joiner {
+        let (companion_id, speakers, source, transcript, continuity) =
+            crate::multiplayer::remote_generation::joiner_prompt_inputs(&joiner);
+        let compaction_context = match source.context(companion_id) {
+            Ok(context) => context,
+            Err(e) => {
+                println!("Failed to load compaction context: {}", e);
+                return HttpResponse::InternalServerError().body(
+                    "Error while loading compaction context, check logs for more information",
+                );
+            }
+        };
+        let transcript_source = InMemoryTranscript(transcript);
+        return match assemble_prompt(
+            query.prompt.as_deref().unwrap_or(""),
+            companion_id,
+            long_term_memory,
+            &config_view,
+            &transcript_source,
+            &speakers,
+            &compaction_context,
+        ) {
+            Ok(mut assembled) => {
+                assembled.continuity = continuity;
+                HttpResponse::Ok().json(assembled)
+            }
+            Err(e) => {
+                println!("Failed to assemble prompt: {}", e);
+                HttpResponse::InternalServerError()
+                    .body("Error while assembling prompt, check logs for more information")
+            }
+        };
+    }
 
     let companion_id = match query.companion_id {
         Some(id) => id,
@@ -4078,7 +4119,6 @@ async fn main() -> std::io::Result<()> {
             })?;
             let identity = JoinerIdentity::from_config(&multiplayer_config, &companion_data)
                 .map_err(std::io::Error::other)?;
-            let handle: JoinerHandle = Arc::new(RwLock::new(JoinerShared::new(&identity)));
             // Read before `identity` moves into `joiner::run` below:
             // `LocalModelGeneration` needs its own id to know which speaker
             // it is generating for.
@@ -4088,6 +4128,31 @@ async fn main() -> std::io::Result<()> {
                     "cannot read companion id for joiner generation: {e}"
                 ))
             })?;
+            // Seeds `JoinerShared::local_compacted_through` from whatever
+            // this instance already committed in a previous run, so a
+            // restart never re-extracts an already-compacted range from
+            // scratch (#186).
+            let initial_compacted_through = SqliteCompactionStore
+                .compacted_through(companion_id)
+                .unwrap_or_else(|e| {
+                    eprintln!(
+                    "cannot read this joiner's own compacted_through, starting from scratch: {e}"
+                );
+                    None
+                });
+            let handle: JoinerHandle = Arc::new(RwLock::new(JoinerShared::new(
+                &identity,
+                companion_id,
+                initial_compacted_through,
+            )));
+            let extraction_handle = handle.clone();
+            let extraction_job: crate::multiplayer::joiner_compaction::JoinerExtractionJob =
+                Arc::new(move |request| {
+                    crate::multiplayer::joiner_compaction::run_joiner_extraction(
+                        &extraction_handle,
+                        request,
+                    );
+                });
             actix_web::rt::spawn(crate::multiplayer::joiner::run(
                 handle.clone(),
                 identity,
@@ -4096,6 +4161,7 @@ async fn main() -> std::io::Result<()> {
                     self_id,
                     handle.clone(),
                 )),
+                extraction_job,
             ));
             Some(web::Data::new(handle))
         } else {

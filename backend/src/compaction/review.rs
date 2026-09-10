@@ -73,7 +73,11 @@ fn is_quote_category(category: FactCategory) -> bool {
     matches!(category, FactCategory::Rule | FactCategory::KeyQuote)
 }
 
-fn fact_to_draft(fact: &Fact) -> FactDraft {
+/// `pub(crate)`: also reused by `multiplayer::joiner_compaction` (#186) to
+/// turn a joiner's own stored facts into the `FactDraft`s its own-facts-only
+/// `ReviewedDraft` carries, the same conversion `apply_review` uses for the
+/// host's review request.
+pub(crate) fn fact_to_draft(fact: &Fact) -> FactDraft {
     FactDraft {
         category: fact.category,
         subject: fact.subject.clone(),

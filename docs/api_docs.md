@@ -639,12 +639,14 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   - `prompt` (string, optional): message the long-term memory recall is keyed on. Omitted, the prompt is assembled with no recalled entries.
 - **Response:**
   - Status: 200 OK
-  - Body: `{ "system_prompt": string, "chat_history": [[bool, string]], "attitude_context": string, "managed_messages": [Message], "compaction": CompactionBlocks, "compacted_through": integer | null }`
+  - Body: `{ "system_prompt": string, "chat_history": [[bool, string]], "attitude_context": string, "managed_messages": [Message], "compaction": CompactionBlocks, "compacted_through": integer | null, "continuity": ContinuityPayload | omitted }`
   - `compaction` (conversation compaction): `{ "user_overlay": string, "companion_overlay": string, "rules": string, "story_so_far": string, "recent_detail": string, "pins": string, "over_budget_by": integer | null }` — the rendered compaction blocks folded into `system_prompt`, each `""` when that section has nothing to say. `over_budget_by` is only set when the user overlay, companion overlay, and rules block together exceed the compaction token slice (those three are never trimmed).
   - `compacted_through`: the checkpoint `managed_messages` starts after, `null` for a companion that has never been compacted.
+  - `continuity` (#186, joiner mode only): the raw `ContinuityPayload` from the most recent `GenerateRequest` this joiner rendered against — the same object `compaction`/`compacted_through` above were computed from, so a caller can compare the rendered blocks to their source. Omitted entirely (not `null`) in solo/host mode, and on a joiner that has not yet received one.
 - **Notes:**
   - No model is loaded, so for `PromptTemplate::Auto` the response holds the pre-template system text plus the role-tagged `chat_history` rather than the final rendered string. Every other template returns the finished prompt in `system_prompt`.
   - `docs/attitude_verification.md` records a comparison run made with this route and `backend/scripts/attitude_comparison.sh`.
+  - In `joiner` multiplayer mode (#186), `compaction`/`compacted_through`/`continuity` are rendered from the host's own committed summaries/rules (mirrored via `GenerateRequest`) plus this joiner's own locally-kept companion overlay, not from a local compaction store of its own — unlike the compaction routes in the next section, this one stays readable on a joiner rather than 409ing, since it only inspects state the joiner already has.
 
 ### Unload resident models
 
@@ -773,7 +775,7 @@ Every frame is a JSON object tagged `"type"` (snake_case, e.g. `"reply_complete"
 
 ### 8. Compaction
 
-Conversation compaction (#171-#186): a checkpoint rolls a run of messages into a summary plus extracted facts, so old turns can drop out of the prompt without the companion losing what happened. Every route below is gated the same way the prompting routes are: `409 Conflict` in `joiner` multiplayer mode, since a joiner has no compaction store of its own.
+Conversation compaction (#171-#186): a checkpoint rolls a run of messages into a summary plus extracted facts, so old turns can drop out of the prompt without the companion losing what happened. Every route below is gated the same way the prompting routes are: `409 Conflict` in `joiner` multiplayer mode. A joiner does keep its own local compaction store (#186), but only for its own automatic, unreviewed auto-extraction — triggered internally as the host's `ContinuityPayload` advances, never through these routes, which stay host-only since they are where a human reviews and commits a draft.
 
 #### 8.1 Trigger a draft manually
 

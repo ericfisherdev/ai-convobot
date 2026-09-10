@@ -17,6 +17,7 @@ use crate::inference_performance::{ModelConfig, INFERENCE_TRACKER};
 use crate::long_term_mem::LongTermMem;
 use crate::model_cache::{ModelKey, ResidentCache};
 use crate::model_metadata::{self, ModelFacts};
+use crate::multiplayer::protocol::ContinuityPayload;
 use crate::participants::{
     expand_placeholders, render_mentions, Participant, ParticipantId, ParticipantRegistry,
 };
@@ -527,18 +528,6 @@ impl CompactionSource for SqliteCompaction {
     }
 }
 
-/// A fixed [`CompactionContext`], cloned on every call: this module's own
-/// tests, and the joiner's `LocalModelGeneration`
-/// (`multiplayer::remote_generation`) until #182 replaces it with its own
-/// `HostContinuity` impl built from the host's `ContinuityPayload`.
-pub struct FixedCompaction(pub CompactionContext);
-
-impl CompactionSource for FixedCompaction {
-    fn context(&self, _companion_id: i32) -> std::io::Result<CompactionContext> {
-        Ok(self.0.clone())
-    }
-}
-
 /// An owned, `Clone + Send` snapshot of who is in the chat and which of them
 /// the current turn is generating for. Owned so it can move into
 /// `web::block` closures and the `stream-generation` thread without holding
@@ -598,6 +587,17 @@ pub struct AssembledPrompt {
     /// The checkpoint `managed_messages` starts after — `None` for a
     /// companion that has never been compacted.
     pub compacted_through: Option<i32>,
+    /// The host's `ContinuityPayload` this prompt was rendered against
+    /// (#186), so `GET /api/debug/prompt` can show a joiner's rendered
+    /// prompt alongside the raw payload it came from. Always `None` on
+    /// solo/host, which never receive one; left unset by `assemble_prompt`
+    /// itself (it only ever sees the already-merged `CompactionContext`,
+    /// never the wire payload) and filled in afterward by
+    /// `main.rs::inspect_prompt`'s joiner branch.
+    /// `skip_serializing_if` keeps the solo/host JSON shape byte-identical
+    /// to before this field existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuity: Option<ContinuityPayload>,
 }
 
 /// The result of rendering a message history for one turn.
@@ -936,6 +936,7 @@ pub fn assemble_prompt(
         managed_messages,
         compaction: compaction_blocks,
         compacted_through: compaction.compacted_through,
+        continuity: None,
     })
 }
 

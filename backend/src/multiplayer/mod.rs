@@ -49,6 +49,20 @@
 //! when nothing is mentioned), and `schedule_follow_ups` lets a bot's own
 //! `@mention` of another bot queue it a follow-up turn, bounded by
 //! `RoutingPolicy::max_followup_depth` so a chain can never run forever.
+//!
+//! `joiner_compaction.rs` (#186) is a joiner's own auto-extraction: once
+//! the host's `ContinuityPayload` (#182) shows it has compacted further
+//! than this joiner has locally caught up to, `maybe_queue_extraction`
+//! (called from `joiner.rs::serve`) queues an extraction pass over the
+//! newly compacted range, purely from this joiner's own transcript mirror,
+//! and commits only what is safe for it to keep without host review
+//! (`companion_state` and its own rules/key-quotes) — everything else is
+//! stored inactive with a reason, since it describes the shared user/world.
+//! `remote_generation.rs`'s `HostContinuity` (#186) is the matching
+//! `llm::CompactionSource`: it renders the host's payload together with
+//! this joiner's own local overlay (`joiner_compaction::local_overlay`),
+//! replacing #174's placeholder (a fixed, never-compacted
+//! `CompactionContext`) in `LocalModelGeneration`.
 
 pub mod avatar;
 pub mod backoff;
@@ -57,6 +71,7 @@ pub mod handshake;
 pub mod host;
 pub mod join_throttle;
 pub mod joiner;
+pub mod joiner_compaction;
 pub mod protocol;
 pub mod remote_bots;
 pub mod remote_generation;

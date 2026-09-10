@@ -3,8 +3,10 @@ import { AttitudeData } from './AttitudeData';
 // Mirrors the backend's `compaction::types::CompactionStatus`.
 export type CompactionStatus = 'draft' | 'committed' | 'discarded' | 'stale';
 
-// Mirrors the backend's `compaction::types::CompactionTrigger`.
-export type CompactionTrigger = 'threshold' | 'scene_break' | 'manual';
+// Mirrors the backend's `compaction::types::CompactionTrigger`. `joiner_sync`
+// (#186) never reaches the frontend: the compaction routes 409 on a joiner
+// instance, so a checkpoint carrying this trigger is never listed here.
+export type CompactionTrigger = 'threshold' | 'scene_break' | 'manual' | 'joiner_sync';
 
 // Mirrors the backend's `compaction::types::FactCategory`.
 export type FactCategory =

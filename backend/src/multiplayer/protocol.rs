@@ -27,10 +27,11 @@
 //! joiner's own reply is grounded in the same committed summaries and
 //! rules the host renders for itself. `#[serde(default)]` keeps a
 //! pre-#182 `GenerateRequest` (no `continuity` key at all) deserialising
-//! as `None`, so `PROTOCOL_VERSION` does not need to change. #186 is what
-//! actually reads it on the joiner side (`HostContinuity`); this crate's
-//! own joiner code (`multiplayer::joiner`/`remote_generation`) does not
-//! look at the field yet.
+//! as `None`, so `PROTOCOL_VERSION` does not need to change. #186 reads it
+//! on the joiner side: `multiplayer::joiner::serve` mirrors it onto
+//! `JoinerShared::last_continuity` and queues an auto-extraction job
+//! through it, and `multiplayer::remote_generation::HostContinuity` renders
+//! it into a turn's prompt.
 
 use serde::{Deserialize, Serialize};
 
@@ -158,10 +159,9 @@ impl From<CompactionContext> for ContinuityPayload {
 
 impl ContinuityPayload {
     /// Rebuilds a full [`CompactionContext`] from this wire payload plus the
-    /// two per-instance fields it dropped. #186's `HostContinuity` is the
-    /// only production caller, once the joiner side renders this the same
+    /// two per-instance fields it dropped. `multiplayer::remote_generation::HostContinuity`
+    /// is the only production caller (#186), which renders this the same
     /// way the host renders its own `CompactionContext`.
-    #[allow(dead_code)] // wired up by #186
     pub fn into_context(
         self,
         companion_state: Vec<String>,
