@@ -6,6 +6,10 @@ export interface MessageInterface {
     speaker_id: string;
     content: string;
     created_at: string;
+    // Whether this message is exempt from compaction (#179). A `joiner`
+    // multiplayer instance always reports `false`, since pins live on the
+    // host.
+    pinned: boolean;
 }
 
 // What kind of `StreamChunk` this is, mirroring the backend's
@@ -32,4 +36,7 @@ export interface StreamChunk {
     message_id?: number;
     error?: string;
     attitude?: AttitudeStreamUpdate;
+    // Set only on the compaction-draft-ready chunk (#179): the id of the
+    // checkpoint draft this round's compaction hook just queued.
+    compaction_draft_id?: number;
 }

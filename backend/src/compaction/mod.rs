@@ -88,6 +88,13 @@
 //! #177, since nothing reaches `production_commit_deps`/`commit::commit` in
 //! production until #179's route lands; flipping the default is deferred to
 //! follow-up issue #201 once that path is live.
+//!
+//! `review.rs` (#179) is the request side of commit: `apply_review` turns
+//! a `POST /api/compaction/{id}/commit` body into the `commit::ReviewedDraft`
+//! `commit` takes, re-running `validate` over whatever the request edited.
+//! `view.rs` (#179) holds every response DTO the HTTP routes in `main.rs`
+//! serialise, `From`-built from this module's domain types plus whatever
+//! extra context (attitude, phase) a single domain struct does not carry.
 #![allow(dead_code)]
 
 pub mod commit;
@@ -99,10 +106,12 @@ pub mod persons;
 pub mod range;
 pub mod registry_speakers;
 pub mod render;
+pub mod review;
 pub mod store;
 pub mod trigger;
 pub mod types;
 pub mod validate;
+pub mod view;
 
 use serde::Deserialize;
 

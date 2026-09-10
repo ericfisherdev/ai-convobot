@@ -39,6 +39,7 @@ export function parseStreamChunk(record: string): StreamChunk | null {
       message_id: parsed.message_id,
       error: parsed.error,
       attitude: parsed.attitude,
+      compaction_draft_id: parsed.compaction_draft_id,
     };
   } catch (parseError) {
     console.error('Failed to parse stream chunk:', parseError);
@@ -61,10 +62,13 @@ export interface RoundStreamState {
   error: string | null;
   attitudeStreamed: boolean;
   roundComplete: boolean;
+  // The compaction draft id this round's compaction-draft-ready chunk
+  // carried, if any (#179). `null` for a round that queued no draft.
+  draftQueuedId: number | null;
 }
 
 export function initialRoundStreamState(): RoundStreamState {
-  return { bubbles: [], error: null, attitudeStreamed: false, roundComplete: false };
+  return { bubbles: [], error: null, attitudeStreamed: false, roundComplete: false, draftQueuedId: null };
 }
 
 export type StreamEffect =
@@ -72,6 +76,7 @@ export type StreamEffect =
   | { type: 'set_content'; tempId: number; content: string }
   | { type: 'settle_bubble'; tempId: number; speakerId: string; messageId: number | null; content: string }
   | { type: 'apply_attitude'; update: AttitudeStreamUpdate }
+  | { type: 'compaction_draft'; draftId: number }
   | { type: 'round_complete' }
   | { type: 'error'; message: string };
 
@@ -95,6 +100,17 @@ export function reduceStreamChunk(
     return {
       state: { ...state, attitudeStreamed: true },
       effects: [{ type: 'apply_attitude', update: chunk.attitude }],
+    };
+  }
+
+  // Same short-circuit as the attitude chunk above: a chunk with
+  // `compaction_draft_id` set carries only that, never content, regardless
+  // of `event`.
+  if (chunk.compaction_draft_id !== undefined) {
+    const draftId = chunk.compaction_draft_id;
+    return {
+      state: { ...state, draftQueuedId: draftId },
+      effects: [{ type: 'compaction_draft', draftId }],
     };
   }
 

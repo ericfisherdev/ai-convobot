@@ -109,6 +109,41 @@ describe('roundStream', () => {
     expect(effects.filter(e => e.type === 'apply_attitude')).toHaveLength(1)
   })
 
+  it('applies the compaction-draft-ready chunk once, before round_complete, without touching bubbles', () => {
+    const { state, effects } = runChunks([
+      { request_id: 'r1', event: 'reply_started', content: '', is_complete: false, speaker_id: 'char' },
+      { request_id: 'r1', event: 'reply_complete', content: 'hi', is_complete: false, speaker_id: 'char', message_id: 1 },
+      {
+        request_id: 'r1',
+        event: 'token',
+        content: '',
+        is_complete: false,
+        speaker_id: '',
+        compaction_draft_id: 3,
+      },
+      { request_id: 'r1', event: 'round_complete', content: '', is_complete: true, speaker_id: '' },
+    ])
+
+    expect(state.draftQueuedId).toBe(3)
+    expect(state.bubbles).toEqual([{ tempId: -1, speakerId: 'char', content: 'hi', messageId: 1 }])
+    const compactionEffects = effects.filter(e => e.type === 'compaction_draft')
+    expect(compactionEffects).toEqual([{ type: 'compaction_draft', draftId: 3 }])
+    expect(effects.indexOf(compactionEffects[0])).toBeLessThan(
+      effects.findIndex(e => e.type === 'round_complete')
+    )
+  })
+
+  it('yields no compaction_draft effect when the round queued no draft', () => {
+    const { state, effects } = runChunks([
+      { request_id: 'r1', event: 'reply_started', content: '', is_complete: false, speaker_id: 'char' },
+      { request_id: 'r1', event: 'reply_complete', content: 'hi', is_complete: false, speaker_id: 'char', message_id: 1 },
+      { request_id: 'r1', event: 'round_complete', content: '', is_complete: true, speaker_id: '' },
+    ])
+
+    expect(state.draftQueuedId).toBeNull()
+    expect(effects.some(e => e.type === 'compaction_draft')).toBe(false)
+  })
+
   it('still produces one bubble for a legacy stream with no event field', () => {
     const { state } = runChunks([
       { request_id: 'r1', content: 'Hel', is_complete: false },

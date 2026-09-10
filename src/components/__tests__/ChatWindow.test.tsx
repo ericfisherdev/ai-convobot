@@ -3,6 +3,7 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import ChatWindow from '../ChatWindow'
 import { MessagesProvider, useMessages } from '../context/messageContext'
+import { CompactionProvider } from '../context/compactionContext'
 import { UserDataProvider } from '../context/userContext'
 import { CompanionDataProvider } from '../context/companionContext'
 import { ConfigProvider } from '../context/configContext'
@@ -106,7 +107,9 @@ const MockProviders: React.FC<{ children: React.ReactNode }> = ({ children }) =>
             <ParticipantsProvider>
               <AttitudeProvider>
                 <SessionProvider>
-                  {children}
+                  <CompactionProvider>
+                    {children}
+                  </CompactionProvider>
                 </SessionProvider>
               </AttitudeProvider>
             </ParticipantsProvider>
@@ -131,6 +134,9 @@ describe('ChatWindow Component', () => {
       }
       if (url.startsWith('/api/attitude/summary/')) {
         return Promise.resolve(jsonResponse({ attitude, summary: 'neutral' }))
+      }
+      if (url.startsWith('/api/compaction')) {
+        return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
       }
       return Promise.resolve(jsonResponse([]))
     }) as unknown as typeof fetch
@@ -216,6 +222,9 @@ describe('ChatWindow Component', () => {
       if (url.startsWith('/api/attitude/summary/')) {
         return Promise.resolve(jsonResponse({ attitude, summary: 'neutral' }))
       }
+      if (url.startsWith('/api/compaction')) {
+        return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
+      }
       return Promise.resolve(jsonResponse([]))
     })
     global.fetch = fetchMock as unknown as typeof fetch
@@ -282,6 +291,9 @@ describe('ChatWindow Component', () => {
       }
       if (url.startsWith('/api/attitude/summary/')) {
         return Promise.resolve(jsonResponse({ attitude, summary: 'neutral' }))
+      }
+      if (url.startsWith('/api/compaction')) {
+        return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
       }
       return Promise.resolve(jsonResponse([]))
     })
@@ -365,6 +377,9 @@ describe('ChatWindow Component', () => {
       if (url.startsWith('/api/attitude/summary/')) {
         return Promise.resolve(jsonResponse({ attitude, summary: 'neutral' }))
       }
+      if (url.startsWith('/api/compaction')) {
+        return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
+      }
       return Promise.resolve(jsonResponse([]))
     })
     global.fetch = fetchMock as unknown as typeof fetch
@@ -438,6 +453,9 @@ describe('ChatWindow Component', () => {
       if (url.startsWith('/api/attitude/summary/')) {
         return Promise.resolve(jsonResponse({ attitude, summary: 'neutral' }))
       }
+      if (url.startsWith('/api/compaction')) {
+        return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
+      }
       return Promise.resolve(jsonResponse([]))
     })
     global.fetch = fetchMock as unknown as typeof fetch
@@ -484,6 +502,9 @@ describe('ChatWindow Component', () => {
       if (url.startsWith('/api/attitude/summary/')) {
         return Promise.resolve(jsonResponse({ attitude, summary: 'neutral' }))
       }
+      if (url.startsWith('/api/compaction')) {
+        return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
+      }
       return Promise.resolve(jsonResponse([]))
     })
     global.fetch = fetchMock as unknown as typeof fetch
@@ -518,6 +539,9 @@ describe('ChatWindow Component', () => {
       }
       if (url.startsWith('/api/attitude/summary/')) {
         return Promise.resolve(jsonResponse({ attitude, summary: 'neutral' }))
+      }
+      if (url.startsWith('/api/compaction')) {
+        return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
       }
       return Promise.resolve(jsonResponse([]))
     })
@@ -561,6 +585,9 @@ describe('ChatWindow Component', () => {
       if (url.startsWith('/api/attitude/summary/')) {
         return Promise.resolve(jsonResponse({ attitude, summary: 'neutral' }))
       }
+      if (url.startsWith('/api/compaction')) {
+        return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
+      }
       return Promise.resolve(jsonResponse([]))
     })
     global.fetch = fetchMock as unknown as typeof fetch
@@ -600,6 +627,9 @@ describe('ChatWindow Component', () => {
       }
       if (url.startsWith('/api/attitude/summary/')) {
         return Promise.resolve(jsonResponse({ attitude, summary: 'neutral' }))
+      }
+      if (url.startsWith('/api/compaction')) {
+        return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
       }
       return Promise.resolve(jsonResponse([]))
     })
