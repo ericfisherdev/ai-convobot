@@ -926,19 +926,42 @@ async fn erase_long_term() -> HttpResponse {
 /// (`compaction::ltm::LtmObserver`) keeps the index current as checkpoints
 /// commit, so this is only needed after the index was recreated (a schema
 /// mismatch on startup) or if it drifts for any other reason.
+///
+/// Reading the active facts and writing them into tantivy are two separate
+/// steps (SQLite and tantivy have no shared transaction to hold the premise
+/// between them), so a checkpoint could commit — and its own
+/// `LtmObserver` write land — in the gap between this handler's read and
+/// its write. `LongTermMem::replace_facts_if_current` closes that gap with
+/// a compare-and-swap on the index's generation counter instead: this
+/// handler snapshots the generation *before* reading the facts, and the
+/// write only lands if nothing else indexed a fact since. A declined write
+/// means a concurrent commit is the reason, so the retry below re-reads a
+/// fresh snapshot and tries again rather than silently leaving the index
+/// stale. `MAX_ATTEMPTS` only bounds pathological, unending contention;
+/// the loop body is otherwise expected to succeed on its first pass.
 #[post("/api/memory/longTerm/rebuild")]
 async fn rebuild_long_term() -> HttpResponse {
     match off_worker("Error while rebuilding long term memory", || {
+        const MAX_ATTEMPTS: u32 = 5;
+        let ltm = LongTermMem::shared()?;
         let companion_id = Database::get_companion_id()?;
-        let facts = SqliteCompactionStore.active_facts(companion_id)?;
-        let entries: Vec<(i64, String)> = facts
-            .iter()
-            .map(|fact| (fact.id, compaction::ltm::fact_entry(fact)))
-            .collect();
-        let count = entries.len();
-        LongTermMem::shared()?
-            .replace_facts(entries.iter().map(|(id, text)| (*id, text.as_str())))?;
-        Ok::<usize, RebuildError>(count)
+        for _ in 0..MAX_ATTEMPTS {
+            let expected_generation = ltm.generation();
+            let facts = SqliteCompactionStore.active_facts(companion_id)?;
+            let entries: Vec<(i64, String)> = facts
+                .iter()
+                .map(|fact| (fact.id, compaction::ltm::fact_entry(fact)))
+                .collect();
+            let count = entries.len();
+            let applied = ltm.replace_facts_if_current(
+                expected_generation,
+                entries.iter().map(|(id, text)| (*id, text.as_str())),
+            )?;
+            if applied {
+                return Ok::<usize, RebuildError>(count);
+            }
+        }
+        Err(RebuildError::Contended)
     })
     .await
     {
@@ -950,14 +973,19 @@ async fn rebuild_long_term() -> HttpResponse {
 }
 
 /// Unifies `Database::get_companion_id`'s `rusqlite::Error`,
-/// `CompactionStore::active_facts`'s `rusqlite::Error`, and
-/// `LongTermMem::replace_facts`'s `tantivy::TantivyError` behind one type so
-/// `rebuild_long_term`'s task closure has a single error type for `?` to
-/// convert into, as `off_worker` requires.
+/// `CompactionStore::active_facts`'s `rusqlite::Error`,
+/// `LongTermMem::replace_facts_if_current`'s `tantivy::TantivyError`, and
+/// `rebuild_long_term`'s own give-up-after-`MAX_ATTEMPTS` case behind one
+/// type so its task closure has a single error type for `?` to convert
+/// into, as `off_worker` requires.
 #[derive(Debug)]
 enum RebuildError {
     Storage(rusqlite::Error),
     Index(tantivy::TantivyError),
+    /// The index's generation kept moving out from under every attempt —
+    /// pathological, sustained concurrent commits rather than the ordinary
+    /// case of at most one racing in.
+    Contended,
 }
 
 impl std::fmt::Display for RebuildError {
@@ -965,6 +993,10 @@ impl std::fmt::Display for RebuildError {
         match self {
             RebuildError::Storage(e) => write!(f, "{e}"),
             RebuildError::Index(e) => write!(f, "{e}"),
+            RebuildError::Contended => write!(
+                f,
+                "long-term memory index kept changing during rebuild; try again"
+            ),
         }
     }
 }
