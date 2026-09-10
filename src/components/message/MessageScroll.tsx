@@ -7,6 +7,8 @@ import { useMessages } from "../context/messageContext";
 import { useMobile } from "../../hooks/useMobile";
 import { cn } from "../../lib/utils";
 import { isBotSpeaker } from "../../lib/speakers";
+import { messageAnchorId } from "../../lib/messageAnchors";
+import { CompactionMarker } from "./CompactionMarker";
 
 export function MessageScroll() {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -123,6 +125,7 @@ export function MessageScroll() {
           {messages.map((message, index) => (
             <div
               key={message.id || index}
+              id={messageAnchorId(message.id)}
               className="animate-in fade-in-0 duration-300"
               style={{ animationDelay: `${Math.min(index * 50, 500)}ms` }}
             >
@@ -135,6 +138,7 @@ export function MessageScroll() {
                 speakerId={message.speaker_id}
                 pinned={message.pinned ?? false}
               />
+              <CompactionMarker messageId={message.id} />
             </div>
           ))}
           <TypingIndicator isVisible={isTyping} />

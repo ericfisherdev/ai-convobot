@@ -19,7 +19,7 @@ import {
 import { useCompanionData } from "./context/companionContext";
 import { CompanionData } from "./interfaces/CompanionData";
 import { useMessages } from "./context/messageContext";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./ui/tooltip";
 import { cn } from "../lib/utils";
@@ -38,6 +38,7 @@ import {
     splitSseRecords,
     StreamEffect,
 } from "../lib/roundStream";
+import { scrollToMessage } from "../lib/messageAnchors";
 
 const ChatWindow = () => {
   const companionDataContext = useCompanionData();
@@ -46,7 +47,7 @@ const ChatWindow = () => {
 
   const { refreshMessages, pushMessage, updateMessage, settleMessage } = useMessages();
   const { applyAttitudeStreamUpdate } = useAttitude();
-  const { draftReady } = useCompaction();
+  const { draftReady, pendingDraft } = useCompaction();
   const { session } = useSession();
   const { status, refreshParticipants } = useParticipants();
 
@@ -58,6 +59,30 @@ const ChatWindow = () => {
   // a time, so a second send before this one settles would corrupt turn order.
   const [isSending, setIsSending] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // A `compaction_draft` stream effect stashes the id here so the `useEffect`
+  // below can scroll to it once `pendingDraft` catches up; `scrolledDraftIdRef`
+  // stops that effect from scrolling a second time on every later re-render
+  // that leaves `pendingDraft` unchanged (refs, not state, since neither
+  // needs to trigger a render on its own).
+  const awaitedDraftScrollIdRef = useRef<number | null>(null);
+  const scrolledDraftIdRef = useRef<number | null>(null);
+
+  // Scrolls to the message a freshly queued draft covers exactly once: fires
+  // whenever `pendingDraft` changes (i.e. after `draftReady`'s `refresh()`
+  // picks up the new draft), but only follows through if this stream is
+  // still waiting on that specific id and has not already scrolled for it.
+  useEffect(() => {
+    const awaitedId = awaitedDraftScrollIdRef.current;
+    if (
+      awaitedId !== null &&
+      pendingDraft?.id === awaitedId &&
+      scrolledDraftIdRef.current !== awaitedId
+    ) {
+      scrollToMessage(pendingDraft.through_message_id);
+      scrolledDraftIdRef.current = awaitedId;
+    }
+  }, [pendingDraft]);
 
   const handleMessageChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
     if (isImpersonating) {
@@ -153,6 +178,7 @@ const ChatWindow = () => {
               break;
             case 'compaction_draft':
               draftReady(effect.draftId);
+              awaitedDraftScrollIdRef.current = effect.draftId;
               break;
             case 'round_complete':
               // A bot may have dropped mid-round; pick that up immediately
