@@ -1371,6 +1371,26 @@ impl Database {
         Ok(count as usize)
     }
 
+    /// Every message with `id > after_id`, oldest first — the uncompacted
+    /// tail compaction's hook (#172) reads once per round, right after the
+    /// round's own inserts. Unlike `get_x_messages`, this never goes through
+    /// `MESSAGE_CACHE`: it runs at most once per round, not once per page
+    /// request, so the cache would only add staleness risk for no benefit.
+    pub fn get_messages_after(after_id: i32) -> Result<Vec<Message>> {
+        let con = Self::open()?;
+        Self::get_messages_after_on(&con, after_id)
+    }
+
+    /// Testable half of `get_messages_after`, taking a caller-provided
+    /// connection.
+    fn get_messages_after_on(con: &Connection, after_id: i32) -> Result<Vec<Message>> {
+        let mut stmt = con.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM messages WHERE id > ? ORDER BY id ASC"
+        ))?;
+        let rows = stmt.query_map(params![after_id], message_from_row)?;
+        rows.collect()
+    }
+
     pub fn get_companion_data() -> Result<CompanionView> {
         let con = Self::open()?;
         let mut stmt = con.prepare("SELECT name, persona, example_dialogue, first_message, long_term_mem, short_term_mem, roleplay, dialogue_tuning, avatar_path FROM companion LIMIT 1")?;
@@ -5107,6 +5127,29 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn get_messages_after_on_returns_messages_strictly_after_the_given_id_in_ascending_order() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        insert_message_row(&con, USER_SPEAKER_ID, "one");
+        insert_message_row(&con, CHAR_SPEAKER_ID, "two");
+        insert_message_row(&con, USER_SPEAKER_ID, "three");
+
+        let messages = Database::get_messages_after_on(&con, 1).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["two", "three"],
+            "the boundary message (id 1) itself must be excluded"
+        );
+
+        assert!(Database::get_messages_after_on(&con, 3).unwrap().is_empty());
+        assert_eq!(Database::get_messages_after_on(&con, 0).unwrap().len(), 3);
     }
 
     #[test]

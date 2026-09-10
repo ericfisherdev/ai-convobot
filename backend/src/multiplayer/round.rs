@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::chat_turn::{PendingTurn, PersistedReply, TurnStore};
+use crate::compaction::hook::{after_round as compaction_after_round, QueuedDraft};
 use crate::database::{CompanionAttitude, Message};
 use crate::multiplayer::protocol::ServerFrame;
 pub use crate::multiplayer::routing::{plan_round, RoundPlan};
@@ -148,6 +149,11 @@ pub struct RoundOutcome {
     /// end result, not the running commentary.
     #[allow(dead_code)]
     pub attitude: Option<(CompanionAttitude, CompanionAttitude)>,
+    /// The compaction draft (#172) this round's `after_round` hook queued,
+    /// if any. Read by neither handler today; the SSE draft-ready
+    /// notification (a later compaction issue) is what reads this next.
+    #[allow(dead_code)]
+    pub queued_draft: Option<QueuedDraft>,
 }
 
 /// Assigns each round a distinct id, for `RemoteRequest::round_id` — #154's
@@ -288,13 +294,21 @@ pub fn run_round(
         }
     }
 
+    // Read before `finish` consumes `pending`.
+    let companion_id = pending.companion_id();
     let attitude = pending.finish(store, host_reply.as_ref().map(|r| r.text.as_str()));
+    // Runs whether or not the host spoke this round (a mention-filtered
+    // round still finishes a turn worth checking for compaction); a
+    // compaction failure must never fail the round, so `after_round` logs
+    // and returns `None` internally rather than propagating.
+    let queued_draft = compaction_after_round(store, companion_id);
     sink.round_complete(attitude.as_ref());
 
     Ok(RoundOutcome {
         host_reply,
         replies,
         attitude,
+        queued_draft,
     })
 }
 
@@ -425,6 +439,10 @@ pub fn regenerate_reply(
 mod tests {
     use super::*;
     use crate::chat_turn::RecordingStore;
+    use crate::compaction::hook::CompactionTailView;
+    use crate::compaction::trigger::CompactionConfig;
+    use crate::compaction::types::CompactionTrigger;
+    use crate::compaction::MessageRef;
     use crate::participants::{Participant, ParticipantKind};
     use crate::turn_slot::TurnSlot;
     use std::collections::HashMap;
@@ -1128,5 +1146,245 @@ mod tests {
             other => panic!("expected Offline, got {:?}", other),
         }
         assert!(store.replies.lock().unwrap().is_empty());
+    }
+
+    fn message_ref(id: i32, is_human: bool, tokens: usize) -> MessageRef {
+        MessageRef {
+            id,
+            is_human,
+            tokens,
+        }
+    }
+
+    /// A tail whose token sum is well past `threshold_tokens` (each message
+    /// carries `tokens: 100`, threshold is `50`), with no scene-break cue in
+    /// `last_user_turn`, so a round against it always queues a `Threshold`
+    /// draft — used by every "does the hook fire" test below.
+    fn over_threshold_tail() -> CompactionTailView {
+        CompactionTailView {
+            compacted_through: None,
+            messages: vec![
+                message_ref(1, true, 100),
+                message_ref(2, false, 100),
+                message_ref(3, true, 100),
+            ],
+            last_user_turn: "hello there".to_string(),
+            short_term_mem: 0,
+            draft_pending: false,
+            config: CompactionConfig {
+                threshold_tokens: 50,
+                min_messages: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn a_round_over_the_threshold_queues_exactly_one_draft_matching_the_outcome() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = RecordingStore::new(None).with_compaction_tail(over_threshold_tail());
+        let registry = ParticipantRegistry::solo("Alice", "Bob", None);
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), registry.clone())
+                .expect("insert should succeed");
+
+        let plan = plan_round("hello", &registry, &no_followups());
+        let mut sink = RecordingSink::default();
+
+        let outcome = run_round(
+            guard,
+            pending,
+            plan,
+            &store,
+            &registry,
+            &no_followups(),
+            &mut |_prompt, _on_token| Ok("hi".to_string()),
+            &NoRemotes,
+            &|_frame| {},
+            Duration::from_secs(30),
+            &mut sink,
+        )
+        .expect("round should succeed");
+
+        let queued = outcome
+            .queued_draft
+            .expect("a tail over threshold should queue a draft");
+        assert_eq!(queued.trigger, CompactionTrigger::Threshold);
+        assert_eq!(queued.range.from_id, 1);
+        assert_eq!(queued.range.through_id, 3);
+        assert_eq!(
+            *store.queued_drafts.lock().unwrap(),
+            vec![(queued.range, queued.trigger)]
+        );
+    }
+
+    #[test]
+    fn a_second_round_with_a_draft_already_pending_queues_none() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let store = RecordingStore::new(None).with_compaction_tail(over_threshold_tail());
+        let registry = ParticipantRegistry::solo("Alice", "Bob", None);
+
+        let first_guard = SLOT.try_claim().expect("slot should be free");
+        let first_pending = PendingTurn::begin(
+            &first_guard,
+            &store,
+            1,
+            1,
+            "hello".to_string(),
+            registry.clone(),
+        )
+        .expect("insert should succeed");
+        let first_outcome = run_round(
+            first_guard,
+            first_pending,
+            plan_round("hello", &registry, &no_followups()),
+            &store,
+            &registry,
+            &no_followups(),
+            &mut |_prompt, _on_token| Ok("hi".to_string()),
+            &NoRemotes,
+            &|_frame| {},
+            Duration::from_secs(30),
+            &mut RecordingSink::default(),
+        )
+        .expect("round should succeed");
+        assert!(first_outcome.queued_draft.is_some());
+
+        let second_guard = SLOT.try_claim().expect("slot should be free again");
+        let second_pending = PendingTurn::begin(
+            &second_guard,
+            &store,
+            1,
+            1,
+            "hello again".to_string(),
+            registry.clone(),
+        )
+        .expect("insert should succeed");
+        let second_outcome = run_round(
+            second_guard,
+            second_pending,
+            plan_round("hello again", &registry, &no_followups()),
+            &store,
+            &registry,
+            &no_followups(),
+            &mut |_prompt, _on_token| Ok("hi again".to_string()),
+            &NoRemotes,
+            &|_frame| {},
+            Duration::from_secs(30),
+            &mut RecordingSink::default(),
+        )
+        .expect("round should succeed");
+
+        assert!(
+            second_outcome.queued_draft.is_none(),
+            "a pending draft must suppress every trigger"
+        );
+        assert_eq!(store.queued_drafts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_scene_break_user_turn_on_a_long_tail_queues_a_scene_break_draft_before_that_turn() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        // human(1) ai(2) human(3) ai(4) human(5); the last human turn (id 5)
+        // is where the scene-break cue lives, so the draft must stop at id 4.
+        let tail = CompactionTailView {
+            compacted_through: None,
+            messages: vec![
+                message_ref(1, true, 1),
+                message_ref(2, false, 1),
+                message_ref(3, true, 1),
+                message_ref(4, false, 1),
+                message_ref(5, true, 1),
+            ],
+            last_user_turn: "the next morning, everything was different".to_string(),
+            short_term_mem: 0,
+            draft_pending: false,
+            config: CompactionConfig {
+                threshold_tokens: 1_000_000,
+                min_messages: 2,
+            },
+        };
+        let store = RecordingStore::new(None).with_compaction_tail(tail);
+        let registry = ParticipantRegistry::solo("Alice", "Bob", None);
+        let pending = PendingTurn::begin(
+            &guard,
+            &store,
+            1,
+            1,
+            "the next morning, everything was different".to_string(),
+            registry.clone(),
+        )
+        .expect("insert should succeed");
+
+        let outcome = run_round(
+            guard,
+            pending,
+            plan_round(
+                "the next morning, everything was different",
+                &registry,
+                &no_followups(),
+            ),
+            &store,
+            &registry,
+            &no_followups(),
+            &mut |_prompt, _on_token| Ok("good morning".to_string()),
+            &NoRemotes,
+            &|_frame| {},
+            Duration::from_secs(30),
+            &mut RecordingSink::default(),
+        )
+        .expect("round should succeed");
+
+        let queued = outcome
+            .queued_draft
+            .expect("a long tail with a scene-break cue should queue a draft");
+        assert_eq!(queued.trigger, CompactionTrigger::SceneBreak);
+        assert_eq!(queued.range.from_id, 1);
+        assert_eq!(
+            queued.range.through_id, 4,
+            "the range must stop at the message before the scene-break turn"
+        );
+    }
+
+    #[test]
+    fn a_mention_filtered_round_with_no_host_reply_still_runs_the_compaction_hook() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = RecordingStore::new(None).with_compaction_tail(over_threshold_tail());
+        let registry = registry_with_bots();
+        let pending = PendingTurn::begin(
+            &guard,
+            &store,
+            1,
+            1,
+            "@bot1 hi".to_string(),
+            registry.clone(),
+        )
+        .expect("insert should succeed");
+
+        let plan = plan_round("@bot1 hi", &registry, &no_followups());
+        let remotes = FakeRemote::new(vec![(bot("bot1"), Ok("hello"))]);
+
+        let outcome = run_round(
+            guard,
+            pending,
+            plan,
+            &store,
+            &registry,
+            &no_followups(),
+            &mut |_prompt, _on_token| panic!("char should never be asked to speak"),
+            &remotes,
+            &|_frame| {},
+            Duration::from_secs(30),
+            &mut RecordingSink::default(),
+        )
+        .expect("round should succeed");
+
+        assert!(outcome.host_reply.is_none());
+        assert!(
+            outcome.queued_draft.is_some(),
+            "the compaction hook must run even when the host did not speak"
+        );
     }
 }
