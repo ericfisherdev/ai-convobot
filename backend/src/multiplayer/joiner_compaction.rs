@@ -264,12 +264,7 @@ fn joiner_commit_deps(extractor: &dyn crate::llm::Extractor) -> CommitDeps<'_> {
 /// on top of it rather than replacing it — the row never becomes visible
 /// anywhere (compaction routes 409 on a joiner), but it does accumulate,
 /// unbounded, in this joiner's own database on every failed retry.
-fn discard_or_log(
-    store: &SqliteCompactionStore,
-    draft_id: i64,
-    self_id: &ParticipantId,
-    why: &str,
-) {
+fn discard_or_log(store: &dyn CompactionStore, draft_id: i64, self_id: &ParticipantId, why: &str) {
     match crate::compaction::commit::discard(store, draft_id) {
         Ok(()) => {}
         // Already past `Draft` status -- `fill_draft` itself already
@@ -635,24 +630,26 @@ mod tests {
 
         // A lower `compacted_through` than the local cursor (simulating the
         // job having advanced it, the way the real production job does on
-        // success) queues nothing further. Sleeps first so a wrongly-spawned
-        // job — the regression this test exists to catch — has every chance
-        // to run and record itself on its own thread before the assertion
-        // below runs: checking immediately after `maybe_queue_extraction`
-        // returns could observe the "nothing happened yet" state even for
-        // buggy code that did wrongly spawn one (PR #204 review finding).
+        // success) queues nothing further. The `calls` recording below is
+        // inherently racy on its own (`spawn_holding` pushes to it from
+        // another thread, so a wrongly-spawned job could still be mid-flight
+        // when this assertion runs and pass vacuously); the slot claim right
+        // after is not, because `maybe_queue_extraction` claims `ACTIVE_TURN`
+        // synchronously, on this thread, before ever handing the guard to
+        // `spawn_holding` — so a wrongly-spawned job has already made the
+        // slot unavailable by the time `maybe_queue_extraction` returns, no
+        // sleep required (PR #204 review finding).
         handle.write().unwrap().local_compacted_through = Some(5);
         set_last_continuity(&handle, Some(payload(3)));
         maybe_queue_extraction(&handle, &job);
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            ACTIVE_TURN.try_claim().is_some(),
+            "nothing should hold the turn slot when no job was queued"
+        );
         assert_eq!(
             *calls.lock().unwrap(),
             vec![(1, 5)],
             "a payload at or behind the local cursor must queue no job"
-        );
-        assert!(
-            ACTIVE_TURN.try_claim().is_some(),
-            "nothing should hold the turn slot when no job was queued"
         );
 
         // The slot claimed by someone else: the target is remembered as
@@ -689,6 +686,56 @@ mod tests {
         assert!(
             ACTIVE_TURN.try_claim().is_some(),
             "the slot should be free again once every spawned job has finished"
+        );
+    }
+
+    // -- discard_or_log --
+
+    #[test]
+    fn discard_or_log_flips_a_draft_to_discarded_so_retries_never_pile_up() {
+        use crate::compaction::store::RecordingStore;
+        use crate::compaction::types::{CompactionStatus, CompactionTrigger, NewDraft};
+
+        let store = RecordingStore::new();
+        let draft_id = store
+            .insert_draft(NewDraft {
+                companion_id: 1,
+                from_message_id: 1,
+                through_message_id: 3,
+                trigger: CompactionTrigger::JoinerSync,
+                raw_model_output: None,
+            })
+            .unwrap();
+
+        // Simulates every `run_joiner_extraction` failure branch after
+        // `insert_draft` succeeded (PR #204 review finding): without this
+        // call, the row stays `Draft` forever and the next retry over the
+        // same range inserts a second one on top of it.
+        discard_or_log(&store, draft_id, &test_identity().id, "a simulated failure");
+
+        assert_eq!(
+            store.get_checkpoint(draft_id).unwrap().unwrap().status,
+            CompactionStatus::Discarded,
+            "a failed extraction must discard the draft it created, not leave it pending"
+        );
+        assert!(
+            store.pending_draft(1).unwrap().is_none(),
+            "no draft row should still be visible as pending after the discard"
+        );
+
+        // Idempotent: `fill_draft` itself already discards the draft for
+        // some of its own error variants, so a second call from a later
+        // branch in the same run must not panic or report a spurious error.
+        discard_or_log(
+            &store,
+            draft_id,
+            &test_identity().id,
+            "a second simulated failure",
+        );
+        assert_eq!(
+            store.get_checkpoint(draft_id).unwrap().unwrap().status,
+            CompactionStatus::Discarded,
+            "discarding an already-discarded draft must stay a silent no-op"
         );
     }
 
