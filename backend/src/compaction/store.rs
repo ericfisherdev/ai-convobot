@@ -592,17 +592,32 @@ pub(crate) fn discard_draft_containing_on(
     )
 }
 
-/// Retires every `Stale` or `Committed` checkpoint for `companion_id`
-/// (other than `draft_id` itself) whose range *overlaps* `[from, through]`
-/// — flips it to `Discarded` and deactivates its facts — and returns the
-/// retired checkpoint ids (`Ok(vec![])` when none match). Called on the
-/// caller's own transaction, not its own: #175's
+/// Retires every `Stale`, `Committed`, or `Failed` checkpoint for
+/// `companion_id` (other than `draft_id` itself) whose range *overlaps*
+/// `[from, through]` — flips it to `Discarded` and deactivates its facts —
+/// and returns the retired checkpoint ids (`Ok(vec![])` when none match).
+/// Called on the caller's own transaction, not its own: #175's
 /// `SqliteCompactionStore::commit_checkpoint` runs this as one more step of
 /// its existing `Immediate` transaction, right after `draft_id` itself has
 /// already been flipped to `Committed` (hence excluding it explicitly)
 /// and right before it sets `compacted_through`, so a fresh checkpoint that
-/// re-covers a stale or ordinary committed range heals it atomically with
-/// the rest of the commit.
+/// re-covers a stale, ordinary committed, or previously-failed range heals
+/// it atomically with the rest of the commit.
+///
+/// `Failed` joined the predicate in #208 review (esfisher): a failed draft
+/// never advances `compacted_through`, so the *next* trigger over the same
+/// uncompacted tail can commit a range that overlaps but does not exactly
+/// match the failed one's own `[from, through]` — e.g. failed `1..10`, then
+/// new messages arrive and the retry commits `1..15`. Without `Failed` here,
+/// that row outlived every commit that superseded it, forever the only
+/// match at its own `through_message_id` and rendering a dead-end
+/// `CompactionFailedNotice`/`Retry` no client-side lookup ordering can fix,
+/// since the row simply never stops existing. `active_facts_on` never
+/// included `Failed` (a failed draft rarely gets as far as `insert_facts`),
+/// so retiring it here only needs the status flip, not fact deactivation,
+/// but the shared loop below runs both unconditionally — no different from
+/// scoping it to just the status update, and keeping one code path for
+/// every retired status is simpler than branching per status.
 ///
 /// Overlap, not containment: a re-compaction's own range
 /// (`crate::compaction::range::select_recompaction_range`) is cut by the
@@ -611,10 +626,9 @@ pub(crate) fn discard_draft_containing_on(
 /// would leave it stuck `Stale` forever, since `oldest_stale_from` would
 /// keep pointing at it and every later re-compaction would reproduce the
 /// same non-healing draft. Overlap also lets a re-compaction spanning
-/// multiple prior checkpoints (one stale, one still `Committed`) retire
-/// both: the `Committed` one's content becomes redundant with the new
-/// checkpoint's own range the moment they overlap, exactly like the stale
-/// one's does.
+/// multiple prior checkpoints (one stale, one still `Committed`, one
+/// `Failed`) retire all three: each one's content becomes redundant with
+/// the new checkpoint's own range the moment they overlap.
 pub(crate) fn retire_stale_within_on(
     con: &Connection,
     companion_id: i32,
@@ -623,7 +637,7 @@ pub(crate) fn retire_stale_within_on(
     through: i32,
 ) -> Result<Vec<i64>> {
     let mut stmt = con.prepare(
-        "SELECT id FROM compactions WHERE companion_id = ? AND id != ? AND status IN (?, ?) AND from_message_id <= ? AND through_message_id >= ?",
+        "SELECT id FROM compactions WHERE companion_id = ? AND id != ? AND status IN (?, ?, ?) AND from_message_id <= ? AND through_message_id >= ?",
     )?;
     let ids: Vec<i64> = stmt
         .query_map(
@@ -632,6 +646,7 @@ pub(crate) fn retire_stale_within_on(
                 draft_id,
                 &CompactionStatus::Stale as &dyn ToSql,
                 &CompactionStatus::Committed as &dyn ToSql,
+                &CompactionStatus::Failed as &dyn ToSql,
                 through,
                 from
             ],
@@ -1591,7 +1606,10 @@ impl CompactionStore for RecordingStore {
         // #181: heals any `Stale` or ordinary `Committed` checkpoint this
         // commit's range now overlaps, mirroring `retire_stale_within_on`'s
         // SQL side (overlap, not containment; excludes `record.draft_id`
-        // itself, already flipped to `Committed` above).
+        // itself, already flipped to `Committed` above). `Failed` joined
+        // the predicate in #208 review: a failed draft never advances
+        // `compacted_through`, so it can otherwise outlive every commit
+        // that supersedes its range.
         {
             let mut checkpoints = self.checkpoints.lock().unwrap();
             let retired: Vec<i64> = checkpoints
@@ -1601,7 +1619,9 @@ impl CompactionStore for RecordingStore {
                         && c.id != record.draft_id
                         && matches!(
                             c.status,
-                            CompactionStatus::Stale | CompactionStatus::Committed
+                            CompactionStatus::Stale
+                                | CompactionStatus::Committed
+                                | CompactionStatus::Failed
                         )
                         && c.from_message_id <= record.through_message_id
                         && c.through_message_id >= record.from_message_id
@@ -2737,6 +2757,60 @@ mod tests {
         assert_eq!(
             get_checkpoint_on(&con, draft_id).unwrap().unwrap().status,
             CompactionStatus::Draft
+        );
+    }
+
+    /// Mirrors `a_committed_checkpoint` for a `Failed` row (#208 review).
+    fn a_failed_checkpoint(con: &Connection, from: i32, through: i32) -> i64 {
+        let id = insert_draft_on(
+            con,
+            &NewDraft {
+                companion_id: 1,
+                from_message_id: from,
+                through_message_id: through,
+                trigger: CompactionTrigger::Threshold,
+                raw_model_output: None,
+            },
+        )
+        .unwrap();
+        fail_draft_on(con, id, "boom").unwrap();
+        id
+    }
+
+    #[test]
+    fn retire_stale_within_on_discards_an_overlapping_failed_checkpoint() {
+        // #208 review (esfisher): a failed draft never advances
+        // `compacted_through`, so the *next* trigger over the same
+        // uncompacted tail can commit a *wider* range that overlaps but
+        // does not exactly match the failed one's own `[from, through]`
+        // (failed `1..10`, retry commits `1..15`) -- without `Failed` in
+        // this predicate, that row outlives every commit that supersedes
+        // it and keeps rendering a dead-end failure notice forever.
+        let (_dir, con) = fresh_db();
+        let failed_id = a_failed_checkpoint(&con, 1, 10);
+
+        let retired = retire_stale_within_on(&con, 1, 999, 1, 15).unwrap();
+
+        assert_eq!(retired, vec![failed_id]);
+        let retired_checkpoint = get_checkpoint_on(&con, failed_id).unwrap().unwrap();
+        assert_eq!(retired_checkpoint.status, CompactionStatus::Discarded);
+        // The failure reason is not erased -- only the status changes, the
+        // same as every other retired row here (`update_status_on` never
+        // touches `extraction_error`).
+        assert_eq!(retired_checkpoint.extraction_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn retire_stale_within_on_leaves_a_failed_checkpoint_outside_the_range_untouched() {
+        let (_dir, con) = fresh_db();
+        let failed_id = a_failed_checkpoint(&con, 10, 12);
+
+        let retired = retire_stale_within_on(&con, 1, 999, 1, 3).unwrap();
+
+        assert!(retired.is_empty());
+        assert_eq!(
+            get_checkpoint_on(&con, failed_id).unwrap().unwrap().status,
+            CompactionStatus::Failed
         );
     }
 

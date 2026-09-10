@@ -1742,6 +1742,59 @@ mod tests {
         assert_eq!(active[0].text, "re-compacted summary of 1-10");
     }
 
+    /// #208 review (esfisher): a failed draft never advances
+    /// `compacted_through`, so a later commit whose range overlaps it must
+    /// still retire it -- exactly like `commit_over_a_stale_range_retires_it`
+    /// above, but for `Failed` instead of `Stale`, and through the real
+    /// `commit()` entry point (not `retire_stale_within_on` directly), to
+    /// prove `RecordingStore::commit_checkpoint`'s in-memory retirement
+    /// mirrors the SQL predicate's `Failed` inclusion, not just the SQL side.
+    #[test]
+    fn commit_over_a_range_a_failed_draft_covers_retires_it() {
+        let store = RecordingStore::new();
+        let (failed_id, _) = seed_draft(&store, 1, &[]);
+        store.fail_draft(failed_id, "boom").unwrap();
+        assert_eq!(
+            store.get_checkpoint(failed_id).unwrap().unwrap().status,
+            CompactionStatus::Failed
+        );
+
+        let deps = deps_with(IdentityMerger::new());
+        let new_fact = FactDraft {
+            category: FactCategory::Milestone,
+            subject: None,
+            text: "recovered summary of 1-10".to_string(),
+            quote_speaker: None,
+            sources: vec![1],
+            replaces: vec![],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        };
+        let (new_draft_id, new_ids) = seed_draft(&store, 1, std::slice::from_ref(&new_fact));
+        commit(
+            &store,
+            ReviewedDraft {
+                draft_id: new_draft_id,
+                items: vec![accepted_item(
+                    new_ids[0],
+                    FactCategory::Milestone,
+                    "recovered summary of 1-10",
+                )],
+                summary: "s".to_string(),
+            },
+            &deps,
+            &budget(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.get_checkpoint(failed_id).unwrap().unwrap().status,
+            CompactionStatus::Discarded
+        );
+    }
+
     /// #181 review finding: a re-compaction's range can re-cover more than
     /// just the stale checkpoint it was queued for — here it also re-covers
     /// B, an ordinary `Committed` checkpoint that was never marked stale.
