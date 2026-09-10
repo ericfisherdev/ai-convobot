@@ -296,6 +296,7 @@ mod tests {
             compact_min_messages: 8,
             compaction_model_path: compaction_model_path.map(str::to_string),
             heuristic_person_detection: true,
+            compaction_attitude_weight: 0.5,
         }
     }
 

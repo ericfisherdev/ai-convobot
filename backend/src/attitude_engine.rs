@@ -107,6 +107,35 @@ impl AttitudeDimension {
         }
     }
 
+    /// Writes `value` onto this dimension of `attitude` in place: the
+    /// mutable counterpart of `value_of`, so a caller that computes a new
+    /// value per dimension (`compaction::attitude::blended`) doesn't repeat
+    /// the 20-arm match to write it back.
+    pub fn set_value(self, attitude: &mut CompanionAttitude, value: f32) {
+        match self {
+            AttitudeDimension::Attraction => attitude.attraction = value,
+            AttitudeDimension::Trust => attitude.trust = value,
+            AttitudeDimension::Fear => attitude.fear = value,
+            AttitudeDimension::Anger => attitude.anger = value,
+            AttitudeDimension::Joy => attitude.joy = value,
+            AttitudeDimension::Sorrow => attitude.sorrow = value,
+            AttitudeDimension::Disgust => attitude.disgust = value,
+            AttitudeDimension::Surprise => attitude.surprise = value,
+            AttitudeDimension::Curiosity => attitude.curiosity = value,
+            AttitudeDimension::Respect => attitude.respect = value,
+            AttitudeDimension::Suspicion => attitude.suspicion = value,
+            AttitudeDimension::Gratitude => attitude.gratitude = value,
+            AttitudeDimension::Jealousy => attitude.jealousy = value,
+            AttitudeDimension::Empathy => attitude.empathy = value,
+            AttitudeDimension::Lust => attitude.lust = value,
+            AttitudeDimension::Love => attitude.love = value,
+            AttitudeDimension::Anxiety => attitude.anxiety = value,
+            AttitudeDimension::Butterflies => attitude.butterflies = value,
+            AttitudeDimension::Submissiveness => attitude.submissiveness = value,
+            AttitudeDimension::Dominance => attitude.dominance = value,
+        }
+    }
+
     /// Value of this dimension on a persisted `database::AttitudeDelta`.
     ///
     /// Lets a caller walk a stored delta dimension by dimension without
@@ -612,5 +641,18 @@ mod tests {
         let deltas = scorer.evaluate_turn("wonderful, amazing!", "", &current);
 
         assert_eq!(delta_for(&deltas, AttitudeDimension::Joy), None);
+    }
+
+    #[test]
+    fn set_value_writes_onto_the_matching_field_for_every_dimension() {
+        for dimension in AttitudeDimension::ALL {
+            let mut attitude = attitude_with(0.0);
+            dimension.set_value(&mut attitude, 42.0);
+            assert_eq!(
+                dimension.value_of(&attitude),
+                42.0,
+                "set_value/value_of disagree for {dimension:?}"
+            );
+        }
     }
 }

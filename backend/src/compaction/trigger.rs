@@ -259,6 +259,7 @@ mod tests {
             compact_min_messages: DEFAULT_MIN_MESSAGES,
             compaction_model_path: None,
             heuristic_person_detection: false,
+            compaction_attitude_weight: 0.5,
         }
     }
 }

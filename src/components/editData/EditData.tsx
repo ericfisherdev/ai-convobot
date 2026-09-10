@@ -1007,6 +1007,36 @@ export function EditData() {
                 </div>
               </div>
             </div>
+
+            <div className="border-t pt-4">
+              <h3 className="text-lg font-semibold mb-4">Compaction</h3>
+              <div className="space-y-4">
+                <div className="space-y-1">
+                  <Label htmlFor="compactionAttitudeWeight" className="flex flex-row gap-2">
+                    <div className="flex items-center gap-2">
+                      Narrative Attitude Weight
+                      <TooltipProvider delayDuration={0}>
+                        <Tooltip>
+                          <TooltipTrigger className="cursor-default"> <Info /></TooltipTrigger>
+                          <TooltipContent>
+                            <p>At each compaction commit, how far the companion&apos;s feelings move toward the story&apos;s rating: 0 keeps the running values, 1 adopts the rating</p>
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    </div>
+                  </Label>
+                  <Input
+                    id="compactionAttitudeWeight"
+                    type="number"
+                    step="0.05"
+                    min="0"
+                    max="1"
+                    value={configFormData.compaction_attitude_weight}
+                    onChange={(e) => setConfigFormData({ ...configFormData, compaction_attitude_weight: parseFloat(e.target.value) })}
+                  />
+                </div>
+              </div>
+            </div>
           </CardContent>
           <CardFooter className="flex justify-center">
             <Button onClick={async () => {

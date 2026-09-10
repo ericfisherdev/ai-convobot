@@ -542,6 +542,11 @@ pub struct ConfigView {
     /// Whether #173's extraction pass should also run the heuristic
     /// person-detection path already used elsewhere in the codebase.
     pub heuristic_person_detection: bool,
+    /// How far a compaction commit's `AttitudeRecalibrator` (#176) blends
+    /// the companion's running attitude toward the extraction model's
+    /// narrative rating: `0.0` keeps the running values untouched, `1.0`
+    /// adopts the rating outright. Clamped to `0.0..=1.0` on write.
+    pub compaction_attitude_weight: f32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -583,6 +588,8 @@ pub struct ConfigModify {
     pub compaction_model_path: Option<String>,
     #[serde(default = "default_heuristic_person_detection")]
     pub heuristic_person_detection: bool,
+    #[serde(default = "default_compaction_attitude_weight")]
+    pub compaction_attitude_weight: f32,
 }
 
 fn default_multiplayer_mode() -> String {
@@ -603,6 +610,10 @@ fn default_compact_min_messages() -> usize {
 
 fn default_heuristic_person_detection() -> bool {
     true
+}
+
+fn default_compaction_attitude_weight() -> f32 {
+    0.5
 }
 
 /// The one way `Database::write_config` (#128) can reject a `PUT
@@ -809,6 +820,7 @@ fn calculate_priority_score(delta: &AttitudeDelta, impact_score: f32, memory_typ
     let type_score = match memory_type {
         "BondingMoment" | "Betrayal" => 95.0,
         "PowerShift" | "AttractionSpike" => 90.0,
+        "NarrativeRecalibration" => 90.0,
         "ThreatDetection" | "ConflictMoment" => 85.0,
         "RespectGained" | "RespectLost" => 80.0,
         "JoyfulMemory" | "SadMoment" => 70.0,
@@ -858,6 +870,39 @@ pub fn evaluate_attitude_shift(
         impact_score,
         delta,
     })
+}
+
+/// Builds the `attitude_memories` draft for one compaction commit's
+/// narrative recalibration ([`crate::compaction::attitude::AttitudeRecalibrator`]),
+/// with no [`SIGNIFICANT_IMPACT_THRESHOLD`] gate: a checkpoint the extraction
+/// model rated is always worth remembering, however small the resulting
+/// move. `"NarrativeRecalibration"` scores `90.0` in
+/// `calculate_priority_score`'s `type_score` match, ahead of the lexicon
+/// scorer's uncategorised `"SignificantChange"` default (`60.0`), so it
+/// survives `prune_attitude_memories` alongside turn-scored memories of
+/// similar impact.
+pub fn recalibration_memory_draft(
+    previous: &CompanionAttitude,
+    new: &CompanionAttitude,
+    checkpoint_id: i64,
+) -> AttitudeMemoryDraft {
+    let delta = calculate_attitude_delta(previous, new);
+    let impact_score = calculate_impact_score(&delta);
+    let memory_type = "NarrativeRecalibration".to_string();
+    let priority_score = calculate_priority_score(&delta, impact_score, &memory_type);
+    // No dates or clock times (compaction's "user turns canon" rule): what
+    // matters is that the feelings moved to match the story, not when.
+    let description = format!(
+        "Looking back over the story so far (checkpoint {checkpoint_id}), {{{{char}}}}'s feelings settled to match what actually happened"
+    );
+
+    AttitudeMemoryDraft {
+        memory_type,
+        description,
+        priority_score,
+        impact_score,
+        delta,
+    }
 }
 
 fn generate_memory_description(
@@ -1109,7 +1154,8 @@ impl Database {
                 compact_threshold_tokens INTEGER,
                 compact_min_messages INTEGER DEFAULT 8,
                 compaction_model_path TEXT,
-                heuristic_person_detection BOOLEAN DEFAULT true
+                heuristic_person_detection BOOLEAN DEFAULT true,
+                compaction_attitude_weight REAL DEFAULT 0.5
             )",
             [],
         )?;
@@ -1835,7 +1881,7 @@ impl Database {
     /// path (matches how `migrate_config_table` already takes a
     /// connection).
     fn read_config(con: &Connection) -> Result<ConfigView> {
-        let mut stmt = con.prepare("SELECT device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb, dynamic_gpu_allocation, gpu_safety_margin, min_free_vram_mb, enable_hybrid_context, max_system_ram_usage_gb, context_expansion_strategy, ram_safety_margin_gb, multiplayer_mode, multiplayer_password, multiplayer_host_address, multiplayer_participant_id, mention_followup_depth, remote_generation_timeout_secs, compact_threshold_tokens, compact_min_messages, compaction_model_path, heuristic_person_detection FROM config LIMIT 1")?;
+        let mut stmt = con.prepare("SELECT device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb, dynamic_gpu_allocation, gpu_safety_margin, min_free_vram_mb, enable_hybrid_context, max_system_ram_usage_gb, context_expansion_strategy, ram_safety_margin_gb, multiplayer_mode, multiplayer_password, multiplayer_host_address, multiplayer_participant_id, mention_followup_depth, remote_generation_timeout_secs, compact_threshold_tokens, compact_min_messages, compaction_model_path, heuristic_person_detection, compaction_attitude_weight FROM config LIMIT 1")?;
         let row = stmt.query_row([], |row| {
             let multiplayer_password: String =
                 row.get::<_, Option<String>>(16)?.unwrap_or_default();
@@ -1872,6 +1918,7 @@ impl Database {
                 // Empty string and NULL both read as "use llm_model_path".
                 compaction_model_path: compaction_model_path.filter(|s| !s.is_empty()),
                 heuristic_person_detection: row.get::<_, Option<bool>>(24)?.unwrap_or(true),
+                compaction_attitude_weight: row.get::<_, Option<f32>>(25)?.unwrap_or(0.5),
             })
         })?;
         Ok(row)
@@ -1956,10 +2003,15 @@ impl Database {
                 ));
             }
         }
+        if !(0.0..=1.0).contains(&config.compaction_attitude_weight) {
+            return Err(ConfigChangeError::Invalid(
+                "compaction_attitude_weight must be within 0..=1".to_string(),
+            ));
+        }
 
         let tx = con.unchecked_transaction()?;
         tx.execute(
-            "UPDATE config SET device = ?, llm_model_path = ?, gpu_layers = ?, prompt_template = ?, context_window_size = ?, max_response_tokens = ?, enable_dynamic_context = ?, vram_limit_gb = ?, dynamic_gpu_allocation = ?, gpu_safety_margin = ?, min_free_vram_mb = ?, enable_hybrid_context = ?, max_system_ram_usage_gb = ?, context_expansion_strategy = ?, ram_safety_margin_gb = ?, multiplayer_mode = ?, multiplayer_host_address = ?, multiplayer_participant_id = ?, mention_followup_depth = ?, remote_generation_timeout_secs = ?, compact_threshold_tokens = ?, compact_min_messages = ?, compaction_model_path = ?, heuristic_person_detection = ?",
+            "UPDATE config SET device = ?, llm_model_path = ?, gpu_layers = ?, prompt_template = ?, context_window_size = ?, max_response_tokens = ?, enable_dynamic_context = ?, vram_limit_gb = ?, dynamic_gpu_allocation = ?, gpu_safety_margin = ?, min_free_vram_mb = ?, enable_hybrid_context = ?, max_system_ram_usage_gb = ?, context_expansion_strategy = ?, ram_safety_margin_gb = ?, multiplayer_mode = ?, multiplayer_host_address = ?, multiplayer_participant_id = ?, mention_followup_depth = ?, remote_generation_timeout_secs = ?, compact_threshold_tokens = ?, compact_min_messages = ?, compaction_model_path = ?, heuristic_person_detection = ?, compaction_attitude_weight = ?",
             params![
                 &device as &dyn ToSql,
                 &config.llm_model_path,
@@ -1985,6 +2037,7 @@ impl Database {
                 &config.compact_min_messages,
                 &config.compaction_model_path,
                 &config.heuristic_person_detection,
+                &config.compaction_attitude_weight,
             ],
         )?;
 
@@ -3075,9 +3128,10 @@ impl Database {
 
     /// Persists an attitude shift as a memory when it is significant enough.
     ///
-    /// Detection itself lives in `evaluate_attitude_shift`; this only writes.
-    /// Callers pass the whole turn's before/after pair, so one turn produces at
-    /// most one memory. `message_context` should be an excerpt of what the user
+    /// Detection itself lives in `evaluate_attitude_shift`; this only calls
+    /// `insert_attitude_memory` when a shift clears the threshold. Callers
+    /// pass the whole turn's before/after pair, so one turn produces at most
+    /// one memory. `message_context` should be an excerpt of what the user
     /// said, so the memory records why the feelings moved.
     pub fn detect_attitude_change(
         companion_id: i32,
@@ -3091,8 +3145,64 @@ impl Database {
             return Ok(());
         };
 
-        let attitude_delta_json = serde_json::to_string(&draft.delta).unwrap_or_default();
+        Database::insert_attitude_memory(
+            companion_id,
+            target_id,
+            target_type,
+            &draft,
+            message_context.unwrap_or(""),
+        )
+    }
+
+    /// Writes one attitude-shift memory row and prunes back to
+    /// `MAX_ATTITUDE_MEMORIES_PER_COMPANION`. The single writer both
+    /// `detect_attitude_change` (lexicon-scored turns, gated by
+    /// `evaluate_attitude_shift`'s significance threshold) and
+    /// `compaction::attitude::AttitudeRecalibrator` (narrative recalibration
+    /// at commit, no gate) call.
+    ///
+    /// # Errors
+    /// Returns `rusqlite::Error::SqliteFailure` on a foreign-key violation
+    /// (`companion_id` names no `companion` row, with `PRAGMA foreign_keys`
+    /// on) or any other statement open/execute failure.
+    pub fn insert_attitude_memory(
+        companion_id: i32,
+        target_id: i32,
+        target_type: &str,
+        draft: &AttitudeMemoryDraft,
+        message_context: &str,
+    ) -> Result<()> {
         let con = Self::open()?;
+        Self::insert_attitude_memory_on(
+            &con,
+            companion_id,
+            target_id,
+            target_type,
+            draft,
+            message_context,
+        )?;
+
+        // The only writers maintain the bound, so the table cannot grow
+        // without limit however many turns are played or checkpoints
+        // committed.
+        Database::prune_attitude_memories(companion_id, MAX_ATTITUDE_MEMORIES_PER_COMPANION)?;
+
+        Ok(())
+    }
+
+    /// Testable half of `insert_attitude_memory`, taking a caller-provided
+    /// connection so tests can point it at a `TempDir`-backed database
+    /// instead of the hardwired `paths::db_path()`. Does not prune: tests
+    /// exercise that separately via `prune_attitude_memories_on`.
+    fn insert_attitude_memory_on(
+        con: &Connection,
+        companion_id: i32,
+        target_id: i32,
+        target_type: &str,
+        draft: &AttitudeMemoryDraft,
+        message_context: &str,
+    ) -> Result<()> {
+        let attitude_delta_json = serde_json::to_string(&draft.delta).unwrap_or_default();
         let current_time = get_current_date();
 
         con.execute(
@@ -3109,14 +3219,10 @@ impl Database {
                 draft.priority_score,
                 attitude_delta_json,
                 draft.impact_score,
-                message_context.unwrap_or(""),
+                message_context,
                 current_time
             ],
         )?;
-
-        // The only writer maintains the bound, so the table cannot grow without
-        // limit however many turns are played.
-        Database::prune_attitude_memories(companion_id, MAX_ATTITUDE_MEMORIES_PER_COMPANION)?;
 
         Ok(())
     }
@@ -3131,6 +3237,17 @@ impl Database {
     /// Returns the number of rows deleted.
     pub fn prune_attitude_memories(companion_id: i32, keep: usize) -> Result<usize> {
         let con = Self::open()?;
+        Self::prune_attitude_memories_on(&con, companion_id, keep)
+    }
+
+    /// Testable half of `prune_attitude_memories`, taking a caller-provided
+    /// connection so tests can point it at a `TempDir`-backed database
+    /// instead of the hardwired `paths::db_path()`.
+    fn prune_attitude_memories_on(
+        con: &Connection,
+        companion_id: i32,
+        keep: usize,
+    ) -> Result<usize> {
         con.execute(
             "DELETE FROM attitude_memories
              WHERE companion_id = ?1
@@ -4813,6 +4930,10 @@ impl Database {
                 "heuristic_person_detection",
                 "ALTER TABLE config ADD COLUMN heuristic_person_detection BOOLEAN DEFAULT true",
             ),
+            (
+                "compaction_attitude_weight",
+                "ALTER TABLE config ADD COLUMN compaction_attitude_weight REAL DEFAULT 0.5",
+            ),
         ];
 
         let mut stmt = con.prepare("PRAGMA table_info(config)")?;
@@ -5965,6 +6086,153 @@ mod tests {
         }
     }
 
+    /// A minimal `AttitudeMemoryDraft` a test only needs to override a field
+    /// or two of, mirroring `simple_tests.rs`'s `memory_fixture` for
+    /// `AttitudeMemory` rows.
+    fn draft_fixture(memory_type: &str, priority_score: f32) -> AttitudeMemoryDraft {
+        AttitudeMemoryDraft {
+            memory_type: memory_type.to_string(),
+            description: format!("a {memory_type} memory"),
+            priority_score,
+            impact_score: 20.0,
+            delta: AttitudeDelta {
+                attraction: 0.0,
+                trust: 5.0,
+                fear: 0.0,
+                anger: 0.0,
+                joy: 0.0,
+                sorrow: 0.0,
+                disgust: 0.0,
+                surprise: 0.0,
+                curiosity: 0.0,
+                respect: 0.0,
+                suspicion: 0.0,
+                gratitude: 0.0,
+                jealousy: 0.0,
+                empathy: 0.0,
+                lust: 0.0,
+                love: 0.0,
+                anxiety: 0.0,
+                butterflies: 0.0,
+                submissiveness: 0.0,
+                dominance: 0.0,
+            },
+        }
+    }
+
+    #[test]
+    fn insert_attitude_memory_then_prune_still_caps_at_the_configured_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_companion_row(&con);
+        Database::create_attitude_memories_table(&con).unwrap();
+
+        for i in 0..5 {
+            Database::insert_attitude_memory_on(
+                &con,
+                1,
+                1,
+                "user",
+                &draft_fixture("SignificantChange", i as f32),
+                "",
+            )
+            .unwrap();
+        }
+        // The insert helper already prunes after every write; asking for a
+        // stricter cap here exercises the same statement `prune_attitude_memories`
+        // itself runs, against the rows this test just inserted.
+        Database::prune_attitude_memories_on(&con, 1, 2).unwrap();
+
+        let count: usize = con
+            .query_row(
+                "SELECT COUNT(*) FROM attitude_memories WHERE companion_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // The two highest-priority rows (priority 3 and 4) are the ones kept.
+        let mut stmt = con
+            .prepare("SELECT priority_score FROM attitude_memories WHERE companion_id = 1 ORDER BY priority_score DESC")
+            .unwrap();
+        let kept: Vec<f32> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(kept, vec![4.0, 3.0]);
+    }
+
+    #[test]
+    fn recalibration_memory_draft_outranks_a_significant_change_of_equal_impact() {
+        let previous = attitude_fixture();
+        let mut new = previous.clone();
+        // A lone, moderate trust move: too small for any of
+        // `classify_memory_type`'s named buckets, so `evaluate_attitude_shift`
+        // falls through to its uncategorised `"SignificantChange"` default —
+        // the actual "equal impact" comparison this test names.
+        new.trust += 12.0;
+
+        let recalibration = recalibration_memory_draft(&previous, &new, 42);
+        let turn_scored =
+            evaluate_attitude_shift(&previous, &new).expect("shift is significant enough");
+
+        assert_eq!(turn_scored.memory_type, "SignificantChange");
+        assert_eq!(recalibration.memory_type, "NarrativeRecalibration");
+        assert!(recalibration.description.contains("42"));
+        assert_eq!(recalibration.impact_score, turn_scored.impact_score);
+        assert!(recalibration.priority_score > turn_scored.priority_score);
+    }
+
+    #[test]
+    fn recalibration_memory_draft_has_no_significance_gate() {
+        let previous = attitude_fixture();
+        let mut new = previous.clone();
+        new.trust += 0.5; // Well under `SIGNIFICANT_IMPACT_THRESHOLD`.
+
+        assert!(evaluate_attitude_shift(&previous, &new).is_none());
+        // `recalibration_memory_draft` has no threshold to clear: a narrative
+        // rating is always worth remembering, however small the move.
+        let draft = recalibration_memory_draft(&previous, &new, 7);
+        assert_eq!(draft.memory_type, "NarrativeRecalibration");
+    }
+
+    /// A `CompanionAttitude` every field of which is neutral, for tests that
+    /// only care about one or two dimensions' movement. Mirrors
+    /// `simple_tests.rs`'s `attitude_fixture`.
+    fn attitude_fixture() -> CompanionAttitude {
+        CompanionAttitude {
+            id: Some(1),
+            companion_id: 1,
+            target_id: 1,
+            target_type: "user".to_string(),
+            attraction: 0.0,
+            trust: 0.0,
+            fear: 0.0,
+            anger: 0.0,
+            joy: 0.0,
+            sorrow: 0.0,
+            disgust: 0.0,
+            surprise: 0.0,
+            curiosity: 0.0,
+            respect: 0.0,
+            suspicion: 0.0,
+            gratitude: 0.0,
+            jealousy: 0.0,
+            empathy: 0.0,
+            lust: 0.0,
+            love: 0.0,
+            anxiety: 0.0,
+            butterflies: 0.0,
+            submissiveness: 0.0,
+            dominance: 0.0,
+            relationship_score: Some(0.0),
+            last_updated: "now".to_string(),
+            created_at: "now".to_string(),
+        }
+    }
+
     #[test]
     fn migrate_messages_speaker_id_backfills_legacy_rows() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -6262,7 +6530,8 @@ mod tests {
                 compact_threshold_tokens INTEGER,
                 compact_min_messages INTEGER DEFAULT 8,
                 compaction_model_path TEXT,
-                heuristic_person_detection BOOLEAN DEFAULT true
+                heuristic_person_detection BOOLEAN DEFAULT true,
+                compaction_attitude_weight REAL DEFAULT 0.5
             )",
             [],
         )
@@ -6303,6 +6572,7 @@ mod tests {
             compact_min_messages: 8,
             compaction_model_path: None,
             heuristic_person_detection: true,
+            compaction_attitude_weight: 0.5,
         }
     }
 
@@ -6346,6 +6616,7 @@ mod tests {
             "compact_min_messages",
             "compaction_model_path",
             "heuristic_person_detection",
+            "compaction_attitude_weight",
         ] {
             assert!(columns.contains(column), "missing column {column}");
         }
@@ -6481,6 +6752,66 @@ mod tests {
         assert!(
             matches!(err, ConfigChangeError::Invalid(ref msg) if msg.contains("compact_threshold_tokens"))
         );
+    }
+
+    #[test]
+    fn write_config_then_read_config_round_trips_compaction_attitude_weight() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_config_table(&con);
+
+        let mut modify = valid_config_modify();
+        modify.compaction_attitude_weight = 0.75;
+        Database::write_config(&con, modify).unwrap();
+
+        let view = Database::read_config(&con).unwrap();
+        assert_eq!(view.compaction_attitude_weight, 0.75);
+    }
+
+    #[test]
+    fn write_config_rejects_compaction_attitude_weight_above_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_config_table(&con);
+
+        let mut modify = valid_config_modify();
+        modify.compaction_attitude_weight = 1.5;
+
+        let err = Database::write_config(&con, modify).unwrap_err();
+        assert!(
+            matches!(err, ConfigChangeError::Invalid(ref msg) if msg.contains("compaction_attitude_weight"))
+        );
+    }
+
+    #[test]
+    fn write_config_rejects_compaction_attitude_weight_below_zero() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_config_table(&con);
+
+        let mut modify = valid_config_modify();
+        modify.compaction_attitude_weight = -0.1;
+
+        let err = Database::write_config(&con, modify).unwrap_err();
+        assert!(
+            matches!(err, ConfigChangeError::Invalid(ref msg) if msg.contains("compaction_attitude_weight"))
+        );
+    }
+
+    #[test]
+    fn get_config_defaults_compaction_attitude_weight_for_a_pre_176_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_legacy_config_table(&con);
+        Database::migrate_config_table(&con).unwrap();
+        // A migrated row's new column reads back as its `ALTER TABLE ...
+        // DEFAULT` (SQLite backfills existing rows with it), so this also
+        // stands in for a config row written before this column existed.
+        con.execute("UPDATE config SET compaction_attitude_weight = NULL", [])
+            .unwrap();
+
+        let view = Database::read_config(&con).unwrap();
+        assert_eq!(view.compaction_attitude_weight, 0.5);
     }
 
     /// The pre-compaction `companion` DDL (no `compacted_through`), matching
