@@ -168,6 +168,14 @@ than a silently broken container; `docker logs` names the exact path (e.g.
 `/app/data/companion_database.db` or `/app/data/longterm_memory`) that
 could not be opened.
 
+**Upgrading past the compaction fact index (#178):** the first start after
+this change opens `longterm_memory/` and finds the pre-compaction
+`chat`-only schema, so it recreates the directory empty (logged to stdout)
+rather than migrating it in place. Repopulate it with `POST
+/api/memory/longTerm/rebuild`, which re-indexes every currently active
+compaction fact; anything indexed only as an old raw turn pair is not
+recoverable.
+
 ### Development Deployment
 
 #### Prerequisites

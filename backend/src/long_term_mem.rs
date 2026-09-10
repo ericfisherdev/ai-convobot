@@ -26,6 +26,12 @@ const WRITER_HEAP_BYTES: usize = 15_000_000;
 pub struct LongTermMem {
     index: Index,
     chat_field: Field,
+    /// Carries a fact's `compaction_facts.id` on documents `add_fact` wrote
+    /// (#178), so `remove_fact` can delete exactly that document by term
+    /// instead of by text. Absent (tantivy allows a missing field) on the
+    /// manual entries `add_entry` still writes, which is why `remove_fact`
+    /// on an id nothing indexed is a no-op rather than an error.
+    fact_id_field: Field,
     writer: Mutex<IndexWriter>,
     reader: IndexReader,
     query_cache: QueryCache,
@@ -67,17 +73,33 @@ impl LongTermMem {
 
     /// Opens (or creates) the index at `dir`, building the single long-lived
     /// writer and a `Manual`-reload reader. Split out from `shared()` so
-    /// tests can point it at a `tempfile::TempDir` instead of the process's
-    /// `longterm_memory` directory.
-    fn open_at(dir: &Path) -> tantivy::Result<Self> {
+    /// tests — this module's own, and #178's `compaction::ltm` observer
+    /// tests — can point it at a `tempfile::TempDir` instead of the
+    /// process's `longterm_memory` directory.
+    pub(crate) fn open_at(dir: &Path) -> tantivy::Result<Self> {
         let mut schema_builder = SchemaBuilder::default();
         let chat_field = schema_builder.add_text_field("chat", TEXT | STORED);
+        let fact_id_field =
+            schema_builder.add_u64_field("fact_id", NumericOptions::default().set_indexed());
         let schema = schema_builder.build();
         if !dir.exists() {
             fs::create_dir_all(dir)?;
         }
         let index = match Index::open_in_dir(dir) {
-            Ok(index) => index,
+            Ok(index) if index.schema() == schema => index,
+            Ok(_) => {
+                // Pre-#178 indexes hold only the `chat`-only schema (raw
+                // turn pairs and manual entries). Facts replace turn pairs
+                // as of this issue, so there is nothing worth migrating:
+                // recreate the index empty and let `POST
+                // /api/memory/longTerm/rebuild` re-index active facts.
+                println!(
+                    "long-term memory index has the pre-compaction schema, recreating it; run POST /api/memory/longTerm/rebuild to re-index facts"
+                );
+                fs::remove_dir_all(dir)?;
+                fs::create_dir_all(dir)?;
+                Index::create_in_dir(dir, schema)?
+            }
             Err(_) => Index::create_in_dir(dir, schema)?,
         };
 
@@ -97,6 +119,7 @@ impl LongTermMem {
         Ok(LongTermMem {
             index,
             chat_field,
+            fact_id_field,
             writer: Mutex::new(writer),
             reader,
             query_cache,
@@ -109,6 +132,57 @@ impl LongTermMem {
         writer.add_document(tantivy::doc!(
             self.chat_field => text
         ))?;
+        self.commit_and_invalidate(&mut writer)
+    }
+
+    /// Indexes one committed fact (#178's `LtmObserver`), tagged with
+    /// `fact_id` so a later supersede can remove exactly this document.
+    pub fn add_fact(&self, fact_id: i64, text: &str) -> Result<(), TantivyError> {
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        writer.add_document(tantivy::doc!(
+            self.chat_field => text,
+            self.fact_id_field => fact_id as u64
+        ))?;
+        self.commit_and_invalidate(&mut writer)
+    }
+
+    /// Removes the document tagged with `fact_id`, if any. A no-op (not an
+    /// error) when nothing was indexed under that id — a fact that was
+    /// never active, or a manual `add_entry` document, which never carries
+    /// `fact_id` at all.
+    pub fn remove_fact(&self, fact_id: i64) -> Result<(), TantivyError> {
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        writer.delete_term(Term::from_field_u64(self.fact_id_field, fact_id as u64));
+        self.commit_and_invalidate(&mut writer)
+    }
+
+    /// Replaces the whole index with `facts` in one commit: the rebuild
+    /// primitive behind `POST /api/memory/longTerm/rebuild`. Deliberately
+    /// one `delete_all_documents` plus one `add_document` per fact under a
+    /// single commit, not a commit per fact — a rebuild can cover hundreds
+    /// of facts.
+    pub fn replace_facts<'a>(
+        &self,
+        facts: impl IntoIterator<Item = (i64, &'a str)>,
+    ) -> Result<(), TantivyError> {
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        writer.delete_all_documents()?;
+        for (fact_id, text) in facts {
+            writer.add_document(tantivy::doc!(
+                self.chat_field => text,
+                self.fact_id_field => fact_id as u64
+            ))?;
+        }
+        self.commit_and_invalidate(&mut writer)
+    }
+
+    /// Commits `writer`'s pending changes and reloads the reader, bumping
+    /// the generation counter and clearing the query cache. Shared tail of
+    /// every mutation method (`add_entry`/`add_fact`/`remove_fact`/
+    /// `replace_facts`/`erase_memory`) — see the comment this carried
+    /// forward from `add_entry` on why the generation bump happens before
+    /// the cache clear.
+    fn commit_and_invalidate(&self, writer: &mut IndexWriter) -> Result<(), TantivyError> {
         writer.commit()?;
         self.reader.reload()?;
 
@@ -123,7 +197,7 @@ impl LongTermMem {
         // relative to the clear below.
         self.generation.fetch_add(1, Ordering::SeqCst);
 
-        // Clear cache when new entries are added to ensure fresh results
+        // Clear cache when the index changes to ensure fresh results
         if let Ok(mut cache) = self.query_cache.lock() {
             cache.clear();
         }
@@ -221,20 +295,7 @@ impl LongTermMem {
     pub fn erase_memory(&self) -> Result<(), TantivyError> {
         let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         writer.delete_all_documents()?;
-        writer.commit()?;
-        self.reader.reload()?;
-
-        // See add_entry: bump the generation before clearing the cache so
-        // an in-flight get_matches reading the old generation cannot slip
-        // a stale insert past cache_insert_if_fresh after this clear.
-        self.generation.fetch_add(1, Ordering::SeqCst);
-
-        // Clear cache when memory is erased
-        if let Ok(mut cache) = self.query_cache.lock() {
-            cache.clear();
-        }
-
-        Ok(())
+        self.commit_and_invalidate(&mut writer)
     }
 }
 
@@ -390,6 +451,113 @@ mod tests {
         assert_eq!(
             ltm.query_cache.lock().unwrap().get("fresh:5").unwrap().0,
             vec!["fresh result".to_string()]
+        );
+    }
+
+    #[test]
+    fn add_fact_is_searchable_immediately() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ltm = LongTermMem::open_at(dir.path()).unwrap();
+
+        ltm.add_fact(42, "loves stargazing").unwrap();
+
+        let matches = ltm.get_matches("stargazing", 5).unwrap();
+        assert_eq!(matches, vec!["loves stargazing".to_string()]);
+    }
+
+    #[test]
+    fn remove_fact_drops_only_that_id_and_leaves_manual_entries_and_other_facts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ltm = LongTermMem::open_at(dir.path()).unwrap();
+
+        ltm.add_entry("a manual note about gardening").unwrap();
+        ltm.add_fact(1, "fact one about gardening").unwrap();
+        ltm.add_fact(2, "fact two about gardening").unwrap();
+
+        ltm.remove_fact(1).unwrap();
+
+        let mut matches = ltm.get_matches("gardening", 10).unwrap();
+        matches.sort();
+        assert_eq!(
+            matches,
+            vec![
+                "a manual note about gardening".to_string(),
+                "fact two about gardening".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn remove_fact_on_an_unindexed_id_is_a_no_op() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ltm = LongTermMem::open_at(dir.path()).unwrap();
+        ltm.add_fact(1, "still here").unwrap();
+
+        ltm.remove_fact(999).unwrap();
+
+        let matches = ltm.get_matches("here", 5).unwrap();
+        assert_eq!(matches, vec!["still here".to_string()]);
+    }
+
+    #[test]
+    fn replace_facts_leaves_only_the_new_set_after_one_commit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ltm = LongTermMem::open_at(dir.path()).unwrap();
+        ltm.add_fact(1, "old fact about the moon").unwrap();
+
+        ltm.replace_facts(vec![(2, "new fact about the sun")])
+            .unwrap();
+
+        assert!(ltm.get_matches("moon", 5).unwrap().is_empty());
+        assert_eq!(
+            ltm.get_matches("sun", 5).unwrap(),
+            vec!["new fact about the sun".to_string()]
+        );
+    }
+
+    #[test]
+    fn opening_a_chat_only_index_recreates_it_with_the_two_field_schema() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Build a pre-#178 index directly with tantivy: `chat` only.
+        {
+            let mut schema_builder = SchemaBuilder::default();
+            schema_builder.add_text_field("chat", TEXT | STORED);
+            let schema = schema_builder.build();
+            let index = Index::create_in_dir(dir.path(), schema.clone()).unwrap();
+            let mut writer: IndexWriter =
+                index.writer_with_num_threads(1, WRITER_HEAP_BYTES).unwrap();
+            let chat_field = schema.get_field("chat").unwrap();
+            writer
+                .add_document(tantivy::doc!(chat_field => "an old turn pair"))
+                .unwrap();
+            writer.commit().unwrap();
+        }
+
+        let ltm = LongTermMem::open_at(dir.path()).unwrap();
+
+        assert!(ltm.get_matches("old", 5).unwrap().is_empty());
+        // The recreated index accepts the new two-field schema.
+        ltm.add_fact(1, "a fresh fact").unwrap();
+        assert_eq!(
+            ltm.get_matches("fresh", 5).unwrap(),
+            vec!["a fresh fact".to_string()]
+        );
+    }
+
+    #[test]
+    fn reopening_a_two_field_index_keeps_its_documents() {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let ltm = LongTermMem::open_at(dir.path()).unwrap();
+            ltm.add_fact(1, "a durable fact").unwrap();
+        }
+
+        let ltm = LongTermMem::open_at(dir.path()).unwrap();
+
+        assert_eq!(
+            ltm.get_matches("durable", 5).unwrap(),
+            vec!["a durable fact".to_string()]
         );
     }
 }

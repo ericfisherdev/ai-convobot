@@ -465,7 +465,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
 
 - **URL:** `/memory/longTerm`
 - **Method:** `POST`
-- **Description:** Add data to ai long-term memory
+- **Description:** Add data to ai long-term memory. Manual entries are plain text with no date prefix (the compaction feature dropped the old `* at <date> *` stamp for every entry, manual or automatic) and are not touched by extraction — they are dropped when `POST /memory/longTerm/rebuild` re-indexes, since rebuild only re-indexes facts.
 - **Request Body:**
   - `entry` (string): Information that you want to save in your companion's long-term memory, I recommend breaking large pieces of text into parts
 - **Response:**
@@ -494,7 +494,20 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   DELETE /memory/longTerm
   ```
 
-#### 5.3 Add last dialogue to dialogue tuning
+#### 5.3 Rebuild long-term memory from facts
+
+- **URL:** `/memory/longTerm/rebuild`
+- **Method:** `POST`
+- **Description:** Repair path for the tantivy long-term memory index: replaces its contents with the companion's currently active compaction facts (any manual entries added via 5.1 are dropped). The index is kept current automatically as checkpoints commit; this endpoint is only needed if it drifts, or after a schema mismatch recreated it empty on startup.
+- **Response:**
+  - Status: 200 OK
+  - Body: `Long term memory rebuilt from {n} facts`
+- **Example Request:**
+  ```http
+  POST /memory/longTerm/rebuild
+  ```
+
+#### 5.4 Add last dialogue to dialogue tuning
 
 - **URL:** `/memory/dialogueTuning`
 - **Method:** `POST`
@@ -507,7 +520,7 @@ The base URL for accessing the Companion API is `http://localhost:3000/api` or `
   POST /memory/dialogueTuing
   ```
 
-#### 5.4 Erase dialogue tuning entries
+#### 5.5 Erase dialogue tuning entries
 
   - **URL:** `/memory/dialogueTuning`
 - **Method:** `DELETE`
@@ -895,6 +908,7 @@ Endpoint sections above cover the core messaging, companion, user, configuration
 | `POST` | `/api/memory/dialogueTuning` |
 | `DELETE` | `/api/memory/longTerm` |
 | `POST` | `/api/memory/longTerm` |
+| `POST` | `/api/memory/longTerm/rebuild` |
 | `DELETE` | `/api/message` |
 | `GET` | `/api/message` |
 | `POST` | `/api/message` |

@@ -921,6 +921,66 @@ async fn erase_long_term() -> HttpResponse {
     }
 }
 
+/// Repair path for the tantivy long-term memory index: re-indexes every
+/// currently active fact from scratch. The primary path
+/// (`compaction::ltm::LtmObserver`) keeps the index current as checkpoints
+/// commit, so this is only needed after the index was recreated (a schema
+/// mismatch on startup) or if it drifts for any other reason.
+#[post("/api/memory/longTerm/rebuild")]
+async fn rebuild_long_term() -> HttpResponse {
+    match off_worker("Error while rebuilding long term memory", || {
+        let companion_id = Database::get_companion_id()?;
+        let facts = SqliteCompactionStore.active_facts(companion_id)?;
+        let entries: Vec<(i64, String)> = facts
+            .iter()
+            .map(|fact| (fact.id, compaction::ltm::fact_entry(fact)))
+            .collect();
+        let count = entries.len();
+        LongTermMem::shared()?
+            .replace_facts(entries.iter().map(|(id, text)| (*id, text.as_str())))?;
+        Ok::<usize, RebuildError>(count)
+    })
+    .await
+    {
+        Ok(count) => {
+            HttpResponse::Ok().body(format!("Long term memory rebuilt from {count} facts"))
+        }
+        Err(response) => response,
+    }
+}
+
+/// Unifies `Database::get_companion_id`'s `rusqlite::Error`,
+/// `CompactionStore::active_facts`'s `rusqlite::Error`, and
+/// `LongTermMem::replace_facts`'s `tantivy::TantivyError` behind one type so
+/// `rebuild_long_term`'s task closure has a single error type for `?` to
+/// convert into, as `off_worker` requires.
+#[derive(Debug)]
+enum RebuildError {
+    Storage(rusqlite::Error),
+    Index(tantivy::TantivyError),
+}
+
+impl std::fmt::Display for RebuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RebuildError::Storage(e) => write!(f, "{e}"),
+            RebuildError::Index(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<rusqlite::Error> for RebuildError {
+    fn from(e: rusqlite::Error) -> Self {
+        RebuildError::Storage(e)
+    }
+}
+
+impl From<tantivy::TantivyError> for RebuildError {
+    fn from(e: tantivy::TantivyError) -> Self {
+        RebuildError::Index(e)
+    }
+}
+
 #[post("/api/memory/dialogueTuning")]
 async fn add_tuning_message() -> HttpResponse {
     let messages = match Database::get_x_messages(2, 0) {
@@ -4060,6 +4120,7 @@ async fn main() -> std::io::Result<()> {
             .service(user_put)
             .service(add_memory_long_term_message)
             .service(erase_long_term)
+            .service(rebuild_long_term)
             .service(add_tuning_message)
             .service(erase_tuning_message)
             .service(prompt_message)
