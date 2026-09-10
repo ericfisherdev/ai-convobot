@@ -29,16 +29,20 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use actix_web::{web, App, HttpServer};
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::chat_turn::{PendingTurn, RecordingStore, TurnStore};
+use crate::compaction::context::{QuoteLine, QuoteSpeaker};
 use crate::database::{CompanionAttitude, Message};
 use crate::llm::PromptSpeakers;
+use crate::multiplayer::handshake;
 use crate::multiplayer::host::{multiplayer_ws, HostConfigSource, HostSettings};
 use crate::multiplayer::join_throttle::JoinThrottle;
 use crate::multiplayer::joiner::{
     GenerateRequestHandler, JoinerHandle, JoinerIdentity, JoinerShared,
 };
-use crate::multiplayer::protocol::ServerFrame;
+use crate::multiplayer::protocol::{ClientFrame, ContinuityPayload, ServerFrame, PROTOCOL_VERSION};
 use crate::multiplayer::remote_bots::RemoteBots;
 use crate::multiplayer::remote_generation::{LocalModelGeneration, RemoteGenerator};
 use crate::multiplayer::remote_generator::SocketRemoteGenerator;
@@ -484,6 +488,269 @@ async fn a_disconnected_bot_is_skipped_and_the_round_still_completes() {
     assert_eq!(
         notice.map(|m| m.content),
         Some("bot1 did not respond".to_string())
+    );
+
+    host.stop().await;
+}
+
+/// A raw joiner socket, deliberately not `joiner::run`: #182's
+/// `ContinuityPayload` has no `GenerateRequestHandler`-level counterpart
+/// yet (#186's job), so a test that needs to see the raw
+/// `ServerFrame::GenerateRequest` — payload and all — has to read frames
+/// straight off the socket instead of going through `joiner::run`'s own
+/// per-round dispatch.
+type RawJoinerSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Connects to `port` and completes the join handshake for `id`, the same
+/// wire sequence `joiner::run`'s own `handshake` function drives.
+async fn connect_raw_joiner(port: u16, id: &str, password: &str) -> RawJoinerSocket {
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/api/multiplayer/ws"))
+            .await
+            .expect("failed to connect to the multiplayer socket");
+
+    let nonce = match recv_server_frame(&mut ws).await {
+        ServerFrame::Challenge { nonce, .. } => nonce,
+        other => panic!("expected a Challenge frame, got {:?}", other),
+    };
+    let nonce_bytes: [u8; handshake::NONCE_BYTES] = handshake::decode(&nonce)
+        .and_then(|bytes| bytes.try_into().ok())
+        .expect("Challenge nonce should decode to NONCE_BYTES bytes");
+    let participant_id = ParticipantId::parse(id).expect("valid participant id");
+    let proof = handshake::join_proof(password, &nonce_bytes, &participant_id);
+
+    send_client_frame(
+        &mut ws,
+        &ClientFrame::Join {
+            protocol_version: PROTOCOL_VERSION,
+            id: participant_id,
+            display_name: "Raw Joiner".to_string(),
+            avatar: None,
+            proof: handshake::encode(&proof),
+        },
+    )
+    .await;
+
+    match recv_server_frame(&mut ws).await {
+        ServerFrame::Joined { .. } => {}
+        other => panic!("expected a Joined frame, got {:?}", other),
+    }
+
+    ws
+}
+
+async fn send_client_frame(ws: &mut RawJoinerSocket, frame: &ClientFrame) {
+    let text = serde_json::to_string(frame).expect("ClientFrame always serializes");
+    ws.send(WsMessage::text(text))
+        .await
+        .expect("failed to send a frame to the host");
+}
+
+async fn recv_server_frame(ws: &mut RawJoinerSocket) -> ServerFrame {
+    loop {
+        match ws.next().await {
+            Some(Ok(WsMessage::Text(text))) => {
+                return serde_json::from_str(&text)
+                    .unwrap_or_else(|e| panic!("unparsable frame {text:?}: {e}"));
+            }
+            Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => continue,
+            other => panic!(
+                "unexpected websocket event while waiting for a frame: {:?}",
+                other
+            ),
+        }
+    }
+}
+
+/// Reads frames until a `GenerateRequest` arrives, discarding every
+/// `Message` broadcast along the way (the user's turn, and — on a second
+/// round over the same socket — the previous round's own reply broadcast
+/// back to its sender). Returns the request's `round_id`, transcript and
+/// continuity payload so the caller can both assert on them and answer.
+async fn wait_for_generate_request(
+    ws: &mut RawJoinerSocket,
+) -> (u64, Vec<Message>, Option<ContinuityPayload>) {
+    loop {
+        match recv_server_frame(ws).await {
+            ServerFrame::Message(_) => continue,
+            ServerFrame::GenerateRequest {
+                round_id,
+                transcript,
+                continuity,
+            } => return (round_id, transcript, continuity),
+            other => panic!(
+                "unexpected frame while waiting for a GenerateRequest: {:?}",
+                other
+            ),
+        }
+    }
+}
+
+/// #182: a committed checkpoint ships its `ContinuityPayload` on every
+/// `GenerateRequest` and trims the transcript to messages after
+/// `compacted_through`; a companion that has never been compacted (or was
+/// reset) carries neither, unchanged from before #182.
+#[actix_web::test]
+async fn a_committed_checkpoint_ships_continuity_and_a_trimmed_transcript_to_the_joiner() {
+    let host = HostHandle::start("test-secret").await;
+    let bot1 = ParticipantId::parse("bot1").expect("valid id");
+
+    let mut raw = connect_raw_joiner(host.port, "bot1", "test-secret").await;
+    wait_for_bot_connected(&host, &bot1).await;
+
+    static SLOT: TurnSlot = TurnSlot::new();
+    let policy = RoutingPolicy {
+        max_followup_depth: 1,
+    };
+
+    // --- Round 1: a committed checkpoint through id 2 ---
+    let guard = SLOT.try_claim().expect("slot should be free");
+    let registry_snapshot = host
+        .registry
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let remotes = SocketRemoteGenerator::new(host.remote_bots.clone());
+    let remote_bots_for_broadcast = host.remote_bots.clone();
+    let payload = ContinuityPayload {
+        compacted_through: 2,
+        rules: vec![QuoteLine {
+            speaker: QuoteSpeaker::User,
+            text: "never call me Bob".to_string(),
+        }],
+        ..Default::default()
+    };
+    let payload_for_round = payload.clone();
+    let round_registry = registry_snapshot.clone();
+    let round_policy = policy;
+
+    let round_task = tokio::task::spawn_blocking(move || {
+        let store = RecordingStore::new(None);
+        // Seeds ids 1-4; `compacted_through: 2` should drop the first two.
+        store.insert_reply(&ParticipantId::USER, "one").unwrap();
+        store.insert_reply(&ParticipantId::CHAR, "two").unwrap();
+        store.insert_reply(&ParticipantId::USER, "three").unwrap();
+        store.insert_reply(&ParticipantId::CHAR, "four").unwrap();
+        store.set_continuity(Some(payload_for_round));
+
+        let pending = PendingTurn::begin(
+            &guard,
+            &store,
+            COMPANION_ID,
+            USER_ID,
+            "@bot1 hi".to_string(),
+            round_registry.clone(),
+        )
+        .expect("insert the user turn");
+        let plan = RoundPlan::from_speakers([ParticipantId::parse("bot1").unwrap()]);
+        let broadcast = move |frame: ServerFrame| remote_bots_for_broadcast.broadcast(frame, None);
+        let mut sink = RecordingSink::default();
+        run_round(
+            guard,
+            pending,
+            plan,
+            &store,
+            &round_registry,
+            &round_policy,
+            &mut |_prompt: &str, _on_token: &mut dyn FnMut(&str)| -> io::Result<String> {
+                panic!("char should never be asked to speak in this test")
+            },
+            &remotes,
+            &broadcast,
+            Duration::from_secs(5),
+            &mut sink,
+        )
+        .expect("the round should complete")
+    });
+
+    let (round_id, transcript, continuity) = wait_for_generate_request(&mut raw).await;
+    send_client_frame(
+        &mut raw,
+        &ClientFrame::ReplyComplete {
+            round_id,
+            text: "hi from bot1".to_string(),
+        },
+    )
+    .await;
+    round_task.await.expect("the round task should not panic");
+
+    assert_eq!(
+        continuity,
+        Some(payload),
+        "the checkpoint's continuity payload should ride along unchanged"
+    );
+    assert!(
+        transcript.iter().all(|m| m.id > 2),
+        "no message at or before compacted_through should reach the joiner: {:?}",
+        transcript
+    );
+
+    // --- Round 2: no compaction ever happened, so no payload and the full tail ---
+    let guard = SLOT.try_claim().expect("slot should be free again");
+    let remotes = SocketRemoteGenerator::new(host.remote_bots.clone());
+    let remote_bots_for_broadcast = host.remote_bots.clone();
+    let round_registry = registry_snapshot.clone();
+    let round_policy = policy;
+
+    let round_task = tokio::task::spawn_blocking(move || {
+        // `RecordingStore::new` defaults `continuity` to `None`.
+        let store = RecordingStore::new(None);
+        store.insert_reply(&ParticipantId::USER, "one").unwrap();
+        store.insert_reply(&ParticipantId::CHAR, "two").unwrap();
+
+        let pending = PendingTurn::begin(
+            &guard,
+            &store,
+            COMPANION_ID,
+            USER_ID,
+            "@bot1 hi again".to_string(),
+            round_registry.clone(),
+        )
+        .expect("insert the user turn");
+        let plan = RoundPlan::from_speakers([ParticipantId::parse("bot1").unwrap()]);
+        let broadcast = move |frame: ServerFrame| remote_bots_for_broadcast.broadcast(frame, None);
+        let mut sink = RecordingSink::default();
+        run_round(
+            guard,
+            pending,
+            plan,
+            &store,
+            &round_registry,
+            &round_policy,
+            &mut |_prompt: &str, _on_token: &mut dyn FnMut(&str)| -> io::Result<String> {
+                panic!("char should never be asked to speak in this test")
+            },
+            &remotes,
+            &broadcast,
+            Duration::from_secs(5),
+            &mut sink,
+        )
+        .expect("the round should complete")
+    });
+
+    let (round_id, transcript, continuity) = wait_for_generate_request(&mut raw).await;
+    send_client_frame(
+        &mut raw,
+        &ClientFrame::ReplyComplete {
+            round_id,
+            text: "hi again from bot1".to_string(),
+        },
+    )
+    .await;
+    round_task.await.expect("the round task should not panic");
+
+    assert_eq!(
+        continuity, None,
+        "a companion that has never been compacted must carry no payload"
+    );
+    assert_eq!(
+        transcript
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>(),
+        vec!["one", "two", "@bot1 hi again"],
+        "with no compaction, the tail is the full, untrimmed transcript"
     );
 
     host.stop().await;

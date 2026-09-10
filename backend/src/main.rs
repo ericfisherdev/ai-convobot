@@ -1127,6 +1127,12 @@ mod stream_turn_tests {
             self.inner
                 .queue_compaction_draft(companion_id, range, trigger)
         }
+
+        fn continuity(
+            &self,
+        ) -> rusqlite::Result<Option<crate::multiplayer::protocol::ContinuityPayload>> {
+            self.inner.continuity()
+        }
     }
 
     #[test]

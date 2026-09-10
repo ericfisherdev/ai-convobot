@@ -191,6 +191,12 @@ async fn a_joiner_answers_a_generate_request_and_its_reply_is_persisted_and_broa
     // frame is bot1's own `GenerateRequest`.
     let generate_request = recv_json(&mut ws).await;
     assert_eq!(generate_request["type"], "generate_request");
+    // #182: this companion has never been compacted, so the frame carries
+    // no `continuity` key at all (`skip_serializing_if`), not `null`.
+    assert!(
+        generate_request.get("continuity").is_none(),
+        "an un-compacted host must not send a continuity key: {generate_request:?}"
+    );
     let round_id = generate_request["round_id"].as_u64().unwrap();
 
     send_json(

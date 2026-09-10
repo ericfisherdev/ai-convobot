@@ -467,6 +467,11 @@ async fn serve(
                 Ok(ServerFrame::GenerateRequest {
                     round_id,
                     transcript,
+                    // #186 is what teaches `GenerateRequestHandler` to
+                    // render this alongside the joiner's own overlay
+                    // (`HostContinuity`); this crate's own generation path
+                    // does not read it yet.
+                    continuity: _,
                 }) => {
                     generation.handle(round_id, transcript, tx.clone());
                 }
@@ -793,6 +798,7 @@ mod tests {
                     &ServerFrame::GenerateRequest {
                         round_id: 42,
                         transcript: vec![sample_message(1)],
+                        continuity: None,
                     },
                 )
                 .await;

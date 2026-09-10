@@ -28,7 +28,7 @@ use std::time::Duration;
 use crate::chat_turn::{PendingTurn, PersistedReply, TurnStore};
 use crate::compaction::hook::{after_round as compaction_after_round, QueuedDraft};
 use crate::database::{CompanionAttitude, Message};
-use crate::multiplayer::protocol::ServerFrame;
+use crate::multiplayer::protocol::{ContinuityPayload, ServerFrame};
 pub use crate::multiplayer::routing::{plan_round, RoundPlan};
 use crate::multiplayer::routing::{schedule_follow_ups, RoutingPolicy};
 use crate::participants::{ParticipantId, ParticipantRegistry};
@@ -38,6 +38,19 @@ use crate::turn_slot::TurnGuard;
 /// the same page length `GET /api/message` uses for the frontend's first
 /// page.
 const TRANSCRIPT_TAIL_MESSAGES: usize = 50;
+
+/// Drops every message at or before `compacted_through` from `tail` (#182):
+/// once the host has committed a checkpoint through that id, a joiner
+/// should see the [`ContinuityPayload`] covering it instead of the raw
+/// messages a second time. `None` (never compacted) passes `tail` through
+/// unchanged; a tail that falls entirely inside the compacted range yields
+/// an empty transcript, which is still a valid `RemoteRequest`.
+fn transcript_after(tail: Vec<Message>, compacted_through: Option<i32>) -> Vec<Message> {
+    match compacted_through {
+        None => tail,
+        Some(through) => tail.into_iter().filter(|m| m.id > through).collect(),
+    }
+}
 
 /// The seam between the round orchestrator and a remote joiner's socket
 /// connection. The production implementation, over the host WebSocket via
@@ -68,6 +81,11 @@ pub struct RemoteRequest<'a> {
     /// two tokens. This is the one meaning `config.remote_generation_timeout_secs`
     /// (#128) has, wherever it is read.
     pub timeout: Duration,
+    /// The host's compaction checkpoint (#182), read once per round (or
+    /// once per `regenerate_reply` call) so every remote speaker sees the
+    /// same one even if a background job commits mid-round. `None` in solo
+    /// mode and in host mode before the host has ever compacted.
+    pub continuity: Option<&'a ContinuityPayload>,
 }
 
 /// Why a remote speaker did not produce a reply.
@@ -214,6 +232,12 @@ pub fn run_round(
 ) -> io::Result<RoundOutcome> {
     let _turn_guard = turn_guard;
     let round_id = next_round_id();
+    // Read once, before the speaker loop, so every remote speaker in this
+    // round sees the same checkpoint even if a background extraction job
+    // commits a new one mid-round (#182).
+    let continuity = store
+        .continuity()
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     broadcast_message(store, pending.user_message_id(), broadcast);
 
@@ -249,6 +273,7 @@ pub fn run_round(
         let tail = store
             .transcript_tail(TRANSCRIPT_TAIL_MESSAGES)
             .map_err(|e| io::Error::other(e.to_string()))?;
+        let tail = transcript_after(tail, continuity.as_ref().map(|c| c.compacted_through));
         let attempt = pending.reply(store, speaker.clone(), |_generation_prompt| {
             remotes
                 .generate(
@@ -257,6 +282,7 @@ pub fn run_round(
                         speaker,
                         transcript: &tail,
                         timeout,
+                        continuity: continuity.as_ref(),
                     },
                     &mut |token| sink.token(speaker, token),
                 )
@@ -404,9 +430,11 @@ pub fn regenerate_reply(
                     speaker_id, e
                 )))
             })?;
+            let continuity = store.continuity().map_err(RegenerateError::Database)?;
             let tail = store
                 .transcript_tail(TRANSCRIPT_TAIL_MESSAGES)
                 .map_err(RegenerateError::Database)?;
+            let tail = transcript_after(tail, continuity.as_ref().map(|c| c.compacted_through));
             let text = remotes
                 .generate(
                     RemoteRequest {
@@ -414,6 +442,7 @@ pub fn regenerate_reply(
                         speaker: &speaker,
                         transcript: &tail,
                         timeout,
+                        continuity: continuity.as_ref(),
                     },
                     &mut |_token| {},
                 )
@@ -469,6 +498,10 @@ mod tests {
     struct FakeRemote {
         outcomes: HashMap<ParticipantId, Result<String, RemoteFailure>>,
         seen_transcripts: Mutex<HashMap<ParticipantId, Vec<Message>>>,
+        /// Every speaker's `request.continuity`, cloned out of the borrow —
+        /// how the tests below confirm a round ships the same
+        /// `ContinuityPayload` `store.continuity()` returned (#182).
+        seen_continuity: Mutex<HashMap<ParticipantId, Option<ContinuityPayload>>>,
     }
 
     impl FakeRemote {
@@ -479,6 +512,7 @@ mod tests {
                     .map(|(id, result)| (id, result.map(|text| text.to_string())))
                     .collect(),
                 seen_transcripts: Mutex::new(HashMap::new()),
+                seen_continuity: Mutex::new(HashMap::new()),
             }
         }
 
@@ -489,6 +523,15 @@ mod tests {
                 .get(id)
                 .cloned()
                 .unwrap_or_default()
+        }
+
+        fn continuity_seen_by(&self, id: &ParticipantId) -> Option<ContinuityPayload> {
+            self.seen_continuity
+                .lock()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .flatten()
         }
     }
 
@@ -502,6 +545,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(request.speaker.clone(), request.transcript.to_vec());
+            self.seen_continuity
+                .lock()
+                .unwrap()
+                .insert(request.speaker.clone(), request.continuity.cloned());
             match self.outcomes.get(request.speaker) {
                 Some(outcome) => outcome.clone(),
                 None => Err(RemoteFailure::Offline),
@@ -650,6 +697,115 @@ mod tests {
                 SinkEvent::Complete(bot("bot2"), "hi from bot2".to_string()),
                 SinkEvent::RoundComplete,
             ]
+        );
+    }
+
+    #[test]
+    fn a_round_ships_the_hosts_continuity_and_trims_the_transcript_below_it() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = RecordingStore::new(None);
+        store.set_continuity(Some(ContinuityPayload {
+            compacted_through: 2,
+            rules: vec![],
+            ..Default::default()
+        }));
+        let registry = registry_with_bots();
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), registry.clone())
+                .expect("insert should succeed");
+
+        // ids: 1 = the user turn `begin` just inserted, 2 = char's reply
+        // below, both at or before `compacted_through`; bot1's reply (3)
+        // is the first id above it.
+        let plan = RoundPlan::from_speakers([ParticipantId::CHAR, bot("bot1"), bot("bot2")]);
+        let remotes = FakeRemote::new(vec![
+            (bot("bot1"), Ok("hi from bot1")),
+            (bot("bot2"), Ok("hi from bot2")),
+        ]);
+        let mut sink = RecordingSink::default();
+
+        run_round(
+            guard,
+            pending,
+            plan,
+            &store,
+            &registry,
+            &no_followups(),
+            &mut |_prompt, _on_token| Ok("hi from char".to_string()),
+            &remotes,
+            &|_frame| {},
+            Duration::from_secs(30),
+            &mut sink,
+        )
+        .expect("round should succeed");
+
+        let expected_payload = Some(ContinuityPayload {
+            compacted_through: 2,
+            rules: vec![],
+            ..Default::default()
+        });
+        assert_eq!(remotes.continuity_seen_by(&bot("bot1")), expected_payload);
+        assert_eq!(remotes.continuity_seen_by(&bot("bot2")), expected_payload);
+
+        let bot1_tail = remotes.transcript_seen_by(&bot("bot1"));
+        assert!(
+            bot1_tail.iter().all(|m| m.id > 2),
+            "bot1 must never see a message at or before compacted_through: {:?}",
+            bot1_tail
+        );
+        let bot2_tail = remotes.transcript_seen_by(&bot("bot2"));
+        assert!(
+            bot2_tail.iter().all(|m| m.id > 2),
+            "bot2 must never see a message at or before compacted_through: {:?}",
+            bot2_tail
+        );
+        assert!(
+            bot2_tail.iter().any(|m| m.content == "hi from bot1"),
+            "bot2 should still see bot1's reply, which is above the checkpoint"
+        );
+    }
+
+    #[test]
+    fn a_round_with_no_compaction_carries_no_continuity_and_the_full_tail() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        // `RecordingStore::new` defaults `continuity` to `None`, matching a
+        // companion that has never been compacted.
+        let store = RecordingStore::new(None);
+        let registry = registry_with_bots();
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), registry.clone())
+                .expect("insert should succeed");
+
+        let plan = RoundPlan::from_speakers([ParticipantId::CHAR, bot("bot1")]);
+        let remotes = FakeRemote::new(vec![(bot("bot1"), Ok("hi from bot1"))]);
+        let mut sink = RecordingSink::default();
+
+        run_round(
+            guard,
+            pending,
+            plan,
+            &store,
+            &registry,
+            &no_followups(),
+            &mut |_prompt, _on_token| Ok("hi from char".to_string()),
+            &remotes,
+            &|_frame| {},
+            Duration::from_secs(30),
+            &mut sink,
+        )
+        .expect("round should succeed");
+
+        assert_eq!(remotes.continuity_seen_by(&bot("bot1")), None);
+        let bot1_tail = remotes.transcript_seen_by(&bot("bot1"));
+        assert_eq!(
+            bot1_tail
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["hello", "hi from char"],
+            "with no compaction, the tail is unchanged from before #182"
         );
     }
 
@@ -1105,6 +1261,67 @@ mod tests {
             *store.replies.lock().unwrap(),
             vec![(bot("bot1"), "hi again from bot1".to_string())]
         );
+    }
+
+    #[test]
+    fn regenerate_reply_remote_carries_continuity_and_trims_the_transcript_below_it() {
+        let store = RecordingStore::new(None);
+        // Seed three prior messages (ids 1-3), same as a real chat would
+        // have accumulated before this regenerate.
+        store.insert_reply(&ParticipantId::USER, "hi").unwrap();
+        store.insert_reply(&ParticipantId::CHAR, "hello").unwrap();
+        store.insert_reply(&bot("bot1"), "old reply").unwrap();
+        store.set_continuity(Some(ContinuityPayload {
+            compacted_through: 2,
+            ..Default::default()
+        }));
+        let user_turn = user_message(1, "hi @bot1");
+        let remotes = FakeRemote::new(vec![(bot("bot1"), Ok("hi again from bot1"))]);
+
+        let persisted = regenerate_reply(
+            RegenerateTarget::Remote("bot1".to_string()),
+            &user_turn,
+            &store,
+            |_prompt| panic!("the host must never be asked to speak for a remote reply"),
+            &remotes,
+            Duration::from_secs(30),
+        )
+        .expect("remote regenerate should succeed");
+
+        assert_eq!(persisted.text, "hi again from bot1");
+        assert_eq!(
+            remotes.continuity_seen_by(&bot("bot1")),
+            Some(ContinuityPayload {
+                compacted_through: 2,
+                ..Default::default()
+            })
+        );
+        let tail = remotes.transcript_seen_by(&bot("bot1"));
+        assert!(
+            tail.iter().all(|m| m.id > 2),
+            "a regenerate must never carry a message at or before compacted_through: {:?}",
+            tail
+        );
+        assert!(tail.iter().any(|m| m.content == "old reply"));
+    }
+
+    #[test]
+    fn regenerate_reply_remote_with_no_compaction_carries_no_continuity() {
+        let store = RecordingStore::new(None);
+        let user_turn = user_message(1, "hi @bot1");
+        let remotes = FakeRemote::new(vec![(bot("bot1"), Ok("hi again from bot1"))]);
+
+        regenerate_reply(
+            RegenerateTarget::Remote("bot1".to_string()),
+            &user_turn,
+            &store,
+            |_prompt| panic!("the host must never be asked to speak for a remote reply"),
+            &remotes,
+            Duration::from_secs(30),
+        )
+        .expect("remote regenerate should succeed");
+
+        assert_eq!(remotes.continuity_seen_by(&bot("bot1")), None);
     }
 
     #[test]

@@ -20,10 +20,13 @@
 //! consumes `self`.
 
 use crate::attitude_engine::{LexiconScorer, ScorerConfig, TurnScorer};
+use crate::compaction::context::CompactionContext;
 use crate::compaction::hook::{compaction_tail_on, queue_compaction_draft_on, CompactionTailView};
 use crate::compaction::range::CompactionRange;
+use crate::compaction::store::{CompactionStore, SqliteCompactionStore};
 use crate::compaction::types::CompactionTrigger;
 use crate::database::{CompanionAttitude, Database, Message, NewMessage};
+use crate::multiplayer::protocol::ContinuityPayload;
 use crate::participants::{normalise_mentions, ParticipantId, ParticipantRegistry};
 use crate::turn_slot::TurnGuard;
 
@@ -88,6 +91,14 @@ pub trait TurnStore {
         range: CompactionRange,
         trigger: CompactionTrigger,
     ) -> rusqlite::Result<i64>;
+
+    /// The [`ContinuityPayload`] a round should ship to every remote
+    /// speaker this turn (#182): `None` when this companion has never been
+    /// compacted (`compacted_through IS NULL`), `Some` otherwise. Read once
+    /// per round by `multiplayer::round::run_round`, before its speaker
+    /// loop, so every remote speaker in the round sees the same checkpoint
+    /// even if a background job commits mid-round.
+    fn continuity(&self) -> rusqlite::Result<Option<ContinuityPayload>>;
 }
 
 /// The production [`TurnStore`], backed by `companion_database.db`.
@@ -148,6 +159,22 @@ impl TurnStore for SqliteTurnStore {
         trigger: CompactionTrigger,
     ) -> rusqlite::Result<i64> {
         queue_compaction_draft_on(companion_id, range, trigger)
+    }
+
+    fn continuity(&self) -> rusqlite::Result<Option<ContinuityPayload>> {
+        // This app has exactly one companion; every HTTP handler in
+        // `main.rs` hardcodes `1` as "the Default companion ID" rather than
+        // threading one through, and this matches that convention instead
+        // of adding a `companion_id` parameter no caller could vary yet.
+        const COMPANION_ID: i32 = 1;
+        let store = SqliteCompactionStore;
+        match store.compacted_through(COMPANION_ID)? {
+            None => Ok(None),
+            Some(_) => {
+                let ctx = CompactionContext::load(&store, &Database::get_message, COMPANION_ID)?;
+                Ok(Some(ContinuityPayload::from(ctx)))
+            }
+        }
     }
 }
 
@@ -487,6 +514,10 @@ pub(crate) struct RecordingStore {
     compaction_tail: std::sync::Mutex<CompactionTailView>,
     /// Every draft `queue_compaction_draft` has queued, in call order.
     pub(crate) queued_drafts: std::sync::Mutex<Vec<(CompactionRange, CompactionTrigger)>>,
+    /// What `continuity` returns. Defaults to `None`, so every existing
+    /// `chat_turn` and `round` test — none of which calls `set_continuity`
+    /// — keeps passing exactly as before #182.
+    continuity: std::sync::Mutex<Option<ContinuityPayload>>,
 }
 
 #[cfg(test)]
@@ -510,7 +541,15 @@ impl RecordingStore {
                 },
             }),
             queued_drafts: std::sync::Mutex::new(Vec::new()),
+            continuity: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Overrides what `continuity` returns, for a test that wants
+    /// `multiplayer::round::run_round` to ship a `ContinuityPayload` to its
+    /// remote speakers.
+    pub(crate) fn set_continuity(&self, payload: Option<ContinuityPayload>) {
+        *self.continuity.lock().unwrap() = payload;
     }
 
     /// Overrides what `compaction_tail` returns, for a test that wants
@@ -604,6 +643,10 @@ impl TurnStore for RecordingStore {
         // just queued is now the pending one.
         self.compaction_tail.lock().unwrap().draft_pending = true;
         Ok(draft_id)
+    }
+
+    fn continuity(&self) -> rusqlite::Result<Option<ContinuityPayload>> {
+        Ok(self.continuity.lock().unwrap().clone())
     }
 }
 

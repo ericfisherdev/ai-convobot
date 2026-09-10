@@ -68,6 +68,12 @@
 //! production `SummaryMerger`, `LlmSummaryMerger`, built on #183's
 //! `Extractor` seam. [`production_commit_deps`] below wires the two
 //! together for #179's handler; `main.rs` never assembles this inline.
+//!
+//! `registry_speakers.rs` (#182) adds [`SpeakerInfo`]'s multiplayer impl:
+//! `RegistrySpeakers`, backed by a live `ParticipantRegistry` snapshot
+//! instead of the fixed `user`/`char` pair `SoloSpeakers` covers — only
+//! `ParticipantKind::Human` counts as canon, matching the epic's canon
+//! rule across host, host-bot and remote-bot turns.
 #![allow(dead_code)]
 
 pub mod commit;
@@ -76,6 +82,7 @@ pub mod extract;
 pub mod hook;
 pub mod merge;
 pub mod range;
+pub mod registry_speakers;
 pub mod render;
 pub mod store;
 pub mod trigger;
