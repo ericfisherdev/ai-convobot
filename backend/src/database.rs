@@ -7233,7 +7233,11 @@ mod tests {
         modify.compact_threshold_tokens = Some(4096);
         modify.compact_min_messages = 12;
         modify.compaction_model_path = Some("/models/compact.gguf".to_string());
-        modify.heuristic_person_detection = false;
+        // `true`, not `false`: the table default is now `false` (#201), so
+        // writing `false` and reading back `false` would pass even if the
+        // write were silently dropped. `true` only comes back if the write
+        // actually round-tripped.
+        modify.heuristic_person_detection = true;
         Database::write_config(&con, modify).unwrap();
 
         let view = Database::read_config(&con).unwrap();
@@ -7243,7 +7247,7 @@ mod tests {
             view.compaction_model_path,
             Some("/models/compact.gguf".to_string())
         );
-        assert!(!view.heuristic_person_detection);
+        assert!(view.heuristic_person_detection);
 
         // None round-trips through NULL back to None, not a stored empty
         // string or a default.
