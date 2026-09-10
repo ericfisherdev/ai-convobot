@@ -16,6 +16,9 @@ pub struct ContextManager {
     pub system_token_budget: usize,
     #[allow(dead_code)]
     pub attitude_token_budget: usize,
+    /// The compaction slice (#174): `llm.rs::assemble_prompt` renders the
+    /// `CompactionContext` against this budget.
+    pub compaction_token_budget: usize,
     pub message_token_budget: usize,
     pub response_token_budget: usize,
 }
@@ -68,6 +71,7 @@ impl ContextManager {
         // Legacy allocations for backward compatibility
         let system_token_budget = token_budget.system_prompt;
         let attitude_token_budget = token_budget.attitude_data;
+        let compaction_token_budget = token_budget.compaction;
         let message_token_budget = token_budget.recent_messages;
         let response_token_budget = token_budget.response_buffer;
 
@@ -79,6 +83,7 @@ impl ContextManager {
             hybrid_context_allocation: hybrid_allocation,
             system_token_budget,
             attitude_token_budget,
+            compaction_token_budget,
             message_token_budget,
             response_token_budget,
         }
@@ -634,6 +639,7 @@ impl ContextManager {
             // Update legacy fields
             self.system_token_budget = self.token_budget.system_prompt;
             self.attitude_token_budget = self.token_budget.attitude_data;
+            self.compaction_token_budget = self.token_budget.compaction;
             self.message_token_budget = self.token_budget.recent_messages;
             self.response_token_budget = self.token_budget.response_buffer;
         }

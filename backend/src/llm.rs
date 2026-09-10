@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 
 use crate::attitude_formatter::AttitudeFormatter;
+use crate::compaction::context::CompactionContext;
+use crate::compaction::render::{render, RenderedBlocks};
+use crate::compaction::store::SqliteCompactionStore;
 use crate::context_manager::ContextManager;
 use crate::database::{
     contains_time_question, get_current_date, CompanionView, ConfigView, Database, Device, Message,
@@ -167,12 +170,28 @@ fn join_names(names: &[&str]) -> String {
 /// template, inserting `attitude_context` (when non-empty) as its own
 /// component before the template's instruct terminator, so it always ends up
 /// inside the system block rather than after the conversation history.
+/// `blocks` (#174's rendered compaction context) is spliced in the same way:
+/// user overlay directly after the user's own persona, companion overlay/
+/// rules/story-so-far/recent-detail/pins directly after the companion's own
+/// persona, every empty field adding no component. `Default`/`Auto` and
+/// `Mistral` move the marker that used to end the companion-persona
+/// component (`<START>` / `[/INST]\n<s>[INST]\n`) to the front of the
+/// example-dialogue component instead, so the new blocks land before it
+/// (inside the system portion) while the joined output stays byte-identical
+/// when every block is empty.
 ///
 /// Names come from `speakers`; personas, example dialogue and dialogue
 /// tuning still come from the caller's own `user`/`companion` rows (a
 /// joiner's own persona, not the host's). When a bot other than `speakers`'
 /// own turn is present, an `Also present: ...` component names the rest, so
 /// no other participant is left for the model to invent.
+///
+/// `too_many_arguments`: every parameter is one of `PromptTemplate`'s inputs
+/// or plain data already owned by the caller; factoring them into a
+/// settings struct would just move the same fields one level down without
+/// reducing what a caller has to supply (same rationale as
+/// `multiplayer::round::run_round`'s identical allow).
+#[allow(clippy::too_many_arguments)]
 fn build_base_components(
     template: &PromptTemplate,
     user: &UserView,
@@ -181,6 +200,7 @@ fn build_base_components(
     tuned_dialogue: &str,
     attitude_context: &str,
     speakers: &PromptSpeakers,
+    blocks: &RenderedBlocks,
 ) -> Vec<String> {
     let participants = &speakers.registry;
     let user_name = speakers.user_name();
@@ -213,6 +233,9 @@ fn build_base_components(
                 expand_placeholders(&user.persona, participants)
             ),
         ];
+        if !blocks.user_overlay.is_empty() {
+            components.push(blocks.user_overlay.clone());
+        }
         if !also_present.is_empty() {
             components.push(also_present);
         }
@@ -220,12 +243,31 @@ fn build_base_components(
             components.push(attitude_context.to_string());
         }
         components.push(format!(
-            "{}'s Persona: {}\n<START>\n",
+            "{}'s Persona: {}\n",
             self_name,
             expand_placeholders(&companion.persona, participants)
         ));
+        if !blocks.companion_overlay.is_empty() {
+            components.push(blocks.companion_overlay.clone());
+        }
+        if !blocks.rules.is_empty() {
+            components.push(blocks.rules.clone());
+        }
+        if !blocks.story_so_far.is_empty() {
+            components.push(blocks.story_so_far.clone());
+        }
+        if !blocks.recent_detail.is_empty() {
+            components.push(blocks.recent_detail.clone());
+        }
+        if !blocks.pins.is_empty() {
+            components.push(blocks.pins.clone());
+        }
+        // The `<START>` that used to end the companion-persona component
+        // above now opens this one instead, so the blocks pushed between
+        // them land before it (still inside the system portion) without
+        // changing the joined output when every block is empty.
         components.push(format!(
-            "{}\n<START>\n",
+            "<START>\n{}\n<START>\n",
             expand_placeholders(&companion.example_dialogue, participants)
         ));
         components.push(format!("{}\n<START>\n", tuned_dialogue));
@@ -242,13 +284,31 @@ fn build_base_components(
         if !attitude_context.is_empty() {
             components.push(attitude_context.to_string());
         }
+        if !blocks.companion_overlay.is_empty() {
+            components.push(blocks.companion_overlay.clone());
+        }
+        if !blocks.rules.is_empty() {
+            components.push(blocks.rules.clone());
+        }
+        if !blocks.story_so_far.is_empty() {
+            components.push(blocks.story_so_far.clone());
+        }
+        if !blocks.recent_detail.is_empty() {
+            components.push(blocks.recent_detail.clone());
+        }
+        if !blocks.pins.is_empty() {
+            components.push(blocks.pins.clone());
+        }
         components.push(format!(
-            "you are talking with {}, {} is {}\n{}\n[INST]\n",
+            "you are talking with {}, {} is {}\n",
             user_name,
             user_name,
-            expand_placeholders(&user.persona, participants),
-            rp
+            expand_placeholders(&user.persona, participants)
         ));
+        if !blocks.user_overlay.is_empty() {
+            components.push(blocks.user_overlay.clone());
+        }
+        components.push(format!("{}\n[INST]\n", rp));
         components.push(format!(
             "{}\n",
             expand_placeholders(&companion.example_dialogue, participants)
@@ -268,6 +328,9 @@ fn build_base_components(
                 expand_placeholders(&user.persona, participants)
             ),
         ];
+        if !blocks.user_overlay.is_empty() {
+            components.push(blocks.user_overlay.clone());
+        }
         if !also_present.is_empty() {
             components.push(also_present);
         }
@@ -275,12 +338,30 @@ fn build_base_components(
             components.push(attitude_context.to_string());
         }
         components.push(format!(
-            "{}'s Persona: {}[/INST]\n<s>[INST]\n",
+            "{}'s Persona: {}",
             self_name,
             expand_placeholders(&companion.persona, participants)
         ));
+        if !blocks.companion_overlay.is_empty() {
+            components.push(blocks.companion_overlay.clone());
+        }
+        if !blocks.rules.is_empty() {
+            components.push(blocks.rules.clone());
+        }
+        if !blocks.story_so_far.is_empty() {
+            components.push(blocks.story_so_far.clone());
+        }
+        if !blocks.recent_detail.is_empty() {
+            components.push(blocks.recent_detail.clone());
+        }
+        if !blocks.pins.is_empty() {
+            components.push(blocks.pins.clone());
+        }
+        // The `[/INST]\n<s>[INST]\n` that used to end the companion-persona
+        // component above now opens this one instead, for the same reason
+        // as the `<START>` move in the Default/Auto branch.
         components.push(format!(
-            "{}[/INST]\n<s>[INST]\n",
+            "[/INST]\n<s>[INST]\n{}[/INST]\n<s>[INST]\n",
             expand_placeholders(&companion.example_dialogue, participants)
         ));
         components.push(format!("{}[/INST]\n", tuned_dialogue));
@@ -302,8 +383,16 @@ pub fn prompt(
     companion_id: i32,
     transcript: &dyn TranscriptSource,
     speakers: &PromptSpeakers,
+    compaction: &dyn CompactionSource,
 ) -> Result<String, std::io::Error> {
-    generate(prompt, companion_id, &mut |_token| {}, transcript, speakers)
+    generate(
+        prompt,
+        companion_id,
+        &mut |_token| {},
+        transcript,
+        speakers,
+        compaction,
+    )
 }
 
 /// Generates a reply, invoking `on_token` with each token as it is produced.
@@ -320,8 +409,16 @@ pub fn prompt_streaming(
     on_token: &mut dyn FnMut(&str),
     transcript: &dyn TranscriptSource,
     speakers: &PromptSpeakers,
+    compaction: &dyn CompactionSource,
 ) -> Result<String, std::io::Error> {
-    generate(prompt, companion_id, on_token, transcript, speakers)
+    generate(
+        prompt,
+        companion_id,
+        on_token,
+        transcript,
+        speakers,
+        compaction,
+    )
 }
 
 /// Whether each turn should print the full attitude block it injected.
@@ -368,19 +465,21 @@ fn sampler_seed() -> u32 {
 /// [`SqliteTranscript`]; a joiner (#130) generates from a transcript it
 /// received over the wire, hence [`InMemoryTranscript`].
 pub trait TranscriptSource {
-    /// The newest `limit` messages, oldest first.
+    /// The newest `limit` messages with `id > after` (`None` = no cutoff,
+    /// i.e. every message compaction has not yet compacted away), oldest
+    /// first.
     ///
     /// # Errors
     /// Returns `std::io::ErrorKind::Other` if the underlying read fails.
-    fn recent_messages(&self, limit: usize) -> std::io::Result<Vec<Message>>;
+    fn recent_messages(&self, after: Option<i32>, limit: usize) -> std::io::Result<Vec<Message>>;
 }
 
 /// The production [`TranscriptSource`], backed by `companion_database.db`.
 pub struct SqliteTranscript;
 
 impl TranscriptSource for SqliteTranscript {
-    fn recent_messages(&self, limit: usize) -> std::io::Result<Vec<Message>> {
-        Database::get_x_messages(limit, 0).map_err(|e| {
+    fn recent_messages(&self, after: Option<i32>, limit: usize) -> std::io::Result<Vec<Message>> {
+        Database::get_messages_after(after, limit).map_err(|e| {
             eprintln!("Error while getting short term memory entries: {}", e);
             std::io::Error::other("Error while getting short term memory entries")
         })
@@ -391,15 +490,54 @@ impl TranscriptSource for SqliteTranscript {
 /// this module's own tests, and by the joiner's [`LocalModelGeneration`]
 /// (`multiplayer::remote_generation`, #153), which generates from the
 /// transcript the host sent over the wire rather than its own local
-/// `messages` table.
+/// `messages` table. #182's host already ships a post-`compacted_through`
+/// transcript over the wire, so `after` is a no-op there in practice; the
+/// filter still runs so this impl matches [`SqliteTranscript`]'s contract.
 ///
 /// [`LocalModelGeneration`]: crate::multiplayer::remote_generation::LocalModelGeneration
 pub struct InMemoryTranscript(pub Vec<Message>);
 
 impl TranscriptSource for InMemoryTranscript {
-    fn recent_messages(&self, limit: usize) -> std::io::Result<Vec<Message>> {
-        let start = self.0.len().saturating_sub(limit);
-        Ok(self.0[start..].to_vec())
+    fn recent_messages(&self, after: Option<i32>, limit: usize) -> std::io::Result<Vec<Message>> {
+        let after = after.unwrap_or(0);
+        let filtered: Vec<Message> = self.0.iter().filter(|m| m.id > after).cloned().collect();
+        let start = filtered.len().saturating_sub(limit);
+        Ok(filtered[start..].to_vec())
+    }
+}
+
+/// Where a turn's [`CompactionContext`] comes from — mirrors
+/// [`TranscriptSource`]'s split between a real database and a fixed,
+/// in-memory value.
+pub trait CompactionSource {
+    /// # Errors
+    /// Returns `std::io::ErrorKind::Other` if the underlying read fails.
+    fn context(&self, companion_id: i32) -> std::io::Result<CompactionContext>;
+}
+
+/// The production [`CompactionSource`], backed by `companion_database.db`
+/// through [`SqliteCompactionStore`] and `Database::get_message`.
+pub struct SqliteCompaction;
+
+impl CompactionSource for SqliteCompaction {
+    fn context(&self, companion_id: i32) -> std::io::Result<CompactionContext> {
+        CompactionContext::load(&SqliteCompactionStore, &Database::get_message, companion_id)
+            .map_err(|e| {
+                eprintln!("Error while loading compaction context: {}", e);
+                std::io::Error::other("Error while loading compaction context")
+            })
+    }
+}
+
+/// A fixed [`CompactionContext`], cloned on every call: this module's own
+/// tests, and the joiner's `LocalModelGeneration`
+/// (`multiplayer::remote_generation`) until #182 replaces it with its own
+/// `HostContinuity` impl built from the host's `ContinuityPayload`.
+pub struct FixedCompaction(pub CompactionContext);
+
+impl CompactionSource for FixedCompaction {
+    fn context(&self, _companion_id: i32) -> std::io::Result<CompactionContext> {
+        Ok(self.0.clone())
     }
 }
 
@@ -455,6 +593,13 @@ pub struct AssembledPrompt {
     pub attitude_context: String,
     /// The history after `ContextManager` trimming.
     pub managed_messages: Vec<Message>,
+    /// The compaction blocks (#174) folded into `system_prompt`: overlays,
+    /// rules, story-so-far, recent detail, and pins, plus whether the
+    /// never-trimmed part alone exceeded its budget.
+    pub compaction: RenderedBlocks,
+    /// The checkpoint `managed_messages` starts after — `None` for a
+    /// companion that has never been compacted.
+    pub compacted_through: Option<i32>,
 }
 
 /// The result of rendering a message history for one turn.
@@ -581,6 +726,7 @@ pub fn assemble_prompt(
     config: &ConfigView,
     transcript: &dyn TranscriptSource,
     speakers: &PromptSpeakers,
+    compaction: &CompactionContext,
 ) -> Result<AssembledPrompt, std::io::Error> {
     let user: UserView = match Database::get_user_data() {
         Ok(user) => user,
@@ -698,6 +844,23 @@ pub fn assemble_prompt(
         );
     }
 
+    // Render the compaction context (overlays, rules, story-so-far, recent
+    // detail, pins) against its own token slice, same as the attitude block
+    // above: built before `base_components` so it can be spliced into the
+    // system portion rather than after the conversation history.
+    let compaction_blocks = render(
+        compaction,
+        speakers.user_name(),
+        speakers.self_name(),
+        context_manager.compaction_token_budget,
+    );
+    if let Some(excess) = compaction_blocks.over_budget_by {
+        eprintln!(
+            "⚠️ Compaction overlays and rules exceed their token budget by {} tokens; rendering them anyway",
+            excess
+        );
+    }
+
     // Build base prompt components.
     // Auto renders through the model's own chat template, so its system content
     // must be plain prose; the Mistral branch below would embed [INST] markers.
@@ -709,6 +872,7 @@ pub fn assemble_prompt(
         &tuned_dialogue,
         &attitude_context,
         speakers,
+        &compaction_blocks,
     );
 
     base_prompt = base_components.join("");
@@ -736,12 +900,16 @@ pub fn assemble_prompt(
         }
     }
     // `TranscriptSource` impls log the cause of a read failure themselves.
-    let short_term_memory_entries: Vec<Message> =
-        transcript.recent_messages(if companion.short_term_mem > 0 {
+    // History starts after `compacted_through`, so a compacted range never
+    // resurfaces once it drops out of the prompt.
+    let short_term_memory_entries: Vec<Message> = transcript.recent_messages(
+        compaction.compacted_through,
+        if companion.short_term_mem > 0 {
             companion.short_term_mem
         } else {
             50
-        })?;
+        },
+    )?;
 
     // Apply context management to optimize memory usage
     let managed_messages = context_manager.manage_message_context(short_term_memory_entries);
@@ -764,6 +932,8 @@ pub fn assemble_prompt(
         chat_history,
         attitude_context,
         managed_messages,
+        compaction: compaction_blocks,
+        compacted_through: compaction.compacted_through,
     })
 }
 
@@ -1214,6 +1384,7 @@ fn generate(
     on_token: &mut dyn FnMut(&str),
     transcript: &dyn TranscriptSource,
     speakers: &PromptSpeakers,
+    compaction: &dyn CompactionSource,
 ) -> Result<String, std::io::Error> {
     let _generation_guard = GENERATION_LOCK
         .lock()
@@ -1253,6 +1424,7 @@ fn generate(
         .unwrap_or(4); // Fallback to 4 cores if detection fails
 
     println!("🚀 Generating AI response with optimized session...");
+    let compaction_context = compaction.context(companion_id)?;
     let assembled = assemble_prompt(
         prompt,
         companion_id,
@@ -1260,12 +1432,14 @@ fn generate(
         &config,
         transcript,
         speakers,
+        &compaction_context,
     )?;
     let AssembledPrompt {
         system_prompt: base_prompt,
         chat_history,
         attitude_context,
         managed_messages,
+        ..
     } = assembled;
     // Built from the config passed into `assemble_prompt`, so the budgets below
     // match the ones the assembly was trimmed against.
@@ -1950,6 +2124,7 @@ mod tests {
             "",
             ATTITUDE_MARKER,
             &solo_speakers(),
+            &RenderedBlocks::default(),
         );
         let joined = components.join("");
         let start_index = joined
@@ -1968,6 +2143,7 @@ mod tests {
             "",
             ATTITUDE_MARKER,
             &solo_speakers(),
+            &RenderedBlocks::default(),
         );
         let joined = components.join("");
         let start_index = joined
@@ -1986,6 +2162,7 @@ mod tests {
             "",
             ATTITUDE_MARKER,
             &solo_speakers(),
+            &RenderedBlocks::default(),
         );
         let joined = components.join("");
         let inst_index = joined
@@ -2004,6 +2181,7 @@ mod tests {
             "",
             ATTITUDE_MARKER,
             &solo_speakers(),
+            &RenderedBlocks::default(),
         );
         let joined = components.join("");
         let inst_index = joined
@@ -2022,6 +2200,7 @@ mod tests {
             "",
             ATTITUDE_MARKER,
             &solo_speakers(),
+            &RenderedBlocks::default(),
         );
         let without_attitude = build_base_components(
             &PromptTemplate::Default,
@@ -2031,6 +2210,7 @@ mod tests {
             "",
             "",
             &solo_speakers(),
+            &RenderedBlocks::default(),
         );
         assert_eq!(with_attitude.len(), without_attitude.len() + 1);
         assert!(!without_attitude.join("").contains(ATTITUDE_MARKER));
@@ -2047,6 +2227,7 @@ mod tests {
             "",
             "",
             &speakers,
+            &RenderedBlocks::default(),
         );
         let joined = components.join("");
         assert!(joined.contains("Alice, Ada and Bob"));
@@ -2063,6 +2244,7 @@ mod tests {
             "",
             "",
             &solo_speakers(),
+            &RenderedBlocks::default(),
         );
         let joined = components.join("");
         assert!(joined.contains("TestUser and TestCompanion"));
@@ -2181,11 +2363,20 @@ mod tests {
     #[test]
     fn in_memory_transcript_returns_the_tail_oldest_first() {
         let transcript = InMemoryTranscript(vec![
-            message("user", "a"),
-            message("char", "b"),
-            message("user", "c"),
+            Message {
+                id: 1,
+                ..message("user", "a")
+            },
+            Message {
+                id: 2,
+                ..message("char", "b")
+            },
+            Message {
+                id: 3,
+                ..message("user", "c")
+            },
         ]);
-        let recent = transcript.recent_messages(2).unwrap();
+        let recent = transcript.recent_messages(None, 2).unwrap();
         assert_eq!(
             recent
                 .iter()
@@ -2328,5 +2519,322 @@ ws ::= [ \n]*"#;
         assert!(RESIDENT_EXTRACTOR.resident_key().is_some());
         assert!(RESIDENT_MODEL.resident_key().is_none());
         assert!(ResidentExtractor.context_window() <= EXTRACTOR_MAX_CONTEXT);
+    }
+
+    /// Regression guard for `HostContinuity` (#182), which is expected to
+    /// ship a transcript that already starts after `compacted_through` — in
+    /// which case this filter is a no-op — but must still behave correctly
+    /// if it ever receives one that has not been pre-trimmed.
+    #[test]
+    fn in_memory_transcript_skips_ids_at_or_before_compacted_through() {
+        let transcript = InMemoryTranscript(vec![
+            Message {
+                id: 1,
+                ..message("user", "a")
+            },
+            Message {
+                id: 2,
+                ..message("char", "b")
+            },
+            Message {
+                id: 3,
+                ..message("user", "c")
+            },
+        ]);
+        let recent = transcript.recent_messages(Some(2), 10).unwrap();
+        assert_eq!(
+            recent
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c"]
+        );
+    }
+
+    /// A byte-for-byte copy of `build_base_components` as it existed before
+    /// #174 added the `blocks` parameter, kept only so
+    /// `empty_compaction_blocks_render_byte_identical_output_for_every_template`
+    /// below can prove `RenderedBlocks::default()` changes nothing for a
+    /// companion that has never compacted.
+    fn legacy_build_base_components(
+        template: &PromptTemplate,
+        user: &UserView,
+        companion: &CompanionView,
+        rp: &str,
+        tuned_dialogue: &str,
+        attitude_context: &str,
+        speakers: &PromptSpeakers,
+    ) -> Vec<String> {
+        let participants = &speakers.registry;
+        let user_name = speakers.user_name();
+        let self_name = speakers.self_name();
+        let all_names: Vec<&str> = participants
+            .iter()
+            .map(|p| p.display_name.as_str())
+            .collect();
+        let other_bot_names: Vec<&str> = speakers
+            .others()
+            .filter(|p| p.id != ParticipantId::USER)
+            .map(|p| p.display_name.as_str())
+            .collect();
+        let also_present = if other_bot_names.is_empty() {
+            String::new()
+        } else {
+            format!("Also present: {}.\n", join_names(&other_bot_names))
+        };
+
+        if *template == PromptTemplate::Default || *template == PromptTemplate::Auto {
+            let mut components = vec![
+                format!(
+                    "Text transcript of a conversation between {}. {}\n",
+                    join_names(&all_names),
+                    rp
+                ),
+                format!(
+                    "{}'s Persona: {}\n",
+                    user_name,
+                    expand_placeholders(&user.persona, participants)
+                ),
+            ];
+            if !also_present.is_empty() {
+                components.push(also_present);
+            }
+            if !attitude_context.is_empty() {
+                components.push(attitude_context.to_string());
+            }
+            components.push(format!(
+                "{}'s Persona: {}\n<START>\n",
+                self_name,
+                expand_placeholders(&companion.persona, participants)
+            ));
+            components.push(format!(
+                "{}\n<START>\n",
+                expand_placeholders(&companion.example_dialogue, participants)
+            ));
+            components.push(format!("{}\n<START>\n", tuned_dialogue));
+            components
+        } else if *template == PromptTemplate::Llama2 {
+            let mut components = vec![format!(
+                "<<SYS>>\nYou are {}, {}\n",
+                self_name,
+                expand_placeholders(&companion.persona, participants)
+            )];
+            if !also_present.is_empty() {
+                components.push(also_present);
+            }
+            if !attitude_context.is_empty() {
+                components.push(attitude_context.to_string());
+            }
+            components.push(format!(
+                "you are talking with {}, {} is {}\n{}\n[INST]\n",
+                user_name,
+                user_name,
+                expand_placeholders(&user.persona, participants),
+                rp
+            ));
+            components.push(format!(
+                "{}\n",
+                expand_placeholders(&companion.example_dialogue, participants)
+            ));
+            components.push(format!("{}\n[/INST]\n", tuned_dialogue));
+            components
+        } else {
+            let mut components = vec![
+                format!(
+                    "<s>[INST]Text transcript of a conversation between {}. {}\n",
+                    join_names(&all_names),
+                    rp
+                ),
+                format!(
+                    "{}'s Persona: {}\n",
+                    user_name,
+                    expand_placeholders(&user.persona, participants)
+                ),
+            ];
+            if !also_present.is_empty() {
+                components.push(also_present);
+            }
+            if !attitude_context.is_empty() {
+                components.push(attitude_context.to_string());
+            }
+            components.push(format!(
+                "{}'s Persona: {}[/INST]\n<s>[INST]\n",
+                self_name,
+                expand_placeholders(&companion.persona, participants)
+            ));
+            components.push(format!(
+                "{}[/INST]\n<s>[INST]\n",
+                expand_placeholders(&companion.example_dialogue, participants)
+            ));
+            components.push(format!("{}[/INST]\n", tuned_dialogue));
+            components
+        }
+    }
+
+    #[test]
+    fn empty_compaction_blocks_render_byte_identical_output_for_every_template() {
+        let templates: [(&str, PromptTemplate); 4] = [
+            ("Default", PromptTemplate::Default),
+            ("Auto", PromptTemplate::Auto),
+            ("Llama2", PromptTemplate::Llama2),
+            ("Mistral", PromptTemplate::Mistral),
+        ];
+        for (name, template) in templates {
+            for speakers in [solo_speakers(), three_speaker_speakers(ParticipantId::CHAR)] {
+                let legacy = legacy_build_base_components(
+                    &template,
+                    &user(),
+                    &companion(),
+                    "some rp text",
+                    "TestUser: hi\nTestCompanion: hello",
+                    ATTITUDE_MARKER,
+                    &speakers,
+                )
+                .join("");
+                let updated = build_base_components(
+                    &template,
+                    &user(),
+                    &companion(),
+                    "some rp text",
+                    "TestUser: hi\nTestCompanion: hello",
+                    ATTITUDE_MARKER,
+                    &speakers,
+                    &RenderedBlocks::default(),
+                )
+                .join("");
+                assert_eq!(legacy, updated, "{name} template regressed");
+            }
+        }
+    }
+
+    /// One marker string per compaction block, checked against a fixed
+    /// [`CompactionContext`] rendered at a large budget (nothing trimmed),
+    /// extending the `*_places_attitude_before_*` family above: every block
+    /// must land before the first history line, in the order `render`
+    /// documents.
+    fn marker_blocks() -> RenderedBlocks {
+        RenderedBlocks {
+            user_overlay: "USER_OVERLAY_MARKER\n".to_string(),
+            companion_overlay: "COMPANION_OVERLAY_MARKER\n".to_string(),
+            rules: "RULES_MARKER\n".to_string(),
+            story_so_far: "STORY_MARKER\n".to_string(),
+            recent_detail: "RECENT_MARKER\n".to_string(),
+            pins: "PINS_MARKER\n".to_string(),
+            over_budget_by: None,
+        }
+    }
+
+    /// Asserts every marker in `order` appears in `joined`, strictly
+    /// increasing, and before `terminator`. `order` differs by template:
+    /// Default/Auto/Mistral put the user overlay right after the user's own
+    /// persona (earliest); Llama2's "you are talking with ..." user section
+    /// comes after the companion's own `<<SYS>>` header, so its user
+    /// overlay lands last, directly ahead of `{rp}\n[INST]\n`.
+    fn assert_markers_increasing_and_before(joined: &str, order: &[&str], terminator: &str) {
+        let terminator_index = joined
+            .find(terminator)
+            .unwrap_or_else(|| panic!("no {terminator} marker in rendered prompt"));
+        let indices: Vec<usize> = order
+            .iter()
+            .map(|marker| {
+                joined
+                    .find(marker)
+                    .unwrap_or_else(|| panic!("no {marker} marker in rendered prompt"))
+            })
+            .collect();
+        for window in indices.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "block markers out of order: {:?} for {:?}",
+                indices,
+                order
+            );
+        }
+        assert!(
+            *indices.last().unwrap() < terminator_index,
+            "a compaction block landed after the history terminator"
+        );
+    }
+
+    const OVERLAY_FIRST_ORDER: [&str; 6] = [
+        "USER_OVERLAY_MARKER",
+        "COMPANION_OVERLAY_MARKER",
+        "RULES_MARKER",
+        "STORY_MARKER",
+        "RECENT_MARKER",
+        "PINS_MARKER",
+    ];
+
+    const USER_OVERLAY_LAST_ORDER: [&str; 6] = [
+        "COMPANION_OVERLAY_MARKER",
+        "RULES_MARKER",
+        "STORY_MARKER",
+        "RECENT_MARKER",
+        "PINS_MARKER",
+        "USER_OVERLAY_MARKER",
+    ];
+
+    #[test]
+    fn default_template_places_every_compaction_block_before_start() {
+        let joined = build_base_components(
+            &PromptTemplate::Default,
+            &user(),
+            &companion(),
+            "",
+            "",
+            "",
+            &solo_speakers(),
+            &marker_blocks(),
+        )
+        .join("");
+        assert_markers_increasing_and_before(&joined, &OVERLAY_FIRST_ORDER, "<START>");
+    }
+
+    #[test]
+    fn auto_template_places_every_compaction_block_before_start() {
+        let joined = build_base_components(
+            &PromptTemplate::Auto,
+            &user(),
+            &companion(),
+            "",
+            "",
+            "",
+            &solo_speakers(),
+            &marker_blocks(),
+        )
+        .join("");
+        assert_markers_increasing_and_before(&joined, &OVERLAY_FIRST_ORDER, "<START>");
+    }
+
+    #[test]
+    fn llama2_template_places_every_compaction_block_before_inst() {
+        let joined = build_base_components(
+            &PromptTemplate::Llama2,
+            &user(),
+            &companion(),
+            "",
+            "",
+            "",
+            &solo_speakers(),
+            &marker_blocks(),
+        )
+        .join("");
+        assert_markers_increasing_and_before(&joined, &USER_OVERLAY_LAST_ORDER, "[/INST]");
+    }
+
+    #[test]
+    fn mistral_template_places_every_compaction_block_before_inst() {
+        let joined = build_base_components(
+            &PromptTemplate::Mistral,
+            &user(),
+            &companion(),
+            "",
+            "",
+            "",
+            &solo_speakers(),
+            &marker_blocks(),
+        )
+        .join("");
+        assert_markers_increasing_and_before(&joined, &OVERLAY_FIRST_ORDER, "[/INST]");
     }
 }

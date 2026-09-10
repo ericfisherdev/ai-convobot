@@ -15,7 +15,10 @@ use serde::Deserialize;
 mod llm;
 mod model_cache;
 mod model_metadata;
-use crate::llm::{assemble_prompt, prompt, prompt_streaming, PromptSpeakers, SqliteTranscript};
+use crate::llm::{
+    assemble_prompt, prompt, prompt_streaming, CompactionSource, PromptSpeakers, SqliteCompaction,
+    SqliteTranscript,
+};
 use uuid::Uuid;
 mod context_manager;
 mod inference_optimizer;
@@ -1635,6 +1638,7 @@ async fn prompt_message(
                     companion_id,
                     &SqliteTranscript,
                     &speakers,
+                    &SqliteCompaction,
                 )
             },
             remotes.as_ref(),
@@ -1772,7 +1776,15 @@ async fn regenerate_prompt(
             target,
             &user_turn,
             &store,
-            |text| prompt(text, companion_id, &SqliteTranscript, &speakers),
+            |text| {
+                prompt(
+                    text,
+                    companion_id,
+                    &SqliteTranscript,
+                    &speakers,
+                    &SqliteCompaction,
+                )
+            },
             remotes.as_ref(),
             timeout,
         )
@@ -2013,6 +2025,15 @@ async fn inspect_prompt(
         },
     };
 
+    let compaction_context = match SqliteCompaction.context(companion_id) {
+        Ok(context) => context,
+        Err(e) => {
+            println!("Failed to load compaction context: {}", e);
+            return HttpResponse::InternalServerError()
+                .body("Error while loading compaction context, check logs for more information");
+        }
+    };
+
     let speakers = snapshot_speakers(&registry);
     match assemble_prompt(
         query.prompt.as_deref().unwrap_or(""),
@@ -2021,6 +2042,7 @@ async fn inspect_prompt(
         &config_view,
         &SqliteTranscript,
         &speakers,
+        &compaction_context,
     ) {
         Ok(assembled) => HttpResponse::Ok().json(assembled),
         Err(e) => {
@@ -2684,6 +2706,7 @@ async fn start_streaming_session(
                         on_token,
                         &SqliteTranscript,
                         &speakers,
+                        &SqliteCompaction,
                     )
                 },
                 remotes.as_ref(),
