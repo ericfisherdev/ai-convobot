@@ -76,7 +76,7 @@ describe('compactionReview', () => {
       expect(payload.items).toEqual([{ id: 5, accepted: false }]);
     });
 
-    it('includes edited text in the payload and omits untouched text', () => {
+    it('includes edited text in the payload and omits untouched items entirely', () => {
       const edited = aFact({ id: 6, text: 'original text' });
       const untouched = aFact({ id: 7, text: 'unchanged text' });
       let state = initialReviewState(aDraft([edited, untouched]));
@@ -86,8 +86,26 @@ describe('compactionReview', () => {
       const editedReview = payload.items.find((i) => i.id === 6);
       const untouchedReview = payload.items.find((i) => i.id === 7);
 
+      // An untouched item must be *omitted*, not sent as a bare
+      // `{ id, accepted }` -- `apply_review` only leaves a fact exactly as
+      // extracted for ids absent from `request.items`; a present entry with
+      // `accepted: false` overwrites the validator's own `rejected_reason`.
       expect(editedReview).toEqual({ id: 6, accepted: true, text: 'a rewritten fact' });
-      expect(untouchedReview).toEqual({ id: 7, accepted: true });
+      expect(untouchedReview).toBeUndefined();
+    });
+
+    it('omits a validator-rejected item the user never touched, but sends one they explicitly re-accepted', () => {
+      const struckUntouched = aFact({ id: 20, rejected_reason: 'duplicate of an active fact' });
+      const struckReaccepted = aFact({ id: 21, rejected_reason: 'duplicate of an active fact' });
+      let state = initialReviewState(aDraft([struckUntouched, struckReaccepted]));
+      // Both start `accepted: false` (validator-rejected); only #21 is
+      // explicitly toggled back on by the user.
+      state = toggleAccepted(state, 21);
+
+      const payload = toReviewPayload(state);
+
+      expect(payload.items.find((i) => i.id === 20)).toBeUndefined();
+      expect(payload.items.find((i) => i.id === 21)).toEqual({ id: 21, accepted: true });
     });
 
     it('edits a rule/key_quote item through its quote field, not text', () => {

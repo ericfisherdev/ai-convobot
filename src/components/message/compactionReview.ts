@@ -121,22 +121,29 @@ export function applyServerRejection(
   };
 }
 
-// One entry per item, `text`/`quote` included only when they differ from
-// the fact's stored value -- an untouched item is sent as a bare
-// `{ id, accepted }` so the backend's `apply_review` leaves it exactly as
-// extracted.
+// One entry per item the user actually changed (acceptance, text or
+// quote); an untouched item is omitted so `apply_review` keeps it exactly
+// as extracted -- sending it would overwrite a validator's
+// `rejected_reason` with "struck at review" or re-validate a passing item.
 export function toReviewPayload(state: ReviewState): CompactionDraftReview {
-  const items: ItemReview[] = state.items.map((item) => {
+  const items: ItemReview[] = [];
+  for (const item of state.items) {
     const review: ItemReview = { id: item.fact.id, accepted: item.accepted };
+    const extractedAccepted = item.fact.rejected_reason === null;
+    let edited = false;
     if (isQuoteCategory(item.fact.category)) {
       if (item.quote !== undefined && item.quote !== item.fact.text) {
         review.quote = item.quote;
+        edited = true;
       }
     } else if (item.text !== item.fact.text) {
       review.text = item.text;
+      edited = true;
     }
-    return review;
-  });
+    if (edited || item.accepted !== extractedAccepted) {
+      items.push(review);
+    }
+  }
   return { items, summary: state.summary };
 }
 
