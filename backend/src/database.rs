@@ -602,7 +602,7 @@ fn default_compact_min_messages() -> usize {
 }
 
 fn default_heuristic_person_detection() -> bool {
-    false
+    true
 }
 
 /// The one way `Database::write_config` (#128) can reject a `PUT
@@ -1109,7 +1109,7 @@ impl Database {
                 compact_threshold_tokens INTEGER,
                 compact_min_messages INTEGER DEFAULT 8,
                 compaction_model_path TEXT,
-                heuristic_person_detection BOOLEAN DEFAULT false
+                heuristic_person_detection BOOLEAN DEFAULT true
             )",
             [],
         )?;
@@ -1871,7 +1871,7 @@ impl Database {
                 compact_min_messages: row.get::<_, Option<usize>>(22)?.unwrap_or(8),
                 // Empty string and NULL both read as "use llm_model_path".
                 compaction_model_path: compaction_model_path.filter(|s| !s.is_empty()),
-                heuristic_person_detection: row.get::<_, Option<bool>>(24)?.unwrap_or(false),
+                heuristic_person_detection: row.get::<_, Option<bool>>(24)?.unwrap_or(true),
             })
         })?;
         Ok(row)
@@ -2575,10 +2575,22 @@ impl Database {
 
     /// The connection-taking half of [`Database::upsert_compaction_person`],
     /// split out so tests can run it against `Database::open_at(tempdir)`.
+    ///
+    /// The name lookup and the insert/update run inside one `IMMEDIATE`
+    /// transaction (started before the read, matching
+    /// `migrate_messages_speaker_id`'s and `apply_attitude_deltas`'s shape),
+    /// so "no row named this, case-insensitively" is a premise this
+    /// transaction's own write lock enforces, not a fact read on one
+    /// autocommit statement and assumed still true on the next. Without it,
+    /// two commits racing to upsert the same newly-introduced person could
+    /// both see "no existing row" and both `INSERT`, colliding on the
+    /// `UNIQUE(name)` index for an exact-case duplicate or silently
+    /// duplicating a differently-cased one.
     pub(crate) fn upsert_compaction_person_in(con: &Connection, p: &PersonUpsert) -> Result<i32> {
+        let tx = Transaction::new_unchecked(con, TransactionBehavior::Immediate)?;
         let current_time = get_current_date();
 
-        let existing: Option<(i32, i32)> = con
+        let existing: Option<(i32, i32)> = tx
             .query_row(
                 "SELECT id, mention_count FROM third_party_individuals WHERE name = ? COLLATE NOCASE",
                 [&p.name],
@@ -2586,10 +2598,10 @@ impl Database {
             )
             .optional()?;
 
-        if let Some((id, existing_mentions)) = existing {
+        let result_id = if let Some((id, existing_mentions)) = existing {
             let total_mentions = existing_mentions + p.mentions;
             let importance = crate::compaction::persons::importance_from_mentions(total_mentions);
-            con.execute(
+            tx.execute(
                 "UPDATE third_party_individuals SET
                     relationship_to_user = COALESCE(?, relationship_to_user),
                     relationship_to_companion = COALESCE(?, relationship_to_companion),
@@ -2609,10 +2621,10 @@ impl Database {
                     id
                 ],
             )?;
-            Ok(id)
+            id
         } else {
             let importance = crate::compaction::persons::importance_from_mentions(p.mentions);
-            con.execute(
+            tx.execute(
                 "INSERT INTO third_party_individuals (
                     name, relationship_to_user, relationship_to_companion,
                     first_mentioned, mention_count, importance_score,
@@ -2629,8 +2641,11 @@ impl Database {
                     current_time,
                 ],
             )?;
-            Ok(con.last_insert_rowid() as i32)
-        }
+            tx.last_insert_rowid() as i32
+        };
+
+        tx.commit()?;
+        Ok(result_id)
     }
 
     /// Deletes one `third_party_individuals` row and everything that
@@ -3530,70 +3545,32 @@ impl Database {
             }
         }
 
-        // Also check for entries that don't look like proper names, are
-        // junk (a pronoun, a stop word, or too short), or are a heuristic
-        // row with nothing but the auto-fill (#177: a bare `newly_mentioned`
-        // guess the detector never fleshed out with anything else).
-        //
-        // A local struct rather than a `Vec<(i32, String, Option<String>, ...)>`
-        // tuple: clippy's `type_complexity` lint rejects a seven-field tuple
-        // type, and named fields read better at each of the three checks
-        // below anyway.
-        struct HeuristicCandidate {
-            id: i32,
-            name: String,
-            relationship_to_user: Option<String>,
-            relationship_to_companion: Option<String>,
-            occupation: Option<String>,
-            personality_traits: Option<String>,
-            physical_description: Option<String>,
-        }
+        // Also check for entries that don't look like proper names, or are
+        // junk (a pronoun, a stop word, or too short). #177 deliberately
+        // does *not* also flag a bare `relationship_to_companion =
+        // 'newly_mentioned'` with nothing else filled in: `analyze_context_for_person`
+        // sets that value on every heuristically detected person
+        // unconditionally, real or not, and `extract_occupation`/
+        // `extract_personality_traits`/etc. commonly find nothing to fill
+        // in even for a genuine person mentioned in passing — a rule keyed
+        // on that combination would delete correctly detected people, not
+        // just junk.
+        let mut stmt =
+            con.prepare("SELECT id, name FROM third_party_individuals WHERE source = 'heuristic'")?;
 
-        let mut stmt = con.prepare(
-            "
-            SELECT id, name, relationship_to_user, relationship_to_companion,
-                   occupation, personality_traits, physical_description
-            FROM third_party_individuals
-            WHERE source = 'heuristic'
-        ",
-        )?;
-
-        let entries: Vec<HeuristicCandidate> = stmt
-            .query_map([], |row| {
-                Ok(HeuristicCandidate {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    relationship_to_user: row.get(2)?,
-                    relationship_to_companion: row.get(3)?,
-                    occupation: row.get(4)?,
-                    personality_traits: row.get(5)?,
-                    physical_description: row.get(6)?,
-                })
-            })?
+        let entries: Vec<(i32, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        for candidate in entries {
-            let looks_wrong = !Database::is_likely_person_name(&candidate.name)
-                || !candidate.name.chars().next().unwrap_or('a').is_uppercase();
-            let is_junk = crate::compaction::persons::is_junk_person_name(&candidate.name);
-            let bare_auto_fill = candidate.relationship_to_companion.as_deref()
-                == Some("newly_mentioned")
-                && candidate
-                    .relationship_to_user
-                    .as_deref()
-                    .unwrap_or("")
-                    .is_empty()
-                && candidate.occupation.is_none()
-                && candidate.personality_traits.is_none()
-                && candidate.physical_description.is_none();
+        for (id, name) in entries {
+            let looks_wrong = !Database::is_likely_person_name(&name)
+                || !name.chars().next().unwrap_or('a').is_uppercase();
+            let is_junk = crate::compaction::persons::is_junk_person_name(&name);
 
-            if looks_wrong || is_junk || bare_auto_fill {
-                Self::delete_third_party_in(con, candidate.id)?;
+            if looks_wrong || is_junk {
+                Self::delete_third_party_in(con, id)?;
                 cleaned_count += 1;
-                println!(
-                    "Removed invalid third party: {} (id: {})",
-                    candidate.name, candidate.id
-                );
+                println!("Removed invalid third party: {} (id: {})", name, id);
             }
         }
 
@@ -4834,7 +4811,7 @@ impl Database {
             ),
             (
                 "heuristic_person_detection",
-                "ALTER TABLE config ADD COLUMN heuristic_person_detection BOOLEAN DEFAULT false",
+                "ALTER TABLE config ADD COLUMN heuristic_person_detection BOOLEAN DEFAULT true",
             ),
         ];
 
@@ -6285,7 +6262,7 @@ mod tests {
                 compact_threshold_tokens INTEGER,
                 compact_min_messages INTEGER DEFAULT 8,
                 compaction_model_path TEXT,
-                heuristic_person_detection BOOLEAN DEFAULT false
+                heuristic_person_detection BOOLEAN DEFAULT true
             )",
             [],
         )
@@ -6836,7 +6813,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_invalid_third_parties_removes_pronoun_stopword_and_bare_rows_but_keeps_compaction() {
+    fn cleanup_invalid_third_parties_removes_pronoun_and_stopword_rows_but_keeps_compaction() {
         let dir = tempfile::TempDir::new().unwrap();
         let con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_third_party_tables(&con);
@@ -6888,5 +6865,40 @@ mod tests {
         let mut expected = vec![real_id, compaction_id];
         expected.sort();
         assert_eq!(remaining, expected);
+    }
+
+    /// Regression pin: `analyze_context_for_person` sets
+    /// `relationship_to_companion = 'newly_mentioned'` on *every*
+    /// heuristically detected person, real or not, and the extraction
+    /// helpers behind occupation/personality/physical-description commonly
+    /// find nothing even for a genuine person mentioned only in passing.
+    /// Cleanup must not treat "nothing extra was extracted" as "this row is
+    /// junk" — a well-formed capitalised name with a bare `newly_mentioned`
+    /// value and no other detail is still a real, legitimately detected
+    /// person and must survive.
+    #[test]
+    fn cleanup_invalid_third_parties_keeps_a_real_name_with_nothing_but_the_auto_fill() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_third_party_tables(&con);
+
+        let bare_real_id = insert_heuristic_third_party(&con, "Marcus");
+        con.execute(
+            "UPDATE third_party_individuals SET relationship_to_companion = 'newly_mentioned' WHERE id = ?",
+            [bare_real_id],
+        )
+        .unwrap();
+
+        let cleaned = Database::cleanup_invalid_third_parties_in(&con).unwrap();
+
+        assert_eq!(cleaned, 0);
+        let remaining: i64 = con
+            .query_row(
+                "SELECT COUNT(*) FROM third_party_individuals WHERE id = ?",
+                [bare_real_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 1);
     }
 }

@@ -87,7 +87,7 @@
 //! `ConfigView::heuristic_person_detection` is on — still the default as of
 //! #177, since nothing reaches `production_commit_deps`/`commit::commit` in
 //! production until #179's route lands; flipping the default is deferred to
-//! a follow-up issue once that path is live.
+//! follow-up issue #201 once that path is live.
 #![allow(dead_code)]
 
 pub mod commit;
