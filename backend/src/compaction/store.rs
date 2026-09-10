@@ -340,13 +340,22 @@ pub(crate) fn supersede_on(con: &Connection, fact_id: i64, by: i64) -> Result<()
     Ok(())
 }
 
-/// `None` = never compacted (or reset by #181's clear-chat).
+/// `None` = never compacted (or reset by #181's clear-chat) *and* an
+/// unknown `companion_id` — matching `RecordingStore::compacted_through`,
+/// which has no way to distinguish the two either (a missing map entry
+/// flattens to `None`). `.optional()` turns the `QueryReturnedNoRows` an
+/// unmatched `WHERE id = ?` would otherwise raise into that same `Ok(None)`;
+/// `.flatten()` then collapses `Option<Option<i32>>` (row found or not, and
+/// separately, `compacted_through` NULL or not) into the one `Option<i32>`
+/// this returns.
 pub(crate) fn compacted_through_on(con: &Connection, companion_id: i32) -> Result<Option<i32>> {
     con.query_row(
         "SELECT compacted_through FROM companion WHERE id = ?",
         params![companion_id],
         |row| row.get(0),
     )
+    .optional()
+    .map(Option::flatten)
 }
 
 pub(crate) fn set_compacted_through_on(
@@ -1098,5 +1107,13 @@ mod tests {
 
         set_compacted_through_on(&con, 1, None).unwrap();
         assert_eq!(compacted_through_on(&con, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn compacted_through_on_an_unknown_companion_is_ok_none_not_an_error() {
+        let (_dir, con) = fresh_db();
+        // Matches `RecordingStore::compacted_through`, which has no
+        // separate "unknown companion" error path either.
+        assert_eq!(compacted_through_on(&con, 999).unwrap(), None);
     }
 }

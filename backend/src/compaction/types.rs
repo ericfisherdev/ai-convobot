@@ -211,12 +211,37 @@ impl ToSql for FactCategory {
 /// `user`, `companion`, nor `person:`-prefixed is an error, never a silent
 /// fallback. Not `Copy`, unlike the plain enums above, since it owns a
 /// `String`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// `Serialize`/`Deserialize` are hand-written through `Display`/`FromStr`
+/// rather than derived: a derive would encode `Person("Ann")` externally
+/// tagged as `{"person":"Ann"}`, disagreeing with the `person:Ann` every
+/// other representation (`Display`, `FromStr`, `ToSql`, `FromSql`) uses.
+/// Going through the same string form everywhere means JSON and SQLite can
+/// never disagree about a `FactSubject` value.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FactSubject {
     User,
     Companion,
     Person(String),
+}
+
+impl Serialize for FactSubject {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for FactSubject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 /// Prefix a stored/wire `FactSubject::Person` value carries before the
@@ -463,6 +488,25 @@ mod tests {
         assert_eq!(
             "person:Ann".parse::<FactSubject>().unwrap(),
             FactSubject::Person("Ann".to_string())
+        );
+    }
+
+    #[test]
+    fn fact_subject_serializes_as_its_string_form_not_an_externally_tagged_object() {
+        // Guards against a derived `Serialize`/`Deserialize`, which would
+        // encode `Person` as `{"person":"Ann"}` instead of the `person:Ann`
+        // string every other representation uses.
+        let json = serde_json::to_string(&FactSubject::Person("Ann".to_string())).unwrap();
+        assert_eq!(json, "\"person:Ann\"");
+        assert_eq!(json, serde_json::to_string("person:Ann").unwrap());
+
+        assert_eq!(
+            serde_json::to_string(&FactSubject::User).unwrap(),
+            "\"user\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FactSubject::Companion).unwrap(),
+            "\"companion\""
         );
     }
 

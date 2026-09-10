@@ -4625,7 +4625,16 @@ impl Database {
     /// there is no backfill, just the `ALTER TABLE`. Idempotent, via the
     /// same `PRAGMA table_info` check.
     pub fn migrate_companion_compacted_through(con: &Connection) -> Result<()> {
-        let mut stmt = con.prepare("PRAGMA table_info(companion)")?;
+        // `IMMEDIATE`, before the check, for the same reason
+        // `migrate_messages_speaker_id` above needs it: without it, two
+        // `init()` calls against the same database file can both observe
+        // "column missing" before either runs its `ALTER TABLE`, and the
+        // second then fails with a duplicate-column error instead of
+        // blocking (via the busy timeout) and seeing the column already
+        // there.
+        let tx = Transaction::new_unchecked(con, TransactionBehavior::Immediate)?;
+
+        let mut stmt = tx.prepare("PRAGMA table_info(companion)")?;
         let has_compacted_through = stmt
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<Result<Vec<_>>>()?
@@ -4633,14 +4642,15 @@ impl Database {
             .any(|name| name == "compacted_through");
         drop(stmt);
 
-        if !has_compacted_through {
-            con.execute(
-                "ALTER TABLE companion ADD COLUMN compacted_through INTEGER",
-                [],
-            )?;
+        if has_compacted_through {
+            return tx.commit();
         }
 
-        Ok(())
+        tx.execute(
+            "ALTER TABLE companion ADD COLUMN compacted_through INTEGER",
+            [],
+        )?;
+        tx.commit()
     }
 
     /// Adds every `config` column introduced after the original four
@@ -6372,6 +6382,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(name, "Assistant");
+        assert_eq!(compacted_through, None);
+    }
+
+    #[test]
+    fn migrate_companion_compacted_through_run_concurrently_by_two_connections_does_not_error() {
+        // Mirrors `migrate_messages_speaker_id_run_concurrently_by_two_connections_does_not_error`:
+        // both connections open the column-missing table before either
+        // starts migrating, so without the `IMMEDIATE` transaction the
+        // second to reach `ALTER TABLE` would fail with a duplicate-column
+        // error instead of blocking on the first and then seeing the
+        // column already there.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("t.db");
+        let setup = Database::open_at(&db_path).unwrap();
+        create_legacy_companion_table(&setup);
+        drop(setup);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let other_barrier = Arc::clone(&barrier);
+        let other_path = db_path.clone();
+
+        let other = thread::spawn(move || {
+            let con = Database::open_at(&other_path).unwrap();
+            other_barrier.wait();
+            Database::migrate_companion_compacted_through(&con)
+        });
+
+        let con = Database::open_at(&db_path).unwrap();
+        barrier.wait();
+        let result = Database::migrate_companion_compacted_through(&con);
+
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(
+            other.join().unwrap().is_ok(),
+            "the concurrent migration call should also succeed, not hit a duplicate column error"
+        );
+
+        let compacted_through: Option<i32> = con
+            .query_row(
+                "SELECT compacted_through FROM companion LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(compacted_through, None);
     }
 }
