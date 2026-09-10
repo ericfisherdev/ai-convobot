@@ -230,14 +230,17 @@ impl LocalModelGeneration {
     /// After the reply is generated (and *only* after: `turn_guard` is
     /// explicitly dropped first), the spawned thread makes one independent
     /// attempt at this joiner's own auto-extraction
-    /// (`joiner_compaction::maybe_queue_extraction`). This ordering is
-    /// load-bearing: extraction must never contend with the reply for the
-    /// same `GenerateRequest`'s turn-slot claim, or every reply on a frame
-    /// that advances `compacted_through` would lose that race and come back
-    /// as `ReplyFailed` (PR #204 review finding) — extraction gets its own,
-    /// later, independent claim instead, falling back to
-    /// `JoinerShared::pending_extraction` if something else has it in that
-    /// (very small) window.
+    /// (`joiner_compaction::maybe_queue_extraction`), which claims its own
+    /// dedicated `turn_slot::JOINER_EXTRACTION` slot rather than `ACTIVE_TURN`
+    /// (PR #204 review finding, twice over): dropping `turn_guard` first
+    /// stops extraction from ever winning the race for the *same*
+    /// `GenerateRequest`'s reply, but only a slot of its own stops a
+    /// *later* `GenerateRequest` — arriving anywhere in extraction's
+    /// model-bound extract+merge window, not just on the frame that queued
+    /// it — from finding the slot still held and coming back `ReplyFailed`
+    /// too. `maybe_queue_extraction` falls back to
+    /// `JoinerShared::pending_extraction` if another extraction already
+    /// holds its slot.
     fn try_handle(
         &self,
         round_id: u64,
@@ -734,12 +737,15 @@ mod tests {
         );
 
         // Extraction runs on a further spawned thread of its own
-        // (`joiner_compaction::spawn_holding`); wait for it to release the
-        // slot it claims before asserting it ran, the same polling pattern
+        // (`joiner_compaction::spawn_holding`), holding `JOINER_EXTRACTION`
+        // rather than `ACTIVE_TURN` (PR #204 review finding: a dedicated
+        // slot, so extraction can never contend with a reply even while
+        // still running); wait for it to release that slot before asserting
+        // it ran, the same polling pattern
         // `local_model_generation_claims_and_releases_the_shared_turn_slot`
         // and `joiner_compaction`'s own tests use for the same reason.
         for _ in 0..100 {
-            if ACTIVE_TURN.try_claim().is_some() {
+            if crate::turn_slot::JOINER_EXTRACTION.try_claim().is_some() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -749,5 +755,50 @@ mod tests {
             vec![(1, 5)],
             "extraction should still run, independently, after the reply"
         );
+
+        // PR #204 review finding (reopened): `ACTIVE_TURN` alone was not
+        // enough — even after the same-frame race above was fixed,
+        // extraction held `ACTIVE_TURN` for its whole model-bound
+        // extract+merge, so any `GenerateRequest` landing *during* that
+        // window (not just the one that queued it) still came back
+        // `ReplyFailed`. With extraction on its own `JOINER_EXTRACTION`
+        // slot, a reply must succeed even while an extraction is still
+        // running.
+        let held_extraction = crate::turn_slot::JOINER_EXTRACTION
+            .try_claim()
+            .expect("nothing else holds it at this point in the test");
+        let generation_during_extraction = LocalModelGeneration::new(
+            1,
+            ParticipantId::parse("bot1").unwrap(),
+            handle.clone(),
+            Arc::new(|_transcript, _speakers, on_token| {
+                on_token("hi again");
+                Ok("hi again".to_string())
+            }),
+            crate::multiplayer::joiner_compaction::noop_job(),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let join_handle = generation_during_extraction
+            .try_handle(10, vec![sample_message(2, USER_SPEAKER_ID, "hi")], tx)
+            .expect("ACTIVE_TURN was free, so a thread should have been spawned");
+        join_handle
+            .join()
+            .expect("generation thread should not panic");
+        assert_eq!(
+            drain(&mut rx),
+            vec![
+                ClientFrame::Token {
+                    round_id: 10,
+                    text: "hi again".to_string()
+                },
+                ClientFrame::ReplyComplete {
+                    round_id: 10,
+                    text: "hi again".to_string()
+                },
+            ],
+            "a reply must succeed while a joiner's own extraction is still \
+             running, not just outside the one frame that queued it"
+        );
+        drop(held_extraction);
     }
 }

@@ -8,11 +8,14 @@
 //! tested with no model and no store. [`maybe_queue_extraction`] is the
 //! impure dispatch [`remote_generation::LocalModelGeneration::try_handle`]
 //! calls *after* a reply it generated has already released its own claim on
-//! [`ACTIVE_TURN`] — never on the same claim a reply needed, and never
+//! `ACTIVE_TURN` — never on the same claim a reply needed, and never
 //! before that reply has been sent, so a `GenerateRequest` that advances
 //! `compacted_through` still always gets its reply. It then claims
-//! `ACTIVE_TURN` itself, independently, and hands the actual work to an
-//! injected [`JoinerExtractionJob`] (mirroring
+//! [`JOINER_EXTRACTION`] itself, a dedicated slot that never contends with
+//! `ACTIVE_TURN`: a reply that lands while an extraction (a model-bound
+//! extract + merge, potentially the slowest thing this module does) is
+//! still running must never come back `ReplyFailed` either. It hands the
+//! actual work to an injected [`JoinerExtractionJob`] (mirroring
 //! `remote_generation::RemoteGenerator`'s injectable seam), so this module's
 //! own tests can observe "a job was queued" with a recording stub instead of
 //! touching SQLite or a model. [`run_joiner_extraction`] is the production
@@ -46,7 +49,7 @@ use crate::llm::ResidentExtractor;
 use crate::multiplayer::joiner::JoinerHandle;
 use crate::multiplayer::protocol::ContinuityPayload;
 use crate::participants::{ParticipantId, ParticipantRegistry};
-use crate::turn_slot::ACTIVE_TURN;
+use crate::turn_slot::JOINER_EXTRACTION;
 
 /// Why a joiner-committed item that would otherwise be active is instead
 /// stored inactive: everything except `companion_state` and this joiner's
@@ -133,17 +136,20 @@ pub type JoinerExtractionJob = Arc<dyn Fn(JoinerExtractionRequest) + Send + Sync
 /// `joiner::serve` before a reply is even attempted) or a previously-queued
 /// retry (`JoinerShared::pending_extraction`) advances this joiner's own
 /// compacted-through cursor, and if so either spawns `job` under a freshly
-/// claimed [`ACTIVE_TURN`] slot or — if the slot is already held elsewhere —
-/// remembers the target `through` on `pending_extraction` for the next call
-/// to retry.
+/// claimed [`JOINER_EXTRACTION`] slot or — if the slot is already held by
+/// another in-flight extraction — remembers the target `through` on
+/// `pending_extraction` for the next call to retry.
 ///
-/// Callers must never call this while still holding the reply's own claim
-/// on [`ACTIVE_TURN`] for the same `GenerateRequest`: the sole production
-/// caller, `remote_generation::LocalModelGeneration::try_handle`, calls it
-/// from the reply-generation thread only *after* explicitly dropping that
-/// thread's own [`crate::turn_slot::TurnGuard`], so extraction's claim here
-/// is always independent of, and never racing, the reply this same frame
-/// needed the slot for.
+/// Claims [`JOINER_EXTRACTION`], never `ACTIVE_TURN`: a reply arriving
+/// while this joiner's own extraction is still running (a model-bound
+/// extract + merge) must never come back `ReplyFailed` just because
+/// extraction happened to still hold the slot a reply would otherwise need.
+/// The sole production caller, `remote_generation::LocalModelGeneration::try_handle`,
+/// calls this from the reply-generation thread only *after* explicitly
+/// dropping that thread's own claim on `ACTIVE_TURN`, so a `GenerateRequest`
+/// that advances `compacted_through` still always gets its reply — but even
+/// callers that skipped that ordering would be safe, since the two slots
+/// never contend.
 pub(crate) fn maybe_queue_extraction(handle: &JoinerHandle, job: &JoinerExtractionJob) {
     let (local, pending, last_continuity_through, snapshot, participants, companion_id, self_id) = {
         let shared = handle.read().unwrap_or_else(|p| p.into_inner());
@@ -180,7 +186,7 @@ pub(crate) fn maybe_queue_extraction(handle: &JoinerHandle, job: &JoinerExtracti
         return;
     };
 
-    match ACTIVE_TURN.try_claim() {
+    match JOINER_EXTRACTION.try_claim() {
         Some(guard) => {
             {
                 let mut shared = handle.write().unwrap_or_else(|p| p.into_inner());
@@ -600,8 +606,8 @@ mod tests {
             .last_continuity = payload;
     }
 
-    // Shares the process-wide `ACTIVE_TURN`, so every case below runs as one
-    // `#[test]` function — the same convention
+    // Shares the process-wide `JOINER_EXTRACTION` slot, so every case below
+    // runs as one `#[test]` function — the same convention
     // `remote_generation::tests::local_model_generation_claims_and_releases_the_shared_turn_slot`
     // documents for the same reason.
     #[test]
@@ -616,7 +622,7 @@ mod tests {
         // `spawn_holding` runs on its own thread; give it a moment, then
         // join by re-claiming the slot once it releases the guard.
         for _ in 0..100 {
-            if ACTIVE_TURN.try_claim().is_some() {
+            if JOINER_EXTRACTION.try_claim().is_some() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -634,17 +640,17 @@ mod tests {
         // inherently racy on its own (`spawn_holding` pushes to it from
         // another thread, so a wrongly-spawned job could still be mid-flight
         // when this assertion runs and pass vacuously); the slot claim right
-        // after is not, because `maybe_queue_extraction` claims `ACTIVE_TURN`
-        // synchronously, on this thread, before ever handing the guard to
-        // `spawn_holding` — so a wrongly-spawned job has already made the
-        // slot unavailable by the time `maybe_queue_extraction` returns, no
-        // sleep required (PR #204 review finding).
+        // after is not, because `maybe_queue_extraction` claims
+        // `JOINER_EXTRACTION` synchronously, on this thread, before ever
+        // handing the guard to `spawn_holding` — so a wrongly-spawned job has
+        // already made the slot unavailable by the time `maybe_queue_extraction`
+        // returns, no sleep required (PR #204 review finding).
         handle.write().unwrap().local_compacted_through = Some(5);
         set_last_continuity(&handle, Some(payload(3)));
         maybe_queue_extraction(&handle, &job);
         assert!(
-            ACTIVE_TURN.try_claim().is_some(),
-            "nothing should hold the turn slot when no job was queued"
+            JOINER_EXTRACTION.try_claim().is_some(),
+            "nothing should hold the extraction slot when no job was queued"
         );
         assert_eq!(
             *calls.lock().unwrap(),
@@ -652,10 +658,11 @@ mod tests {
             "a payload at or behind the local cursor must queue no job"
         );
 
-        // The slot claimed by someone else: the target is remembered as
+        // The slot claimed by someone else (e.g. a still-running extraction
+        // from an earlier call): the target is remembered as
         // `pending_extraction` instead of spawning, and retried once the
         // slot frees up.
-        let outer_guard = ACTIVE_TURN.try_claim().expect("slot should be free");
+        let outer_guard = JOINER_EXTRACTION.try_claim().expect("slot should be free");
         set_last_continuity(&handle, Some(payload(8)));
         maybe_queue_extraction(&handle, &job);
         assert_eq!(
@@ -671,7 +678,7 @@ mod tests {
         set_last_continuity(&handle, None);
         maybe_queue_extraction(&handle, &job);
         for _ in 0..100 {
-            if ACTIVE_TURN.try_claim().is_some() {
+            if JOINER_EXTRACTION.try_claim().is_some() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -684,7 +691,7 @@ mod tests {
         assert_eq!(handle.read().unwrap().pending_extraction, None);
 
         assert!(
-            ACTIVE_TURN.try_claim().is_some(),
+            JOINER_EXTRACTION.try_claim().is_some(),
             "the slot should be free again once every spawned job has finished"
         );
     }
