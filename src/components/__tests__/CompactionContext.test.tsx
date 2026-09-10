@@ -155,6 +155,40 @@ describe('CompactionContext', () => {
     expect(detailCalls).toBe(1)
   })
 
+  it('starts polling on its own when the listing reports an already-extracting draft', async () => {
+    // A page reload (or a second tab) mid-extraction hands the provider a
+    // `pending_draft` with `phase: 'extracting'` and no poll running yet --
+    // only its own mount effect can start one; no button click queues it.
+    let detailCalls = 0
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.startsWith('/api/message')) return Promise.resolve(jsonResponse(emptyMessagePage))
+      if (url === '/api/compaction/7') {
+        detailCalls++
+        return Promise.resolve(jsonResponse({ id: 7, phase: 'review' }))
+      }
+      if (url.startsWith('/api/compaction')) {
+        return Promise.resolve(
+          jsonResponse({
+            checkpoints: [],
+            pending_draft: { id: 7, from_message_id: 1, through_message_id: 5, created_at: '2024-01-01', phase: 'extracting' },
+          })
+        )
+      }
+      return Promise.resolve(jsonResponse({}))
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    render(
+      <MockProviders>
+        <Probe />
+      </MockProviders>
+    )
+
+    await vi.advanceTimersByTimeAsync(5_000)
+    await vi.waitFor(() => expect(detailCalls).toBe(1))
+  })
+
   it('commit passes the 422 body back to the caller instead of toasting', async () => {
     const rejected = [{ item_id: 12, reason: 'quote is not verbatim in any cited message' }]
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
