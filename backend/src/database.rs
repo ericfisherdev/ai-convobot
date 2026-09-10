@@ -1371,7 +1371,7 @@ impl Database {
     /// (#174's `TranscriptSource::recent_messages`) instead of a plain
     /// offset from the end. Same `MESSAGE_CACHE` pattern as `get_x_messages`;
     /// `clear_message_cache` already wipes every key, this one included.
-    pub fn get_messages_after(after: Option<i32>, limit: usize) -> Result<Vec<Message>> {
+    pub fn get_x_messages_after(after: Option<i32>, limit: usize) -> Result<Vec<Message>> {
         let cache_key = format!("messages_after:{:?}:{}", after, limit);
 
         if let Ok(cache) = MESSAGE_CACHE.lock() {
@@ -1383,7 +1383,7 @@ impl Database {
         }
 
         let con = Self::open()?;
-        let result = Self::get_messages_after_on(&con, after, limit)?;
+        let result = Self::get_x_messages_after_on(&con, after, limit)?;
 
         if let Ok(mut cache) = MESSAGE_CACHE.lock() {
             if cache.len() > 50 {
@@ -1395,10 +1395,10 @@ impl Database {
         Ok(result)
     }
 
-    /// Testable half of `get_messages_after`, taking a caller-provided
+    /// Testable half of `get_x_messages_after`, taking a caller-provided
     /// connection so tests can point it at a `TempDir`-backed database
     /// instead of the hardwired `paths::db_path()`.
-    fn get_messages_after_on(
+    fn get_x_messages_after_on(
         con: &Connection,
         after: Option<i32>,
         limit: usize,
@@ -5320,7 +5320,7 @@ mod tests {
     }
 
     #[test]
-    fn get_messages_after_returns_the_oldest_first_tail_beyond_the_cutoff() {
+    fn get_x_messages_after_returns_the_oldest_first_tail_beyond_the_cutoff() {
         let dir = tempfile::TempDir::new().unwrap();
         let con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
@@ -5329,7 +5329,7 @@ mod tests {
         insert_message_row(&con, USER_SPEAKER_ID, "three");
         insert_message_row(&con, CHAR_SPEAKER_ID, "four");
 
-        let after_two = Database::get_messages_after_on(&con, Some(2), 10).unwrap();
+        let after_two = Database::get_x_messages_after_on(&con, Some(2), 10).unwrap();
         assert_eq!(
             after_two
                 .iter()
@@ -5338,12 +5338,12 @@ mod tests {
             vec!["three", "four"]
         );
 
-        let no_cutoff = Database::get_messages_after_on(&con, None, 10).unwrap();
+        let no_cutoff = Database::get_x_messages_after_on(&con, None, 10).unwrap();
         assert_eq!(no_cutoff.len(), 4);
     }
 
     #[test]
-    fn get_messages_after_respects_the_limit() {
+    fn get_x_messages_after_respects_the_limit() {
         let dir = tempfile::TempDir::new().unwrap();
         let con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_messages_table(&con);
@@ -5351,7 +5351,7 @@ mod tests {
             insert_message_row(&con, USER_SPEAKER_ID, &format!("msg {i}"));
         }
 
-        let limited = Database::get_messages_after_on(&con, None, 2).unwrap();
+        let limited = Database::get_x_messages_after_on(&con, None, 2).unwrap();
         assert_eq!(
             limited
                 .iter()
