@@ -25,7 +25,10 @@
 //! below, which is what the #171 acceptance criteria ask for.
 #![allow(dead_code)]
 
-use rusqlite::{params, Connection, Error, OptionalExtension, Result, Row, ToSql};
+use rusqlite::{
+    params, Connection, Error, OptionalExtension, Result, Row, ToSql, Transaction,
+    TransactionBehavior,
+};
 
 use crate::compaction::types::{Checkpoint, CompactionStatus, Fact, FactDraft, NewDraft, Pin};
 // Only named directly by this module's own tests (production code reaches
@@ -360,6 +363,87 @@ pub(crate) fn supersede_on(con: &Connection, fact_id: i64, by: i64) -> Result<()
     Ok(())
 }
 
+/// One promoted fact: the stored row named by `fact_id` (one of #185's
+/// `fill_draft` rows) gets its reviewed content and verdict written back in
+/// place. #175's commit never inserts a new row here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FactPromotion {
+    pub fact_id: i64,
+    pub draft: FactDraft,
+}
+
+/// What [`CompactionStore::commit_checkpoint`] writes in one transaction:
+/// the promoted fact rows, which prior facts they supersede, which
+/// duplicate rule/key-quote rows fold into an existing one, and the
+/// checkpoint's own summary/cutoff update. Built by
+/// `compaction::commit::commit`'s private `plan_commit`, which owns the
+/// merge/supersede/over-budget decisions; this module only knows how to
+/// apply the result transactionally.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommitRecord {
+    pub draft_id: i64,
+    pub companion_id: i32,
+    pub through_message_id: i32,
+    pub summary: String,
+    pub rolling_summary: String,
+    pub needs_merge: bool,
+    pub promote: Vec<FactPromotion>,
+    pub supersede: Vec<(i64, i64)>,
+    pub merge_into: Vec<(i64, i64, Vec<i32>)>,
+}
+
+/// Rewrites the reviewed text/verdict onto an existing `compaction_facts`
+/// row (`category`, `subject`, `relation_to`, `relation` are not editable
+/// at review and are left as stored). `active = p.draft.rejected_reason.is_none()`,
+/// the same rule [`insert_facts_on`] uses, so a row's verdict is consistent
+/// whether it was stored by #185's `fill_draft` or rewritten here.
+/// `QueryReturnedNoRows` (via `changes() == 0`) if `p.fact_id` does not
+/// belong to `compaction_id` — a `fact_id` from another checkpoint can
+/// never be promoted by this transaction.
+pub(crate) fn promote_fact_on(
+    con: &Connection,
+    compaction_id: i64,
+    p: &FactPromotion,
+) -> Result<()> {
+    let active = p.draft.rejected_reason.is_none();
+    let sources_json = serde_json::to_string(&p.draft.sources).expect("Vec<i32> always serializes");
+    let replaces_json =
+        serde_json::to_string(&p.draft.replaces).expect("Vec<i64> always serializes");
+    let changed = con.execute(
+        "UPDATE compaction_facts SET text = ?, quote_speaker = ?, sources = ?, replaces = ?, canon = ?, rejected_reason = ?, active = ? WHERE id = ? AND compaction_id = ?",
+        params![
+            p.draft.text,
+            p.draft.quote_speaker,
+            sources_json,
+            replaces_json,
+            p.draft.canon,
+            p.draft.rejected_reason,
+            active,
+            p.fact_id,
+            compaction_id,
+        ],
+    )?;
+    if changed == 0 {
+        return Err(Error::QueryReturnedNoRows);
+    }
+    Ok(())
+}
+
+/// Rewrites an existing fact's `sources` column, used when a duplicate
+/// rule/key-quote is folded into it instead of promoted as a second copy.
+/// `QueryReturnedNoRows` if `existing_id` is unknown.
+pub(crate) fn merge_sources_on(con: &Connection, existing_id: i64, sources: &[i32]) -> Result<()> {
+    let sources_json = serde_json::to_string(sources).expect("Vec<i32> always serializes");
+    let changed = con.execute(
+        "UPDATE compaction_facts SET sources = ? WHERE id = ?",
+        params![sources_json, existing_id],
+    )?;
+    if changed == 0 {
+        return Err(Error::QueryReturnedNoRows);
+    }
+    Ok(())
+}
+
 /// `None` = never compacted (or reset by #181's clear-chat) *and* an
 /// unknown `companion_id` — matching `RecordingStore::compacted_through`,
 /// which has no way to distinguish the two either (a missing map entry
@@ -512,6 +596,18 @@ pub trait CompactionStore {
 
     /// Ordered by `message_id`.
     fn pins(&self) -> Result<Vec<Pin>>;
+
+    /// Promotes the fact rows #185's `fill_draft` already stored (writes
+    /// back reviewed text/verdict via [`promote_fact_on`], sets
+    /// `active`), marks superseded/merged rows, flips the checkpoint to
+    /// `Committed` with its new summaries, and sets `compacted_through` —
+    /// all inside one transaction on the production impl. #175's
+    /// `compaction::commit::commit` builds the [`CommitRecord`]; this
+    /// method only applies it. `QueryReturnedNoRows` if `record.draft_id`
+    /// or any id it references is unknown; otherwise the underlying
+    /// `rusqlite::Error`. A mid-way error rolls back every mutation,
+    /// including already-applied promotions.
+    fn commit_checkpoint(&self, record: CommitRecord) -> Result<Checkpoint>;
 }
 
 /// Production [`CompactionStore`], opening `Database::open()` per call,
@@ -619,6 +715,34 @@ impl CompactionStore for SqliteCompactionStore {
     fn pins(&self) -> Result<Vec<Pin>> {
         let con = Database::open()?;
         pins_on(&con)
+    }
+
+    fn commit_checkpoint(&self, record: CommitRecord) -> Result<Checkpoint> {
+        let con = Database::open()?;
+        let tx = Transaction::new_unchecked(&con, TransactionBehavior::Immediate)?;
+        for promotion in &record.promote {
+            promote_fact_on(&tx, record.draft_id, promotion)?;
+        }
+        for (old_id, new_id) in &record.supersede {
+            supersede_on(&tx, *old_id, *new_id)?;
+        }
+        for (existing_id, duplicate_fact_id, sources) in &record.merge_into {
+            merge_sources_on(&tx, *existing_id, sources)?;
+            supersede_on(&tx, *duplicate_fact_id, *existing_id)?;
+        }
+        update_status_on(&tx, record.draft_id, CompactionStatus::Committed)?;
+        tx.execute(
+            "UPDATE compactions SET summary = ?, rolling_summary = ?, needs_merge = ? WHERE id = ?",
+            params![
+                record.summary,
+                record.rolling_summary,
+                record.needs_merge,
+                record.draft_id,
+            ],
+        )?;
+        set_compacted_through_on(&tx, record.companion_id, Some(record.through_message_id))?;
+        tx.commit()?;
+        get_checkpoint_on(&con, record.draft_id)?.ok_or(Error::QueryReturnedNoRows)
     }
 }
 
@@ -876,6 +1000,68 @@ impl CompactionStore for RecordingStore {
                 pinned_at: get_current_date(),
             })
             .collect())
+    }
+
+    fn commit_checkpoint(&self, record: CommitRecord) -> Result<Checkpoint> {
+        {
+            let mut facts = self.facts.lock().unwrap();
+            for promotion in &record.promote {
+                let fact = facts
+                    .iter_mut()
+                    .find(|f| f.id == promotion.fact_id && f.compaction_id == record.draft_id)
+                    .ok_or(Error::QueryReturnedNoRows)?;
+                fact.text = promotion.draft.text.clone();
+                fact.quote_speaker = promotion.draft.quote_speaker.clone();
+                fact.sources = promotion.draft.sources.clone();
+                fact.replaces = promotion.draft.replaces.clone();
+                fact.canon = promotion.draft.canon;
+                fact.rejected_reason = promotion.draft.rejected_reason.clone();
+                fact.active = promotion.draft.rejected_reason.is_none();
+            }
+            for (old_id, new_id) in &record.supersede {
+                let fact = facts
+                    .iter_mut()
+                    .find(|f| f.id == *old_id)
+                    .ok_or(Error::QueryReturnedNoRows)?;
+                fact.active = false;
+                fact.superseded_by = Some(*new_id);
+            }
+            for (existing_id, duplicate_fact_id, sources) in &record.merge_into {
+                {
+                    let existing = facts
+                        .iter_mut()
+                        .find(|f| f.id == *existing_id)
+                        .ok_or(Error::QueryReturnedNoRows)?;
+                    existing.sources = sources.clone();
+                }
+                let duplicate = facts
+                    .iter_mut()
+                    .find(|f| f.id == *duplicate_fact_id)
+                    .ok_or(Error::QueryReturnedNoRows)?;
+                duplicate.active = false;
+                duplicate.superseded_by = Some(*existing_id);
+            }
+        }
+
+        {
+            let mut checkpoints = self.checkpoints.lock().unwrap();
+            let checkpoint = checkpoints
+                .iter_mut()
+                .find(|c| c.id == record.draft_id)
+                .ok_or(Error::QueryReturnedNoRows)?;
+            checkpoint.status = CompactionStatus::Committed;
+            checkpoint.committed_at = Some(get_current_date());
+            checkpoint.summary = Some(record.summary.clone());
+            checkpoint.rolling_summary = Some(record.rolling_summary.clone());
+            checkpoint.needs_merge = record.needs_merge;
+        }
+
+        self.compacted_through
+            .lock()
+            .unwrap()
+            .insert(record.companion_id, Some(record.through_message_id));
+
+        Ok(self.get_checkpoint(record.draft_id)?.unwrap())
     }
 }
 
@@ -1286,5 +1472,206 @@ mod tests {
         assert_eq!(facts.len(), 1);
         assert_eq!(compacted_through, Some(2));
         assert_eq!(latest_committed.unwrap().id, compaction_id);
+    }
+
+    /// Runs the same sequence of `_on` primitives, in the same order,
+    /// [`CompactionStore::commit_checkpoint`]'s `SqliteCompactionStore` impl
+    /// composes inside one `Transaction::new_unchecked(.., Immediate)` —
+    /// `SqliteCompactionStore` itself is only reachable through the
+    /// hardwired `Database::open()` path, untestable against a `TempDir`
+    /// like every other trait method's `_on` helper above.
+    fn commit_via_on(con: &Connection, record: &CommitRecord) -> Result<()> {
+        let tx = Transaction::new_unchecked(con, TransactionBehavior::Immediate)?;
+        for promotion in &record.promote {
+            promote_fact_on(&tx, record.draft_id, promotion)?;
+        }
+        for (old_id, new_id) in &record.supersede {
+            supersede_on(&tx, *old_id, *new_id)?;
+        }
+        for (existing_id, duplicate_fact_id, sources) in &record.merge_into {
+            merge_sources_on(&tx, *existing_id, sources)?;
+            supersede_on(&tx, *duplicate_fact_id, *existing_id)?;
+        }
+        update_status_on(&tx, record.draft_id, CompactionStatus::Committed)?;
+        tx.execute(
+            "UPDATE compactions SET summary = ?, rolling_summary = ?, needs_merge = ? WHERE id = ?",
+            params![
+                record.summary,
+                record.rolling_summary,
+                record.needs_merge,
+                record.draft_id,
+            ],
+        )?;
+        set_compacted_through_on(&tx, record.companion_id, Some(record.through_message_id))?;
+        tx.commit()
+    }
+
+    #[test]
+    fn a_mid_transaction_failure_rolls_back_every_promotion_and_leaves_the_draft_untouched() {
+        let (_dir, con) = fresh_db();
+        let earlier_id = insert_draft_on(&con, &a_draft()).unwrap();
+        update_status_on(&con, earlier_id, CompactionStatus::Committed).unwrap();
+        let earlier_fact = FactDraft {
+            category: FactCategory::CompanionState,
+            subject: Some(FactSubject::Companion),
+            text: "is nervous".to_string(),
+            quote_speaker: None,
+            sources: vec![1],
+            replaces: vec![],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        };
+        let earlier_ids =
+            insert_facts_on(&con, earlier_id, std::slice::from_ref(&earlier_fact)).unwrap();
+
+        let draft_id = insert_draft_on(&con, &a_draft()).unwrap();
+        let accepted = FactDraft {
+            category: FactCategory::CompanionState,
+            subject: Some(FactSubject::Companion),
+            text: "original text".to_string(),
+            quote_speaker: None,
+            sources: vec![2],
+            replaces: vec![earlier_ids[0]],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        };
+        let ids = insert_facts_on(&con, draft_id, std::slice::from_ref(&accepted)).unwrap();
+
+        // The last statement `commit_via_on` runs is the `compacted_through`
+        // update; a trigger on it fires `RAISE(ABORT)` after every earlier
+        // statement in the same transaction has already run, so a
+        // successful rollback here proves the whole transaction is atomic,
+        // not just this one statement.
+        con.execute(
+            "CREATE TRIGGER abort_commit BEFORE UPDATE OF compacted_through ON companion
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            [],
+        )
+        .unwrap();
+
+        let record = CommitRecord {
+            draft_id,
+            companion_id: 1,
+            through_message_id: 3,
+            summary: "new summary".to_string(),
+            rolling_summary: "".to_string(),
+            needs_merge: false,
+            promote: vec![FactPromotion {
+                fact_id: ids[0],
+                draft: FactDraft {
+                    text: "edited text".to_string(),
+                    ..accepted.clone()
+                },
+            }],
+            supersede: vec![(earlier_ids[0], ids[0])],
+            merge_into: vec![],
+        };
+
+        let err = commit_via_on(&con, &record).unwrap_err();
+        assert!(matches!(err, Error::SqliteFailure(_, _)));
+
+        let draft_facts = facts_for_on(&con, draft_id).unwrap();
+        assert_eq!(draft_facts.len(), 1);
+        assert_eq!(draft_facts[0].text, "original text");
+        assert!(draft_facts[0].active);
+        assert!(draft_facts[0].superseded_by.is_none());
+
+        let earlier_fact_row = facts_for_on(&con, earlier_id)
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == earlier_ids[0])
+            .unwrap();
+        assert!(earlier_fact_row.active);
+        assert!(earlier_fact_row.superseded_by.is_none());
+
+        let draft_checkpoint = get_checkpoint_on(&con, draft_id).unwrap().unwrap();
+        assert_eq!(draft_checkpoint.status, CompactionStatus::Draft);
+        assert!(draft_checkpoint.summary.is_none());
+
+        assert_eq!(compacted_through_on(&con, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn a_successful_commit_writes_the_promotion_supersede_and_checkpoint_update_together() {
+        let (_dir, con) = fresh_db();
+        let earlier_id = insert_draft_on(&con, &a_draft()).unwrap();
+        update_status_on(&con, earlier_id, CompactionStatus::Committed).unwrap();
+        let earlier_fact = FactDraft {
+            category: FactCategory::CompanionState,
+            subject: Some(FactSubject::Companion),
+            text: "is nervous".to_string(),
+            quote_speaker: None,
+            sources: vec![1],
+            replaces: vec![],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        };
+        let earlier_ids =
+            insert_facts_on(&con, earlier_id, std::slice::from_ref(&earlier_fact)).unwrap();
+
+        let draft_id = insert_draft_on(&con, &a_draft()).unwrap();
+        let accepted = FactDraft {
+            category: FactCategory::CompanionState,
+            subject: Some(FactSubject::Companion),
+            text: "original text".to_string(),
+            quote_speaker: None,
+            sources: vec![2],
+            replaces: vec![earlier_ids[0]],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        };
+        let ids = insert_facts_on(&con, draft_id, std::slice::from_ref(&accepted)).unwrap();
+
+        let record = CommitRecord {
+            draft_id,
+            companion_id: 1,
+            through_message_id: 3,
+            summary: "new summary".to_string(),
+            rolling_summary: "rolling".to_string(),
+            needs_merge: true,
+            promote: vec![FactPromotion {
+                fact_id: ids[0],
+                draft: FactDraft {
+                    text: "edited text".to_string(),
+                    ..accepted
+                },
+            }],
+            supersede: vec![(earlier_ids[0], ids[0])],
+            merge_into: vec![],
+        };
+
+        commit_via_on(&con, &record).unwrap();
+
+        let checkpoint = get_checkpoint_on(&con, draft_id).unwrap().unwrap();
+        assert_eq!(checkpoint.status, CompactionStatus::Committed);
+        assert!(checkpoint.committed_at.is_some());
+        assert!(checkpoint.needs_merge);
+        assert_eq!(checkpoint.summary.as_deref(), Some("new summary"));
+        assert_eq!(checkpoint.rolling_summary.as_deref(), Some("rolling"));
+        assert_eq!(compacted_through_on(&con, 1).unwrap(), Some(3));
+
+        let promoted = facts_for_on(&con, draft_id)
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == ids[0])
+            .unwrap();
+        assert!(promoted.active);
+        assert_eq!(promoted.text, "edited text");
+
+        let superseded = facts_for_on(&con, earlier_id)
+            .unwrap()
+            .into_iter()
+            .find(|f| f.id == earlier_ids[0])
+            .unwrap();
+        assert!(!superseded.active);
+        assert_eq!(superseded.superseded_by, Some(ids[0]));
     }
 }
