@@ -1394,6 +1394,9 @@ mod tests {
             self.inner
                 .set_extraction_result(id, raw_model_output, summary, attitude_ratings)
         }
+        fn fail_draft(&self, id: i64, error: &str) -> rusqlite::Result<()> {
+            self.inner.fail_draft(id, error)
+        }
         fn insert_facts(
             &self,
             compaction_id: i64,

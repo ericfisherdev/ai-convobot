@@ -1,7 +1,12 @@
 import { AttitudeData } from './AttitudeData';
 
-// Mirrors the backend's `compaction::types::CompactionStatus`.
-export type CompactionStatus = 'draft' | 'committed' | 'discarded' | 'stale';
+// Mirrors the backend's `compaction::types::CompactionStatus`. `failed`
+// (#208) is a checkpoint whose extraction pipeline itself errored (a
+// model/store I/O failure) before it ever judged the draft's content --
+// distinct from `discarded`, which covers both a user's deliberate
+// rejection and `fill_draft`'s own content-driven discards (an empty
+// range, unparseable output twice, an over-budget overlay).
+export type CompactionStatus = 'draft' | 'committed' | 'discarded' | 'stale' | 'failed';
 
 // Mirrors the backend's `compaction::types::CompactionTrigger`. `joiner_sync`
 // (#186) never reaches the frontend: the compaction routes 409 on a joiner
@@ -25,6 +30,8 @@ export type FactCategory =
 export type DraftPhase = 'extracting' | 'review';
 
 // Mirrors the backend's `compaction::view::CheckpointSummary`.
+// `extraction_error` (#208) is set only when `status === 'failed'`: why
+// extraction never produced a draft to review.
 export interface CheckpointSummary {
     id: number;
     from_message_id: number;
@@ -33,6 +40,7 @@ export interface CheckpointSummary {
     trigger: CompactionTrigger;
     committed_at: string | null;
     needs_merge: boolean;
+    extraction_error: string | null;
 }
 
 // Mirrors the backend's `compaction::view::PendingDraftSummary`.

@@ -2,8 +2,13 @@
 //! reason, an empty `GET /api/compaction` listing on a fresh chat, and the
 //! pin routes end to end (`GET /api/message` reporting `pinned`, and a
 //! pinned message's content showing up in `GET /api/debug/prompt`'s
-//! rendered `pins` block). The `202` extraction path needs a real GGUF and
-//! is verified manually, per this issue's plan.
+//! rendered `pins` block). A *successful* `202` extraction still needs a
+//! real GGUF and is verified manually, per this issue's plan — but #208's
+//! failure path needs no model at all: this binary's own default
+//! `llm_model_path` (the literal placeholder `path/to/your/gguf/model.gguf`)
+//! fails to load immediately, so `an_extraction_failure_...` below exercises
+//! the real `run_extraction_job`/`fail_pending_draft` wiring end to end
+//! without one.
 
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -292,5 +297,135 @@ fn from_stale_true_queues_a_recompaction_draft_over_the_stale_checkpoints_range(
     assert_eq!(
         listing["pending_draft"]["from_message_id"].as_i64(),
         Some(6)
+    );
+}
+
+/// #208: an extraction that fails must leave the checkpoint in an explicit
+/// terminal state, expose the reason over the API, and unblock the next
+/// trigger — never stuck in `Draft`/`extracting` forever. Runs the real
+/// `POST /api/compaction/draft` -> background `spawn_extraction` ->
+/// `run_extraction_job` pipeline end to end, no mocks or seeded rows:
+/// this binary's default `llm_model_path` (`path/to/your/gguf/model.gguf`,
+/// see `database.rs`'s `Database::init` seeding) names a file that does not
+/// exist and `compaction_model_path` is unset, so `ResidentExtractor` falls
+/// back to it and `LlamaModel::load_from_file` fails immediately with a
+/// clean `std::io::Error` — the same `DraftError::Model` class of failure
+/// #207's grammar bug produced before it was fixed, reached here without
+/// needing a real GGUF.
+///
+/// Before #208, this test would time out waiting for the status to leave
+/// `draft` (the checkpoint was never touched again after the failed
+/// extraction), and the final re-trigger assertion would fail with `409
+/// AlreadyPending` instead of `202`.
+#[test]
+fn an_extraction_failure_without_a_configured_model_reaches_failed_and_unblocks_the_trigger() {
+    let data_dir = tempfile::tempdir().expect("failed to create the data-dir temp dir");
+
+    let (_port, addr, _guard) = spawn_on_a_free_port(
+        |port| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_ai-companion"));
+            command
+                .env("COMPANION_HOST", "127.0.0.1")
+                .env("COMPANION_PORT", port.to_string())
+                .env("COMPANION_DATA_DIR", data_dir.path())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            command
+        },
+        Duration::from_secs(10),
+    );
+    let addr = addr.to_string();
+
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+
+    // Default `short_term_mem` is 5, default `compact_min_messages` is 8
+    // (see the `from_stale` test above for the same arithmetic): 20 user
+    // messages clears `20 - 5 >= 8` with room to spare.
+    for i in 1..=20 {
+        post_message(&agent, &addr, "user", &format!("message {i}"));
+    }
+
+    let draft_response = agent
+        .post(format!("http://{addr}/api/compaction/draft"))
+        .send_empty()
+        .unwrap_or_else(|e| {
+            panic!("POST /api/compaction/draft failed at the transport level: {e}")
+        });
+    assert_eq!(
+        draft_response.status(),
+        202,
+        "expected enough uncompacted messages to queue a draft"
+    );
+    let queued_body: Value = draft_response
+        .into_body()
+        .read_json()
+        .expect("202 body should be valid JSON");
+    let draft_id = queued_body["draft_id"]
+        .as_i64()
+        .expect("202 body should carry draft_id");
+
+    // Poll until the checkpoint leaves `draft` status. No real model load
+    // is attempted (the configured path does not exist), so this resolves
+    // almost immediately; the generous deadline is headroom for a loaded
+    // CI box, not for anything resembling real inference.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut detail;
+    loop {
+        detail = get_json(&agent, &format!("http://{addr}/api/compaction/{draft_id}"));
+        if detail["status"] != json!("draft") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "extraction never left Draft status within the deadline; last detail: {detail}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert_eq!(
+        detail["status"],
+        json!("failed"),
+        "a model-load failure should reach the Failed terminal state, got: {detail}"
+    );
+    let error = detail["extraction_error"]
+        .as_str()
+        .expect("extraction_error should be a readable string once status is failed");
+    assert!(
+        !error.is_empty(),
+        "extraction_error should explain the failure, not just mark it"
+    );
+
+    // The reason is readable from the listing route too, not just the
+    // per-checkpoint detail route.
+    let listing = get_json(&agent, &format!("http://{addr}/api/compaction"));
+    assert_eq!(
+        listing["pending_draft"],
+        Value::Null,
+        "a failed draft must not still read as pending"
+    );
+    let summary = listing["checkpoints"]
+        .as_array()
+        .expect("checkpoints should be a JSON array")
+        .iter()
+        .find(|c| c["id"].as_i64() == Some(draft_id))
+        .expect("the failed checkpoint should still be listed");
+    assert_eq!(summary["status"], json!("failed"));
+    assert_eq!(summary["extraction_error"].as_str(), Some(error));
+
+    // The core of #208's bug: a failed draft must not block the next
+    // trigger. Without the fix this 409s with "a draft is already pending".
+    let second_response = agent
+        .post(format!("http://{addr}/api/compaction/draft"))
+        .send_empty()
+        .unwrap_or_else(|e| {
+            panic!("POST /api/compaction/draft failed at the transport level: {e}")
+        });
+    assert_eq!(
+        second_response.status(),
+        202,
+        "a failed draft must not block a fresh trigger"
     );
 }

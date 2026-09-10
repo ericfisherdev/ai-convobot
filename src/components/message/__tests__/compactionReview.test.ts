@@ -35,6 +35,7 @@ const aDraft = (facts: CompactionFact[], summary = 'a summary'): CheckpointDetai
   trigger: 'threshold',
   committed_at: null,
   needs_merge: false,
+  extraction_error: null,
   phase: 'review',
   summary_text: summary,
   rolling_summary: null,

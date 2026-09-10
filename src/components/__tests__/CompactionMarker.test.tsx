@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { CompactionProvider } from '../context/compactionContext';
 import { MessagesProvider } from '../context/messageContext';
 import { CompactionMarker } from '../message/CompactionMarker';
@@ -26,6 +26,7 @@ const aCheckpoint = (overrides: Partial<CheckpointSummary> = {}): CheckpointSumm
   trigger: 'threshold',
   committed_at: '2024-01-01',
   needs_merge: false,
+  extraction_error: null,
   ...overrides,
 });
 
@@ -90,5 +91,43 @@ describe('CompactionMarker', () => {
     renderMarker([aCheckpoint({ status: 'stale' })]);
 
     expect(await screen.findByText('Continuity notes cover messages up to here')).toBeInTheDocument();
+  });
+
+  it('renders a failed notice with the extraction error, not the committed-checkpoint notice', async () => {
+    renderMarker([
+      aCheckpoint({ status: 'failed', extraction_error: 'model load failed' }),
+    ]);
+
+    expect(
+      await screen.findByText('Continuity notes failed to draft: model load failed')
+    ).toBeInTheDocument();
+    // Falsifies "the marker just always renders `CompactionNotice`": that
+    // component's copy, and its "Show notes" dialog trigger, must be absent
+    // for a failed checkpoint.
+    expect(screen.queryByText('Continuity notes cover messages up to here')).not.toBeInTheDocument();
+    expect(screen.queryByText('Show notes')).not.toBeInTheDocument();
+  });
+
+  it('dismissing a failed notice hides it', async () => {
+    renderMarker([aCheckpoint({ status: 'failed', extraction_error: 'boom' })]);
+
+    const notice = await screen.findByText('Continuity notes failed to draft: boom');
+    fireEvent.click(screen.getByText('Dismiss'));
+
+    await waitFor(() => expect(notice).not.toBeInTheDocument());
+  });
+
+  it('retrying a failed notice re-triggers a compaction draft', async () => {
+    const fetchMock = renderMarker([aCheckpoint({ status: 'failed', extraction_error: 'boom' })]);
+    await screen.findByText('Continuity notes failed to draft: boom');
+
+    fireEvent.click(screen.getByText('Retry'));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/compaction/draft',
+        expect.objectContaining({ method: 'POST' })
+      )
+    );
   });
 });

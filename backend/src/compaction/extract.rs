@@ -956,8 +956,9 @@ pub fn spawn_holding(
 /// to the old hard-coded `SoloSpeakers` in solo mode, since a solo registry
 /// is just `user` then `char`), and calls [`fill_draft`] against the
 /// production [`SqliteCompactionStore`]/[`ResidentExtractor`]. Errors are
-/// logged and swallowed, like every other background job in this codebase;
-/// a missing row just ends the thread.
+/// logged, like every other background job in this codebase, but (#208)
+/// never merely swallowed once a draft row is known: see
+/// [`run_extraction_job`]/[`fail_pending_draft`].
 ///
 /// `registry` is a snapshot (`Clone`, owned, `Send`), not a live handle: the
 /// caller takes it from the same shared registry a round already snapshots
@@ -980,6 +981,30 @@ pub fn spawn_extraction(
     })
 }
 
+/// Loads `draft_id` and runs extraction over it via [`run_extraction`]. A
+/// missing or unreadable row (before we even know a draft exists to
+/// transition) just ends the thread, same as before #208 — there is
+/// nothing to flip a status on. Once the row *is* known, every failure
+/// [`run_extraction`] returns *or panics with* goes through
+/// [`fail_pending_draft`] before this function returns it, so a failed
+/// extraction always leaves the checkpoint in an explicit terminal state
+/// instead of stuck in `Draft`/`extracting` forever (the bug #208 fixes:
+/// the trigger in `hook.rs` treats any pending `Draft` row as a reason not
+/// to queue another one).
+///
+/// The `catch_unwind` is load-bearing, not defensive boilerplate:
+/// `llama-cpp-2`'s `LlamaModel::load_from_file` panics (does not return
+/// `Err`) when the configured GGUF path does not exist, confirmed against
+/// this binary directly while building this fix. Without it, that one
+/// panic would unwind straight out of this function -- `spawn_holding`'s
+/// own doc comment already documents that the *turn slot* survives a
+/// panicking job (`TurnGuard::drop` runs regardless), but nothing downstream
+/// of that ever ran `fail_pending_draft`, so the checkpoint stayed wedged
+/// in `Draft` exactly as before this fix. `AssertUnwindSafe` is safe here:
+/// every value the closure captures (`store`'s reference to a unit struct,
+/// `draft`'s owned plain-data snapshot, `registry`'s owned snapshot) is
+/// left untouched by an aborted call on this thread, and `Database::open()`
+/// inside `run_extraction` starts a fresh connection per call regardless.
 fn run_extraction_job(draft_id: i64, registry: ParticipantRegistry) -> Result<(), String> {
     let store = SqliteCompactionStore;
     let draft = store
@@ -987,6 +1012,66 @@ fn run_extraction_job(draft_id: i64, registry: ParticipantRegistry) -> Result<()
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("draft {draft_id} not found"))?;
 
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_extraction(&store, &draft, registry)
+    }))
+    .unwrap_or_else(|payload| Err(panic_message(&payload)));
+
+    if let Err(err) = &outcome {
+        fail_pending_draft(&store, draft.id, err);
+    }
+    outcome
+}
+
+/// Turns a caught panic payload into a readable message: `&str`/`String`
+/// cover every panic macro (`panic!`, `.unwrap()`, `.expect()`, and the
+/// bare `&str` `llama-cpp-2` itself panics with — see
+/// [`run_extraction_job`]'s doc comment), falling back to a fixed message
+/// for the rare payload that is neither.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = panic_payload_text(payload) {
+        format!("extraction panicked: {message}")
+    } else {
+        "extraction panicked with a non-string payload".to_string()
+    }
+}
+
+/// The `&str`/`String` payload every `panic!`/`.unwrap()`/`.expect()` call
+/// produces, unwrapped through one extra layer of `Box<dyn Any + Send>` if
+/// present. That extra layer is not hypothetical: confirmed empirically
+/// while building this fix -- the panic this guards against most directly
+/// (`llama-cpp-2`'s `debug_assert!` in `LlamaModel::load_from_file`, a
+/// plain formatted `String` at its own panic site) still arrives at
+/// [`run_extraction_job`]'s `catch_unwind` boxed a second time, most likely
+/// by something in the actix/tokio worker machinery between this thread and
+/// wherever the panic actually originates. Recursing (bounded by the
+/// payload no longer being a `Box<dyn Any + Send>`, which `String`/`&str`
+/// never are) means this keeps working regardless of exactly how many
+/// layers a given call stack adds.
+fn panic_payload_text(payload: &(dyn std::any::Any + Send)) -> Option<String> {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return Some((*s).to_string());
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return Some(s.clone());
+    }
+    if let Some(inner) = payload.downcast_ref::<Box<dyn std::any::Any + Send>>() {
+        return panic_payload_text(inner.as_ref());
+    }
+    None
+}
+
+/// The extraction pipeline for an already-loaded `draft` row: builds the
+/// range and speaker policy, then calls [`fill_draft`]. Split out from
+/// [`run_extraction_job`] so every failure after the row is known —
+/// `Database::get_messages_between`, `Database::get_config`, and whatever
+/// `fill_draft` itself returns — funnels through this one `Result<(), String>`
+/// for [`run_extraction_job`] to hand to [`fail_pending_draft`].
+fn run_extraction(
+    store: &impl CompactionStore,
+    draft: &Checkpoint,
+    registry: ParticipantRegistry,
+) -> Result<(), String> {
     let speakers = RegistrySpeakers(registry);
 
     let messages = Database::get_messages_between(draft.from_message_id, draft.through_message_id)
@@ -1000,14 +1085,46 @@ fn run_extraction_job(draft_id: i64, registry: ParticipantRegistry) -> Result<()
     let overlay_budget_tokens = ContextManager::new(config).token_budget.total * 15 / 100;
 
     fill_draft(
-        &store,
+        store,
         &ResidentExtractor,
-        &draft,
+        draft,
         &range,
         &speakers,
         overlay_budget_tokens,
     )
     .map_err(|e| e.to_string())
+}
+
+/// Gives a failed extraction an explicit terminal state (#208): flips
+/// `draft_id` from `Draft` to `Failed` via [`CompactionStore::fail_draft`],
+/// recording `error` so `GET /api/compaction/{id}` can explain it. Uses the
+/// same conditional-update pattern #175's `transition_status` established
+/// (`UPDATE ... WHERE id = ? AND status = ?`, `changes() == 0` read as a
+/// lost race), so this can never clobber a status `fill_draft` or a
+/// concurrent commit/discard already moved on. That covers two distinct
+/// "already handled" cases, both surfacing as `QueryReturnedNoRows` here:
+/// `fill_draft`'s own `discard_draft` already flipped the row to
+/// `Discarded` for a content reason (empty range, unparseable output twice,
+/// an over-budget overlay) before returning its error, and an unrelated
+/// commit/discard raced this thread from the API. Either way the row is
+/// already terminal, so this is a no-op, not an error — logged at a level
+/// that says so rather than reads as a new failure.
+fn fail_pending_draft(store: &impl CompactionStore, draft_id: i64, error: &str) {
+    match store.fail_draft(draft_id, error) {
+        Ok(()) => {
+            eprintln!("compaction: draft {draft_id} failed extraction: {error}");
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            eprintln!(
+                "compaction: draft {draft_id} failed extraction ({error}), but had already left Draft status (its own discard, or a concurrent commit/discard) -- nothing to do"
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "compaction: draft {draft_id} failed extraction ({error}), and recording that failure itself failed: {e}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1487,6 +1604,192 @@ mod tests {
         let updated = store.get_checkpoint(draft.id).unwrap().unwrap();
         assert_eq!(updated.status, CompactionStatus::Discarded);
         assert!(store.facts_for(draft.id).unwrap().is_empty());
+    }
+
+    // --- fail_pending_draft (#208) ---
+
+    #[test]
+    fn fail_pending_draft_flips_a_pending_draft_to_failed_with_its_reason() {
+        let store = RecordingStore::new();
+        let range = synthetic_range();
+        let draft = a_pending_draft(&store, &range);
+
+        fail_pending_draft(
+            &store,
+            draft.id,
+            "extraction model error: model load failed",
+        );
+
+        let updated = store.get_checkpoint(draft.id).unwrap().unwrap();
+        assert_eq!(updated.status, CompactionStatus::Failed);
+        assert_eq!(
+            updated.extraction_error.as_deref(),
+            Some("extraction model error: model load failed")
+        );
+    }
+
+    #[test]
+    fn fail_pending_draft_does_not_block_the_next_trigger() {
+        // The core of #208's bug: a stuck `Draft` row makes
+        // `pending_draft` keep reporting it, which `should_compact`/the
+        // manual-trigger route both read as "a draft is already pending".
+        // Once `fail_pending_draft` runs, `pending_draft` must go back to
+        // `None` so a fresh draft can be queued.
+        let store = RecordingStore::new();
+        let range = synthetic_range();
+        let draft = a_pending_draft(&store, &range);
+        assert!(store.pending_draft(draft.companion_id).unwrap().is_some());
+
+        fail_pending_draft(&store, draft.id, "boom");
+
+        assert!(store.pending_draft(draft.companion_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn fail_pending_draft_never_clobbers_a_draft_that_already_moved_on() {
+        // A concurrent commit/discard (or `fill_draft`'s own content-reason
+        // discard, already run by the time this is called) must win: the
+        // conditional `Draft -> Failed` transition has to lose that race
+        // silently rather than overwrite a row that already reached some
+        // other terminal state.
+        let store = RecordingStore::new();
+        let range = synthetic_range();
+        let draft = a_pending_draft(&store, &range);
+        store
+            .transition_status(
+                draft.id,
+                CompactionStatus::Draft,
+                CompactionStatus::Discarded,
+            )
+            .unwrap();
+
+        fail_pending_draft(&store, draft.id, "too late");
+
+        let updated = store.get_checkpoint(draft.id).unwrap().unwrap();
+        assert_eq!(updated.status, CompactionStatus::Discarded);
+        assert_eq!(updated.extraction_error, None);
+    }
+
+    #[test]
+    fn fail_pending_draft_on_an_unknown_id_does_not_panic() {
+        let store = RecordingStore::new();
+        // No draft was ever inserted; `fail_draft` returns
+        // `QueryReturnedNoRows`, the same "lost race" path a concurrent
+        // discard would produce. Just asserting this returns at all is the
+        // regression test: `fail_pending_draft` must not `.unwrap()`.
+        fail_pending_draft(&store, 999, "boom");
+    }
+
+    // --- panic_message / panic_payload_text (#208) ---
+    //
+    // Exercises the exact failure mode discovered while building this fix:
+    // `llama-cpp-2`'s `LlamaModel::load_from_file` does not return `Err` on
+    // a missing GGUF path in a debug build, it `debug_assert!`s and panics
+    // -- confirmed by running this binary directly against the default,
+    // unconfigured `llm_model_path`. Without `run_extraction_job`'s
+    // `catch_unwind`, that panic unwinds straight past `fail_pending_draft`
+    // and the checkpoint stays wedged in `Draft` exactly like the bug this
+    // issue fixes. The nested-payload case (`panic_payload_text` recursing
+    // through one `Box<dyn Any + Send>` layer) is not a hypothetical either:
+    // the payload `catch_unwind` actually receives for that panic is boxed
+    // a second time somewhere between this thread and the panic site, also
+    // confirmed by running the binary directly and inspecting it.
+
+    #[test]
+    fn panic_message_formats_a_str_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(panic_message(payload.as_ref()), "extraction panicked: boom");
+    }
+
+    #[test]
+    fn panic_message_formats_a_string_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom".to_string());
+        assert_eq!(panic_message(payload.as_ref()), "extraction panicked: boom");
+    }
+
+    #[test]
+    fn panic_message_unwraps_one_layer_of_boxed_any() {
+        // The shape actually observed for `debug_assert!`'s panic: the
+        // `String` payload arrives wrapped in an extra `Box<dyn Any + Send>`.
+        let inner: Box<dyn std::any::Any + Send> = Box::new("nested boom".to_string());
+        let payload: Box<dyn std::any::Any + Send> = Box::new(inner);
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            "extraction panicked: nested boom"
+        );
+    }
+
+    #[test]
+    fn panic_message_falls_back_for_a_non_string_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42i32);
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            "extraction panicked with a non-string payload"
+        );
+    }
+
+    #[test]
+    fn run_extraction_jobs_catch_unwind_converts_a_panic_to_a_failed_draft() {
+        // `run_extraction_job` itself is wired to the real `Database`/
+        // `ResidentExtractor` globals and cannot run in a unit test (see the
+        // comment on `run_extraction_surfaces_fill_drafts_model_error_...`
+        // below), so this exercises the exact same `catch_unwind` ->
+        // `fail_pending_draft` sequence `run_extraction_job` runs, against
+        // a closure that panics the same way `fill_draft`'s real call chain
+        // does -- proving the wiring this issue is actually about, not just
+        // `fail_pending_draft` in isolation (that only proves the DB write
+        // works once something remembers to call it).
+        let store = RecordingStore::new();
+        let range = synthetic_range();
+        let draft = a_pending_draft(&store, &range);
+
+        let outcome: Result<(), String> = std::panic::catch_unwind(|| {
+            panic!("{}", "simulated model load panic");
+        })
+        .unwrap_or_else(|payload| Err(panic_message(payload.as_ref())));
+
+        assert!(outcome.is_err());
+        if let Err(err) = &outcome {
+            fail_pending_draft(&store, draft.id, err);
+        }
+
+        let updated = store.get_checkpoint(draft.id).unwrap().unwrap();
+        assert_eq!(updated.status, CompactionStatus::Failed);
+        assert_eq!(
+            updated.extraction_error.as_deref(),
+            Some("extraction panicked: simulated model load panic")
+        );
+    }
+
+    // --- run_extraction (#208) ---
+
+    #[test]
+    fn run_extraction_surfaces_fill_drafts_model_error_without_panicking() {
+        // `extract_chunk` maps an `Extractor::extract` I/O error straight to
+        // `DraftError::Model` and returns early -- `fill_draft` never calls
+        // `discard_draft` for this path (unlike `Unparseable`), so this is
+        // exactly the failure #208 exists to terminal-ize: without the fix,
+        // this draft is left in `Draft` forever.
+        let store = RecordingStore::new();
+        let range = synthetic_range();
+        let draft = a_pending_draft(&store, &range);
+        let speakers = solo_speakers();
+        let extractor = FakeExtractor::returning(vec![Err(std::io::Error::other(
+            "simulated model load failure",
+        ))]);
+
+        let err = fill_draft(&store, &extractor, &draft, &range, &speakers, usize::MAX)
+            .expect_err("a model error should fail, not silently succeed");
+        assert!(matches!(err, DraftError::Model(_)));
+
+        // `fill_draft` alone (what this test exercises directly, since
+        // `run_extraction`/`run_extraction_job` are wired to the real
+        // `Database`/`ResidentExtractor` globals and cannot run in a unit
+        // test) leaves the row exactly as it found it -- still `Draft`.
+        // `fail_pending_draft`'s own tests above cover the transition this
+        // error is meant to trigger once `run_extraction_job` calls it.
+        let updated = store.get_checkpoint(draft.id).unwrap().unwrap();
+        assert_eq!(updated.status, CompactionStatus::Draft);
     }
 
     // --- spawn_holding ---
