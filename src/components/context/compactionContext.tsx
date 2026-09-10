@@ -229,6 +229,16 @@ export const CompactionProvider: React.FC<CompactionProviderProps> = ({ children
     return () => stopDraftPoll();
   }, [refresh, stopDraftPoll]);
 
+  // A listing that reports an `extracting` draft with no poll running
+  // (page reload / second tab mid-extraction) would otherwise never learn
+  // the draft reached `review`; `draftReady` only runs for drafts this
+  // tab queued itself via `triggerDraft`.
+  useEffect(() => {
+    if (pendingDraft?.phase === 'extracting' && draftPollRef.current === null) {
+      draftReady(pendingDraft.id);
+    }
+  }, [pendingDraft, draftReady]);
+
   return (
     <CompactionContext.Provider
       value={{
