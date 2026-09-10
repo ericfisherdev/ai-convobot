@@ -409,16 +409,16 @@ pub fn build_extraction_prompt(
 /// Every rule definition here is a single physical line (`root`/`attitude`
 /// reference named per-field sub-rules rather than wrapping), because
 /// llama.cpp's C grammar parser only treats a bare newline as insignificant
-/// while inside an unclosed `(...)` group — outside of one, a newline ends
-/// the current rule, and the next line is then parsed as if it must start a
-/// new `name ::=` definition. A rule split across lines like the pre-#207
-/// version of `root` therefore fails with `expecting name at ...` against a
-/// real model, even though every unit test here (which never hands this
-/// string to llama.cpp) passes. `#[cfg(test)] mod tests`'s
-/// `gbnf_rule_boundary_lint` module-free-checks this constraint on every
-/// grammar constant below; `llm.rs`'s
-/// `extract_returns_grammar_valid_json_when_a_test_gguf_is_available` test
-/// exercises this exact constant against a real GGUF when one is available.
+/// while inside an unclosed `(...)` group (or right after `::=`/`|`) —
+/// otherwise, a newline ends the current rule, and the next line is then
+/// parsed as if it must start a new `name ::=` definition. A rule split
+/// across lines like the pre-#207 version of `root` therefore fails with
+/// `expecting name at ...` against a real model, even though every unit test
+/// here (which never hands this string to llama.cpp) passes. `mod tests`'s
+/// `// --- #207` section checks this constraint on every grammar constant
+/// below via `check_gbnf_rule_boundaries`, without a GGUF; this same
+/// module's own `extracts_from_a_real_gguf` test exercises this exact
+/// constant against a real GGUF when one is available.
 pub const EXTRACTION_GRAMMAR: &str = r#"root ::= "{" ws companion-state-field ws "," ws user-state-field ws "," ws milestones-field ws "," ws backstory-field ws "," ws open-threads-field ws "," ws rules-field ws "," ws people-field ws "," ws key-quotes-field ws "," ws summary-field ws "," ws attitude-field ws "}"
 
 companion-state-field ::= "\"companion_state\"" ws ":" ws state-array
@@ -525,6 +525,15 @@ fn check_gbnf_rule_boundaries(gbnf: &str) -> Result<(), String> {
     let mut escaped = false;
     let mut line_no = 1usize;
     let mut skip_to_eol = false;
+    // Tracks whether the most recent depth-0 non-whitespace token was `::=`
+    // or `|`: `llama-grammar.cpp`'s `parse_rule` (line 675, immediately
+    // after consuming `::=`) and `parse_alternates` (line 443, immediately
+    // after consuming `|`) both call `parse_space(pos, /*newline_ok=*/true)`
+    // unconditionally, regardless of nesting — so a newline right there is
+    // always legal, unlike every other depth-0 position. Whitespace and `#`
+    // comments never clear this; any other real token does.
+    let mut colon_run = 0u8;
+    let mut after_free_newline_token = false;
     for (byte_idx, ch) in gbnf.char_indices() {
         if skip_to_eol {
             if ch == '\n' {
@@ -548,16 +557,43 @@ fn check_gbnf_rule_boundaries(gbnf: &str) -> Result<(), String> {
             '\n' if depth == 0
                 && !in_string
                 && !in_char_class
+                && !after_free_newline_token
                 && !rule_starts_or_grammar_ends(&gbnf[byte_idx + 1..]) =>
             {
                 return Err(format!(
-                    "line {line_no}: bare newline at paren depth 0 outside a rule \
-                     boundary; llama.cpp's grammar parser ends the rule here and then \
-                     fails to parse the next line as a new `name ::=` definition"
+                    "line {line_no}: bare newline at paren depth 0, not right after \
+                     `::=` or `|`, and outside a rule boundary; llama.cpp's grammar \
+                     parser ends the rule here and then fails to parse the next line \
+                     as a new `name ::=` definition"
                 ));
             }
             _ => {}
         }
+
+        if !in_string && !in_char_class && depth == 0 && !skip_to_eol {
+            match ch {
+                ':' => {
+                    colon_run = (colon_run + 1).min(2);
+                    after_free_newline_token = false;
+                }
+                '=' if colon_run == 2 => {
+                    after_free_newline_token = true;
+                    colon_run = 0;
+                }
+                '|' => {
+                    after_free_newline_token = true;
+                    colon_run = 0;
+                }
+                ' ' | '\t' | '\r' | '\n' | '#' => {
+                    // Whitespace and comments never cancel a pending `::=`/`|`.
+                }
+                _ => {
+                    after_free_newline_token = false;
+                    colon_run = 0;
+                }
+            }
+        }
+
         if ch == '\n' {
             line_no += 1;
         }
@@ -1555,6 +1591,49 @@ string ::= "\"" [a-z]* "\""
 value ::= string
 "#;
         assert_eq!(check_gbnf_rule_boundaries(nested), Ok(()));
+    }
+
+    /// A newline directly after `::=`, at paren depth 0, is legal per
+    /// `llama-grammar.cpp::parse_rule` (line 675:
+    /// `pos = parse_space(pos + 3, /*newline_ok=*/true);`, called
+    /// immediately after matching `::=`) — this is exactly the shape
+    /// llama.cpp's own bundled `json.gbnf` uses for every multi-line rule
+    /// (`object ::=\n  "{" (...)? "}"`). The pre-fix version of this lint
+    /// rejected it as a false positive.
+    #[test]
+    fn the_lint_allows_a_newline_directly_after_coloncoloneq() {
+        let after_coloncoloneq = r#"object ::=
+  "{" ws "}"
+ws ::= [ \n\t]*
+"#;
+        assert_eq!(check_gbnf_rule_boundaries(after_coloncoloneq), Ok(()));
+    }
+
+    /// A newline directly after a trailing `|`, at paren depth 0, is legal
+    /// per `llama-grammar.cpp::parse_alternates` (line 443:
+    /// `pos = parse_space(pos + 1, true);`, called immediately after
+    /// matching `|`, unconditionally — not gated on `is_nested`). A newline
+    /// *before* a leading `|` on the next line is not: `parse_sequence`
+    /// stops at the newline (its own `parse_space` calls pass
+    /// `is_nested`, which is `false` at depth 0), so `parse_alternates`'s
+    /// `while (*pos == '|')` loop never sees it and the rule ends there —
+    /// the next line is then read as a new `name ::=` definition and fails,
+    /// exactly like the original bug.
+    #[test]
+    fn the_lint_allows_a_newline_directly_after_a_trailing_pipe_but_not_before_a_leading_one() {
+        let trailing_pipe = r#"value ::= "a" |
+  "b" | "c"
+"#;
+        assert_eq!(check_gbnf_rule_boundaries(trailing_pipe), Ok(()));
+
+        let leading_pipe = r#"value ::= "a" | "b"
+  | "c"
+"#;
+        assert!(
+            check_gbnf_rule_boundaries(leading_pipe).is_err(),
+            "a newline before a leading `|` is not the exception llama.cpp grants; \
+             the lint should still reject it"
+        );
     }
 
     // --- manual/CI-optional acceptance test ---
