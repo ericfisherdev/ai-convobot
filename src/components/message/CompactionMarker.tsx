@@ -6,7 +6,7 @@ import { useMobile } from '../../hooks/useMobile';
 import { CheckpointDetail, CompactionDraftReview, DraftPhase, RejectedItem } from '../interfaces/Compaction';
 import { CompactionDraftCard } from './CompactionDraftCard';
 import { CompactionNotice } from './CompactionNotice';
-import { initialReviewState, ReviewState } from './compactionReview';
+import { applyServerRejection, initialReviewState, ReviewState } from './compactionReview';
 import { scrollToMessage } from '../../lib/messageAnchors';
 import { Button } from '../ui/button';
 import { Drawer, DrawerContent, DrawerTrigger } from '../ui/drawer';
@@ -77,7 +77,14 @@ function PendingDraftMarker({
       return;
     }
     if (outcome.status === 422) {
-      setRejections(toRejectedItems(outcome.body));
+      const rejected = toRejectedItems(outcome.body);
+      setRejections(rejected);
+      // Applied once, here, at the moment the rejection arrives -- not by
+      // the card's own mount effect (removed below), which would otherwise
+      // re-strike an item the user re-accepted every time the mobile
+      // drawer closes and reopens (it persists this same `rejections`
+      // across the remount and would re-run against it).
+      setReview((prev) => (prev ? applyServerRejection(prev, rejected) : prev));
     }
     // Any other failure is already toasted by `useCompaction().commit`.
   };

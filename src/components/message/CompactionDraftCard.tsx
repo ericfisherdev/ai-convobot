@@ -229,12 +229,23 @@ export function CompactionDraftCard({
   };
 
   useEffect(() => {
+    // A controlled owner (`PendingDraftMarker`) applies a server rejection
+    // itself, once, at the moment the `422` arrives (see its `handleCommit`).
+    // Re-applying here on every mount would re-strike an item the user has
+    // since re-accepted: the mobile drawer unmounts this card on close and
+    // remounts it on reopen, but `serverRejections` is unchanged (it is
+    // still the same rejection from the earlier failed attempt), so this
+    // effect would run again against the user's already-corrected state.
+    // The uncontrolled path (internal `useState`, used by `CompactionNotice`'s
+    // read-only dialog) has no such owner and keeps applying it here.
+    if (onStateChange) return;
     applyUpdate((prev) => applyServerRejection(prev, serverRejections));
-    // Only re-run when the rejections themselves change -- `applyUpdate`
-    // closes over `state`, which changes on every edit and would otherwise
-    // reapply an already-applied (and by then stale) rejection list.
+    // Only re-run when `serverRejections` (or the controlled/uncontrolled
+    // mode itself) actually changes -- `applyUpdate` is omitted from the
+    // dep list since it is redefined every render but forwards the updater
+    // unchanged, so including it would only cause needless re-runs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [serverRejections]);
+  }, [serverRejections, onStateChange]);
 
   const grouped = groupByCategory(state.items);
   const { current, rated, blended } = draft.attitude;
