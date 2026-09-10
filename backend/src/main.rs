@@ -792,6 +792,7 @@ fn queue_recompaction_draft() -> Result<RecompactionOutcome, String> {
 async fn compaction_draft(
     body: web::Json<DraftRequest>,
     joiner: Option<web::Data<JoinerHandle>>,
+    registry: web::Data<RwLock<ParticipantRegistry>>,
 ) -> HttpResponse {
     if let Some(response) = reject_if_joiner(&joiner) {
         return response;
@@ -807,6 +808,12 @@ async fn compaction_draft(
             .body("A reply is still being generated; wait for it to finish before re-compacting");
     };
 
+    // Snapshotted before the blocking closure runs, same as every other
+    // handler that calls `spawn_extraction`/`run_round`: #182's
+    // `RegistrySpeakers` needs an owned, `Send` registry, not a live lock
+    // held across the extraction thread.
+    let speaker_registry = snapshot_speakers(&registry).registry;
+
     match off_worker(
         "Error while queuing a re-compaction draft",
         queue_recompaction_draft,
@@ -814,7 +821,7 @@ async fn compaction_draft(
     .await
     {
         Ok(RecompactionOutcome::Queued(draft_id)) => {
-            crate::compaction::extract::spawn_extraction(turn_guard, draft_id);
+            crate::compaction::extract::spawn_extraction(turn_guard, draft_id, speaker_registry);
             HttpResponse::Accepted().body(format!("Re-compaction draft {} queued", draft_id))
         }
         Ok(RecompactionOutcome::PendingDraftExists) => {
