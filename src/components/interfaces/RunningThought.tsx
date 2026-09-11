@@ -11,3 +11,8 @@ export interface RunningThought {
     edited: boolean;
     created_at: string;
 }
+
+// `PATCH /api/thoughts/{id}`'s body (#217/#218).
+export interface RunningThoughtEdit {
+    text: string;
+}

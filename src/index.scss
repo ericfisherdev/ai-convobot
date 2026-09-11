@@ -84,7 +84,7 @@ body {
 
 @layer utilities {
   .max-container {
-    @apply max-w-5xl mx-auto sm:px-16 pb-12 px-8 h-full flex flex-col gap-2 items-center;
+    @apply max-w-5xl lg:max-w-7xl mx-auto sm:px-16 pb-12 px-8 h-full flex flex-col gap-2 items-center;
     height: calc(var(--vh, 1vh) * 100);
     min-height: -webkit-fill-available;
   }

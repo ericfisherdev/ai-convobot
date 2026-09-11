@@ -259,5 +259,42 @@ export function reduceStreamChunk(
         effects,
       };
     }
+
+    // An `event` a newer backend sends that this build does not know about
+    // yet. Ignoring it (rather than falling through and crashing the
+    // caller's destructure) keeps a mixed-version deploy from breaking the
+    // whole stream over one unrecognised chunk.
+    default:
+      return { state, effects: [] };
+  }
+}
+
+// Owns the `getReader()`/`TextDecoder`/`splitSseRecords`/`parseStreamChunk`
+// loop shared by `/api/prompt/stream` (`ChatWindow.promptMessage`) and
+// `/api/thoughts/regenerate` (`runningThoughtsContext.regenerateFrom`), so
+// neither caller re-implements SSE framing on its own. Server-Sent Events
+// arrive as "data: {json}\n\n" records, and a single `read()` can return a
+// partial record, so the trailing remainder is held over to the next read.
+// A malformed record is skipped, not fatal, matching `parseStreamChunk`'s
+// own "one bad record" contract.
+export async function* readStreamChunks(
+  body: ReadableStream<Uint8Array>
+): AsyncGenerator<StreamChunk> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const { records, rest } = splitSseRecords(buffer);
+    buffer = rest;
+
+    for (const record of records) {
+      const chunk = parseStreamChunk(record);
+      if (chunk) yield chunk;
+    }
   }
 }

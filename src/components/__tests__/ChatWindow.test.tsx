@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event'
 import ChatWindow from '../ChatWindow'
 import { MessagesProvider, useMessages } from '../context/messageContext'
 import { CompactionProvider } from '../context/compactionContext'
+import { RunningThoughtsProvider } from '../context/runningThoughtsContext'
 import { UserDataProvider } from '../context/userContext'
 import { CompanionDataProvider } from '../context/companionContext'
 import { ConfigProvider } from '../context/configContext'
@@ -108,7 +109,9 @@ const MockProviders: React.FC<{ children: React.ReactNode }> = ({ children }) =>
               <AttitudeProvider>
                 <SessionProvider>
                   <CompactionProvider>
-                    {children}
+                    <RunningThoughtsProvider>
+                      {children}
+                    </RunningThoughtsProvider>
                   </CompactionProvider>
                 </SessionProvider>
               </AttitudeProvider>
@@ -137,6 +140,9 @@ describe('ChatWindow Component', () => {
       }
       if (url.startsWith('/api/compaction')) {
         return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
+      }
+      if (url.startsWith('/api/thoughts')) {
+        return Promise.resolve(jsonResponse({ thoughts: [] }))
       }
       return Promise.resolve(jsonResponse([]))
     }) as unknown as typeof fetch
@@ -212,6 +218,9 @@ describe('ChatWindow Component', () => {
       if (url.startsWith('/api/compaction')) {
         return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
       }
+      if (url.startsWith('/api/thoughts')) {
+        return Promise.resolve(jsonResponse({ thoughts: [] }))
+      }
       return Promise.resolve(jsonResponse([]))
     })
     global.fetch = fetchMock as unknown as typeof fetch
@@ -279,6 +288,9 @@ describe('ChatWindow Component', () => {
       }
       if (url.startsWith('/api/compaction')) {
         return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
+      }
+      if (url.startsWith('/api/thoughts')) {
+        return Promise.resolve(jsonResponse({ thoughts: [] }))
       }
       return Promise.resolve(jsonResponse([]))
     })
@@ -349,6 +361,9 @@ describe('ChatWindow Component', () => {
       }
       if (url.startsWith('/api/compaction')) {
         return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
+      }
+      if (url.startsWith('/api/thoughts')) {
+        return Promise.resolve(jsonResponse({ thoughts: [] }))
       }
       return Promise.resolve(jsonResponse([]))
     })
@@ -435,6 +450,9 @@ describe('ChatWindow Component', () => {
       if (url.startsWith('/api/compaction')) {
         return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
       }
+      if (url.startsWith('/api/thoughts')) {
+        return Promise.resolve(jsonResponse({ thoughts: [] }))
+      }
       return Promise.resolve(jsonResponse([]))
     })
     global.fetch = fetchMock as unknown as typeof fetch
@@ -462,6 +480,95 @@ describe('ChatWindow Component', () => {
 
     await waitFor(() => {
       expect(textarea).not.toBeDisabled()
+    })
+  })
+
+  it('renders a streamed running thought in the panel before the reply it informed', async () => {
+    const user = userEvent.setup()
+    let releaseReply: (() => void) | undefined
+    const replyGate = new Promise<void>(resolve => { releaseReply = resolve })
+
+    const aThought = {
+      id: 1,
+      companion_id: 1,
+      speaker_id: 'char',
+      from_message_id: 1,
+      through_message_id: 1,
+      text: 'the user seems glad to be chatting',
+      edited: false,
+      created_at: '2024-01-15 09:30',
+    }
+    const preReplyChunks = [
+      { request_id: 'r1', event: 'thought_started', content: '', is_complete: false, speaker_id: 'char' },
+      { request_id: 'r1', event: 'token', content: '', is_complete: false, speaker_id: 'char', thought: aThought },
+    ]
+    const replyChunks = [
+      { request_id: 'r1', event: 'reply_started', content: '', is_complete: false, speaker_id: 'char' },
+      { request_id: 'r1', event: 'reply_complete', content: 'hi', is_complete: false, speaker_id: 'char', message_id: 2 },
+      { request_id: 'r1', event: 'round_complete', content: '', is_complete: true, speaker_id: '' },
+    ]
+
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url.startsWith('/api/config')) {
+        return Promise.resolve(jsonResponse({ multiplayer_mode: 'solo', running_thoughts_enabled: true }))
+      }
+      if (url.startsWith('/api/prompt/stream')) {
+        const encoder = new TextEncoder()
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          body: new ReadableStream<Uint8Array>({
+            async start(controller) {
+              for (const chunk of preReplyChunks) {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+              }
+              await replyGate
+              for (const chunk of replyChunks) {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+              }
+              controller.close()
+            },
+          }),
+        })
+      }
+      if (url.startsWith('/api/session')) {
+        return Promise.resolve(jsonResponse(session))
+      }
+      if (url.startsWith('/api/attitude/summary/')) {
+        return Promise.resolve(jsonResponse({ attitude, summary: 'neutral' }))
+      }
+      if (url.startsWith('/api/compaction')) {
+        return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
+      }
+      if (url.startsWith('/api/thoughts')) {
+        return Promise.resolve(jsonResponse({ thoughts: [] }))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+    global.fetch = fetchMock as unknown as typeof fetch
+
+    render(
+      <MockProviders>
+        <ChatWindow />
+        <MessageSpy />
+      </MockProviders>
+    )
+
+    const textarea = screen.getByRole('textbox')
+    await user.type(textarea, 'hello')
+    await user.click(screen.getByRole('button', { name: /^send message$/i }))
+
+    await waitFor(() => {
+      expect(screen.getByText('the user seems glad to be chatting')).toBeInTheDocument()
+    })
+    // The reply this thought informed has not streamed yet.
+    expect(screen.queryByTestId('message-char')).not.toBeInTheDocument()
+
+    releaseReply?.()
+
+    await waitFor(() => {
+      expect(screen.getByTestId('message-char')).toHaveTextContent('hi')
     })
   })
 
@@ -510,6 +617,9 @@ describe('ChatWindow Component', () => {
       }
       if (url.startsWith('/api/compaction')) {
         return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
+      }
+      if (url.startsWith('/api/thoughts')) {
+        return Promise.resolve(jsonResponse({ thoughts: [] }))
       }
       return Promise.resolve(jsonResponse([]))
     })
@@ -560,6 +670,9 @@ describe('ChatWindow Component', () => {
       if (url.startsWith('/api/compaction')) {
         return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
       }
+      if (url.startsWith('/api/thoughts')) {
+        return Promise.resolve(jsonResponse({ thoughts: [] }))
+      }
       return Promise.resolve(jsonResponse([]))
     })
     global.fetch = fetchMock as unknown as typeof fetch
@@ -597,6 +710,9 @@ describe('ChatWindow Component', () => {
       }
       if (url.startsWith('/api/compaction')) {
         return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
+      }
+      if (url.startsWith('/api/thoughts')) {
+        return Promise.resolve(jsonResponse({ thoughts: [] }))
       }
       return Promise.resolve(jsonResponse([]))
     })
@@ -643,6 +759,9 @@ describe('ChatWindow Component', () => {
       if (url.startsWith('/api/compaction')) {
         return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
       }
+      if (url.startsWith('/api/thoughts')) {
+        return Promise.resolve(jsonResponse({ thoughts: [] }))
+      }
       return Promise.resolve(jsonResponse([]))
     })
     global.fetch = fetchMock as unknown as typeof fetch
@@ -685,6 +804,9 @@ describe('ChatWindow Component', () => {
       }
       if (url.startsWith('/api/compaction')) {
         return Promise.resolve(jsonResponse({ checkpoints: [], pending_draft: null }))
+      }
+      if (url.startsWith('/api/thoughts')) {
+        return Promise.resolve(jsonResponse({ thoughts: [] }))
       }
       return Promise.resolve(jsonResponse([]))
     })
