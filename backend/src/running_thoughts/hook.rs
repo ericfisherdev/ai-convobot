@@ -25,12 +25,20 @@ use crate::running_thoughts::types::RunningThought;
 ///
 /// Works over `SqliteTranscript` (host) and `InMemoryTranscript` (joiner)
 /// alike.
+///
+/// `NO_LIMIT`, not `usize::MAX`: `SqliteTranscript::recent_messages` binds
+/// the limit as a SQLite `LIMIT` parameter, and rusqlite's checked `usize`
+/// -> `i64` conversion rejects `usize::MAX` on a 64-bit host with
+/// `ToSqlConversionFailure` — which would silently disable running-thought
+/// generation entirely (`thought_inputs_on`'s caller logs the error and
+/// returns `None`). `i64::MAX` messages is not a real limit in practice.
 pub fn thought_range(
     transcript: &dyn TranscriptSource,
     from: i32,
     through: i32,
 ) -> io::Result<Vec<Message>> {
-    let mut messages = transcript.recent_messages(Some(from - 1), usize::MAX)?;
+    const NO_LIMIT: usize = i64::MAX as usize;
+    let mut messages = transcript.recent_messages(Some(from - 1), NO_LIMIT)?;
     messages.retain(|m| m.id <= through);
     if messages.len() > THOUGHT_ROUND_MAX_MESSAGES {
         let start = messages.len() - THOUGHT_ROUND_MAX_MESSAGES;
