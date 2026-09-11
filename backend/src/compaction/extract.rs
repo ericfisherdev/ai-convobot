@@ -298,7 +298,15 @@ const SUMMARY_MAX_TOKENS: usize = 300;
 /// Tokens reserved off the top of an extractor's context window before
 /// [`chunk_range`] sizes a chunk against what is left: headroom for the
 /// model's own chat-template wrapping and the completion itself.
-pub const CONTEXT_RESERVE_TOKENS: usize = 1024;
+///
+/// **Must stay above [`EXTRACTION_MAX_TOKENS`]**, which is the completion
+/// this reserve is covering. When it was below (1024 against 1536),
+/// `chunk_range` accepted chunks that `extract` then rejected as too long —
+/// a 6703-token prompt cleared chunking by 465 tokens and failed the length
+/// check by 47 — so any range long enough to need chunking could not be
+/// extracted at all. `the_reserve_covers_the_completion_budget` pins the
+/// relationship.
+pub const CONTEXT_RESERVE_TOKENS: usize = 2048;
 
 /// What the extraction prompt renders as "already known" before the
 /// transcript: prior `companion_state`/`user_state` overlay facts (`[F<id>]

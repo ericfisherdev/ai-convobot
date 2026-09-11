@@ -1699,6 +1699,7 @@ pub(crate) enum ExtractError {
     /// context window; the caller chunks and retries.
     PromptTooLong {
         prompt_tokens: usize,
+        max_tokens: usize,
         context_tokens: usize,
     },
     /// Tokenisation or decode failed.
@@ -1714,11 +1715,12 @@ impl std::fmt::Display for ExtractError {
             ExtractError::Grammar(e) => write!(f, "invalid grammar: {}", e),
             ExtractError::PromptTooLong {
                 prompt_tokens,
+                max_tokens,
                 context_tokens,
             } => write!(
                 f,
-                "prompt is {} tokens but the context window is only {}",
-                prompt_tokens, context_tokens
+                "prompt is {} tokens plus {} reserved for the completion, over the {}-token context window",
+                prompt_tokens, max_tokens, context_tokens
             ),
             ExtractError::Decode(e) => write!(f, "decode failed: {}", e),
         }
@@ -1864,6 +1866,7 @@ pub(crate) fn run_extraction(
     if prompt_token_count + max_tokens > window {
         return Err(ExtractError::PromptTooLong {
             prompt_tokens: prompt_token_count,
+            max_tokens,
             context_tokens: window,
         });
     }
