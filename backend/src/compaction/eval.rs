@@ -998,6 +998,7 @@ fn extractor_config(gguf_path: String) -> crate::database::ConfigModify {
         compaction_model_path: Some(gguf_path),
         heuristic_person_detection: true,
         compaction_attitude_weight: 0.5,
+        running_thoughts_enabled: false,
     }
 }
 

@@ -29,7 +29,17 @@
 //! `store.rs`: the DDL, `_on` helpers, the `RunningThoughtStore` trait, its
 //! production `SqliteRunningThoughtStore` impl, and a `#[cfg(test)]`
 //! in-memory `RecordingStore`, mirroring `compaction::store`.
-#![allow(dead_code)]
+//!
+//! #216 (generation, host companion only) adds three more modules:
+//! `prompt.rs` (pure prompt assembly: `ThoughtInputs`, `build_thought_prompt`,
+//! `render_reply_block`, `clean_thought`), `hook.rs` (the seam-based inputs
+//! reader `thought_inputs_for_range` plus the host's live-round
+//! `Database`-touching `thought_inputs_on`), and `generate.rs`
+//! (`generate_thought`/`generate_thought_into`, which run the character
+//! model and persist the result). Remote bots' own thoughts are #220.
 
+pub mod generate;
+pub mod hook;
+pub mod prompt;
 pub mod store;
 pub mod types;

@@ -32,6 +32,9 @@ use crate::multiplayer::protocol::{ContinuityPayload, ServerFrame};
 pub use crate::multiplayer::routing::{plan_round, RoundPlan};
 use crate::multiplayer::routing::{schedule_follow_ups, RoutingPolicy};
 use crate::participants::{ParticipantId, ParticipantRegistry};
+use crate::running_thoughts::generate::ThoughtError;
+use crate::running_thoughts::prompt::ThoughtInputs;
+use crate::running_thoughts::types::{NewRunningThought, RunningThought};
 use crate::turn_slot::TurnGuard;
 
 /// The newest-messages page size a remote speaker's request is built from:
@@ -138,6 +141,19 @@ pub trait RoundSink {
     /// so every existing sink (`NoopSink`, and any test double implementing
     /// this trait) keeps compiling unchanged.
     fn draft_queued(&mut self, _draft_id: i64) {}
+
+    /// The host companion is about to write its running thought about the
+    /// round that just closed (#216), before its reply. Default no-op, like
+    /// `draft_queued`, so every existing sink keeps compiling unchanged; with
+    /// the flag off this is never called.
+    fn thought_started(&mut self, _speaker: &ParticipantId) {}
+
+    /// The host companion's running thought (#216) was generated and
+    /// persisted. Never called without a preceding `thought_started` for the
+    /// same speaker; a swallowed generation failure calls `thought_started`
+    /// and nothing else for that speaker — the client treats that speaker's
+    /// `reply_started` as the end of the pending state.
+    fn thought_written(&mut self, _thought: &RunningThought) {}
 }
 
 /// A [`RoundSink`] that observes nothing. Used by the non-streaming
@@ -230,6 +246,10 @@ pub fn run_round(
     registry: &ParticipantRegistry,
     policy: &RoutingPolicy,
     host: &mut dyn FnMut(&str, &mut dyn FnMut(&str)) -> io::Result<String>,
+    host_think: &mut dyn FnMut(
+        &ThoughtInputs,
+        &dyn Fn(NewRunningThought) -> rusqlite::Result<RunningThought>,
+    ) -> Result<RunningThought, ThoughtError>,
     remotes: &dyn RemoteGenerator,
     broadcast: &dyn Fn(ServerFrame),
     timeout: Duration,
@@ -251,9 +271,23 @@ pub fn run_round(
 
     while let Some(next) = plan.next_speaker() {
         let speaker = &next.id;
-        sink.reply_started(speaker);
 
         if *speaker == ParticipantId::CHAR {
+            // Before the reply: the companion's read of the round that just
+            // closed, written in awareness of nothing yet (#216). `None`
+            // when running thoughts are disabled, so neither sink call
+            // happens and the wire is unchanged. A swallowed generation
+            // failure still emits `thought_started` — the client treats
+            // this speaker's `reply_started` as the end of the pending
+            // state — but never `thought_written`, and leaves no row.
+            if let Some(inputs) = pending.thought_inputs(store, speaker) {
+                sink.thought_started(speaker);
+                if let Some(thought) = pending.think(store, &inputs, &mut *host_think) {
+                    sink.thought_written(&thought);
+                }
+            }
+
+            sink.reply_started(speaker);
             // A failed host generate ends the round immediately: no notice,
             // no further speakers, no `finish` — the #84 regression guard,
             // now covering the whole round instead of a single turn.
@@ -275,6 +309,7 @@ pub fn run_round(
             continue;
         }
 
+        sink.reply_started(speaker);
         let tail = store
             .transcript_tail(TRANSCRIPT_TAIL_MESSAGES)
             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -610,6 +645,8 @@ mod tests {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum SinkEvent {
+        ThoughtStarted(ParticipantId),
+        Thought(ParticipantId, String),
         Started(ParticipantId),
         Complete(ParticipantId, String),
         Skipped(ParticipantId),
@@ -637,6 +674,14 @@ mod tests {
         }
         fn round_complete(&mut self, _attitude: Option<&(CompanionAttitude, CompanionAttitude)>) {
             self.events.push(SinkEvent::RoundComplete);
+        }
+        fn thought_started(&mut self, speaker: &ParticipantId) {
+            self.events.push(SinkEvent::ThoughtStarted(speaker.clone()));
+        }
+        fn thought_written(&mut self, thought: &RunningThought) {
+            let speaker = ParticipantId::parse(&thought.speaker_id).unwrap();
+            self.events
+                .push(SinkEvent::Thought(speaker, thought.text.clone()));
         }
     }
 
@@ -707,6 +752,7 @@ mod tests {
             &registry,
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi from char".to_string()),
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -752,6 +798,223 @@ mod tests {
         );
     }
 
+    fn thought_inputs_for_char() -> ThoughtInputs {
+        ThoughtInputs {
+            companion_id: 1,
+            speaker_id: ParticipantId::CHAR,
+            previous: vec![],
+            round: vec![],
+            from_message_id: 1,
+            through_message_id: 1,
+        }
+    }
+
+    fn write_a_thought(
+        inputs: &ThoughtInputs,
+        insert: &dyn Fn(NewRunningThought) -> rusqlite::Result<RunningThought>,
+    ) -> Result<RunningThought, ThoughtError> {
+        insert(NewRunningThought {
+            companion_id: inputs.companion_id,
+            speaker_id: inputs.speaker_id.to_string(),
+            from_message_id: inputs.from_message_id,
+            through_message_id: inputs.through_message_id,
+            text: "the user seems friendly".to_string(),
+            edited: false,
+        })
+        .map_err(ThoughtError::Store)
+    }
+
+    #[test]
+    fn a_round_writes_and_streams_the_hosts_thought_before_generating_its_reply() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = RecordingStore::new(None).with_thought_inputs(thought_inputs_for_char());
+        let registry = registry_with_bots();
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), registry.clone())
+                .expect("insert should succeed");
+
+        let plan = RoundPlan::from_speakers([ParticipantId::CHAR]);
+        let remotes = FakeRemote::new(vec![]);
+        let mut sink = RecordingSink::default();
+        let mut rows_seen_by_host: Option<usize> = None;
+
+        let outcome = run_round(
+            guard,
+            pending,
+            plan,
+            &store,
+            &registry,
+            &no_followups(),
+            &mut |_prompt, _on_token| {
+                rows_seen_by_host = Some(store.thoughts.lock().unwrap().len());
+                Ok("hi from char".to_string())
+            },
+            &mut write_a_thought,
+            &remotes,
+            &|_frame| {},
+            Duration::from_secs(30),
+            &mut sink,
+        )
+        .expect("round should succeed");
+
+        assert_eq!(
+            rows_seen_by_host,
+            Some(1),
+            "the thought must already be persisted by the time the reply is generated"
+        );
+        assert_eq!(store.thoughts.lock().unwrap().len(), 1);
+        assert_eq!(
+            outcome.host_reply.as_ref().map(|r| r.text.as_str()),
+            Some("hi from char")
+        );
+        assert_eq!(
+            sink.events,
+            vec![
+                SinkEvent::ThoughtStarted(ParticipantId::CHAR),
+                SinkEvent::Thought(ParticipantId::CHAR, "the user seems friendly".to_string()),
+                SinkEvent::Started(ParticipantId::CHAR),
+                SinkEvent::Complete(ParticipantId::CHAR, "hi from char".to_string()),
+                SinkEvent::RoundComplete,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_thought_generation_still_yields_the_full_round_with_no_row() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = RecordingStore::new(None).with_thought_inputs(thought_inputs_for_char());
+        let registry = registry_with_bots();
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), registry.clone())
+                .expect("insert should succeed");
+
+        let plan = RoundPlan::from_speakers([ParticipantId::CHAR]);
+        let remotes = FakeRemote::new(vec![]);
+        let mut sink = RecordingSink::default();
+
+        let outcome = run_round(
+            guard,
+            pending,
+            plan,
+            &store,
+            &registry,
+            &no_followups(),
+            &mut |_prompt, _on_token| Ok("hi from char".to_string()),
+            &mut |_inputs, _insert| {
+                Err(ThoughtError::Generate(std::io::Error::other(
+                    "no model loaded",
+                )))
+            },
+            &remotes,
+            &|_frame| {},
+            Duration::from_secs(30),
+            &mut sink,
+        )
+        .expect("round should succeed");
+
+        assert!(store.thoughts.lock().unwrap().is_empty());
+        assert_eq!(
+            outcome.host_reply.as_ref().map(|r| r.text.as_str()),
+            Some("hi from char")
+        );
+        assert_eq!(
+            sink.events,
+            vec![
+                SinkEvent::ThoughtStarted(ParticipantId::CHAR),
+                SinkEvent::Started(ParticipantId::CHAR),
+                SinkEvent::Complete(ParticipantId::CHAR, "hi from char".to_string()),
+                SinkEvent::RoundComplete,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_round_with_no_thought_inputs_never_calls_host_think() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        // Default `RecordingStore`, no `with_thought_inputs` call: running
+        // thoughts are disabled.
+        let store = RecordingStore::new(None);
+        let registry = registry_with_bots();
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), registry.clone())
+                .expect("insert should succeed");
+
+        let plan = RoundPlan::from_speakers([ParticipantId::CHAR]);
+        let remotes = FakeRemote::new(vec![]);
+        let mut sink = RecordingSink::default();
+
+        run_round(
+            guard,
+            pending,
+            plan,
+            &store,
+            &registry,
+            &no_followups(),
+            &mut |_prompt, _on_token| Ok("hi from char".to_string()),
+            &mut |_inputs, _insert| {
+                panic!("host_think must not run when running thoughts are disabled")
+            },
+            &remotes,
+            &|_frame| {},
+            Duration::from_secs(30),
+            &mut sink,
+        )
+        .expect("round should succeed");
+
+        assert!(!sink
+            .events
+            .iter()
+            .any(|e| matches!(e, SinkEvent::ThoughtStarted(_) | SinkEvent::Thought(..))));
+    }
+
+    #[test]
+    fn a_mention_filtered_round_where_char_does_not_speak_writes_no_thought() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = RecordingStore::new(None).with_thought_inputs(thought_inputs_for_char());
+        let registry = registry_with_bots();
+        let pending = PendingTurn::begin(
+            &guard,
+            &store,
+            1,
+            1,
+            "@bot1 hi".to_string(),
+            registry.clone(),
+        )
+        .expect("insert should succeed");
+
+        // `char` is excluded from the plan entirely, the same as a live
+        // mention-filtered round.
+        let plan = RoundPlan::from_speakers([bot("bot1")]);
+        let remotes = FakeRemote::new(vec![(bot("bot1"), Ok("hi from bot1"))]);
+        let mut sink = RecordingSink::default();
+
+        run_round(
+            guard,
+            pending,
+            plan,
+            &store,
+            &registry,
+            &no_followups(),
+            &mut |_prompt, _on_token| panic!("char should never be asked to speak here"),
+            &mut |_inputs, _insert| panic!("host_think must not run when char does not speak"),
+            &remotes,
+            &|_frame| {},
+            Duration::from_secs(30),
+            &mut sink,
+        )
+        .expect("round should succeed");
+
+        assert!(store.thoughts.lock().unwrap().is_empty());
+        assert!(!sink
+            .events
+            .iter()
+            .any(|e| matches!(e, SinkEvent::ThoughtStarted(_) | SinkEvent::Thought(..))));
+    }
+
     #[test]
     fn a_round_ships_the_hosts_continuity_and_trims_the_transcript_below_it() {
         static SLOT: TurnSlot = TurnSlot::new();
@@ -785,6 +1048,7 @@ mod tests {
             &registry,
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi from char".to_string()),
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -842,6 +1106,7 @@ mod tests {
             &registry,
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi from char".to_string()),
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -886,6 +1151,7 @@ mod tests {
             &registry,
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi from char".to_string()),
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -940,6 +1206,7 @@ mod tests {
             &registry,
             &no_followups(),
             &mut |_prompt, _on_token| Err(std::io::Error::other("no model")),
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -991,6 +1258,7 @@ mod tests {
             &registry,
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi".to_string()),
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
             &NoRemotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1031,6 +1299,7 @@ mod tests {
             &registry,
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi".to_string()),
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1079,6 +1348,7 @@ mod tests {
                 max_followup_depth: 1,
             },
             &mut |_prompt, _on_token| Ok("hi @bot1 do you agree?".to_string()),
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1129,6 +1399,7 @@ mod tests {
             &registry,
             &no_followups(),
             &mut |_prompt, _on_token| panic!("char should never be asked to speak"),
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1186,6 +1457,7 @@ mod tests {
             &registry,
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi from char".to_string()),
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
             &remotes,
             &|frame| broadcasts.lock().unwrap().push(frame),
             Duration::from_secs(30),
@@ -1468,6 +1740,7 @@ mod tests {
             &registry,
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi".to_string()),
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
             &NoRemotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1511,6 +1784,7 @@ mod tests {
             &registry,
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi".to_string()),
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
             &NoRemotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1537,6 +1811,7 @@ mod tests {
             &registry,
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi again".to_string()),
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
             &NoRemotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1598,6 +1873,7 @@ mod tests {
             &registry,
             &no_followups(),
             &mut |_prompt, _on_token| Ok("good morning".to_string()),
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
             &NoRemotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1643,6 +1919,7 @@ mod tests {
             &registry,
             &no_followups(),
             &mut |_prompt, _on_token| panic!("char should never be asked to speak"),
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),

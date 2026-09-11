@@ -4,6 +4,7 @@
 // DOM or a running fetch.
 import { StreamChunk, StreamEvent } from '../components/interfaces/Message';
 import { AttitudeStreamUpdate } from '../components/interfaces/AttitudeData';
+import { RunningThought } from '../components/interfaces/RunningThought';
 
 /// Splits a raw SSE byte buffer into complete "data: ...\n\n" records plus
 /// whatever partial record is still waiting on the next `read()`.
@@ -40,6 +41,7 @@ export function parseStreamChunk(record: string): StreamChunk | null {
       error: parsed.error,
       attitude: parsed.attitude,
       compaction_draft_id: parsed.compaction_draft_id,
+      thought: parsed.thought,
     };
   } catch (parseError) {
     console.error('Failed to parse stream chunk:', parseError);
@@ -65,10 +67,24 @@ export interface RoundStreamState {
   // The compaction draft id this round's compaction-draft-ready chunk
   // carried, if any (#179). `null` for a round that queued no draft.
   draftQueuedId: number | null;
+  // Every running thought (#216) this round's `thought` chunks carried.
+  thoughts: RunningThought[];
+  // The speaker id a `thought_started` chunk named, until either its
+  // `thought` chunk arrives or the round moves on without one (a swallowed
+  // generation failure) -- `null` when no thought is currently pending.
+  pendingThoughtSpeaker: string | null;
 }
 
 export function initialRoundStreamState(): RoundStreamState {
-  return { bubbles: [], error: null, attitudeStreamed: false, roundComplete: false, draftQueuedId: null };
+  return {
+    bubbles: [],
+    error: null,
+    attitudeStreamed: false,
+    roundComplete: false,
+    draftQueuedId: null,
+    thoughts: [],
+    pendingThoughtSpeaker: null,
+  };
 }
 
 export type StreamEffect =
@@ -77,6 +93,11 @@ export type StreamEffect =
   | { type: 'settle_bubble'; tempId: number; speakerId: string; messageId: number | null; content: string }
   | { type: 'apply_attitude'; update: AttitudeStreamUpdate }
   | { type: 'compaction_draft'; draftId: number }
+  | { type: 'thought_started'; speakerId: string }
+  | { type: 'thought'; thought: RunningThought }
+  // A thought was announced (`thought_started`) but never arrived -- a
+  // swallowed generation failure. #218's pending-bubble consumer removes it.
+  | { type: 'thought_dropped'; speakerId: string }
   | { type: 'round_complete' }
   | { type: 'error'; message: string };
 
@@ -114,6 +135,22 @@ export function reduceStreamChunk(
     };
   }
 
+  // Same short-circuit again: a chunk with `thought` set (#216) carries only
+  // the just-generated running thought, never content, regardless of
+  // `event`. Its arrival clears the pending speaker `thought_started` set,
+  // with no `thought_dropped` -- the thought did arrive.
+  if (chunk.thought) {
+    const thought = chunk.thought;
+    return {
+      state: {
+        ...state,
+        thoughts: [...state.thoughts, thought],
+        pendingThoughtSpeaker: null,
+      },
+      effects: [{ type: 'thought', thought }],
+    };
+  }
+
   switch (chunk.event) {
     case 'reply_started': {
       const tempId = nextTempId();
@@ -123,11 +160,25 @@ export function reduceStreamChunk(
         content: '',
         messageId: null,
       };
+      const effects: StreamEffect[] = [];
+      // A thought was announced but the round moved straight to this
+      // speaker's reply without a `thought` chunk -- a swallowed
+      // generation failure (#216).
+      if (state.pendingThoughtSpeaker !== null) {
+        effects.push({ type: 'thought_dropped', speakerId: state.pendingThoughtSpeaker });
+      }
+      effects.push({ type: 'open_bubble', tempId, speakerId: chunk.speaker_id });
       return {
-        state: { ...state, bubbles: [...state.bubbles, bubble] },
-        effects: [{ type: 'open_bubble', tempId, speakerId: chunk.speaker_id }],
+        state: { ...state, bubbles: [...state.bubbles, bubble], pendingThoughtSpeaker: null },
+        effects,
       };
     }
+
+    case 'thought_started':
+      return {
+        state: { ...state, pendingThoughtSpeaker: chunk.speaker_id },
+        effects: [{ type: 'thought_started', speakerId: chunk.speaker_id }],
+      };
 
     case 'token': {
       let bubbles = state.bubbles;
@@ -184,17 +235,28 @@ export function reduceStreamChunk(
       return { state: { ...state, bubbles }, effects };
     }
 
-    case 'round_complete':
+    case 'round_complete': {
+      const effects: StreamEffect[] = [];
+      if (state.pendingThoughtSpeaker !== null) {
+        effects.push({ type: 'thought_dropped', speakerId: state.pendingThoughtSpeaker });
+      }
+      effects.push({ type: 'round_complete' });
       return {
-        state: { ...state, roundComplete: true },
-        effects: [{ type: 'round_complete' }],
+        state: { ...state, roundComplete: true, pendingThoughtSpeaker: null },
+        effects,
       };
+    }
 
     case 'error': {
       const message = chunk.error ?? 'Unknown streaming error';
+      const effects: StreamEffect[] = [];
+      if (state.pendingThoughtSpeaker !== null) {
+        effects.push({ type: 'thought_dropped', speakerId: state.pendingThoughtSpeaker });
+      }
+      effects.push({ type: 'error', message });
       return {
-        state: { ...state, error: message },
-        effects: [{ type: 'error', message }],
+        state: { ...state, error: message, pendingThoughtSpeaker: null },
+        effects,
       };
     }
   }

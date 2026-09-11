@@ -49,6 +49,7 @@ const baseConfig: ConfigInterface = {
   compaction_model_path: null,
   heuristic_person_detection: true,
   compaction_attitude_weight: 0.5,
+  running_thoughts_enabled: false,
 }
 
 const MODELS = [
@@ -158,6 +159,20 @@ describe('MemorySettings', () => {
 
     expect(onChange).toHaveBeenCalledWith(
       expect.objectContaining({ heuristic_person_detection: false })
+    )
+  })
+
+  it('toggles running_thoughts_enabled', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    renderMemorySettings(
+      <MemorySettings config={{ ...baseConfig, running_thoughts_enabled: false }} onChange={onChange} />
+    )
+
+    await user.click(screen.getByRole('switch', { name: 'Running thoughts' }))
+
+    expect(onChange).toHaveBeenCalledWith(
+      expect.objectContaining({ running_thoughts_enabled: true })
     )
   })
 

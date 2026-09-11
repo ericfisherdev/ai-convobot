@@ -47,6 +47,9 @@ export interface ConfigInterface {
     /** How far a compaction commit blends the running attitude toward the
      * narrative rating: 0 keeps the running values, 1 adopts the rating. */
     compaction_attitude_weight: number;
+    /** After each round, the companion writes a short private note about
+     * what it took from it, and replies in light of that note. */
+    running_thoughts_enabled: boolean;
 }
 
 export interface ModelInfo {

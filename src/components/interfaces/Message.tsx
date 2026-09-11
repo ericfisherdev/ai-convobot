@@ -1,4 +1,5 @@
 import { AttitudeStreamUpdate } from './AttitudeData';
+import { RunningThought } from './RunningThought';
 
 export interface MessageInterface {
     id: number;
@@ -17,9 +18,17 @@ export interface MessageInterface {
 // `speaker_id`; `token` appends `content` to the current speaker's bubble
 // (or, when `attitude` is set instead, carries the attitude update and no
 // content); `reply_complete` replaces the current bubble's content with the
-// sanitized `content` and carries `message_id`; `round_complete` and `error`
+// sanitized `content` and carries `message_id`; `thought_started` (#216)
+// announces that `speaker_id` is about to write its running thought about
+// the round that just closed, before its reply; `round_complete` and `error`
 // are the two terminal events (`is_complete: true`).
-export type StreamEvent = 'reply_started' | 'token' | 'reply_complete' | 'round_complete' | 'error';
+export type StreamEvent =
+    | 'reply_started'
+    | 'token'
+    | 'reply_complete'
+    | 'thought_started'
+    | 'round_complete'
+    | 'error';
 
 // One Server-Sent Event on `/api/prompt/stream`, one per speaker action in a
 // round. `event` says which kind this is; `speaker_id` is who the chunk is
@@ -39,4 +48,7 @@ export interface StreamChunk {
     // Set only on the compaction-draft-ready chunk (#179): the id of the
     // checkpoint draft this round's compaction hook just queued.
     compaction_draft_id?: number;
+    // Set only on the `thought` chunk (#216): the just-generated running
+    // thought.
+    thought?: RunningThought;
 }

@@ -163,4 +163,63 @@ describe('roundStream', () => {
 
     expect(chunk?.speaker_id).toBe('')
   })
+
+  const aThought = {
+    id: 1,
+    companion_id: 1,
+    speaker_id: 'char',
+    from_message_id: 1,
+    through_message_id: 2,
+    text: 'the user seems excited',
+    edited: false,
+    created_at: '2026-01-01T00:00:00Z',
+  }
+
+  it('thought_started sets the pending speaker and opens no bubble', () => {
+    const { state, effects } = runChunks([
+      { request_id: 'r1', event: 'thought_started', content: '', is_complete: false, speaker_id: 'char' },
+    ])
+
+    expect(state.pendingThoughtSpeaker).toBe('char')
+    expect(state.bubbles).toEqual([])
+    expect(effects).toEqual([{ type: 'thought_started', speakerId: 'char' }])
+  })
+
+  it('a thought chunk appends to state.thoughts, clears pending, and opens no bubble', () => {
+    const { state, effects } = runChunks([
+      { request_id: 'r1', event: 'thought_started', content: '', is_complete: false, speaker_id: 'char' },
+      { request_id: 'r1', event: 'token', content: '', is_complete: false, speaker_id: 'char', thought: aThought },
+    ])
+
+    expect(state.thoughts).toEqual([aThought])
+    expect(state.pendingThoughtSpeaker).toBeNull()
+    expect(state.bubbles).toEqual([])
+    const thoughtEffects = effects.filter(e => e.type === 'thought')
+    expect(thoughtEffects).toEqual([{ type: 'thought', thought: aThought }])
+  })
+
+  it('reply_started after a thought_started with no thought clears pending, emits thought_dropped, and still opens its bubble', () => {
+    const { state, effects } = runChunks([
+      { request_id: 'r1', event: 'thought_started', content: '', is_complete: false, speaker_id: 'char' },
+      { request_id: 'r1', event: 'reply_started', content: '', is_complete: false, speaker_id: 'char' },
+    ])
+
+    expect(state.pendingThoughtSpeaker).toBeNull()
+    expect(state.bubbles).toHaveLength(1)
+    expect(effects).toEqual([
+      { type: 'thought_started', speakerId: 'char' },
+      { type: 'thought_dropped', speakerId: 'char' },
+      { type: 'open_bubble', tempId: -1, speakerId: 'char' },
+    ])
+  })
+
+  it('a thought chunk emits no thought_dropped effect', () => {
+    const { effects } = runChunks([
+      { request_id: 'r1', event: 'thought_started', content: '', is_complete: false, speaker_id: 'char' },
+      { request_id: 'r1', event: 'token', content: '', is_complete: false, speaker_id: 'char', thought: aThought },
+      { request_id: 'r1', event: 'reply_started', content: '', is_complete: false, speaker_id: 'char' },
+    ])
+
+    expect(effects.some(e => e.type === 'thought_dropped')).toBe(false)
+  })
 })

@@ -547,6 +547,11 @@ pub struct ConfigView {
     /// narrative rating: `0.0` keeps the running values untouched, `1.0`
     /// adopts the rating outright. Clamped to `0.0..=1.0` on write.
     pub compaction_attitude_weight: f32,
+    /// Whether the host companion writes a running thought (#216) about each
+    /// round, on the chat model, before its reply. Off by default, so a chat
+    /// with the feature disabled makes no extra model call and renders a
+    /// byte-identical prompt.
+    pub running_thoughts_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -590,6 +595,8 @@ pub struct ConfigModify {
     pub heuristic_person_detection: bool,
     #[serde(default = "default_compaction_attitude_weight")]
     pub compaction_attitude_weight: f32,
+    #[serde(default)]
+    pub running_thoughts_enabled: bool,
 }
 
 fn default_multiplayer_mode() -> String {
@@ -1201,7 +1208,8 @@ impl Database {
                 compact_min_messages INTEGER DEFAULT 8,
                 compaction_model_path TEXT,
                 heuristic_person_detection BOOLEAN DEFAULT false,
-                compaction_attitude_weight REAL DEFAULT 0.5
+                compaction_attitude_weight REAL DEFAULT 0.5,
+                running_thoughts_enabled BOOLEAN DEFAULT false
             )",
             [],
         )?;
@@ -1970,7 +1978,7 @@ impl Database {
     /// path (matches how `migrate_config_table` already takes a
     /// connection).
     fn read_config(con: &Connection) -> Result<ConfigView> {
-        let mut stmt = con.prepare("SELECT device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb, dynamic_gpu_allocation, gpu_safety_margin, min_free_vram_mb, enable_hybrid_context, max_system_ram_usage_gb, context_expansion_strategy, ram_safety_margin_gb, multiplayer_mode, multiplayer_password, multiplayer_host_address, multiplayer_participant_id, mention_followup_depth, remote_generation_timeout_secs, compact_threshold_tokens, compact_min_messages, compaction_model_path, heuristic_person_detection, compaction_attitude_weight FROM config LIMIT 1")?;
+        let mut stmt = con.prepare("SELECT device, llm_model_path, gpu_layers, prompt_template, context_window_size, max_response_tokens, enable_dynamic_context, vram_limit_gb, dynamic_gpu_allocation, gpu_safety_margin, min_free_vram_mb, enable_hybrid_context, max_system_ram_usage_gb, context_expansion_strategy, ram_safety_margin_gb, multiplayer_mode, multiplayer_password, multiplayer_host_address, multiplayer_participant_id, mention_followup_depth, remote_generation_timeout_secs, compact_threshold_tokens, compact_min_messages, compaction_model_path, heuristic_person_detection, compaction_attitude_weight, running_thoughts_enabled FROM config LIMIT 1")?;
         let row = stmt.query_row([], |row| {
             let multiplayer_password: String =
                 row.get::<_, Option<String>>(16)?.unwrap_or_default();
@@ -2008,6 +2016,7 @@ impl Database {
                 compaction_model_path: compaction_model_path.filter(|s| !s.is_empty()),
                 heuristic_person_detection: row.get::<_, Option<bool>>(24)?.unwrap_or(false),
                 compaction_attitude_weight: row.get::<_, Option<f32>>(25)?.unwrap_or(0.5),
+                running_thoughts_enabled: row.get::<_, Option<bool>>(26)?.unwrap_or(false),
             })
         })?;
         Ok(row)
@@ -2100,7 +2109,7 @@ impl Database {
 
         let tx = con.unchecked_transaction()?;
         tx.execute(
-            "UPDATE config SET device = ?, llm_model_path = ?, gpu_layers = ?, prompt_template = ?, context_window_size = ?, max_response_tokens = ?, enable_dynamic_context = ?, vram_limit_gb = ?, dynamic_gpu_allocation = ?, gpu_safety_margin = ?, min_free_vram_mb = ?, enable_hybrid_context = ?, max_system_ram_usage_gb = ?, context_expansion_strategy = ?, ram_safety_margin_gb = ?, multiplayer_mode = ?, multiplayer_host_address = ?, multiplayer_participant_id = ?, mention_followup_depth = ?, remote_generation_timeout_secs = ?, compact_threshold_tokens = ?, compact_min_messages = ?, compaction_model_path = ?, heuristic_person_detection = ?, compaction_attitude_weight = ?",
+            "UPDATE config SET device = ?, llm_model_path = ?, gpu_layers = ?, prompt_template = ?, context_window_size = ?, max_response_tokens = ?, enable_dynamic_context = ?, vram_limit_gb = ?, dynamic_gpu_allocation = ?, gpu_safety_margin = ?, min_free_vram_mb = ?, enable_hybrid_context = ?, max_system_ram_usage_gb = ?, context_expansion_strategy = ?, ram_safety_margin_gb = ?, multiplayer_mode = ?, multiplayer_host_address = ?, multiplayer_participant_id = ?, mention_followup_depth = ?, remote_generation_timeout_secs = ?, compact_threshold_tokens = ?, compact_min_messages = ?, compaction_model_path = ?, heuristic_person_detection = ?, compaction_attitude_weight = ?, running_thoughts_enabled = ?",
             params![
                 &device as &dyn ToSql,
                 &config.llm_model_path,
@@ -2127,6 +2136,7 @@ impl Database {
                 &config.compaction_model_path,
                 &config.heuristic_person_detection,
                 &config.compaction_attitude_weight,
+                &config.running_thoughts_enabled,
             ],
         )?;
 
@@ -5052,6 +5062,10 @@ impl Database {
                 "compaction_attitude_weight",
                 "ALTER TABLE config ADD COLUMN compaction_attitude_weight REAL DEFAULT 0.5",
             ),
+            (
+                "running_thoughts_enabled",
+                "ALTER TABLE config ADD COLUMN running_thoughts_enabled BOOLEAN DEFAULT false",
+            ),
         ];
 
         let mut stmt = con.prepare("PRAGMA table_info(config)")?;
@@ -7145,7 +7159,8 @@ mod tests {
                 compact_min_messages INTEGER DEFAULT 8,
                 compaction_model_path TEXT,
                 heuristic_person_detection BOOLEAN DEFAULT false,
-                compaction_attitude_weight REAL DEFAULT 0.5
+                compaction_attitude_weight REAL DEFAULT 0.5,
+                running_thoughts_enabled BOOLEAN DEFAULT false
             )",
             [],
         )
@@ -7187,6 +7202,7 @@ mod tests {
             compaction_model_path: None,
             heuristic_person_detection: true,
             compaction_attitude_weight: 0.5,
+            running_thoughts_enabled: false,
         }
     }
 
@@ -7231,9 +7247,37 @@ mod tests {
             "compaction_model_path",
             "heuristic_person_detection",
             "compaction_attitude_weight",
+            "running_thoughts_enabled",
         ] {
             assert!(columns.contains(column), "missing column {column}");
         }
+    }
+
+    #[test]
+    fn write_config_then_read_config_round_trips_running_thoughts_enabled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_config_table(&con);
+
+        let mut modify = valid_config_modify();
+        modify.running_thoughts_enabled = true;
+        Database::write_config(&con, modify).unwrap();
+
+        let view = Database::read_config(&con).unwrap();
+        assert!(view.running_thoughts_enabled);
+    }
+
+    #[test]
+    fn get_config_defaults_running_thoughts_enabled_for_a_pre_216_row() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_legacy_config_table(&con);
+        Database::migrate_config_table(&con).unwrap();
+        con.execute("UPDATE config SET running_thoughts_enabled = NULL", [])
+            .unwrap();
+
+        let view = Database::read_config(&con).unwrap();
+        assert!(!view.running_thoughts_enabled);
     }
 
     #[test]
