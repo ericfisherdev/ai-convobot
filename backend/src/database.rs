@@ -1436,6 +1436,12 @@ impl Database {
         // predates it.
         crate::compaction::store::migrate_add_extraction_error(&con)?;
 
+        // Running thoughts table (#215): references `companion`, already
+        // created above. `CREATE TABLE IF NOT EXISTS` is the whole
+        // migration for an existing database (brand-new table, nothing to
+        // `ALTER`).
+        crate::running_thoughts::store::create_tables(&con)?;
+
         // Migrate companion_attitudes table to add new attitude dimensions if they don't exist
         Database::migrate_companion_attitudes_table(&con)?;
 
@@ -5973,6 +5979,79 @@ mod tests {
             .unwrap();
         assert_eq!(pin_count, 0);
         assert_eq!(checkpoint_status(&con, checkpoint), CompactionStatus::Stale);
+    }
+
+    /// #215: `running_thoughts` has no foreign key to `messages` and
+    /// `delete_message_on` never touches the table, so a thought survives
+    /// the deletion of the very messages it cites — unlike
+    /// `compaction_facts`, which cascades away with its checkpoint.
+    #[test]
+    fn delete_message_leaves_running_thoughts_untouched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        create_companion_table(&con);
+        create_compaction_tables(&con);
+        crate::running_thoughts::store::create_tables(&con).unwrap();
+        for i in 1..=5 {
+            insert_message_row(&con, USER_SPEAKER_ID, &format!("msg {i}"));
+        }
+        let thought_id = crate::running_thoughts::store::insert_on(
+            &con,
+            &crate::running_thoughts::types::NewRunningThought {
+                companion_id: 1,
+                speaker_id: USER_SPEAKER_ID.to_string(),
+                from_message_id: 1,
+                through_message_id: 5,
+                text: "a thought spanning the deleted message".to_string(),
+                edited: false,
+            },
+        )
+        .unwrap();
+
+        Database::delete_message_on(&mut con, 3).unwrap();
+
+        let thought = crate::running_thoughts::store::get_on(&con, thought_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(thought.text, "a thought spanning the deleted message");
+        assert_eq!(thought.from_message_id, 1);
+        assert_eq!(thought.through_message_id, 5);
+    }
+
+    /// #215/#214 (open question): `erase_messages_on` does not clear
+    /// `running_thoughts`, so a thought survives "clear chat" too. This
+    /// pins the resulting v1 behaviour so whichever answer #214 eventually
+    /// settles on lands as a deliberate test flip, not a surprise.
+    #[test]
+    fn erase_messages_leaves_running_thoughts_untouched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        create_companion_table(&con);
+        create_user_table(&con);
+        create_compaction_tables(&con);
+        create_third_party_tables(&con);
+        crate::running_thoughts::store::create_tables(&con).unwrap();
+        insert_message_row(&con, USER_SPEAKER_ID, "hi");
+        let thought_id = crate::running_thoughts::store::insert_on(
+            &con,
+            &crate::running_thoughts::types::NewRunningThought {
+                companion_id: 1,
+                speaker_id: USER_SPEAKER_ID.to_string(),
+                from_message_id: 1,
+                through_message_id: 1,
+                text: "survives clear chat".to_string(),
+                edited: false,
+            },
+        )
+        .unwrap();
+
+        Database::erase_messages_on(&mut con).unwrap();
+
+        assert!(crate::running_thoughts::store::get_on(&con, thought_id)
+            .unwrap()
+            .is_some());
     }
 
     /// #181 review finding: `mark_stale_containing_on` only ever matches

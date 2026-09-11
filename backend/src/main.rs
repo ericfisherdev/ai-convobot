@@ -44,6 +44,7 @@ use crate::turn_slot::{TurnGuard, ACTIVE_TURN};
 mod chat_turn;
 use crate::chat_turn::{PendingTurn, PersistedReply, SqliteTurnStore, TurnStore};
 mod compaction;
+mod running_thoughts;
 use crate::compaction::commit::{CommitBudget, CommitError};
 use crate::compaction::review::{apply_review, CommitRequest, ReviewError};
 use crate::compaction::store::{CompactionStore, SqliteCompactionStore};
