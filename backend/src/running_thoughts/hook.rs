@@ -64,6 +64,33 @@ pub fn resolve_round_start(latest: Option<&RunningThought>, tail: &[Message], th
         .unwrap_or(through)
 }
 
+/// A joiner's own analogue of [`resolve_round_start`] (#220): the range a
+/// speaker's next thought should cover, given the newest `through_message_id`
+/// it has already written one for (`RunningThoughtStore::latest_for`) and
+/// `visible` — the messages it is about to reply over, oldest first (the
+/// joiner's own `GenerateRequest.transcript`, already post-`compacted_through`
+/// and clamped to whatever its mirror holds).
+///
+/// Named differently from [`resolve_round_start`] because a joiner has no
+/// `tail` to scan for the last `ai` message when there is no prior note —
+/// its very first thought simply starts at `visible`'s own first id, not at
+/// a message before it a joiner may never have seen.
+///
+/// `from` is `previous_through + 1`, clamped up to `visible.first().id`;
+/// `through` is `visible.last().id`. Returns `None` when `visible` is empty
+/// or `from` ends up past `through`: a regenerate re-asks the same speaker
+/// over a transcript whose newest id this speaker already covered, and that
+/// case must not write a second thought.
+pub fn pending_thought_range(
+    previous_through: Option<i32>,
+    visible: &[Message],
+) -> Option<(i32, i32)> {
+    let first = visible.first()?.id;
+    let through = visible.last()?.id;
+    let from = previous_through.map_or(first, |t| (t + 1).max(first));
+    (from <= through).then_some((from, through))
+}
+
 /// Builds a [`ThoughtInputs`] for `[from, through]`: this speaker's chained
 /// context (`store.recent_for`) and the round itself (`thought_range`). No
 /// flag check and no `Database` access — the building block both the host's
@@ -220,5 +247,53 @@ mod tests {
         let start = resolve_round_start(None, &tail, 6);
 
         assert_eq!(start, 5);
+    }
+
+    #[test]
+    fn pending_thought_range_with_no_prior_note_starts_at_visibles_first_id() {
+        let visible = vec![message(3, false), message(4, true)];
+
+        let range = pending_thought_range(None, &visible);
+
+        assert_eq!(range, Some((3, 4)));
+    }
+
+    #[test]
+    fn pending_thought_range_with_a_prior_note_advances_right_after_it() {
+        let visible = vec![message(3, false), message(4, true), message(5, false)];
+
+        let range = pending_thought_range(Some(3), &visible);
+
+        assert_eq!(range, Some((4, 5)));
+    }
+
+    #[test]
+    fn pending_thought_range_clamps_to_visibles_first_id_when_the_prior_note_predates_the_mirror() {
+        // The mirror only holds the newest 50 messages post-`compacted_through`,
+        // so a prior note's range can start before anything this joiner's
+        // mirror still has.
+        let visible = vec![message(10, false), message(11, true)];
+
+        let range = pending_thought_range(Some(2), &visible);
+
+        assert_eq!(range, Some((10, 11)));
+    }
+
+    #[test]
+    fn pending_thought_range_is_none_when_the_prior_note_already_covers_visibles_newest_id() {
+        // The regenerate case: the same speaker is asked again over a
+        // transcript whose newest id it already wrote a thought through.
+        let visible = vec![message(3, false), message(4, true)];
+
+        let range = pending_thought_range(Some(4), &visible);
+
+        assert_eq!(range, None);
+    }
+
+    #[test]
+    fn pending_thought_range_is_none_for_an_empty_visible_window() {
+        let range = pending_thought_range(None, &[]);
+
+        assert_eq!(range, None);
     }
 }

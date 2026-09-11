@@ -25,7 +25,7 @@
 //! answer.
 
 use std::io;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use actix_web::{web, App, HttpServer};
@@ -44,19 +44,40 @@ use crate::multiplayer::joiner::{
 };
 use crate::multiplayer::protocol::{ClientFrame, ContinuityPayload, ServerFrame, PROTOCOL_VERSION};
 use crate::multiplayer::remote_bots::RemoteBots;
-use crate::multiplayer::remote_generation::{LocalModelGeneration, RemoteGenerator};
+use crate::multiplayer::remote_generation::{LocalModelGeneration, RemoteGenerator, Thinker};
 use crate::multiplayer::remote_generator::SocketRemoteGenerator;
-use crate::multiplayer::round::{plan_round, run_round, RoundOutcome, RoundPlan, RoundSink};
+use crate::multiplayer::round::{
+    plan_round, regenerate_reply, run_round, RegenerateTarget, RoundOutcome, RoundPlan, RoundSink,
+};
 use crate::multiplayer::routing::RoutingPolicy;
 use crate::participants::ParticipantId;
 use crate::participants::ParticipantRegistry;
 use crate::running_thoughts::generate::ThoughtError;
+use crate::running_thoughts::hook::pending_thought_range;
+use crate::running_thoughts::prompt::ThoughtInputs;
+use crate::running_thoughts::types::{NewRunningThought, RunningThought};
 use crate::turn_slot::TurnSlot;
 
 /// The fixed companion/user ids every round in this file scores against —
 /// the same "Default user ID" every prompting handler in `main.rs` uses.
 const COMPANION_ID: i32 = 1;
 const USER_ID: i32 = 1;
+
+/// Serialises every `#[actix_web::test]` in this file against the others.
+///
+/// Every test here spins up a real joiner (`LocalModelGeneration`), which
+/// claims `turn_slot::ACTIVE_TURN` — a process-wide static, by design (it
+/// mirrors production, where one process is ever only one joiner) — for the
+/// duration of each `GenerateRequest` it answers. `cargo test` runs
+/// `#[test]`s concurrently by default, so two of these tests' real joiners
+/// can otherwise contend for that same global slot and one gets a spurious
+/// `ReplyFailed { reason: "a local turn is in progress" }`, exactly the
+/// hazard `remote_generation.rs`'s own tests fold into one `#[test]` fn to
+/// avoid (see its doc comment). An async-aware `tokio::sync::Mutex`, not
+/// `std::sync::Mutex`: every test here holds the guard across several
+/// `.await` points (the whole real host-and-joiner round), which clippy's
+/// `await_holding_lock` correctly refuses for a std lock.
+static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A [`HostConfigSource`] that reports a fixed password, always in `Host`
 /// mode — this file never exercises a mode change, only the join handshake
@@ -130,15 +151,32 @@ impl HostHandle {
 }
 
 /// Connects a joiner to `port` under `id`, generating every reply from
-/// `generator`. Returns the shared status handle and the reconnect-loop
-/// task (`joiner::run`); aborting the task is how a test drops the
-/// connection, since dropping the handle alone leaves the socket open.
+/// `generator` and writing no thought of its own — what every test in this
+/// file that has no interest in running thoughts (#220) uses.
 fn spawn_joiner(
     port: u16,
     id: &str,
     display_name: &str,
     password: &str,
     generator: RemoteGenerator,
+) -> (JoinerHandle, tokio::task::JoinHandle<()>) {
+    spawn_joiner_with_thinker(port, id, display_name, password, generator, noop_thinker())
+}
+
+/// A [`Thinker`] that writes nothing and records nothing.
+fn noop_thinker() -> Thinker {
+    Arc::new(|_transcript, _speakers| {})
+}
+
+/// [`spawn_joiner`], but with an injected [`Thinker`] — what a test
+/// exercising #220's own running-thought generation uses.
+fn spawn_joiner_with_thinker(
+    port: u16,
+    id: &str,
+    display_name: &str,
+    password: &str,
+    generator: RemoteGenerator,
+    thinker: Thinker,
 ) -> (JoinerHandle, tokio::task::JoinHandle<()>) {
     let identity = JoinerIdentity {
         id: ParticipantId::parse(id).expect("valid participant id"),
@@ -157,6 +195,7 @@ fn spawn_joiner(
         identity.id.clone(),
         handle.clone(),
         generator,
+        thinker,
         crate::multiplayer::joiner_compaction::noop_job(),
     ));
     let task = tokio::spawn(crate::multiplayer::joiner::run(
@@ -165,6 +204,39 @@ fn spawn_joiner(
         generation,
     ));
     (handle, task)
+}
+
+/// A [`Thinker`] test double that behaves like production's `think_and_store`
+/// (#220) without touching SQLite: applies the same [`pending_thought_range`]
+/// skip rule against an in-memory "newest id already thought through"
+/// tracker, and records every call it did not skip as `(self_id, from,
+/// through)`.
+struct RecordingThinker {
+    previous_through: Mutex<Option<i32>>,
+    calls: Mutex<Vec<(String, i32, i32)>>,
+}
+
+impl RecordingThinker {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            previous_through: Mutex::new(None),
+            calls: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn as_thinker(self: &Arc<Self>) -> Thinker {
+        let this = Arc::clone(self);
+        Arc::new(move |transcript: &[Message], speakers: &PromptSpeakers| {
+            let mut previous_through = this.previous_through.lock().unwrap();
+            if let Some((from, through)) = pending_thought_range(*previous_through, transcript) {
+                this.calls
+                    .lock()
+                    .unwrap()
+                    .push((speakers.self_id.to_string(), from, through));
+                *previous_through = Some(through);
+            }
+        })
+    }
 }
 
 /// A [`RemoteGenerator`] that ignores the transcript it is handed and emits
@@ -332,6 +404,7 @@ async fn run_one_round(
 
 #[actix_web::test]
 async fn a_full_round_runs_over_a_real_socket_between_a_host_and_a_joiner() {
+    let _serial = TEST_LOCK.lock().await;
     let host = HostHandle::start("test-secret").await;
     let bot1 = ParticipantId::parse("bot1").expect("valid id");
 
@@ -436,6 +509,7 @@ async fn a_full_round_runs_over_a_real_socket_between_a_host_and_a_joiner() {
 
 #[actix_web::test]
 async fn a_disconnected_bot_is_skipped_and_the_round_still_completes() {
+    let _serial = TEST_LOCK.lock().await;
     let host = HostHandle::start("test-secret").await;
     let bot1 = ParticipantId::parse("bot1").expect("valid id");
 
@@ -600,6 +674,7 @@ async fn wait_for_generate_request(
 /// reset) carries neither, unchanged from before #182.
 #[actix_web::test]
 async fn a_committed_checkpoint_ships_continuity_and_a_trimmed_transcript_to_the_joiner() {
+    let _serial = TEST_LOCK.lock().await;
     let host = HostHandle::start("test-secret").await;
     let bot1 = ParticipantId::parse("bot1").expect("valid id");
 
@@ -760,6 +835,182 @@ async fn a_committed_checkpoint_ships_continuity_and_a_trimmed_transcript_to_the
             .collect::<Vec<_>>(),
         vec!["one", "two", "@bot1 hi again"],
         "with no compaction, the tail is the full, untrimmed transcript"
+    );
+
+    host.stop().await;
+}
+
+/// #220: a joiner writes its own bot's running thought once per new round,
+/// over the same transcript its reply is about to generate from — the
+/// host's own `char` thought lands the same round without the two
+/// colliding — and a regenerate that re-asks the same speaker over a
+/// transcript whose newest id it already covered does not write a second
+/// one.
+#[actix_web::test]
+async fn a_joiner_writes_its_own_thought_once_and_a_regenerate_does_not_repeat_it() {
+    let _serial = TEST_LOCK.lock().await;
+    let host = HostHandle::start("test-secret").await;
+    let bot1 = ParticipantId::parse("bot1").expect("valid id");
+
+    let thinker = RecordingThinker::new();
+    let (_joiner_handle, _joiner_task) = spawn_joiner_with_thinker(
+        host.port,
+        "bot1",
+        "Ada",
+        "test-secret",
+        stub_generator(&["hi from bot1"], "hi from bot1"),
+        thinker.as_thinker(),
+    );
+    wait_for_bot_connected(&host, &bot1).await;
+
+    let registry_snapshot = host
+        .registry
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let policy = RoutingPolicy {
+        max_followup_depth: 1,
+    };
+    let plan = plan_round("hello everyone", &registry_snapshot, &policy);
+
+    static SLOT: TurnSlot = TurnSlot::new();
+    let guard = SLOT.try_claim().expect("slot should be free");
+    let remotes = SocketRemoteGenerator::new(host.remote_bots.clone());
+    let remote_bots_for_broadcast = host.remote_bots.clone();
+    let round_registry = registry_snapshot.clone();
+    let round_policy = policy;
+
+    let round_task = tokio::task::spawn_blocking(move || {
+        // #220's host-side counterpart: `char`'s own thought, generated the
+        // same round, so this test also proves the two never collide.
+        let store = RecordingStore::new(None).with_thought_inputs(ThoughtInputs {
+            companion_id: COMPANION_ID,
+            speaker_id: ParticipantId::CHAR,
+            previous: vec![],
+            round: vec![],
+            from_message_id: 1,
+            through_message_id: 1,
+        });
+        let pending = PendingTurn::begin(
+            &guard,
+            &store,
+            COMPANION_ID,
+            USER_ID,
+            "hello everyone".to_string(),
+            round_registry.clone(),
+        )
+        .expect("insert the user turn");
+        let broadcast = move |frame: ServerFrame| remote_bots_for_broadcast.broadcast(frame, None);
+        let mut host_think =
+            |inputs: &ThoughtInputs,
+             insert: &dyn Fn(NewRunningThought) -> rusqlite::Result<RunningThought>| {
+                insert(NewRunningThought {
+                    companion_id: inputs.companion_id,
+                    speaker_id: inputs.speaker_id.to_string(),
+                    from_message_id: inputs.from_message_id,
+                    through_message_id: inputs.through_message_id,
+                    text: "char's own note".to_string(),
+                    edited: false,
+                })
+                .map_err(ThoughtError::Store)
+            };
+        let mut sink = RecordingSink::default();
+        let outcome = run_round(
+            guard,
+            pending,
+            plan,
+            &store,
+            &round_registry,
+            &round_policy,
+            &mut |_prompt: &str, on_token: &mut dyn FnMut(&str)| -> io::Result<String> {
+                on_token("hi from host");
+                Ok("hi from host".to_string())
+            },
+            &mut host_think,
+            &remotes,
+            &broadcast,
+            Duration::from_secs(5),
+            &mut sink,
+        )
+        .expect("the round should complete");
+        (outcome, store)
+    });
+
+    let (outcome, store) = round_task.await.expect("the round task should not panic");
+
+    assert_eq!(
+        outcome.host_reply.as_ref().map(|r| r.text.as_str()),
+        Some("hi from host")
+    );
+
+    let host_thoughts = store.thoughts.lock().unwrap().clone();
+    assert_eq!(
+        host_thoughts.len(),
+        1,
+        "the host must write exactly one thought, char's own: {:?}",
+        host_thoughts
+    );
+    assert_eq!(host_thoughts[0].speaker_id, ParticipantId::CHAR.to_string());
+    drop(host_thoughts);
+
+    let calls_after_round = thinker.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls_after_round,
+        vec![("bot1".to_string(), 1, 2)],
+        "bot1 should write its own thought once, over [user, char's reply]"
+    );
+
+    // --- Regenerate bot1's reply: the same range, so no second thought ---
+
+    // Wait for the joiner's own turn slot to be released (its spawned
+    // generation thread drops it after `run_remote_turn` returns, a moment
+    // after the host already saw `ReplyComplete`) before asking it to
+    // regenerate — the same polling pattern `remote_generation.rs`'s own
+    // tests use for the analogous `JOINER_EXTRACTION` slot.
+    for _ in 0..100 {
+        if crate::turn_slot::ACTIVE_TURN.try_claim().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let remotes = SocketRemoteGenerator::new(host.remote_bots.clone());
+    let (_store, persisted) = tokio::task::spawn_blocking(move || {
+        // Mirrors `Database::pop_latest_bot_reply`, which `main.rs::regenerate_prompt`
+        // calls before `regenerate_reply` in production: the reply being
+        // regenerated is removed first, so the resent transcript ends at
+        // the same id it did the first time, not at the reply being thrown
+        // away.
+        let popped = store
+            .pop_latest()
+            .expect("bot1's reply should still be the newest logged message");
+        assert_eq!(
+            popped.speaker_id, "bot1",
+            "the popped row should be bot1's own reply"
+        );
+        let user_turn = store
+            .get_message(1)
+            .expect("the user's turn should still be there");
+
+        let persisted = regenerate_reply(
+            RegenerateTarget::Remote("bot1".to_string()),
+            &user_turn,
+            &store,
+            |_prompt| panic!("the host must never be asked to speak for a remote regenerate"),
+            &remotes,
+            Duration::from_secs(5),
+        )
+        .expect("the remote regenerate should succeed");
+        (store, persisted)
+    })
+    .await
+    .expect("the regenerate task should not panic");
+
+    assert_eq!(persisted.text, "hi from bot1");
+    assert_eq!(
+        *thinker.calls.lock().unwrap(),
+        calls_after_round,
+        "a regenerate over a range this speaker already covered must not write a second thought"
     );
 
     host.stop().await;

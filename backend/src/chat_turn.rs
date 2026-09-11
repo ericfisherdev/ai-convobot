@@ -704,6 +704,14 @@ impl RecordingStore {
         });
         id
     }
+
+    /// Removes and returns the newest logged message, the same "pop" shape
+    /// `Database::pop_latest_bot_reply` performs before a real regenerate —
+    /// so a test can simulate "this reply was already removed" without a
+    /// real SQLite table to delete a row from.
+    pub(crate) fn pop_latest(&self) -> Option<Message> {
+        self.log.lock().unwrap().pop()
+    }
 }
 
 #[cfg(test)]
