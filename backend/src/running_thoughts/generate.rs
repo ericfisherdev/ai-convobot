@@ -52,10 +52,15 @@ pub fn generate_thought(
     insert: &dyn Fn(NewRunningThought) -> rusqlite::Result<RunningThought>,
 ) -> Result<RunningThought, ThoughtError> {
     let prompt = build_thought_prompt(inputs, &companion.persona, speakers);
-    let raw = model
+    let completion = model
         .complete_in_character(&prompt.system, &prompt.user, THOUGHT_MAX_TOKENS)
         .map_err(ThoughtError::Generate)?;
-    let text = clean_thought(&raw, speakers.self_name()).ok_or(ThoughtError::Empty)?;
+    let text = clean_thought(
+        &completion.text,
+        speakers.self_name(),
+        completion.hit_token_cap,
+    )
+    .ok_or(ThoughtError::Empty)?;
 
     insert(NewRunningThought {
         companion_id: inputs.companion_id,
@@ -191,5 +196,46 @@ mod tests {
 
         assert!(matches!(err, ThoughtError::Empty));
         assert!(store.thoughts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn generate_thought_into_on_a_capped_completion_stores_the_text_trimmed_to_a_sentence() {
+        let store = RecordingStore::new();
+        let model = FakeCharacterModel::returning_capped([Ok(
+            "I'm proud of them. I wonder what they'll do ne".to_string(),
+        )]);
+
+        let stored = generate_thought_into(&store, &inputs(), &companion(), &speakers(), &model)
+            .expect("generation should succeed");
+
+        assert_eq!(stored.text, "I'm proud of them.");
+    }
+
+    #[test]
+    fn generate_thought_into_on_a_capped_whitespace_only_output_is_still_empty() {
+        let store = RecordingStore::new();
+        let model = FakeCharacterModel::returning_capped([Ok("   \n\n  ".to_string())]);
+
+        let err = generate_thought_into(&store, &inputs(), &companion(), &speakers(), &model)
+            .unwrap_err();
+
+        assert!(matches!(err, ThoughtError::Empty));
+        assert!(store.thoughts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn generate_thought_into_on_a_capped_run_on_with_no_boundary_is_still_stored() {
+        let store = RecordingStore::new();
+        let model = FakeCharacterModel::returning_capped([Ok(
+            "one long run-on that never ends and keeps going ab".to_string(),
+        )]);
+
+        let stored = generate_thought_into(&store, &inputs(), &companion(), &speakers(), &model)
+            .expect("a capped run-on with no sentence boundary must still be stored");
+
+        assert_eq!(
+            stored.text,
+            "one long run-on that never ends and keeps going ab"
+        );
     }
 }
