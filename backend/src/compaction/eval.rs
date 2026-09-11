@@ -352,6 +352,14 @@ fn run_range(fixture: &RangeFixture) -> Result<RunOutput, String> {
         extractor.context_window(),
     );
 
+    // `make_eval_fixtures.sh` writes a fixture file even when its id range
+    // selects no rows, and `merge_outputs` panics on an empty chunk list.
+    // Reported as this range failing, so one empty fixture does not abort
+    // the whole run.
+    if chunks.is_empty() {
+        return Err("fixture has no messages to extract".to_string());
+    }
+
     let started = Instant::now();
     let mut outputs = Vec::with_capacity(chunks.len());
     let mut parse_retries = 0;
@@ -666,13 +674,31 @@ fn collect_principal(found: &mut Vec<String>, draft: &FactDraft, fixture: &Range
     let Some(FactSubject::Person(name)) = &draft.subject else {
         return;
     };
-    let lowered = name.to_lowercase();
+    // Whole words, matching `RangeParticipants::is_principal`: substring
+    // containment would count "Erica" as the principal "Eric" and report a
+    // prompt-adherence failure the production filter does not see.
+    let candidate = eval_words(name);
     for principal in [&fixture.user_name, &fixture.companion_name] {
-        if lowered.contains(&principal.to_lowercase()) {
+        let wanted = eval_words(principal);
+        if !wanted.is_empty()
+            && candidate
+                .windows(wanted.len())
+                .any(|window| window == wanted.as_slice())
+        {
             found.push(name.clone());
             return;
         }
     }
+}
+
+/// `text`'s lowercased alphanumeric words. Mirrors `extract.rs`'s `words_of`,
+/// kept separate because the harness deliberately measures emission with its
+/// own code rather than sharing the filter it is scoring.
+fn eval_words(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect()
 }
 
 /// Scores one draft's subject against the gold labels, or records it as

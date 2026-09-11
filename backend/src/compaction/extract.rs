@@ -205,14 +205,17 @@ impl RangeParticipants {
         self.entries.iter().find(|p| !p.canon)
     }
 
-    /// The participant whose name `text` begins with. Longest match wins,
-    /// so one name being a prefix of another ("Ann" inside "Anna") resolves
-    /// to the longer one.
+    /// The participant whose name `text` begins with. The name must end at
+    /// a word boundary, so "Erica feels at home" is not Eric; longest match
+    /// wins, so one name being a prefix of another ("Ann" inside "Anna")
+    /// resolves to the longer one. Only the grammar's fallback path can
+    /// produce text this has to reject — a literal-carrying grammar cannot
+    /// emit a name that is not one of these.
     fn leading(&self, text: &str) -> Option<&RangeParticipant> {
         let trimmed = text.trim_start();
         let mut best: Option<&RangeParticipant> = None;
         for participant in &self.entries {
-            if !trimmed.starts_with(&participant.name) {
+            if !starts_with_name(trimmed, &participant.name) {
                 continue;
             }
             let longer = match best {
@@ -233,18 +236,19 @@ impl RangeParticipants {
 
     /// Whether `name` refers to one of the range's own participants rather
     /// than a third party. Case-insensitive, and matches a participant's
-    /// name appearing as a whole word inside a longer one ("Eric Fisher"),
-    /// so a `people` item cannot smuggle a principal in by decorating the
-    /// name; "Erica" is a different person and does not match.
+    /// whole name appearing as a run of whole words inside a longer one
+    /// ("Eric Fisher" is Eric; "Vi Bright the tinkerer" is "Vi Bright"), so
+    /// a `people` item cannot smuggle a principal in by decorating the
+    /// name. "Erica" is a different person and does not match.
     fn is_principal(&self, name: &str) -> bool {
-        let words: Vec<String> = name
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|w| !w.is_empty())
-            .map(str::to_lowercase)
-            .collect();
-        self.entries
-            .iter()
-            .any(|p| words.iter().any(|word| *word == p.name.to_lowercase()))
+        let candidate = words_of(name);
+        self.entries.iter().any(|participant| {
+            let wanted = words_of(&participant.name);
+            !wanted.is_empty()
+                && candidate
+                    .windows(wanted.len())
+                    .any(|window| window == wanted.as_slice())
+        })
     }
 
     /// Whether every name can be spelled as a GBNF string literal as-is. A
@@ -258,6 +262,48 @@ impl RangeParticipants {
                 && !p.name.contains(['"', '\\'])
                 && !p.name.chars().any(char::is_control)
         })
+    }
+}
+
+/// `text`'s lowercased alphanumeric words, the unit both [`starts_with_name`]
+/// and [`RangeParticipants::is_principal`] compare on, so "Eric", "eric" and
+/// "Eric," are one word and "Erica" is another.
+fn words_of(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Whether `text` opens with `name` ending at a word boundary — the next
+/// character is not alphanumeric, or there is none. Plain `starts_with`
+/// would read "Erica feels at home" as a fact about Eric.
+fn starts_with_name(text: &str, name: &str) -> bool {
+    match text.strip_prefix(name) {
+        None => false,
+        Some(rest) => rest.chars().next().is_none_or(|c| !c.is_alphanumeric()),
+    }
+}
+
+/// `text` with the leading participant name removed, when the name is
+/// followed by whitespace.
+///
+/// The name is how the model declares an item's subject, not part of the
+/// fact: `to_fact_drafts` records the subject in `FactDraft::subject`, and
+/// both consumers re-prefix the text themselves — `render::render_overlay`
+/// lists a fact under a `"{name} now ..."` header, and `ltm::fact_entry`
+/// indexes it as `"{{user}}: ..."`. Keeping the name would render
+/// "Eric: Eric grew up near Millbrook", and would make every new row
+/// ("Vi is cautious") miss `validate::check_duplicate` against the
+/// equivalent pre-existing row ("is cautious").
+///
+/// A possessive opening ("Eric's guard is up") is left alone: the name
+/// there is part of the sentence, so only the subject is taken from it.
+fn strip_leading_name(text: &str, name: &str) -> String {
+    let trimmed = text.trim_start();
+    match trimmed.strip_prefix(name) {
+        Some(rest) if rest.starts_with(char::is_whitespace) => rest.trim_start().to_string(),
+        _ => text.to_string(),
     }
 }
 
@@ -299,14 +345,14 @@ pub fn to_fact_drafts(
 
     for item in &output.state {
         drafts.push(match participants.leading(&item.text) {
-            Some(participant) if participant.canon => {
-                text_item_draft(item, FactCategory::UserState, Some(FactSubject::User))
+            Some(participant) => {
+                let category = if participant.canon {
+                    FactCategory::UserState
+                } else {
+                    FactCategory::CompanionState
+                };
+                named_item_draft(item, category, participant)
             }
-            Some(_) => text_item_draft(
-                item,
-                FactCategory::CompanionState,
-                Some(FactSubject::Companion),
-            ),
             None => unattributed_draft(item, FactCategory::CompanionState),
         });
     }
@@ -315,9 +361,7 @@ pub fn to_fact_drafts(
     }
     for item in &output.backstory {
         drafts.push(match participants.leading(&item.text) {
-            Some(participant) => {
-                text_item_draft(item, FactCategory::Backstory, Some(subject_of(participant)))
-            }
+            Some(participant) => named_item_draft(item, FactCategory::Backstory, participant),
             None => unattributed_draft(item, FactCategory::Backstory),
         });
     }
@@ -360,12 +404,32 @@ fn text_item_draft(
     }
 }
 
+/// A `state`/`backstory` item whose leading name resolved to `participant`:
+/// the subject is recorded on the draft and [`strip_leading_name`] takes the
+/// name back out of the stored text, so a row keeps the same shape as one
+/// written before the name became the subject carrier.
+fn named_item_draft(
+    item: &TextItem,
+    category: FactCategory,
+    participant: &RangeParticipant,
+) -> FactDraft {
+    let mut draft = text_item_draft(item, category, Some(subject_of(participant)));
+    draft.text = strip_leading_name(&item.text, &participant.name);
+    draft
+}
+
 /// A `state`/`backstory` item whose text names no participant of the range.
 /// Unreachable while the grammar carries name literals; reachable when
 /// [`build_extraction_grammar`] fell back to unconstrained strings. Kept as
 /// a draft — nothing is ever dropped silently — but pre-rejected, so it
 /// surfaces on the review card instead of being filed under a guessed
 /// subject.
+///
+/// Accepting the item at review does not un-reject it either:
+/// `review::apply_review` preserves this reason and
+/// [`RejectReason::PrincipalAsPerson`] specifically, because a review
+/// request carries no [`RangeParticipants`] and so cannot re-derive either
+/// one. Every other reason is re-derivable, and review clears those.
 fn unattributed_draft(item: &TextItem, category: FactCategory) -> FactDraft {
     let mut draft = text_item_draft(item, category, None);
     draft.rejected_reason = Some(RejectReason::UnknownSubject.to_string());
@@ -1721,6 +1785,87 @@ mod tests {
             "Erica merely contains `Eric`; she is a different person"
         );
         assert_eq!(drafts[3].rejected_reason, None);
+    }
+
+    #[test]
+    fn the_declaring_name_is_recorded_as_the_subject_and_taken_out_of_the_stored_text() {
+        let raw = r#"{
+            "state": [{"text":"Eric feels at home","sources":[62]}],
+            "milestones": [], "backstory": [
+                {"text":"Vi grew up near Millbrook","sources":[46]}
+            ],
+            "open_threads": [], "rules": [], "people": [], "key_quotes": [],
+            "summary": "s",
+            "attitude": {"trust":0,"love":0,"fear":0,"anger":0,"joy":0,"sorrow":0,"suspicion":0,"gratitude":0}
+        }"#;
+        let output = parse_extraction(raw).unwrap();
+        let drafts = to_fact_drafts(&output, &fixture_participants());
+
+        // `render::render_overlay` and `ltm::fact_entry` both prefix the
+        // subject themselves; keeping the name would render
+        // "Eric: Eric feels at home".
+        assert_eq!(drafts[0].text, "feels at home");
+        assert_eq!(drafts[0].subject, Some(FactSubject::User));
+        assert_eq!(drafts[1].text, "grew up near Millbrook");
+        assert_eq!(drafts[1].subject, Some(FactSubject::Companion));
+    }
+
+    #[test]
+    fn a_possessive_opening_sets_the_subject_but_leaves_the_sentence_intact() {
+        let raw = r#"{
+            "state": [{"text":"Eric's guard is up around strangers","sources":[62]}],
+            "milestones": [], "backstory": [], "open_threads": [],
+            "rules": [], "people": [], "key_quotes": [], "summary": "s",
+            "attitude": {"trust":0,"love":0,"fear":0,"anger":0,"joy":0,"sorrow":0,"suspicion":0,"gratitude":0}
+        }"#;
+        let output = parse_extraction(raw).unwrap();
+        let drafts = to_fact_drafts(&output, &fixture_participants());
+        assert_eq!(drafts[0].subject, Some(FactSubject::User));
+        assert_eq!(drafts[0].text, "Eric's guard is up around strangers");
+    }
+
+    #[test]
+    fn a_name_that_merely_starts_with_a_participants_name_is_not_that_participant() {
+        let raw = r#"{
+            "state": [{"text":"Erica feels at home","sources":[62]}],
+            "milestones": [], "backstory": [], "open_threads": [],
+            "rules": [], "people": [], "key_quotes": [], "summary": "s",
+            "attitude": {"trust":0,"love":0,"fear":0,"anger":0,"joy":0,"sorrow":0,"suspicion":0,"gratitude":0}
+        }"#;
+        let output = parse_extraction(raw).unwrap();
+        let drafts = to_fact_drafts(&output, &fixture_participants());
+        assert_eq!(
+            drafts[0].rejected_reason.as_deref(),
+            Some(RejectReason::UnknownSubject.to_string().as_str()),
+            "`Erica` is not `Eric`; only the fallback grammar can emit this, and it must not \
+             be filed under a guessed subject"
+        );
+    }
+
+    #[test]
+    fn a_multi_word_participant_name_is_still_recognised_as_a_principal() {
+        let range = vec![
+            CitedMessage {
+                id: 1,
+                speaker_id: "user".to_string(),
+                content: "hi".to_string(),
+            },
+            CitedMessage {
+                id: 2,
+                speaker_id: "char".to_string(),
+                content: "hello".to_string(),
+            },
+        ];
+        let speakers = SoloSpeakers {
+            user_name: "Eric".to_string(),
+            companion_name: "Vi Bright".to_string(),
+        };
+        let participants = RangeParticipants::from_range(&range, &speakers);
+
+        assert!(participants.is_principal("Vi Bright"));
+        assert!(participants.is_principal("Vi Bright the tinkerer"));
+        assert!(!participants.is_principal("Vi"));
+        assert!(!participants.is_principal("Bright"));
     }
 
     #[test]
