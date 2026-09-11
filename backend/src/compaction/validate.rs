@@ -38,6 +38,19 @@ pub enum RejectReason {
     /// The item's normalised text matches an active fact in the same
     /// category that it does not replace.
     Duplicate,
+    /// The item named no participant of the range: a `state`/`backstory`
+    /// item whose text does not begin with a participant's display name, or
+    /// a quote/`people` item whose `speaker`/`relation_to` is not one of
+    /// them. Set by `extract::to_fact_drafts` before [`validate`] runs,
+    /// since only the mapping step knows the range's names; [`validate`]
+    /// leaves such a draft alone rather than re-judging it.
+    UnknownSubject,
+    /// A `people` item naming one of the range's own participants. That
+    /// array is for third parties; a principal filed as a person would
+    /// become a duplicate identity alongside their own state facts. Like
+    /// [`RejectReason::UnknownSubject`], set by `extract::to_fact_drafts`,
+    /// which is where the range's names are known.
+    PrincipalAsPerson,
 }
 
 impl fmt::Display for RejectReason {
@@ -63,6 +76,12 @@ impl fmt::Display for RejectReason {
                 )
             }
             RejectReason::Duplicate => write!(f, "duplicates an active fact"),
+            RejectReason::UnknownSubject => {
+                write!(f, "item names no participant of the compacted range")
+            }
+            RejectReason::PrincipalAsPerson => {
+                write!(f, "people item names a participant, not a third party")
+            }
         }
     }
 }
@@ -268,6 +287,13 @@ pub fn validate(
     for draft in drafts.iter_mut() {
         draft.canon = is_canon_sourced(draft, range, is_canon);
 
+        // `extract::to_fact_drafts` rejects an item it could not attribute
+        // to a participant. Such a draft has no subject to run the canon
+        // rule or the speaker check against, so its reason stands as given.
+        if draft.rejected_reason.is_some() {
+            continue;
+        }
+
         let rejection = check_sources(draft, range)
             .or_else(|| check_canon(draft, range, is_canon))
             .or_else(|| check_verbatim(draft, range, is_canon))
@@ -315,6 +341,7 @@ pub fn overlays_fit(drafts: &[FactDraft], budget_tokens: usize) -> Result<(), us
 mod tests {
     use super::*;
     use crate::compaction::extract::to_fact_drafts;
+    use crate::compaction::fixtures::fixture_participants;
     use crate::compaction::fixtures::{bad_draft, synthetic_range};
 
     fn user_is_canon(speaker_id: &str) -> bool {
@@ -735,7 +762,7 @@ mod tests {
     #[test]
     fn validate_returns_exactly_as_many_drafts_as_it_received() {
         let range = synthetic_range();
-        let drafts = to_fact_drafts(&bad_draft());
+        let drafts = to_fact_drafts(&bad_draft(), &fixture_participants());
         let input_len = drafts.len();
         let result = validate(drafts, &range, &[], &user_is_canon);
         assert_eq!(result.len(), input_len);
@@ -744,7 +771,7 @@ mod tests {
     #[test]
     fn bad_draft_fixture_exercises_all_four_deliberate_defects() {
         let range = synthetic_range();
-        let drafts = to_fact_drafts(&bad_draft());
+        let drafts = to_fact_drafts(&bad_draft(), &fixture_participants());
         let result = validate(drafts, &range, &[], &user_is_canon);
 
         let by_category = |category: FactCategory| {

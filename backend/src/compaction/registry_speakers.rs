@@ -150,13 +150,13 @@ mod tests {
 
         let output = format!(
             r#"{{
-                "companion_state": [], "user_state": [
-                    {{"text": "found an old brass key under the porch step", "sources": [{vex_id}], "replaces": []}},
-                    {{"text": "found an old brass key under the porch step", "sources": [59], "replaces": []}}
+                "state": [
+                    {{"text": "Alice found an old brass key under the porch step", "sources": [{vex_id}], "replaces": []}},
+                    {{"text": "Alice found an old brass key under the porch step", "sources": [59], "replaces": []}}
                 ],
                 "milestones": [], "backstory": [], "open_threads": [], "rules": [],
                 "people": [
-                    {{"name": "Finn", "relation_to": "user", "relation": "a dockhand vex mentioned", "sources": [{vex_id}]}}
+                    {{"name": "Finn", "relation_to": "Alice", "relation": "a dockhand vex mentioned", "sources": [{vex_id}]}}
                 ],
                 "key_quotes": [], "summary": "settling into the new place",
                 "attitude": {{"trust":0,"love":0,"fear":0,"anger":0,"joy":0,"sorrow":0,"suspicion":0,"gratitude":0}}

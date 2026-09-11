@@ -14,7 +14,7 @@ use crate::compaction::store::{CompactionStore, SqliteCompactionStore};
 use crate::compaction::types::{
     Checkpoint, CompactionStatus, FactCategory, FactDraft, FactSubject,
 };
-use crate::compaction::validate::{overlays_fit, validate};
+use crate::compaction::validate::{overlays_fit, validate, RejectReason};
 use crate::compaction::{CitedMessage, SpeakerInfo};
 use crate::context_manager::ContextManager;
 use crate::database::Database;
@@ -25,13 +25,22 @@ use crate::turn_slot::TurnGuard;
 /// The model's extraction output, one JSON object per compacted range.
 /// `#[serde(deny_unknown_fields)]` so a model that drifts from the schema
 /// fails parse instead of being silently accepted.
+///
+/// There is one `state` array rather than a `companion_state`/`user_state`
+/// pair, and a backstory item has no `about` key: which participant an item
+/// is about is carried by that participant's own display name at the head
+/// of the item's `text`, and the grammar [`build_extraction_grammar`]
+/// builds forces the name to be one the range actually uses.
+/// [`to_fact_drafts`] resolves the name back to a [`FactSubject`] and a
+/// [`FactCategory`]. This replaces an indirection — the model mapping a
+/// display name onto the token `"companion"`, which never appears in the
+/// transcript — that was the largest single source of subject inversion.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtractionOutput {
-    pub companion_state: Vec<TextItem>,
-    pub user_state: Vec<TextItem>,
+    pub state: Vec<TextItem>,
     pub milestones: Vec<TextItem>,
-    pub backstory: Vec<BackstoryItem>,
+    pub backstory: Vec<TextItem>,
     pub open_threads: Vec<TextItem>,
     pub rules: Vec<QuoteItem>,
     pub people: Vec<PersonItem>,
@@ -40,10 +49,9 @@ pub struct ExtractionOutput {
     pub attitude: AttitudeRatings,
 }
 
-/// One `companion_state`/`user_state`/`milestones`/`open_threads` entry.
-/// `replaces` is only meaningful on `companion_state`/`user_state`: the ids
-/// of prior overlay facts this item updates. `#[serde(default)]` since a
-/// `milestones`/`open_threads` item never carries it.
+/// One `state`/`milestones`/`backstory`/`open_threads` entry. `replaces` is
+/// only meaningful on `state`: the ids of prior overlay facts this item
+/// updates. `#[serde(default)]` since no other array's items carry it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TextItem {
     pub text: String,
@@ -52,41 +60,24 @@ pub struct TextItem {
     pub replaces: Vec<i64>,
 }
 
-/// One `backstory` entry: `about` picks the subject between the user and
-/// the companion.
-#[derive(Debug, Clone, Deserialize)]
-pub struct BackstoryItem {
-    pub about: Party,
-    pub text: String,
-    pub sources: Vec<i32>,
-}
-
-/// One `rules`/`key_quotes` entry: a verbatim quote plus who said it.
+/// One `rules`/`key_quotes` entry: a verbatim quote plus the display name
+/// of whoever said it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct QuoteItem {
     pub quote: String,
-    pub speaker: Party,
+    pub speaker: String,
     pub sources: Vec<i32>,
 }
 
-/// One `people` entry: a person other than the user or companion,
-/// introduced in the compacted range.
+/// One `people` entry: a person other than the range's own participants,
+/// introduced in the compacted range. `relation_to` is a participant's
+/// display name.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PersonItem {
     pub name: String,
-    pub relation_to: Party,
+    pub relation_to: String,
     pub relation: String,
     pub sources: Vec<i32>,
-}
-
-/// Who a `backstory`/`rules`/`key_quotes`/`people` item is about or spoken
-/// by. Serializes/deserializes lowercase (`"user"`/`"companion"`) to match
-/// the grammar's constrained output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Party {
-    User,
-    Companion,
 }
 
 /// The eight `attitude_engine::AttitudeDimension` ratings the model emits
@@ -154,89 +145,202 @@ pub fn parse_extraction(raw: &str) -> Result<ExtractionOutput, serde_json::Error
     serde_json::from_str(raw)
 }
 
-/// Maps a `Party` to the [`FactSubject`] it stands for. `Party` can only
-/// ever be `User`/`Companion`, so this never produces `FactSubject::Person`.
-fn subject_of(party: Party) -> FactSubject {
-    match party {
-        Party::User => FactSubject::User,
-        Party::Companion => FactSubject::Companion,
+/// One participant of a compacted range: the display name the transcript
+/// actually uses for them, and whether their turns count as canon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RangeParticipant {
+    pub name: String,
+    pub canon: bool,
+}
+
+/// The distinct participants a range's messages contain, in first-appearance
+/// order. This is both the vocabulary [`build_extraction_grammar`] turns
+/// into name literals and the table [`to_fact_drafts`] resolves an item's
+/// leading name against, so the grammar and the resolver can never disagree
+/// about who exists.
+///
+/// Deduplicated by display name, first speaker id to use a name winning:
+/// the model only ever sees names, so two speaker ids sharing one name are
+/// indistinguishable to it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RangeParticipants {
+    entries: Vec<RangeParticipant>,
+}
+
+impl RangeParticipants {
+    /// Collects the participants of `range` under `speakers`' naming and
+    /// canon policy. Built once per range and shared by every chunk, so a
+    /// chunk that happens to hold only one speaker's turns still offers the
+    /// model the whole range's names.
+    pub fn from_range(range: &[CitedMessage], speakers: &dyn SpeakerInfo) -> Self {
+        let mut entries: Vec<RangeParticipant> = Vec::new();
+        for message in range {
+            let name = speakers.display_name(&message.speaker_id);
+            if entries.iter().any(|p| p.name == name) {
+                continue;
+            }
+            entries.push(RangeParticipant {
+                name,
+                canon: speakers.is_canon(&message.speaker_id),
+            });
+        }
+        Self { entries }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, RangeParticipant> {
+        self.entries.iter()
+    }
+
+    /// The first canon participant, i.e. the human user of a solo range.
+    pub fn user(&self) -> Option<&RangeParticipant> {
+        self.entries.iter().find(|p| p.canon)
+    }
+
+    /// The first non-canon participant, i.e. the AI companion.
+    pub fn companion(&self) -> Option<&RangeParticipant> {
+        self.entries.iter().find(|p| !p.canon)
+    }
+
+    /// The participant whose name `text` begins with. Longest match wins,
+    /// so one name being a prefix of another ("Ann" inside "Anna") resolves
+    /// to the longer one.
+    fn leading(&self, text: &str) -> Option<&RangeParticipant> {
+        let trimmed = text.trim_start();
+        let mut best: Option<&RangeParticipant> = None;
+        for participant in &self.entries {
+            if !trimmed.starts_with(&participant.name) {
+                continue;
+            }
+            let longer = match best {
+                Some(current) => participant.name.len() > current.name.len(),
+                None => true,
+            };
+            if longer {
+                best = Some(participant);
+            }
+        }
+        best
+    }
+
+    /// The participant with this exact display name.
+    fn named(&self, name: &str) -> Option<&RangeParticipant> {
+        self.entries.iter().find(|p| p.name == name)
+    }
+
+    /// Whether `name` refers to one of the range's own participants rather
+    /// than a third party. Case-insensitive, and matches a participant's
+    /// name appearing as a whole word inside a longer one ("Eric Fisher"),
+    /// so a `people` item cannot smuggle a principal in by decorating the
+    /// name; "Erica" is a different person and does not match.
+    fn is_principal(&self, name: &str) -> bool {
+        let words: Vec<String> = name
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_lowercase)
+            .collect();
+        self.entries
+            .iter()
+            .any(|p| words.iter().any(|word| *word == p.name.to_lowercase()))
+    }
+
+    /// Whether every name can be spelled as a GBNF string literal as-is. A
+    /// name carrying a quote, a backslash or a control character makes
+    /// [`build_extraction_grammar`] fall back to unconstrained strings
+    /// rather than constrain the model to a rewritten name the transcript
+    /// never uses.
+    fn all_names_are_grammar_safe(&self) -> bool {
+        self.entries.iter().all(|p| {
+            !p.name.is_empty()
+                && !p.name.contains(['"', '\\'])
+                && !p.name.chars().any(char::is_control)
+        })
+    }
+}
+
+/// The [`FactSubject`] a participant stands for. Canon (human) participants
+/// are the user; every other participant is the companion. Multiplayer's
+/// several humans therefore all map to `User`, which is as much as the
+/// fact schema's two-subject model can represent today.
+fn subject_of(participant: &RangeParticipant) -> FactSubject {
+    if participant.canon {
+        FactSubject::User
+    } else {
+        FactSubject::Companion
+    }
+}
+
+/// The `quote_speaker` token stored for a participant: the same lowercase
+/// form every other speaker-shaped column uses.
+fn speaker_token(participant: &RangeParticipant) -> &'static str {
+    if participant.canon {
+        "user"
+    } else {
+        "companion"
     }
 }
 
 /// Maps one [`ExtractionOutput`] to the [`FactDraft`]s `validate::validate`
-/// will run the canon rule and the rest over. Preserves each array's order
-/// and item count; `validate` is what may reject an item, never this
-/// function. `output.summary` and `output.attitude` go on the checkpoint
-/// row, not into facts.
-pub fn to_fact_drafts(output: &ExtractionOutput) -> Vec<FactDraft> {
+/// will run the canon rule and the rest over, resolving each item's
+/// participant name through `participants`. Preserves each array's order
+/// and item count; `validate` is what may reject an item for a rule
+/// violation, and the one rejection this function itself sets is
+/// [`RejectReason::UnknownSubject`], for an item naming nobody in the
+/// range. `output.summary` and `output.attitude` go on the checkpoint row,
+/// not into facts.
+pub fn to_fact_drafts(
+    output: &ExtractionOutput,
+    participants: &RangeParticipants,
+) -> Vec<FactDraft> {
     let mut drafts = Vec::new();
 
-    for item in &output.companion_state {
-        drafts.push(text_item_draft(
-            item,
-            FactCategory::CompanionState,
-            Some(FactSubject::Companion),
-        ));
-    }
-    for item in &output.user_state {
-        drafts.push(text_item_draft(
-            item,
-            FactCategory::UserState,
-            Some(FactSubject::User),
-        ));
+    for item in &output.state {
+        drafts.push(match participants.leading(&item.text) {
+            Some(participant) if participant.canon => {
+                text_item_draft(item, FactCategory::UserState, Some(FactSubject::User))
+            }
+            Some(_) => text_item_draft(
+                item,
+                FactCategory::CompanionState,
+                Some(FactSubject::Companion),
+            ),
+            None => unattributed_draft(item, FactCategory::CompanionState),
+        });
     }
     for item in &output.milestones {
         drafts.push(text_item_draft(item, FactCategory::Milestone, None));
     }
     for item in &output.backstory {
-        drafts.push(FactDraft {
-            category: FactCategory::Backstory,
-            subject: Some(subject_of(item.about)),
-            text: item.text.clone(),
-            quote_speaker: None,
-            sources: item.sources.clone(),
-            replaces: Vec::new(),
-            relation_to: None,
-            relation: None,
-            canon: false,
-            rejected_reason: None,
+        drafts.push(match participants.leading(&item.text) {
+            Some(participant) => {
+                text_item_draft(item, FactCategory::Backstory, Some(subject_of(participant)))
+            }
+            None => unattributed_draft(item, FactCategory::Backstory),
         });
     }
     for item in &output.open_threads {
         drafts.push(text_item_draft(item, FactCategory::OpenThread, None));
     }
     for item in &output.rules {
-        drafts.push(quote_item_draft(item, FactCategory::Rule));
+        drafts.push(quote_item_draft(item, FactCategory::Rule, participants));
     }
     for item in &output.people {
-        drafts.push(FactDraft {
-            category: FactCategory::Person,
-            subject: Some(FactSubject::Person(item.name.clone())),
-            // Carries the name, not just `relation`: `check_duplicate`
-            // keys on `(category, normalised text)` alone, so two distinct
-            // people sharing a relation string (e.g. two different "a
-            // neighbor"s) would otherwise collide as the same duplicate.
-            text: format!("{}: {}", item.name, item.relation),
-            quote_speaker: None,
-            sources: item.sources.clone(),
-            replaces: Vec::new(),
-            relation_to: Some(subject_of(item.relation_to)),
-            relation: Some(item.relation.clone()),
-            canon: false,
-            rejected_reason: None,
-        });
+        drafts.push(person_draft(item, participants));
     }
     for item in &output.key_quotes {
-        drafts.push(quote_item_draft(item, FactCategory::KeyQuote));
+        drafts.push(quote_item_draft(item, FactCategory::KeyQuote, participants));
     }
 
     drafts
 }
 
-/// Shared by every `TextItem`-shaped array (`companion_state`, `user_state`,
-/// `milestones`, `open_threads`): only `subject` and `replaces` differ, and
-/// `replaces` is only ever non-empty for the two state categories, since
-/// only `TextItem` carries it.
+/// Shared by every `TextItem`-shaped array (`state`, `milestones`,
+/// `backstory`, `open_threads`): only `subject` differs, and `replaces` is
+/// only ever non-empty on a `state` item, since the grammar only offers the
+/// key there.
 fn text_item_draft(
     item: &TextItem,
     category: FactCategory,
@@ -256,32 +360,74 @@ fn text_item_draft(
     }
 }
 
-/// Shared by `rules` and `key_quotes`: both are a verbatim `QuoteItem`, only
-/// the category differs.
-fn quote_item_draft(item: &QuoteItem, category: FactCategory) -> FactDraft {
+/// A `state`/`backstory` item whose text names no participant of the range.
+/// Unreachable while the grammar carries name literals; reachable when
+/// [`build_extraction_grammar`] fell back to unconstrained strings. Kept as
+/// a draft — nothing is ever dropped silently — but pre-rejected, so it
+/// surfaces on the review card instead of being filed under a guessed
+/// subject.
+fn unattributed_draft(item: &TextItem, category: FactCategory) -> FactDraft {
+    let mut draft = text_item_draft(item, category, None);
+    draft.rejected_reason = Some(RejectReason::UnknownSubject.to_string());
+    draft
+}
+
+/// Shared by `rules` and `key_quotes`: both are a verbatim quote attributed
+/// to a participant by name, only the category differs. An unrecognised
+/// name leaves `quote_speaker` unset and pre-rejects the draft, rather than
+/// letting `check_verbatim` read the absence as "no claim made".
+fn quote_item_draft(
+    item: &QuoteItem,
+    category: FactCategory,
+    participants: &RangeParticipants,
+) -> FactDraft {
+    let speaker = participants.named(&item.speaker);
     FactDraft {
         category,
         subject: None,
         text: item.quote.clone(),
-        quote_speaker: Some(item.speaker_token().to_string()),
+        quote_speaker: speaker.map(|p| speaker_token(p).to_string()),
         sources: item.sources.clone(),
         replaces: Vec::new(),
         relation_to: None,
         relation: None,
         canon: false,
-        rejected_reason: None,
+        rejected_reason: speaker
+            .is_none()
+            .then(|| RejectReason::UnknownSubject.to_string()),
     }
 }
 
-impl QuoteItem {
-    /// `quote_speaker` is stored as the same lowercase token every other
-    /// speaker-shaped column uses (`"user"`/`"companion"`), not `Party`'s
-    /// `Debug` form.
-    fn speaker_token(&self) -> &'static str {
-        match self.speaker {
-            Party::User => "user",
-            Party::Companion => "companion",
-        }
+/// One `people` item. `text` carries the name as well as the relation:
+/// `check_duplicate` keys on `(category, normalised text)` alone, so two
+/// distinct people sharing a relation string (two different "a neighbor"s)
+/// would otherwise collide as the same duplicate.
+///
+/// An item naming one of the range's own participants is rejected here
+/// rather than discouraged in the prompt: a negative instruction ("do not
+/// emit people items for Eric or Jinx") was ignored by the 3B extractor
+/// often enough to be worthless, and the participant table makes the check
+/// exact.
+fn person_draft(item: &PersonItem, participants: &RangeParticipants) -> FactDraft {
+    let relation_to = participants.named(&item.relation_to);
+    let rejected_reason = if participants.is_principal(&item.name) {
+        Some(RejectReason::PrincipalAsPerson.to_string())
+    } else if relation_to.is_none() {
+        Some(RejectReason::UnknownSubject.to_string())
+    } else {
+        None
+    };
+    FactDraft {
+        category: FactCategory::Person,
+        subject: Some(FactSubject::Person(item.name.clone())),
+        text: format!("{}: {}", item.name, item.relation),
+        quote_speaker: None,
+        sources: item.sources.clone(),
+        replaces: Vec::new(),
+        relation_to: relation_to.map(subject_of),
+        relation: Some(item.relation.clone()),
+        canon: false,
+        rejected_reason,
     }
 }
 
@@ -289,7 +435,7 @@ impl QuoteItem {
 /// generous enough for up to twelve items per array ([`EXTRACTION_GRAMMAR`]'s
 /// own bound) without asking a small local model for more than it can
 /// produce in one call.
-const EXTRACTION_MAX_TOKENS: usize = 1536;
+pub const EXTRACTION_MAX_TOKENS: usize = 1536;
 
 /// Token budget for the summary-merge pass over already-summarised chunks
 /// ([`SUMMARY_GRAMMAR`]'s single `summary` string is short by construction).
@@ -304,9 +450,16 @@ const SUMMARY_MAX_TOKENS: usize = 300;
 /// `chunk_range` accepted chunks that `extract` then rejected as too long —
 /// a 6703-token prompt cleared chunking by 465 tokens and failed the length
 /// check by 47 — so any range long enough to need chunking could not be
-/// extracted at all. `the_reserve_covers_the_completion_budget` pins the
-/// relationship.
+/// extracted at all. The `const` assertion below pins the relationship at
+/// compile time, so a later edit to either constant cannot reintroduce the
+/// gap even in a build that never runs the tests.
 pub const CONTEXT_RESERVE_TOKENS: usize = 2048;
+
+const _: () = assert!(
+    CONTEXT_RESERVE_TOKENS >= EXTRACTION_MAX_TOKENS,
+    "CONTEXT_RESERVE_TOKENS must cover EXTRACTION_MAX_TOKENS, or chunk_range \
+     sizes chunks that extract then rejects as too long"
+);
 
 /// What the extraction prompt renders as "already known" before the
 /// transcript: prior `companion_state`/`user_state` overlay facts (`[F<id>]
@@ -333,30 +486,54 @@ pub fn render_range_line(m: &CitedMessage, speakers: &dyn SpeakerInfo) -> String
     }
 }
 
-/// The exact JSON shape [`EXTRACTION_GRAMMAR`] constrains the model to,
-/// spelled out for the model rather than left implicit.
-const SCHEMA_SKELETON: &str = r#"{
-  "companion_state": [{"text": "...", "sources": [id, ...], "replaces": [fact_id, ...]}],
-  "user_state": [{"text": "...", "sources": [id, ...], "replaces": [fact_id, ...]}],
-  "milestones": [{"text": "...", "sources": [id, ...]}],
-  "backstory": [{"about": "user"|"companion", "text": "...", "sources": [id, ...]}],
-  "open_threads": [{"text": "...", "sources": [id, ...]}],
-  "rules": [{"quote": "...", "speaker": "user"|"companion", "sources": [id, ...]}],
-  "people": [{"name": "...", "relation_to": "user"|"companion", "relation": "...", "sources": [id, ...]}],
-  "key_quotes": [{"quote": "...", "speaker": "user"|"companion", "sources": [id, ...]}],
+/// The JSON shape the built grammar constrains the model to, spelled out
+/// for the model rather than left implicit. `names` is the `"A"|"B"`
+/// alternation of the range's participants, so the schema the model reads
+/// names the same people the grammar will let it write.
+fn schema_skeleton(participants: &RangeParticipants) -> String {
+    let names = participants
+        .iter()
+        .map(|p| format!("\"{}\"", p.name))
+        .collect::<Vec<_>>()
+        .join("|");
+    let names = if names.is_empty() {
+        "\"...\"".to_string()
+    } else {
+        names
+    };
+    // No name placeholder on `state`/`backstory` `text`: the grammar
+    // already forces the leading name, and a `"Jinx ..."` example here is
+    // copied verbatim by a 3B model often enough to produce items whose
+    // whole content is the placeholder.
+    format!(
+        r#"{{
+  "state": [{{"text": "...", "sources": [id, ...], "replaces": [fact_id, ...]}}],
+  "milestones": [{{"text": "...", "sources": [id, ...]}}],
+  "backstory": [{{"text": "...", "sources": [id, ...]}}],
+  "open_threads": [{{"text": "...", "sources": [id, ...]}}],
+  "rules": [{{"quote": "...", "speaker": {names}, "sources": [id, ...]}}],
+  "people": [{{"name": "...", "relation_to": {names}, "relation": "...", "sources": [id, ...]}}],
+  "key_quotes": [{{"quote": "...", "speaker": {names}, "sources": [id, ...]}}],
   "summary": "...",
-  "attitude": {"trust": 0-100, "love": 0-100, "fear": 0-100, "anger": 0-100, "joy": 0-100, "sorrow": 0-100, "suspicion": 0-100, "gratitude": 0-100}
-}"#;
+  "attitude": {{"trust": 0-100, "love": 0-100, "fear": 0-100, "anger": 0-100, "joy": 0-100, "sorrow": 0-100, "suspicion": 0-100, "gratitude": 0-100}}
+}}"#
+    )
+}
 
-/// Builds the full extraction prompt for one range of messages: who the two
+/// Builds the full extraction prompt for one range of messages: who the
 /// participants are and the canon rule, the "already known" overlay/rolling
 /// summary block, the rendered transcript, then the JSON schema the model
-/// must fill in. Takes no token budget: [`chunk_range`] is what decides how
-/// much of `range` fits in one call, this only renders whatever it is given.
+/// must fill in.
+///
+/// `participants` is the whole range's participant table, not the chunk's,
+/// and is the same one [`build_extraction_grammar`] and [`to_fact_drafts`]
+/// use. Takes no token budget: [`chunk_range`] decides how much of a range
+/// fits in one call, this renders whatever it is handed.
 pub fn build_extraction_prompt(
     prior: &PriorNotes,
     range: &[CitedMessage],
     speakers: &dyn SpeakerInfo,
+    participants: &RangeParticipants,
 ) -> String {
     let mut prompt = String::new();
     prompt.push_str(
@@ -366,13 +543,25 @@ pub fn build_extraction_prompt(
         "Lines marked (canon) were said by the real human user; every other line is the \
          companion's (or a third party's) in-character speech and may not be literally true.\n",
     );
+    if let (Some(user), Some(companion)) = (participants.user(), participants.companion()) {
+        let (u, c) = (&user.name, &companion.name);
+        prompt.push_str(&format!(
+            "In this transcript {u} is the real human user and {c} is the AI companion.\n\
+             Every \"state\" and \"backstory\" item's text must begin with the name of the \
+             participant it is about, spelled exactly {u} or {c}. Write \"{c} ...\" for a fact \
+             about {c} and \"{u} ...\" for a fact about {u}.\n\
+             \"speaker\" and \"relation_to\" must be exactly {u} or {c}.\n\
+             Do not emit \"people\" items for {u} or {c} themselves - that array is only for \
+             third parties.\n"
+        ));
+    }
     prompt.push_str(
         "Cite [#id] for every item you produce. Do not invent anything; if you are unsure, omit it.\n",
     );
     prompt.push_str("Keep each item under 25 words.\n");
     prompt.push_str(
-        "When a companion_state or user_state item updates one of the previous notes below, \
-         list that note's [F..] id(s) in the item's \"replaces\" array.\n\n",
+        "When a state item updates one of the previous notes below, list that note's [F..] \
+         id(s) in the item's \"replaces\" array.\n\n",
     );
 
     prompt.push_str("Previous notes (already known, update or keep, do not repeat unchanged):\n");
@@ -402,17 +591,18 @@ pub fn build_extraction_prompt(
     prompt.push('\n');
 
     prompt.push_str("Produce JSON with exactly these keys:\n");
-    prompt.push_str(SCHEMA_SKELETON);
+    prompt.push_str(&schema_skeleton(participants));
     prompt
 }
 
-/// GBNF grammar constraining the model's extraction output to exactly
-/// [`ExtractionOutput`]'s shape: fixed key order, every key required, arrays
-/// bounded to 12 items so a runaway model cannot fill the context, strings
-/// bounded to 400 characters. The rule is literally named `root`, as
-/// `LlamaSampler::grammar` requires. `companion_state`/`user_state` items may
-/// carry an optional trailing `"replaces"` array of prior fact ids; every
-/// other item type has no such key.
+/// The fixed half of the GBNF grammar constraining the model's extraction
+/// output to exactly [`ExtractionOutput`]'s shape: fixed key order, every
+/// key required, arrays bounded to 12 items so a runaway model cannot fill
+/// the context, strings bounded to 400 characters.
+/// [`build_extraction_grammar`] appends the two rules this half leaves
+/// undefined — `named-string` and `name` — since both depend on the range's
+/// participant names. `state` items may carry an optional trailing
+/// `"replaces"` array of prior fact ids; no other item type has that key.
 ///
 /// Every rule definition here is a single physical line (`root`/`attitude`
 /// reference named per-field sub-rules rather than wrapping), because
@@ -423,14 +613,14 @@ pub fn build_extraction_prompt(
 /// across lines like the pre-#207 version of `root` therefore fails with
 /// `expecting name at ...` against a real model, even though every unit test
 /// here (which never hands this string to llama.cpp) passes. `mod tests`'s
-/// `// --- #207` section checks this constraint on every grammar constant
-/// below via `check_gbnf_rule_boundaries`, without a GGUF; this same
-/// module's own `extracts_from_a_real_gguf` test exercises this exact
-/// constant against a real GGUF when one is available.
-pub const EXTRACTION_GRAMMAR: &str = r#"root ::= "{" ws companion-state-field ws "," ws user-state-field ws "," ws milestones-field ws "," ws backstory-field ws "," ws open-threads-field ws "," ws rules-field ws "," ws people-field ws "," ws key-quotes-field ws "," ws summary-field ws "," ws attitude-field ws "}"
+/// `// --- #207` section checks this constraint via
+/// `check_gbnf_rule_boundaries` on both the built grammar and every other
+/// shipped constant, without a GGUF; this same module's own
+/// `extracts_from_a_real_gguf` test exercises a built grammar against a
+/// real GGUF when one is available.
+const EXTRACTION_GRAMMAR_BASE: &str = r#"root ::= "{" ws state-field ws "," ws milestones-field ws "," ws backstory-field ws "," ws open-threads-field ws "," ws rules-field ws "," ws people-field ws "," ws key-quotes-field ws "," ws summary-field ws "," ws attitude-field ws "}"
 
-companion-state-field ::= "\"companion_state\"" ws ":" ws state-array
-user-state-field ::= "\"user_state\"" ws ":" ws state-array
+state-field ::= "\"state\"" ws ":" ws state-array
 milestones-field ::= "\"milestones\"" ws ":" ws text-array
 backstory-field ::= "\"backstory\"" ws ":" ws backstory-array
 open-threads-field ::= "\"open_threads\"" ws ":" ws text-array
@@ -446,11 +636,11 @@ backstory-array ::= "[" ws (backstory-item (ws "," ws backstory-item){0,11})? ws
 quote-array ::= "[" ws (quote-item (ws "," ws quote-item){0,11})? ws "]"
 person-array ::= "[" ws (person-item (ws "," ws person-item){0,11})? ws "]"
 
-state-item ::= "{" ws "\"text\"" ws ":" ws string ws "," ws "\"sources\"" ws ":" ws sources (ws "," ws "\"replaces\"" ws ":" ws fact-ids)? ws "}"
+state-item ::= "{" ws "\"text\"" ws ":" ws named-string ws "," ws "\"sources\"" ws ":" ws sources (ws "," ws "\"replaces\"" ws ":" ws fact-ids)? ws "}"
 text-item ::= "{" ws "\"text\"" ws ":" ws string ws "," ws "\"sources\"" ws ":" ws sources ws "}"
-backstory-item ::= "{" ws "\"about\"" ws ":" ws party ws "," ws "\"text\"" ws ":" ws string ws "," ws "\"sources\"" ws ":" ws sources ws "}"
-quote-item ::= "{" ws "\"quote\"" ws ":" ws string ws "," ws "\"speaker\"" ws ":" ws party ws "," ws "\"sources\"" ws ":" ws sources ws "}"
-person-item ::= "{" ws "\"name\"" ws ":" ws string ws "," ws "\"relation_to\"" ws ":" ws party ws "," ws "\"relation\"" ws ":" ws string ws "," ws "\"sources\"" ws ":" ws sources ws "}"
+backstory-item ::= "{" ws "\"text\"" ws ":" ws named-string ws "," ws "\"sources\"" ws ":" ws sources ws "}"
+quote-item ::= "{" ws "\"quote\"" ws ":" ws string ws "," ws "\"speaker\"" ws ":" ws name ws "," ws "\"sources\"" ws ":" ws sources ws "}"
+person-item ::= "{" ws "\"name\"" ws ":" ws string ws "," ws "\"relation_to\"" ws ":" ws name ws "," ws "\"relation\"" ws ":" ws string ws "," ws "\"sources\"" ws ":" ws sources ws "}"
 
 attitude ::= "{" ws trust-field ws "," ws love-field ws "," ws fear-field ws "," ws anger-field ws "," ws joy-field ws "," ws sorrow-field ws "," ws suspicion-field ws "," ws gratitude-field ws "}"
 
@@ -467,13 +657,59 @@ fact-ids ::= "[" ws (int (ws "," ws int){0,7})? ws "]"
 sources ::= "[" ws int (ws "," ws int){0,7} ws "]"
 int ::= [0-9]{1,7}
 rating ::= [0-9] | [1-9] [0-9] | "100"
-party ::= "\"user\"" | "\"companion\""
 string ::= "\"" char{1,400} "\""
 char ::= [^"\\\x7F\x00-\x1F] | "\\" (["\\bfnrt] | "u" [0-9a-fA-F]{4})
 ws ::= [ \n\t]{0,20}
 "#;
 
-/// GBNF grammar for the single-key re-summarise pass over already-summarised
+/// How many characters of an item's text may follow the participant name a
+/// `named-string` must open with. Below `string`'s own 400 so the two
+/// together stay within the same bound.
+const NAMED_STRING_TAIL_CHARS: usize = 380;
+
+/// Builds the extraction grammar for one range: [`EXTRACTION_GRAMMAR_BASE`]
+/// plus the two participant-dependent rules.
+///
+/// `named-string` — what a `state` or `backstory` item's `text` must be —
+/// is forced to open with one of the range's real display names, and
+/// `name`, used by `speaker` and `relation_to`, is forced to be exactly one
+/// of them. Subject identity is therefore structural: the model cannot
+/// produce an item about a participant it has not named, and
+/// [`to_fact_drafts`] reads the subject back off the name rather than
+/// trusting a `"user"`/`"companion"` token the transcript never contains.
+///
+/// Falls back to unconstrained strings when the range has no participants
+/// (an empty range, which `fill_draft` discards before ever extracting) or
+/// when a display name cannot be spelled as a GBNF literal without
+/// rewriting it; [`to_fact_drafts`] pre-rejects whatever it then cannot
+/// attribute.
+pub fn build_extraction_grammar(participants: &RangeParticipants) -> String {
+    let mut grammar = String::from(EXTRACTION_GRAMMAR_BASE);
+    if participants.is_empty() || !participants.all_names_are_grammar_safe() {
+        grammar.push_str("named-string ::= string\n");
+        grammar.push_str("name ::= string\n");
+        return grammar;
+    }
+
+    let bare = participants
+        .iter()
+        .map(|p| format!("\"{}\"", p.name))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let quoted = participants
+        .iter()
+        .map(|p| format!("\"\\\"{}\\\"\"", p.name))
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    grammar.push_str(&format!(
+        "named-string ::= \"\\\"\" name-literal \" \" char{{1,{NAMED_STRING_TAIL_CHARS}}} \"\\\"\"\n"
+    ));
+    grammar.push_str(&format!("name-literal ::= {bare}\n"));
+    grammar.push_str(&format!("name ::= {quoted}\n"));
+    grammar
+}
+
 /// chunk outputs ([`fill_draft`]'s multi-chunk path): `{"summary": "..."}`.
 pub const SUMMARY_GRAMMAR: &str = r#"root ::= "{" ws "\"summary\"" ws ":" ws string ws "}"
 string ::= "\"" char{1,400} "\""
@@ -663,8 +899,7 @@ pub fn merge_outputs(chunks: Vec<ExtractionOutput>) -> ExtractionOutput {
     let mut summaries = vec![std::mem::take(&mut merged.summary)];
 
     for chunk in chunks {
-        merged.companion_state.extend(chunk.companion_state);
-        merged.user_state.extend(chunk.user_state);
+        merged.state.extend(chunk.state);
         merged.milestones.extend(chunk.milestones);
         merged.backstory.extend(chunk.backstory);
         merged.open_threads.extend(chunk.open_threads);
@@ -742,13 +977,18 @@ enum ChunkOutcome {
     },
 }
 
-/// Runs `extractor.extract` over `prompt` with [`EXTRACTION_GRAMMAR`],
-/// retrying once (with the serde error appended to the prompt) if the first
-/// attempt does not parse as [`ExtractionOutput`]. Never retries a second
-/// time: a model that fails grammar-constrained JSON twice in a row is not
-/// going to succeed on a third attempt either.
-fn extract_chunk(extractor: &impl Extractor, prompt: &str) -> Result<ChunkOutcome, std::io::Error> {
-    let first_raw = extractor.extract(prompt, EXTRACTION_GRAMMAR, EXTRACTION_MAX_TOKENS)?;
+/// Runs `extractor.extract` over `prompt` with `grammar` (the range's own,
+/// from [`build_extraction_grammar`]), retrying once (with the serde error
+/// appended to the prompt) if the first attempt does not parse as
+/// [`ExtractionOutput`]. Never retries a second time: a model that fails
+/// grammar-constrained JSON twice in a row is not going to succeed on a
+/// third attempt either.
+fn extract_chunk(
+    extractor: &impl Extractor,
+    prompt: &str,
+    grammar: &str,
+) -> Result<ChunkOutcome, std::io::Error> {
+    let first_raw = extractor.extract(prompt, grammar, EXTRACTION_MAX_TOKENS)?;
     match parse_extraction(&first_raw) {
         Ok(output) => Ok(ChunkOutcome::Parsed {
             output,
@@ -758,8 +998,7 @@ fn extract_chunk(extractor: &impl Extractor, prompt: &str) -> Result<ChunkOutcom
             let retry_prompt = format!(
                 "{prompt}\nYour previous output was not valid JSON: {parse_error}. Produce the JSON again."
             );
-            let second_raw =
-                extractor.extract(&retry_prompt, EXTRACTION_GRAMMAR, EXTRACTION_MAX_TOKENS)?;
+            let second_raw = extractor.extract(&retry_prompt, grammar, EXTRACTION_MAX_TOKENS)?;
             match parse_extraction(&second_raw) {
                 Ok(output) => Ok(ChunkOutcome::Parsed {
                     output,
@@ -872,15 +1111,24 @@ pub fn fill_draft(
     }
 
     let prior = build_prior_notes(store, draft.companion_id)?;
-    let scaffold_tokens =
-        ContextManager::estimate_tokens(&build_extraction_prompt(&prior, &[], speakers));
+    // Built from the whole range, then shared by every chunk's prompt, the
+    // grammar, and `to_fact_drafts`: a chunk holding only one speaker's
+    // turns must still be able to name the other participant.
+    let participants = RangeParticipants::from_range(range, speakers);
+    let grammar = build_extraction_grammar(&participants);
+    let scaffold_tokens = ContextManager::estimate_tokens(&build_extraction_prompt(
+        &prior,
+        &[],
+        speakers,
+        &participants,
+    ));
     let chunks = chunk_range(range, speakers, scaffold_tokens, extractor.context_window());
 
     let mut outputs = Vec::with_capacity(chunks.len());
     let mut raw_outputs = Vec::with_capacity(chunks.len());
     for chunk in &chunks {
-        let prompt = build_extraction_prompt(&prior, chunk, speakers);
-        match extract_chunk(extractor, &prompt).map_err(DraftError::Model)? {
+        let prompt = build_extraction_prompt(&prior, chunk, speakers, &participants);
+        match extract_chunk(extractor, &prompt, &grammar).map_err(DraftError::Model)? {
             ChunkOutcome::Parsed { output, raw } => {
                 outputs.push(output);
                 raw_outputs.push(raw);
@@ -903,7 +1151,7 @@ pub fn fill_draft(
         merged.summary = resummarise(extractor, &merged.summary).map_err(DraftError::Model)?;
     }
 
-    let drafts = to_fact_drafts(&merged);
+    let drafts = to_fact_drafts(&merged, &participants);
     let active = store
         .active_facts(draft.companion_id)
         .map_err(DraftError::Store)?;
@@ -1170,7 +1418,9 @@ fn fail_pending_draft(store: &impl CompactionStore, draft_id: i64, error: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compaction::fixtures::{bad_draft, synthetic_range};
+    use crate::compaction::fixtures::{
+        bad_draft, fixture_participants, fixture_speakers, synthetic_range,
+    };
     use crate::compaction::store::RecordingStore;
     use crate::compaction::types::{CompactionTrigger, Fact, NewDraft};
     use crate::compaction::SoloSpeakers;
@@ -1185,7 +1435,7 @@ mod tests {
     #[test]
     fn an_extra_top_level_key_fails_to_parse() {
         let raw = r#"{
-            "companion_state": [], "user_state": [], "milestones": [],
+            "state": [], "milestones": [],
             "backstory": [], "open_threads": [], "rules": [], "people": [],
             "key_quotes": [], "summary": "s",
             "attitude": {"trust":0,"love":0,"fear":0,"anger":0,"joy":0,"sorrow":0,"suspicion":0,"gratitude":0},
@@ -1197,7 +1447,7 @@ mod tests {
     #[test]
     fn a_rating_of_250_clamps_to_100() {
         let raw = r#"{
-            "companion_state": [], "user_state": [], "milestones": [],
+            "state": [], "milestones": [],
             "backstory": [], "open_threads": [], "rules": [], "people": [],
             "key_quotes": [], "summary": "s",
             "attitude": {"trust":250,"love":0,"fear":0,"anger":0,"joy":0,"sorrow":0,"suspicion":0,"gratitude":0}
@@ -1212,7 +1462,7 @@ mod tests {
         // a `u8` field would make `serde_json` reject it before clamping
         // ever ran. `RawAttitudeRatings` is signed precisely so this parses.
         let raw = r#"{
-            "companion_state": [], "user_state": [], "milestones": [],
+            "state": [], "milestones": [],
             "backstory": [], "open_threads": [], "rules": [], "people": [],
             "key_quotes": [], "summary": "s",
             "attitude": {"trust":999,"love":0,"fear":0,"anger":0,"joy":0,"sorrow":0,"suspicion":0,"gratitude":0}
@@ -1224,7 +1474,7 @@ mod tests {
     #[test]
     fn a_negative_rating_parses_and_clamps_to_0() {
         let raw = r#"{
-            "companion_state": [], "user_state": [], "milestones": [],
+            "state": [], "milestones": [],
             "backstory": [], "open_threads": [], "rules": [], "people": [],
             "key_quotes": [], "summary": "s",
             "attitude": {"trust":-1,"love":0,"fear":0,"anger":0,"joy":0,"sorrow":0,"suspicion":0,"gratitude":0}
@@ -1236,30 +1486,29 @@ mod tests {
     #[test]
     fn to_fact_drafts_preserves_order_and_item_count() {
         let output = bad_draft();
-        let total_items = output.companion_state.len()
-            + output.user_state.len()
+        let total_items = output.state.len()
             + output.milestones.len()
             + output.backstory.len()
             + output.open_threads.len()
             + output.rules.len()
             + output.people.len()
             + output.key_quotes.len();
-        let drafts = to_fact_drafts(&output);
+        let drafts = to_fact_drafts(&output, &fixture_participants());
         assert_eq!(drafts.len(), total_items);
     }
 
     #[test]
     fn a_people_item_maps_to_a_person_draft_with_relation_to_relation_and_no_quote_speaker() {
         let raw = r#"{
-            "companion_state": [], "user_state": [], "milestones": [],
+            "state": [], "milestones": [],
             "backstory": [], "open_threads": [],
             "rules": [], "key_quotes": [],
-            "people": [{"name":"Ann","relation_to":"user","relation":"sister","sources":[46]}],
+            "people": [{"name":"Ann","relation_to":"Eric","relation":"sister","sources":[46]}],
             "summary": "s",
             "attitude": {"trust":0,"love":0,"fear":0,"anger":0,"joy":0,"sorrow":0,"suspicion":0,"gratitude":0}
         }"#;
         let output = parse_extraction(raw).unwrap();
-        let drafts = to_fact_drafts(&output);
+        let drafts = to_fact_drafts(&output, &fixture_participants());
         assert_eq!(drafts.len(), 1);
         let person = &drafts[0];
         assert_eq!(person.category, FactCategory::Person);
@@ -1272,18 +1521,18 @@ mod tests {
     #[test]
     fn two_people_sharing_a_relation_string_get_distinct_text_from_their_names() {
         let raw = r#"{
-            "companion_state": [], "user_state": [], "milestones": [],
+            "state": [], "milestones": [],
             "backstory": [], "open_threads": [],
             "rules": [], "key_quotes": [],
             "people": [
-                {"name":"Ann","relation_to":"user","relation":"a neighbor","sources":[46]},
-                {"name":"Bo","relation_to":"user","relation":"a neighbor","sources":[46]}
+                {"name":"Ann","relation_to":"Eric","relation":"a neighbor","sources":[46]},
+                {"name":"Bo","relation_to":"Eric","relation":"a neighbor","sources":[46]}
             ],
             "summary": "s",
             "attitude": {"trust":0,"love":0,"fear":0,"anger":0,"joy":0,"sorrow":0,"suspicion":0,"gratitude":0}
         }"#;
         let output = parse_extraction(raw).unwrap();
-        let drafts = to_fact_drafts(&output);
+        let drafts = to_fact_drafts(&output, &fixture_participants());
         assert_ne!(drafts[0].text, drafts[1].text);
     }
 
@@ -1291,14 +1540,15 @@ mod tests {
     fn a_companion_state_item_with_replaces_maps_through_while_a_milestone_leaves_it_empty_and_has_no_relation_to(
     ) {
         let raw = r#"{
-            "companion_state": [{"text":"is happier now","sources":[46],"replaces":[3,4]}],
-            "user_state": [], "milestones": [{"text":"left home","sources":[47]}],
+            "state": [{"text":"Vi is happier now","sources":[46],"replaces":[3,4]}],
+            "milestones": [{"text":"left home","sources":[47]}],
             "backstory": [], "open_threads": [], "rules": [], "people": [],
             "key_quotes": [], "summary": "s",
             "attitude": {"trust":0,"love":0,"fear":0,"anger":0,"joy":0,"sorrow":0,"suspicion":0,"gratitude":0}
         }"#;
         let output = parse_extraction(raw).unwrap();
-        let drafts = to_fact_drafts(&output);
+        let drafts = to_fact_drafts(&output, &fixture_participants());
+        assert_eq!(drafts[0].category, FactCategory::CompanionState);
         assert_eq!(drafts[0].replaces, vec![3, 4]);
         assert!(drafts[1].replaces.is_empty());
         assert_eq!(drafts[1].relation_to, None);
@@ -1306,16 +1556,9 @@ mod tests {
 
     // --- render_range_line / build_extraction_prompt ---
 
-    fn solo_speakers() -> SoloSpeakers {
-        SoloSpeakers {
-            user_name: "Eric".to_string(),
-            companion_name: "Vi".to_string(),
-        }
-    }
-
     #[test]
     fn render_range_line_marks_canon_only_for_the_user_and_flattens_newlines() {
-        let speakers = solo_speakers();
+        let speakers = fixture_speakers();
         let user_line = render_range_line(
             &CitedMessage {
                 id: 46,
@@ -1340,8 +1583,10 @@ mod tests {
     #[test]
     fn build_extraction_prompt_marks_only_canon_lines_and_cites_every_id_and_schema_key() {
         let range = synthetic_range();
-        let speakers = solo_speakers();
-        let prompt = build_extraction_prompt(&PriorNotes::default(), &range, &speakers);
+        let speakers = fixture_speakers();
+        let participants = RangeParticipants::from_range(&range, &speakers);
+        let prompt =
+            build_extraction_prompt(&PriorNotes::default(), &range, &speakers, &participants);
 
         for message in &range {
             assert!(
@@ -1354,8 +1599,7 @@ mod tests {
         }
 
         for key in [
-            "companion_state",
-            "user_state",
+            "state",
             "milestones",
             "backstory",
             "open_threads",
@@ -1372,8 +1616,10 @@ mod tests {
     #[test]
     fn build_extraction_prompt_renders_previous_notes_as_none_when_empty_and_lists_overlay_ids_otherwise(
     ) {
-        let speakers = solo_speakers();
-        let empty_prompt = build_extraction_prompt(&PriorNotes::default(), &[], &speakers);
+        let speakers = fixture_speakers();
+        let participants = RangeParticipants::from_range(&synthetic_range(), &speakers);
+        let empty_prompt =
+            build_extraction_prompt(&PriorNotes::default(), &[], &speakers, &participants);
         assert!(empty_prompt.contains("none"));
 
         let prior = PriorNotes {
@@ -1381,18 +1627,136 @@ mod tests {
             companion_overlay: vec![(7, "is cautious".to_string())],
             rolling_summary: "They moved into a lighthouse.".to_string(),
         };
-        let prompt = build_extraction_prompt(&prior, &[], &speakers);
+        let prompt = build_extraction_prompt(&prior, &[], &speakers, &participants);
         assert!(prompt.contains("[F12] feels at ease"));
         assert!(prompt.contains("[F7] is cautious"));
         assert!(prompt.contains("They moved into a lighthouse."));
     }
 
-    // --- EXTRACTION_GRAMMAR / SUMMARY_GRAMMAR ---
+    // --- build_extraction_grammar / SUMMARY_GRAMMAR ---
+
+    /// The grammar for [`synthetic_range`] under [`fixture_speakers`].
+    fn fixture_grammar() -> String {
+        build_extraction_grammar(&fixture_participants())
+    }
 
     #[test]
     fn extraction_grammar_contains_the_root_rule_and_no_nul_bytes() {
-        assert!(EXTRACTION_GRAMMAR.contains("root ::="));
-        assert!(!EXTRACTION_GRAMMAR.contains('\0'));
+        let grammar = fixture_grammar();
+        assert!(grammar.contains("root ::="));
+        assert!(!grammar.contains('\0'));
+    }
+
+    #[test]
+    fn the_built_grammar_offers_the_ranges_names_as_literals() {
+        let grammar = fixture_grammar();
+        assert!(
+            grammar.contains(r#"name-literal ::= "Eric" | "Vi""#),
+            "grammar is missing the range's names as literals:\n{grammar}"
+        );
+        assert!(grammar.contains(r#"name ::= "\"Eric\"" | "\"Vi\"""#));
+        assert!(grammar.contains("named-string ::= \"\\\"\" name-literal"));
+    }
+
+    #[test]
+    fn a_grammar_for_a_range_with_no_participants_falls_back_to_unconstrained_strings() {
+        let grammar = build_extraction_grammar(&RangeParticipants::default());
+        assert!(grammar.contains("named-string ::= string"));
+        assert!(grammar.contains("name ::= string"));
+        assert!(!grammar.contains("name-literal"));
+    }
+
+    #[test]
+    fn a_name_that_cannot_be_a_gbnf_literal_falls_back_instead_of_being_rewritten() {
+        let range = vec![
+            CitedMessage {
+                id: 1,
+                speaker_id: "user".to_string(),
+                content: "hi".to_string(),
+            },
+            CitedMessage {
+                id: 2,
+                speaker_id: "char".to_string(),
+                content: "hello".to_string(),
+            },
+        ];
+        let speakers = SoloSpeakers {
+            user_name: "Eric".to_string(),
+            companion_name: "Vi \"the Bright\"".to_string(),
+        };
+        let grammar = build_extraction_grammar(&RangeParticipants::from_range(&range, &speakers));
+        assert!(grammar.contains("named-string ::= string"));
+        assert!(!grammar.contains("name-literal"));
+    }
+
+    #[test]
+    fn a_people_item_naming_a_principal_is_rejected_while_a_third_party_is_kept() {
+        let raw = r#"{
+            "state": [], "milestones": [], "backstory": [], "open_threads": [],
+            "rules": [], "key_quotes": [],
+            "people": [
+                {"name":"Eric","relation_to":"Vi","relation":"the man she lives with","sources":[46]},
+                {"name":"Vi the Bright","relation_to":"Eric","relation":"his companion","sources":[46]},
+                {"name":"Erica","relation_to":"Eric","relation":"a neighbour","sources":[46]},
+                {"name":"Wren","relation_to":"Eric","relation":"a neighbour","sources":[46]}
+            ],
+            "summary": "s",
+            "attitude": {"trust":0,"love":0,"fear":0,"anger":0,"joy":0,"sorrow":0,"suspicion":0,"gratitude":0}
+        }"#;
+        let output = parse_extraction(raw).unwrap();
+        let drafts = to_fact_drafts(&output, &fixture_participants());
+        let principal = RejectReason::PrincipalAsPerson.to_string();
+
+        assert_eq!(
+            drafts[0].rejected_reason.as_deref(),
+            Some(principal.as_str())
+        );
+        assert_eq!(
+            drafts[1].rejected_reason.as_deref(),
+            Some(principal.as_str()),
+            "a participant's name as a whole word inside a longer one is still that participant"
+        );
+        assert_eq!(
+            drafts[2].rejected_reason, None,
+            "Erica merely contains `Eric`; she is a different person"
+        );
+        assert_eq!(drafts[3].rejected_reason, None);
+    }
+
+    #[test]
+    fn to_fact_drafts_pre_rejects_an_item_naming_nobody_in_the_range() {
+        let raw = r#"{
+            "state": [{"text":"Somebody Else is happier now","sources":[46]}],
+            "milestones": [], "backstory": [], "open_threads": [],
+            "rules": [], "people": [], "key_quotes": [], "summary": "s",
+            "attitude": {"trust":0,"love":0,"fear":0,"anger":0,"joy":0,"sorrow":0,"suspicion":0,"gratitude":0}
+        }"#;
+        let output = parse_extraction(raw).unwrap();
+        let drafts = to_fact_drafts(&output, &fixture_participants());
+        assert_eq!(
+            drafts[0].rejected_reason.as_deref(),
+            Some(RejectReason::UnknownSubject.to_string().as_str())
+        );
+        assert_eq!(drafts[0].subject, None);
+    }
+
+    #[test]
+    fn a_state_item_is_filed_by_the_name_it_opens_with() {
+        let raw = r#"{
+            "state": [
+                {"text":"Eric feels at home","sources":[62]},
+                {"text":"Vi is warmer toward Eric","sources":[54]}
+            ],
+            "milestones": [], "backstory": [], "open_threads": [],
+            "rules": [], "people": [], "key_quotes": [], "summary": "s",
+            "attitude": {"trust":0,"love":0,"fear":0,"anger":0,"joy":0,"sorrow":0,"suspicion":0,"gratitude":0}
+        }"#;
+        let output = parse_extraction(raw).unwrap();
+        let drafts = to_fact_drafts(&output, &fixture_participants());
+        assert_eq!(drafts[0].category, FactCategory::UserState);
+        assert_eq!(drafts[0].subject, Some(FactSubject::User));
+        assert_eq!(drafts[1].category, FactCategory::CompanionState);
+        assert_eq!(drafts[1].subject, Some(FactSubject::Companion));
     }
 
     #[test]
@@ -1404,19 +1768,18 @@ mod tests {
     #[test]
     fn a_hand_written_sample_in_the_grammars_shape_round_trips_through_parse_extraction() {
         let sample = r#"{
-            "companion_state": [{"text": "is warmer toward the user", "sources": [54], "replaces": [3]}],
-            "user_state": [{"text": "feels at home", "sources": [62]}],
+            "state": [{"text": "Vi is warmer toward Eric", "sources": [54], "replaces": [3]}, {"text": "Eric feels at home", "sources": [62]}],
             "milestones": [{"text": "first night settled in", "sources": [62]}],
-            "backstory": [{"about": "user", "text": "grew up near Millbrook", "sources": [46]}],
+            "backstory": [{"text": "Eric grew up near Millbrook", "sources": [46]}],
             "open_threads": [{"text": "whether Rina will visit", "sources": [64]}],
-            "rules": [{"quote": "I promise I will never lie to you, no matter what happens.", "speaker": "user", "sources": [53]}],
-            "people": [{"name": "Wren", "relation_to": "companion", "relation": "a neighbor", "sources": [52]}],
-            "key_quotes": [{"quote": "The old lighthouse keeper's ghost still walks these halls every midnight.", "speaker": "companion", "sources": [55]}],
+            "rules": [{"quote": "I promise I will never lie to you, no matter what happens.", "speaker": "Eric", "sources": [53]}],
+            "people": [{"name": "Wren", "relation_to": "Vi", "relation": "a neighbor", "sources": [52]}],
+            "key_quotes": [{"quote": "The old lighthouse keeper's ghost still walks these halls every midnight.", "speaker": "Vi", "sources": [55]}],
             "summary": "A quiet night in the lighthouse.",
             "attitude": {"trust": 80, "love": 60, "fear": 10, "anger": 0, "joy": 70, "sorrow": 5, "suspicion": 15, "gratitude": 55}
         }"#;
         let output = parse_extraction(sample).expect("shape the grammar produces should parse");
-        assert_eq!(output.companion_state[0].replaces, vec![3]);
+        assert_eq!(output.state[0].replaces, vec![3]);
     }
 
     // --- chunk_range ---
@@ -1424,7 +1787,7 @@ mod tests {
     #[test]
     fn chunk_range_returns_one_chunk_when_everything_fits() {
         let range = synthetic_range();
-        let speakers = solo_speakers();
+        let speakers = fixture_speakers();
 
         let chunks = chunk_range(&range, &speakers, 0, EXTRACTOR_MAX_CONTEXT_FOR_TESTS);
 
@@ -1440,7 +1803,7 @@ mod tests {
     #[test]
     fn chunk_range_splits_a_20_message_range_at_boundaries_without_exceeding_the_budget() {
         let range = synthetic_range();
-        let speakers = solo_speakers();
+        let speakers = fixture_speakers();
         let scaffold_tokens = 0;
         // Small enough that most messages cannot share a chunk.
         let context_window = CONTEXT_RESERVE_TOKENS + 40;
@@ -1467,8 +1830,8 @@ mod tests {
     fn an_output(text: &str, summary: &str, rating: i32) -> ExtractionOutput {
         let raw = format!(
             r#"{{
-                "companion_state": [{{"text": "{text}", "sources": [1], "replaces": []}}],
-                "user_state": [], "milestones": [], "backstory": [], "open_threads": [],
+                "state": [{{"text": "{text}", "sources": [1], "replaces": []}}],
+                "milestones": [], "backstory": [], "open_threads": [],
                 "rules": [], "people": [], "key_quotes": [],
                 "summary": "{summary}",
                 "attitude": {{"trust": {rating}, "love": {rating}, "fear": {rating}, "anger": {rating}, "joy": {rating}, "sorrow": {rating}, "suspicion": {rating}, "gratitude": {rating}}}
@@ -1484,9 +1847,9 @@ mod tests {
             an_output("b", "second", 90),
         ]);
 
-        assert_eq!(merged.companion_state.len(), 2);
-        assert_eq!(merged.companion_state[0].text, "a");
-        assert_eq!(merged.companion_state[1].text, "b");
+        assert_eq!(merged.state.len(), 2);
+        assert_eq!(merged.state[0].text, "a");
+        assert_eq!(merged.state[1].text, "b");
         assert_eq!(merged.summary, "first second");
         assert_eq!(merged.attitude.trust, 90);
     }
@@ -1511,7 +1874,7 @@ mod tests {
         let store = RecordingStore::new();
         let range = synthetic_range();
         let draft = a_pending_draft(&store, &range);
-        let speakers = solo_speakers();
+        let speakers = fixture_speakers();
         let extractor =
             FakeExtractor::returning(vec![
                 Ok(include_str!("fixtures/bad_draft.json").to_string()),
@@ -1525,7 +1888,7 @@ mod tests {
         assert!(updated.raw_model_output.is_some());
         assert!(updated.summary.is_some());
 
-        let expected_item_count = to_fact_drafts(&bad_draft()).len();
+        let expected_item_count = to_fact_drafts(&bad_draft(), &fixture_participants()).len();
         let facts = store.facts_for(draft.id).unwrap();
         assert_eq!(facts.len(), expected_item_count);
         assert!(facts.iter().any(|f| f.rejected_reason.is_some()));
@@ -1537,7 +1900,7 @@ mod tests {
         let store = RecordingStore::new();
         let range = synthetic_range();
         let draft = a_pending_draft(&store, &range);
-        let speakers = solo_speakers();
+        let speakers = fixture_speakers();
         let extractor =
             FakeExtractor::returning(vec![
                 Ok(include_str!("fixtures/bad_draft.json").to_string()),
@@ -1554,7 +1917,7 @@ mod tests {
         let store = RecordingStore::new();
         let range = synthetic_range();
         let draft = a_pending_draft(&store, &range);
-        let speakers = solo_speakers();
+        let speakers = fixture_speakers();
         let extractor = FakeExtractor::returning(vec![
             Ok("not json".to_string()),
             Ok("still not json".to_string()),
@@ -1593,7 +1956,7 @@ mod tests {
             })
             .unwrap();
         let draft = store.get_checkpoint(draft_id).unwrap().unwrap();
-        let speakers = solo_speakers();
+        let speakers = fixture_speakers();
         let extractor = FakeExtractor::returning(Vec::<std::io::Result<String>>::new());
 
         let err = fill_draft(&store, &extractor, &draft, &range, &speakers, usize::MAX)
@@ -1612,7 +1975,7 @@ mod tests {
         // without the guard at the top of `fill_draft`.
         let store = RecordingStore::new();
         let draft = a_pending_draft(&store, &synthetic_range());
-        let speakers = solo_speakers();
+        let speakers = fixture_speakers();
         let extractor = FakeExtractor::returning(Vec::<std::io::Result<String>>::new());
 
         let err = fill_draft(&store, &extractor, &draft, &[], &speakers, usize::MAX)
@@ -1631,7 +1994,7 @@ mod tests {
         let store = RecordingStore::new();
         let range = synthetic_range();
         let draft = a_pending_draft(&store, &range);
-        let speakers = solo_speakers();
+        let speakers = fixture_speakers();
         let extractor =
             FakeExtractor::returning(vec![
                 Ok(include_str!("fixtures/bad_draft.json").to_string()),
@@ -2147,7 +2510,7 @@ mod tests {
         let store = RecordingStore::new();
         let range = synthetic_range();
         let draft = a_pending_draft(&store, &range);
-        let speakers = solo_speakers();
+        let speakers = fixture_speakers();
         let extractor = FakeExtractor::returning(vec![Err(std::io::Error::other(
             "simulated model load failure",
         ))]);
@@ -2221,7 +2584,7 @@ mod tests {
     #[test]
     fn every_shipped_grammar_constant_passes_the_gbnf_rule_boundary_lint() {
         for (name, gbnf) in [
-            ("EXTRACTION_GRAMMAR", EXTRACTION_GRAMMAR),
+            ("the built extraction grammar", fixture_grammar().as_str()),
             ("SUMMARY_GRAMMAR", SUMMARY_GRAMMAR),
         ] {
             assert_eq!(
@@ -2375,18 +2738,34 @@ ws ::= [ \n\t]*
         modify.compaction_model_path = Some(gguf_path);
         Database::change_config(modify).expect("failed to save the extractor config");
 
-        let speakers = solo_speakers();
+        let speakers = fixture_speakers();
         let range = synthetic_range();
-        let prompt = build_extraction_prompt(&PriorNotes::default(), &range, &speakers);
+        let participants = RangeParticipants::from_range(&range, &speakers);
+        let prompt =
+            build_extraction_prompt(&PriorNotes::default(), &range, &speakers, &participants);
 
         let raw = ResidentExtractor
-            .extract(&prompt, EXTRACTION_GRAMMAR, EXTRACTION_MAX_TOKENS)
+            .extract(
+                &prompt,
+                &build_extraction_grammar(&participants),
+                EXTRACTION_MAX_TOKENS,
+            )
             .expect("extraction should succeed against a real GGUF");
         let output = parse_extraction(&raw)
             .expect("extractor output should match the extraction schema on the first attempt");
 
-        assert!(!output.companion_state.is_empty());
-        assert!(!output.user_state.is_empty());
+        assert!(!output.state.is_empty());
         assert!(!output.rules.is_empty());
+        // Structural identity: every state item the grammar allowed must
+        // open with one of the range's real names, so `to_fact_drafts` can
+        // file it without guessing.
+        let drafts = to_fact_drafts(&output, &participants);
+        assert!(drafts
+            .iter()
+            .filter(|d| matches!(
+                d.category,
+                FactCategory::CompanionState | FactCategory::UserState
+            ))
+            .all(|d| d.subject.is_some()));
     }
 }
