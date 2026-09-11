@@ -1,0 +1,6 @@
+# Eval fixtures are derived from a real companion database and therefore
+# contain user chat text. Same rule as `*.db` in the repo root .gitignore:
+# nothing in here is ever committed. The harness that reads it
+# (`src/compaction/eval.rs`) is committed; its input is not.
+*
+!.gitignore

@@ -1,27 +1,25 @@
 {
-  "companion_state": [
-    {"text": "feels warmer toward the user after tonight's conversation", "sources": [54], "replaces": []}
-  ],
-  "user_state": [
-    {"text": "feels more at home in the lighthouse than on the day they moved in", "sources": [62], "replaces": []}
+  "state": [
+    {"text": "Vi feels warmer toward Eric after tonight's conversation", "sources": [54], "replaces": []},
+    {"text": "Eric feels more at home in the lighthouse than on the day they moved in", "sources": [62], "replaces": []}
   ],
   "milestones": [
     {"text": "the user and companion shared their first night fully settled into the new home together after weeks of unpacking boxes and adjusting to the sound of the sea, marking a turning point in how safe, grounded, and hopeful the user finally feels about starting this new chapter here by the lighthouse", "sources": [62]}
   ],
   "backstory": [
-    {"about": "user", "text": "grew up near Millbrook and has a sister named Rina who works nights as a nurse", "sources": [46, 48]}
+    {"text": "Eric grew up near Millbrook and has a sister named Rina who works nights as a nurse", "sources": [46, 48]}
   ],
   "open_threads": [
     {"text": "whether Rina will visit next month", "sources": [64]}
   ],
   "rules": [
-    {"quote": "I swear I will never lie to you, whatever happens", "speaker": "user", "sources": [53]}
+    {"quote": "I swear I will never lie to you, whatever happens", "speaker": "Eric", "sources": [53]}
   ],
   "people": [
-    {"name": "Wren", "relation_to": "companion", "relation": "a neighbor who visits sometimes and forgets things", "sources": [52]}
+    {"name": "Wren", "relation_to": "Vi", "relation": "a neighbor who visits sometimes and forgets things", "sources": [52]}
   ],
   "key_quotes": [
-    {"quote": "The old lighthouse keeper's ghost still walks these halls every midnight.", "speaker": "companion", "sources": [55, 999]}
+    {"quote": "The old lighthouse keeper's ghost still walks these halls every midnight.", "speaker": "Vi", "sources": [55, 999]}
   ],
   "summary": "Eric and his companion settled into the lighthouse, swapped stories about Rina, a mysterious neighbor named Wren, and old ghost stories.",
   "attitude": {"trust": 80, "love": 60, "fear": 10, "anger": 0, "joy": 70, "sorrow": 5, "suspicion": 15, "gratitude": 55}

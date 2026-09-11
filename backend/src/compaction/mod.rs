@@ -117,6 +117,10 @@
 pub mod attitude;
 pub mod commit;
 pub mod context;
+/// Measurement only, never compiled into the binary: the extraction eval
+/// harness (`cargo test ... compaction::eval::extraction_eval`).
+#[cfg(test)]
+mod eval;
 pub mod extract;
 pub mod hook;
 pub mod ltm;
@@ -326,8 +330,8 @@ mod tests {
 /// chat text.
 #[cfg(test)]
 pub(crate) mod fixtures {
-    use super::CitedMessage;
-    use crate::compaction::extract::{parse_extraction, ExtractionOutput};
+    use super::{CitedMessage, SoloSpeakers};
+    use crate::compaction::extract::{parse_extraction, ExtractionOutput, RangeParticipants};
 
     /// Ids 46-65 (non-zero-based on purpose): a human turn stating a world
     /// fact (46, 48), a bot turn inventing a world fact (49), a bot turn
@@ -349,5 +353,23 @@ pub(crate) mod fixtures {
     pub(crate) fn bad_draft() -> ExtractionOutput {
         parse_extraction(include_str!("fixtures/bad_draft.json"))
             .expect("bad_draft.json is well-formed JSON matching the extraction schema")
+    }
+
+    /// The naming and canon policy [`synthetic_range`] is written against:
+    /// `user` is Eric, every other speaker (`char`, and the multiplayer
+    /// `vex`) is the companion Vi.
+    pub(crate) fn fixture_speakers() -> SoloSpeakers {
+        SoloSpeakers {
+            user_name: "Eric".to_string(),
+            companion_name: "Vi".to_string(),
+        }
+    }
+
+    /// The participant table [`bad_draft`]'s items name, and the one every
+    /// test mapping that fixture to drafts must resolve against — the
+    /// fixture's `state`/`backstory` texts open with these names and its
+    /// `speaker`/`relation_to` values are these names.
+    pub(crate) fn fixture_participants() -> RangeParticipants {
+        RangeParticipants::from_range(&synthetic_range(), &fixture_speakers())
     }
 }
