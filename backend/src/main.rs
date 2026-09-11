@@ -2758,13 +2758,24 @@ fn require_known_message(id: i32) -> Result<(), HttpResponse> {
 //              Running thoughts
 //
 // Unlike the compaction routes above (host owns checkpoints), a joiner owns
-// its own bot's thoughts -- `multiplayer::remote_generation` writes them
-// into the joiner's *local* `running_thoughts` table under
-// `JoinerShared::companion_id`/`participant_id` -- so none of the four
-// routes below call `reject_if_joiner`; all four serve the local table in
-// every multiplayer mode. `Database::get_companion_id()` is the right
-// companion id in every mode: `JoinerShared::companion_id` is that same
-// call, cached at startup.
+// its own bot's thoughts: #220 will have `multiplayer::remote_generation`
+// write them into the joiner's *local* `running_thoughts` table under
+// `JoinerShared::companion_id`/`participant_id` (today that generator still
+// runs with `llm::NoThoughts` and writes none, so a joiner's table is
+// simply empty) -- so none of the four routes below call `reject_if_joiner`;
+// all four already serve the local table correctly in every multiplayer
+// mode, #220 or not. `Database::get_companion_id()` is the right companion
+// id in every mode: `JoinerShared::companion_id` is that same call, cached
+// at startup.
+//
+// `thought_edit`/`thought_delete` also claim `ACTIVE_TURN` (PR #227 review):
+// `thoughts_regenerate` deletes a captured row up front and only re-inserts
+// it later if generation fails, so an edit/delete landing in that window
+// would see a row that is about to reappear -- a `DELETE` would 404 a row
+// the client is then shown again, and a `PATCH` would 404 and lose the
+// edit to the restore. Claiming the same slot the regenerate loop holds
+// keeps the two from interleaving at all, the same way `rebuild_long_term`
+// claims it against a concurrent compaction commit.
 
 /// `GET /api/thoughts`'s whole body, oldest first (transcript order).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2840,6 +2851,8 @@ fn thought_lookup_result<T>(
 
 /// Rewrites one thought's text and marks it `edited`, so the generator (and
 /// #218's panel) can tell the user's own words apart from the model's.
+/// Claims [`ACTIVE_TURN`] -- see the "Running thoughts" section comment
+/// above for why.
 #[patch("/api/thoughts/{id}")]
 async fn thought_edit(id: web::Path<i64>, received: web::Json<ThoughtEdit>) -> HttpResponse {
     let thought_id = *id;
@@ -2848,7 +2861,14 @@ async fn thought_edit(id: web::Path<i64>, received: web::Json<ThoughtEdit>) -> H
         return response;
     }
 
+    let Some(turn_guard) = ACTIVE_TURN.try_claim() else {
+        return HttpResponse::Conflict().body(
+            "A reply is still being generated; wait for it to finish before editing a thought",
+        );
+    };
+
     let result = web::block(move || -> rusqlite::Result<RunningThought> {
+        let _turn_guard = turn_guard;
         SqliteRunningThoughtStore.update_text(thought_id, &text)?;
         SqliteRunningThoughtStore
             .get(thought_id)?
@@ -2873,11 +2893,23 @@ async fn thought_edit(id: web::Path<i64>, received: web::Json<ThoughtEdit>) -> H
 }
 
 /// Deletes one thought outright (not the same as regenerating it: this
-/// leaves nothing behind for that round).
+/// leaves nothing behind for that round). Claims [`ACTIVE_TURN`] -- see the
+/// "Running thoughts" section comment above for why.
 #[delete("/api/thoughts/{id}")]
 async fn thought_delete(id: web::Path<i64>) -> HttpResponse {
     let thought_id = *id;
-    let result = web::block(move || SqliteRunningThoughtStore.delete(thought_id)).await;
+
+    let Some(turn_guard) = ACTIVE_TURN.try_claim() else {
+        return HttpResponse::Conflict().body(
+            "A reply is still being generated; wait for it to finish before deleting a thought",
+        );
+    };
+
+    let result = web::block(move || {
+        let _turn_guard = turn_guard;
+        SqliteRunningThoughtStore.delete(thought_id)
+    })
+    .await;
 
     match result {
         Ok(inner) => match thought_lookup_result("delete", "deleting", thought_id, inner) {
@@ -3134,6 +3166,61 @@ mod thoughts_route_tests {
         assert_eq!(
             ThoughtRegenerateError::NothingToRegenerate.to_string(),
             "there is nothing to regenerate from that message"
+        );
+    }
+
+    // PR #227 review: `thought_edit`/`thought_delete` did not claim
+    // `ACTIVE_TURN`, so a `thoughts_regenerate` run in flight could delete a
+    // row, have this route 404 it, and then re-insert it out from under the
+    // caller. `#[patch]`/`#[delete]` replace the function name with an
+    // `HttpServiceFactory` struct (same trick `message`'s unit-struct
+    // collision elsewhere in this file comes from), so the routes cannot be
+    // called directly the way `thought_lookup_result` above is — driven
+    // through a real (minimal, `app_data`-free) service instead, the
+    // `multiplayer::host`-module's own `test::init_service` pattern. With
+    // the slot already held, both routes must return `409` before ever
+    // reaching `SqliteRunningThoughtStore` (a real store call would need
+    // `Database::init()`, which this unit test never runs), which is
+    // exactly what pins the check as the very first thing each handler
+    // does. Folded into one test function, like `remote_generation.rs`'s
+    // identical `ACTIVE_TURN` test: it is a single process-wide static, so
+    // two separate `#[test]`s touching it would race under cargo's default
+    // parallel test execution.
+    #[actix_web::test]
+    async fn edit_and_delete_409_while_a_turn_is_in_flight_without_touching_the_store() {
+        let guard = ACTIVE_TURN.try_claim().expect("slot should start free");
+
+        let app =
+            actix_web::test::init_service(App::new().service(thought_edit).service(thought_delete))
+                .await;
+
+        let edit_req = actix_web::test::TestRequest::patch()
+            .uri("/api/thoughts/999")
+            .set_json(serde_json::json!({ "text": "irrelevant" }))
+            .to_request();
+        let edit_response = actix_web::test::call_service(&app, edit_req).await;
+        assert_eq!(edit_response.status(), StatusCode::CONFLICT);
+        let edit_body = to_bytes(edit_response.into_body()).await.unwrap();
+        assert_eq!(
+            edit_body,
+            "A reply is still being generated; wait for it to finish before editing a thought"
+        );
+
+        let delete_req = actix_web::test::TestRequest::delete()
+            .uri("/api/thoughts/999")
+            .to_request();
+        let delete_response = actix_web::test::call_service(&app, delete_req).await;
+        assert_eq!(delete_response.status(), StatusCode::CONFLICT);
+        let delete_body = to_bytes(delete_response.into_body()).await.unwrap();
+        assert_eq!(
+            delete_body,
+            "A reply is still being generated; wait for it to finish before deleting a thought"
+        );
+
+        drop(guard);
+        assert!(
+            ACTIVE_TURN.try_claim().is_some(),
+            "the slot should be free again once the guard drops"
         );
     }
 }

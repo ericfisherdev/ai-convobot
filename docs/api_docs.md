@@ -869,7 +869,7 @@ See section 1.7/1.8 for the pin/unpin routes, which live under `/message/{id}/pi
 
 ### 9. Running thoughts
 
-A running thought (#214-#220) is a companion-authored, first-person memory note written per exchange, distinct from a compaction checkpoint's extracted facts. Unlike section 8's compaction routes (host-only, `409` in `joiner` mode), every route below serves **this instance's own local table** in every multiplayer mode: on a joiner, that is its own bot's thoughts, mirrored in by `multiplayer::remote_generation`, not the host's.
+A running thought (#214-#220) is a companion-authored, first-person memory note written per exchange, distinct from a compaction checkpoint's extracted facts. Unlike section 8's compaction routes (host-only, `409` in `joiner` mode), every route below serves **this instance's own local table** in every multiplayer mode: on a joiner, that will be its own bot's thoughts once #220 lands writing them; today a joiner's table is simply empty, and these four routes already serve it correctly.
 
 #### 9.1 List running thoughts
 
@@ -877,7 +877,7 @@ A running thought (#214-#220) is a companion-authored, first-person memory note 
 - **Method:** `GET`
 - **Response:**
   - Status: 200 OK
-  - Body: `{ "thoughts": [RunningThought] }`, oldest first. `RunningThought` is `{ id, companion_id, speaker_id, from_message_id, through_message_id, text, edited, created_at }`; `edited` is `true` once a thought has been rewritten by 9.2 or restored by a failed 9.4 run.
+  - Body: `{ "thoughts": [RunningThought] }`, oldest first. `RunningThought` is `{ id, companion_id, speaker_id, from_message_id, through_message_id, text, edited, created_at }`; `edited` is `true` once a thought has been rewritten by 9.2. A failed 9.4 run restores each untouched thought exactly as captured — same `text` and `edited` flag, under a new `id`.
 - **Example Request:**
   ```http
   GET /thoughts
