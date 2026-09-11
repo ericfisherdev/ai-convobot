@@ -118,7 +118,6 @@ pub(crate) fn get_on(con: &Connection, id: i64) -> Result<Option<RunningThought>
 
 /// Every thought for `companion_id`, every speaker, oldest first —
 /// transcript order, the order #217/#218 render.
-#[allow(dead_code)] // wired up by #217: reached once its list route calls this
 pub(crate) fn list_on(con: &Connection, companion_id: i32) -> Result<Vec<RunningThought>> {
     let mut stmt = con.prepare(&format!(
         "SELECT {THOUGHT_COLUMNS} FROM running_thoughts WHERE companion_id = ? ORDER BY id"
@@ -192,7 +191,6 @@ pub(crate) fn in_range_on(
 /// Rewrites `text` and marks the row `edited`. `QueryReturnedNoRows` if `id`
 /// does not exist (checked via `changes() == 0`, so a silent no-op is
 /// impossible).
-#[allow(dead_code)] // wired up by #217: reached once its PATCH route calls this
 pub(crate) fn update_text_on(con: &Connection, id: i64, text: &str) -> Result<()> {
     let changed = con.execute(
         "UPDATE running_thoughts SET text = ?, edited = 1 WHERE id = ?",
@@ -205,7 +203,6 @@ pub(crate) fn update_text_on(con: &Connection, id: i64, text: &str) -> Result<()
 }
 
 /// `QueryReturnedNoRows` if `id` does not exist (so #217 can 404).
-#[allow(dead_code)] // wired up by #217: reached once its DELETE route calls this
 pub(crate) fn delete_on(con: &Connection, id: i64) -> Result<()> {
     let changed = con.execute("DELETE FROM running_thoughts WHERE id = ?", params![id])?;
     if changed == 0 {
@@ -230,7 +227,6 @@ pub(crate) fn delete_on(con: &Connection, id: i64) -> Result<()> {
 /// caller's job (`SqliteRunningThoughtStore::delete_from`) to wrap the call
 /// in one, the same way `insert_facts_on` relies on its own caller for
 /// atomicity.
-#[allow(dead_code)] // wired up by #217/#219/#220: reached once edit/delete invalidation calls this
 pub(crate) fn delete_from_on(
     con: &Connection,
     companion_id: i32,
@@ -264,7 +260,6 @@ pub trait RunningThoughtStore {
     fn get(&self, id: i64) -> Result<Option<RunningThought>>;
 
     /// Every thought for `companion_id`, every speaker, ordered by `id`.
-    #[allow(dead_code)] // wired up by #217: reached once its list route calls this
     fn list(&self, companion_id: i32) -> Result<Vec<RunningThought>>;
 
     /// The last `limit` thoughts for `speaker_id` only, chronological
@@ -286,17 +281,14 @@ pub trait RunningThoughtStore {
 
     /// Rewrites `text` and sets `edited = true`. `QueryReturnedNoRows` if
     /// `id` does not exist.
-    #[allow(dead_code)] // wired up by #217: reached once its PATCH route calls this
     fn update_text(&self, id: i64, text: &str) -> Result<()>;
 
     /// `QueryReturnedNoRows` if `id` does not exist.
-    #[allow(dead_code)] // wired up by #217: reached once its DELETE route calls this
     fn delete(&self, id: i64) -> Result<()>;
 
     /// Deletes every thought (any speaker) with `through_message_id >=
     /// message_id`, in one transaction, and returns the deleted rows in id
     /// order.
-    #[allow(dead_code)] // wired up by #217/#219/#220: reached once edit/delete invalidation calls this
     fn delete_from(&self, companion_id: i32, message_id: i32) -> Result<Vec<RunningThought>>;
 }
 

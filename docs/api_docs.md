@@ -867,6 +867,88 @@ Conversation compaction (#171-#186): a checkpoint rolls a run of messages into a
 
 See section 1.7/1.8 for the pin/unpin routes, which live under `/message/{id}/pin` rather than `/compaction` since they act on a message, not a checkpoint.
 
+### 9. Running thoughts
+
+A running thought (#214-#220) is a companion-authored, first-person memory note written per exchange, distinct from a compaction checkpoint's extracted facts. Unlike section 8's compaction routes (host-only, `409` in `joiner` mode), every route below serves **this instance's own local table** in every multiplayer mode: on a joiner, that is its own bot's thoughts, mirrored in by `multiplayer::remote_generation`, not the host's.
+
+#### 9.1 List running thoughts
+
+- **URL:** `/thoughts`
+- **Method:** `GET`
+- **Response:**
+  - Status: 200 OK
+  - Body: `{ "thoughts": [RunningThought] }`, oldest first. `RunningThought` is `{ id, companion_id, speaker_id, from_message_id, through_message_id, text, edited, created_at }`; `edited` is `true` once a thought has been rewritten by 9.2 or restored by a failed 9.4 run.
+- **Example Request:**
+  ```http
+  GET /thoughts
+  ```
+
+#### 9.2 Edit a running thought
+
+- **URL:** `/thoughts/{id}`
+- **Method:** `PATCH`
+- **Path Parameters:**
+  - `id` (integer): the thought's id.
+- **Request Body:**
+  - `text` (string): the new text. Trimmed; empty after trimming is rejected.
+- **Response:**
+  - Status: 200 OK
+  - Body: the updated `RunningThought`, with `edited: true`.
+  - Status: 404 Not Found — `id` does not name a thought.
+  - Status: 422 Unprocessable Entity — `text` is empty after trimming; body: `{ "reason": "text must not be empty" }`.
+- **Example Request:**
+  ```http
+  PATCH /thoughts/12
+  Content-Type: application/json
+
+  { "text": "the user's own words" }
+  ```
+
+#### 9.3 Delete a running thought
+
+- **URL:** `/thoughts/{id}`
+- **Method:** `DELETE`
+- **Path Parameters:**
+  - `id` (integer): the thought's id.
+- **Response:**
+  - Status: 200 OK
+  - Status: 404 Not Found — `id` does not name a thought.
+- **Example Request:**
+  ```http
+  DELETE /thoughts/12
+  ```
+
+#### 9.4 Regenerate running thoughts from a message forward
+
+- **URL:** `/thoughts/regenerate`
+- **Method:** `POST`
+- **Description:** Rewrites every thought this instance's own speaker (the host companion, or a joiner's own bot) owns whose range reaches `from_message_id` or later, in order; any other speaker's thought in that same range is kept, re-inserted unchanged. Claims the turn slot for its whole run, the same way `/prompt/stream` does, since it may run the model repeatedly.
+- **Request Body:**
+  - `from_message_id` (integer): rewrite every owned thought from this message forward.
+- **Response:**
+  - Status: 200 OK
+  - Content-Type: `text/event-stream`
+  - Body: the same chunk shape section 6.3 uses, reused rather than redefined: a `thought_started` chunk (empty `content`, `speaker_id` set) then, on success, a `thought`-carrying `token` chunk (`thought` set to the freshly regenerated `RunningThought`, the same shape 9.1's rows use) — repeated once per thought this speaker owns in the range — then `round_complete`. A failure ends the stream early with the terminal `error` chunk instead; every thought this run had already deleted but not yet regenerated is restored to its original text and `edited` flag before that chunk goes out, so a failed run loses at most the one thought it was rewriting when it failed.
+  - Status: 409 Conflict — running thoughts are disabled; body: `running thoughts are disabled; enable them in Memory settings before regenerating`.
+  - Status: 409 Conflict — a turn is already in flight; wait for it to finish before sending another message.
+- **Example Request:**
+  ```http
+  POST /thoughts/regenerate
+  Content-Type: application/json
+
+  { "from_message_id": 42 }
+  ```
+- **Example Response:**
+  ```
+  data: {"request_id":"thoughts-abc123","event":"thought_started","content":"","is_complete":false,"speaker_id":"char"}
+
+  data: {"request_id":"thoughts-abc123","event":"token","content":"","is_complete":false,"token_count":1,"speaker_id":"char","thought":{"id":15,"companion_id":1,"speaker_id":"char","from_message_id":42,"through_message_id":44,"text":"...","edited":false,"created_at":"..."}}
+
+  data: {"request_id":"thoughts-abc123","event":"round_complete","content":"","is_complete":true,"token_count":1,"speaker_id":""}
+  ```
+- **Notes:**
+  - Editing or deleting a chat message never touches an existing running thought (#214): a thought records what the companion took from an exchange at the time, and does not become false because the source text changed later. Only an explicit call to this route rewrites one.
+
 ## Route index
 
 Endpoint sections above cover the core messaging, companion, user, configuration, memory and prompting routes. The table below lists every route the backend registers, including those not yet written up in full. It is generated from the handler attributes in `backend/src/main.rs`.
@@ -939,6 +1021,10 @@ Endpoint sections above cover the core messaging, companion, user, configuration
 | `GET` | `/api/session/{session_id}` |
 | `POST` | `/api/session/{session_id}/end` |
 | `GET` | `/api/session/stats/summary` |
+| `GET` | `/api/thoughts` |
+| `PATCH` | `/api/thoughts/{id}` |
+| `DELETE` | `/api/thoughts/{id}` |
+| `POST` | `/api/thoughts/regenerate` |
 | `GET` | `/api/user` |
 | `PUT` | `/api/user` |
 

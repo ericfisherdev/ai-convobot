@@ -37,9 +37,16 @@
 //! `Database`-touching `thought_inputs_on`), and `generate.rs`
 //! (`generate_thought`/`generate_thought_into`, which run the character
 //! model and persist the result). Remote bots' own thoughts are #220.
+//!
+//! #217 (the read/write HTTP surface) adds `regenerate.rs`: the
+//! delete-then-rewrite loop `main.rs`'s `POST /api/thoughts/regenerate`
+//! drives, built on `store.rs`'s `delete_from` and #216's
+//! `hook::thought_inputs_for_range`/`generate::generate_thought_into`
+//! rather than defining its own generation path.
 
 pub mod generate;
 pub mod hook;
 pub mod prompt;
+pub mod regenerate;
 pub mod store;
 pub mod types;

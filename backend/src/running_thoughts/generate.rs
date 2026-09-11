@@ -71,7 +71,12 @@ pub fn generate_thought(
 /// [`generate_thought`] over a [`RunningThoughtStore`]: `insert` then `get`
 /// (the store's `insert` returns only the id). What #220's joiner thinker
 /// (`multiplayer::remote_generation::think_into`) calls with
-/// `SqliteRunningThoughtStore`.
+/// `SqliteRunningThoughtStore`. #217's regenerate loop instead builds the
+/// same insert closure inline and drives generation through `main.rs`'s
+/// `host_thought_writer(speakers)`, the same `(inputs, insert) -> ..`
+/// closure `PendingTurn::think`'s two live-round callers already pass
+/// around, so a regenerated thought is produced exactly the way a live
+/// round's would be.
 pub fn generate_thought_into(
     store: &dyn RunningThoughtStore,
     inputs: &ThoughtInputs,
