@@ -303,9 +303,19 @@ pub fn regenerate_from(
                 // instead of just the one this run was rewriting. The
                 // original `Inputs`/`Generate` error is what gets returned;
                 // a restore failure only replaces it when restoring itself
-                // failed, since that is the more urgent thing to report.
+                // failed, since that is the more urgent thing to report --
+                // but `err` is logged first (same rule as the non-owned
+                // branch above): it is what actually caused this row to
+                // need restoring at all, and returning `Store(e)` instead
+                // must not silently erase that reason from the record.
                 return Err(match restore_all(store, &captured[index..]) {
-                    Some(e) => ThoughtRegenerateError::Store(e),
+                    Some(e) => {
+                        eprintln!(
+                            "running thoughts: regeneration failed for the round starting at message {}: {err}",
+                            original.from_message_id
+                        );
+                        ThoughtRegenerateError::Store(e)
+                    }
                     None => err,
                 });
             }
@@ -634,19 +644,32 @@ mod tests {
         assert!(!restored.edited);
     }
 
+    /// One (`text`, error constructor) pair [`FailingReinsertStore`] fails
+    /// `insert` on.
+    type FailingText = (&'static str, fn() -> rusqlite::Error);
+
     /// A [`RunningThoughtStore`] wrapping a [`RecordingStore`] whose
-    /// `insert` fails for one marked piece of text, everything else
-    /// delegated straight through -- the minimal seam needed to exercise a
-    /// restore failure without touching real SQLite.
+    /// `insert` fails for each marked piece of text with the error paired
+    /// with it -- a distinct error per text, not one shared `InvalidQuery`
+    /// for all of them, so a test asserting on which failure came back
+    /// actually exercises that (rather than every marked text producing an
+    /// indistinguishable error `matches!` would accept regardless of which
+    /// one is reported) -- everything else delegated straight through, the
+    /// minimal seam needed to exercise a restore failure without touching
+    /// real SQLite.
     struct FailingReinsertStore {
         inner: RecordingStore,
-        fails_for_texts: &'static [&'static str],
+        fails_for_texts: &'static [FailingText],
     }
 
     impl RunningThoughtStore for FailingReinsertStore {
         fn insert(&self, thought: NewRunningThought) -> rusqlite::Result<i64> {
-            if self.fails_for_texts.contains(&thought.text.as_str()) {
-                return Err(rusqlite::Error::InvalidQuery);
+            if let Some((_, make_err)) = self
+                .fails_for_texts
+                .iter()
+                .find(|(text, _)| *text == thought.text.as_str())
+            {
+                return Err(make_err());
             }
             self.inner.insert(thought)
         }
@@ -706,7 +729,7 @@ mod tests {
     fn a_failed_restore_still_restores_every_other_row_instead_of_stopping_at_the_first_failure() {
         let store = FailingReinsertStore {
             inner: RecordingStore::new(),
-            fails_for_texts: &["round two"],
+            fails_for_texts: &[("round two", || rusqlite::Error::InvalidQuery)],
         };
         seed(&store.inner, "char", 1, 3, "round one");
         seed(&store.inner, "char", 4, 6, "round two");
@@ -767,7 +790,7 @@ mod tests {
         // pins, just in the other branch.
         let store = FailingReinsertStore {
             inner: RecordingStore::new(),
-            fails_for_texts: &["bot1's own note"],
+            fails_for_texts: &[("bot1's own note", || rusqlite::Error::InvalidQuery)],
         };
         seed(&store.inner, "char", 1, 3, "round one");
         store
@@ -825,7 +848,10 @@ mod tests {
         // though this row's error is what gets reported.
         let store = FailingReinsertStore {
             inner: RecordingStore::new(),
-            fails_for_texts: &["bot1's own note", "round three"],
+            fails_for_texts: &[
+                ("bot1's own note", || rusqlite::Error::InvalidQuery),
+                ("round three", || rusqlite::Error::QueryReturnedNoRows),
+            ],
         };
         seed(&store.inner, "char", 1, 3, "round one");
         store
@@ -850,7 +876,18 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(err, ThoughtRegenerateError::Store(_)));
+        // The two marked texts fail with distinct errors specifically so
+        // this assertion can tell bot1's own (chronologically first)
+        // failure apart from round three's later one -- a `Store(_)` match
+        // alone would pass even if the code regressed to reporting the
+        // later error instead.
+        assert!(
+            matches!(
+                err,
+                ThoughtRegenerateError::Store(rusqlite::Error::InvalidQuery)
+            ),
+            "expected bot1's own InvalidQuery to be reported, got {err:?}"
+        );
 
         let after = store.list(1).unwrap();
         assert!(
