@@ -189,9 +189,11 @@ pub struct RoundOutcome {
     #[allow(dead_code)]
     pub attitude: Option<(CompanionAttitude, CompanionAttitude)>,
     /// The compaction draft (#172) this round's `after_round` hook queued,
-    /// if any. Read by neither handler today; the SSE draft-ready
-    /// notification (a later compaction issue) is what reads this next.
-    #[allow(dead_code)]
+    /// if any — also what `run_round` hands to its `extract` seam (#221),
+    /// so extraction runs on exactly the draft this outcome reports. Both
+    /// prompting handlers already read `draft_id` off this to answer
+    /// `compaction_draft_id`; the SSE draft-ready notification (a later
+    /// compaction issue) is what else reads this.
     pub queued_draft: Option<QueuedDraft>,
 }
 
@@ -227,10 +229,16 @@ fn broadcast_message(store: &impl TurnStore, id: i32, broadcast: &dyn Fn(ServerF
 /// Runs one round on the calling (blocking) thread, exactly like
 /// `PendingTurn::complete` did before this module existed.
 ///
-/// Binds `turn_guard` first so the slot is held until this function
-/// returns, which is after `sink.round_complete` — an overlapping call
-/// cannot start a second round until this one, including its attitude
-/// scoring, has fully settled.
+/// Holds `turn_guard` for the whole round — an overlapping call cannot
+/// start a second round until this one, including its attitude scoring,
+/// has fully settled. The slot is released when this function returns
+/// *unless* the round's compaction hook queued a draft (#221): in that
+/// case ownership of the guard passes to `extract`, called after
+/// `sink.round_complete` (so the client has already seen the reply settle
+/// before extraction begins), which must release it once extraction
+/// finishes — the same slot-handoff shape #216/#220 used for `host_think`.
+/// With no draft queued, `extract` is never called and the slot is freed
+/// exactly as it was before this parameter existed.
 ///
 /// `too_many_arguments`/`type_complexity`: every parameter here is one of
 /// this module's own seam types (`TurnStore`, `RemoteGenerator`,
@@ -250,12 +258,12 @@ pub fn run_round(
         &ThoughtInputs,
         &dyn Fn(NewRunningThought) -> rusqlite::Result<RunningThought>,
     ) -> Result<RunningThought, ThoughtError>,
+    extract: &mut dyn FnMut(TurnGuard, &QueuedDraft),
     remotes: &dyn RemoteGenerator,
     broadcast: &dyn Fn(ServerFrame),
     timeout: Duration,
     sink: &mut dyn RoundSink,
 ) -> io::Result<RoundOutcome> {
-    let _turn_guard = turn_guard;
     let round_id = next_round_id();
     // Read once, before the speaker loop, so every remote speaker in this
     // round sees the same checkpoint even if a background extraction job
@@ -383,6 +391,13 @@ pub fn run_round(
         sink.draft_queued(queued.draft_id);
     }
     sink.round_complete(attitude.as_ref());
+
+    // Handed over only now, after the client has already seen the reply
+    // settle: `turn_guard` otherwise just drops here, releasing the slot
+    // exactly as before this parameter existed.
+    if let Some(queued) = &queued_draft {
+        extract(turn_guard, queued);
+    }
 
     Ok(RoundOutcome {
         host_reply,
@@ -764,6 +779,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi from char".to_string()),
             &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, _queued| {},
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -862,6 +878,7 @@ mod tests {
                 Ok("hi from char".to_string())
             },
             &mut write_a_thought,
+            &mut |_guard, _queued| {},
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -923,6 +940,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi from char".to_string()),
             &mut write_a_thought,
+            &mut |_guard, _queued| {},
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -967,6 +985,7 @@ mod tests {
                     "no model loaded",
                 )))
             },
+            &mut |_guard, _queued| {},
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1017,6 +1036,7 @@ mod tests {
             &mut |_inputs, _insert| {
                 panic!("host_think must not run when running thoughts are disabled")
             },
+            &mut |_guard, _queued| {},
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1061,6 +1081,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| panic!("char should never be asked to speak here"),
             &mut |_inputs, _insert| panic!("host_think must not run when char does not speak"),
+            &mut |_guard, _queued| {},
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1109,6 +1130,7 @@ mod tests {
             &policy,
             &mut |_prompt, _on_token| Ok("hi from char".to_string()),
             &mut write_a_thought,
+            &mut |_guard, _queued| {},
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1172,6 +1194,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi from char".to_string()),
             &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, _queued| {},
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1230,6 +1253,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi from char".to_string()),
             &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, _queued| {},
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1275,6 +1299,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi from char".to_string()),
             &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, _queued| {},
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1330,6 +1355,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| Err(std::io::Error::other("no model")),
             &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, _queued| {},
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1382,6 +1408,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi".to_string()),
             &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, _queued| {},
             &NoRemotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1423,6 +1450,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi".to_string()),
             &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, _queued| {},
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1472,6 +1500,7 @@ mod tests {
             },
             &mut |_prompt, _on_token| Ok("hi @bot1 do you agree?".to_string()),
             &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, _queued| {},
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1523,6 +1552,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| panic!("char should never be asked to speak"),
             &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, _queued| {},
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1581,6 +1611,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi from char".to_string()),
             &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, _queued| {},
             &remotes,
             &|frame| broadcasts.lock().unwrap().push(frame),
             Duration::from_secs(30),
@@ -1864,6 +1895,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi".to_string()),
             &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, _queued| {},
             &NoRemotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1883,11 +1915,125 @@ mod tests {
         );
     }
 
+    /// #221's central pin: the round hands its `TurnGuard` to `extract`
+    /// only once the round has fully settled (after `round_complete`), and
+    /// the slot is still held — not claimable — while `extract` runs, since
+    /// ownership passed by move rather than being released and reclaimed.
     #[test]
-    fn a_second_round_with_a_draft_already_pending_queues_none() {
+    fn a_round_over_the_threshold_hands_the_guard_to_extract_after_round_complete() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = RecordingStore::new(None).with_compaction_tail(over_threshold_tail());
+        let registry = ParticipantRegistry::solo("Alice", "Bob", None);
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), registry.clone())
+                .expect("insert should succeed");
+
+        let plan = plan_round("hello", &registry, &no_followups());
+        let mut sink = RecordingSink::default();
+        let extracted: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+        let slot_held_during_extract: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+        let outcome = run_round(
+            guard,
+            pending,
+            plan,
+            &store,
+            &registry,
+            &no_followups(),
+            &mut |_prompt, _on_token| Ok("hi".to_string()),
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, queued| {
+                *slot_held_during_extract.lock().unwrap() = Some(SLOT.try_claim().is_none());
+                extracted.lock().unwrap().push(queued.draft_id);
+            },
+            &NoRemotes,
+            &|_frame| {},
+            Duration::from_secs(30),
+            &mut sink,
+        )
+        .expect("round should succeed");
+
+        let queued_id = outcome
+            .queued_draft
+            .as_ref()
+            .expect("a tail over threshold should queue a draft")
+            .draft_id;
+        assert_eq!(
+            *extracted.lock().unwrap(),
+            vec![queued_id],
+            "extract must be called exactly once, with the queued draft's id"
+        );
+        assert_eq!(
+            *slot_held_during_extract.lock().unwrap(),
+            Some(true),
+            "the turn slot must still be held while the guard is inside extract"
+        );
+        assert_eq!(
+            sink.events.last(),
+            Some(&SinkEvent::RoundComplete),
+            "round_complete must have already fired before extract runs"
+        );
+        // The guard passed into extract above is dropped there, releasing
+        // the slot; nothing outside `extract` released it.
+        assert!(
+            SLOT.try_claim().is_some(),
+            "the slot must be free once extract's own guard has dropped"
+        );
+    }
+
+    #[test]
+    fn a_round_with_no_draft_queued_never_calls_extract_and_frees_the_slot() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        // `RecordingStore::new(None)` defaults to an empty tail with
+        // `draft_pending: false` and no configured threshold, so the
+        // compaction hook never fires.
+        let store = RecordingStore::new(None);
+        let registry = ParticipantRegistry::solo("Alice", "Bob", None);
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), registry.clone())
+                .expect("insert should succeed");
+
+        let plan = plan_round("hello", &registry, &no_followups());
+        let extract_calls = std::sync::Mutex::new(0);
+
+        let outcome = run_round(
+            guard,
+            pending,
+            plan,
+            &store,
+            &registry,
+            &no_followups(),
+            &mut |_prompt, _on_token| Ok("hi".to_string()),
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, _queued| {
+                *extract_calls.lock().unwrap() += 1;
+            },
+            &NoRemotes,
+            &|_frame| {},
+            Duration::from_secs(30),
+            &mut RecordingSink::default(),
+        )
+        .expect("round should succeed");
+
+        assert!(outcome.queued_draft.is_none());
+        assert_eq!(*extract_calls.lock().unwrap(), 0);
+        assert!(
+            SLOT.try_claim().is_some(),
+            "the slot must be free once run_round returns with no draft queued"
+        );
+    }
+
+    /// #221's AC 3: a pending draft suppresses every later trigger (as
+    /// before), but once it is no longer pending (committed or discarded),
+    /// the *next* round queues and extracts a new one — no permanent wedge.
+    #[test]
+    fn a_third_round_after_the_pending_draft_clears_queues_and_extracts_again() {
         static SLOT: TurnSlot = TurnSlot::new();
         let store = RecordingStore::new(None).with_compaction_tail(over_threshold_tail());
         let registry = ParticipantRegistry::solo("Alice", "Bob", None);
+        let extracted: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
 
         let first_guard = SLOT.try_claim().expect("slot should be free");
         let first_pending = PendingTurn::begin(
@@ -1908,13 +2054,17 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi".to_string()),
             &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, queued| extracted.lock().unwrap().push(queued.draft_id),
             &NoRemotes,
             &|_frame| {},
             Duration::from_secs(30),
             &mut RecordingSink::default(),
         )
         .expect("round should succeed");
-        assert!(first_outcome.queued_draft.is_some());
+        let first_draft_id = first_outcome
+            .queued_draft
+            .expect("a tail over threshold should queue a draft")
+            .draft_id;
 
         let second_guard = SLOT.try_claim().expect("slot should be free again");
         let second_pending = PendingTurn::begin(
@@ -1935,6 +2085,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| Ok("hi again".to_string()),
             &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, queued| extracted.lock().unwrap().push(queued.draft_id),
             &NoRemotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -1947,6 +2098,54 @@ mod tests {
             "a pending draft must suppress every trigger"
         );
         assert_eq!(store.queued_drafts.lock().unwrap().len(), 1);
+        assert_eq!(
+            *extracted.lock().unwrap(),
+            vec![first_draft_id],
+            "extract must have run for the first draft only, so far"
+        );
+
+        // The first draft has now been committed or discarded, the same
+        // thing SQLite's `pending_draft_on` would report once that row left
+        // `Draft` for a terminal status.
+        store.set_draft_pending(false);
+
+        let third_guard = SLOT.try_claim().expect("slot should be free a third time");
+        let third_pending = PendingTurn::begin(
+            &third_guard,
+            &store,
+            1,
+            1,
+            "hello a third time".to_string(),
+            registry.clone(),
+        )
+        .expect("insert should succeed");
+        let third_outcome = run_round(
+            third_guard,
+            third_pending,
+            plan_round("hello a third time", &registry, &no_followups()),
+            &store,
+            &registry,
+            &no_followups(),
+            &mut |_prompt, _on_token| Ok("hi a third time".to_string()),
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, queued| extracted.lock().unwrap().push(queued.draft_id),
+            &NoRemotes,
+            &|_frame| {},
+            Duration::from_secs(30),
+            &mut RecordingSink::default(),
+        )
+        .expect("round should succeed");
+
+        let third_draft_id = third_outcome
+            .queued_draft
+            .expect("a cleared pending draft must let the next round queue a new one")
+            .draft_id;
+        assert_eq!(store.queued_drafts.lock().unwrap().len(), 2);
+        assert_eq!(
+            *extracted.lock().unwrap(),
+            vec![first_draft_id, third_draft_id],
+            "extract must have run for the first and third drafts, never the suppressed second round"
+        );
     }
 
     #[test]
@@ -1997,6 +2196,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| Ok("good morning".to_string()),
             &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, _queued| {},
             &NoRemotes,
             &|_frame| {},
             Duration::from_secs(30),
@@ -2043,6 +2243,7 @@ mod tests {
             &no_followups(),
             &mut |_prompt, _on_token| panic!("char should never be asked to speak"),
             &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, _queued| {},
             &remotes,
             &|_frame| {},
             Duration::from_secs(30),

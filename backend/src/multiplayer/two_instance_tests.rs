@@ -387,6 +387,7 @@ async fn run_one_round(
             &policy,
             &mut host_gen,
             &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, _queued| {},
             &remotes,
             &broadcast,
             timeout,
@@ -736,6 +737,7 @@ async fn a_committed_checkpoint_ships_continuity_and_a_trimmed_transcript_to_the
                 panic!("char should never be asked to speak in this test")
             },
             &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, _queued| {},
             &remotes,
             &broadcast,
             Duration::from_secs(5),
@@ -802,6 +804,7 @@ async fn a_committed_checkpoint_ships_continuity_and_a_trimmed_transcript_to_the
                 panic!("char should never be asked to speak in this test")
             },
             &mut |_inputs, _insert| Err(ThoughtError::Empty),
+            &mut |_guard, _queued| {},
             &remotes,
             &broadcast,
             Duration::from_secs(5),
@@ -924,6 +927,7 @@ async fn a_joiner_writes_its_own_thought_once_and_a_regenerate_does_not_repeat_i
                 Ok("hi from host".to_string())
             },
             &mut host_think,
+            &mut |_guard, _queued| {},
             &remotes,
             &broadcast,
             Duration::from_secs(5),

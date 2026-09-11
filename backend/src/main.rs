@@ -56,6 +56,7 @@ use crate::compaction::contradiction::{
     check as check_contradictions, ContradictionStore, CoveringThoughts, SqliteContradictionStore,
     StoredContradiction,
 };
+use crate::compaction::hook::QueuedDraft;
 use crate::compaction::review::{
     apply_review, recheck_candidates, rejections_from, CommitRequest, RejectedItem, ReviewError,
 };
@@ -1335,6 +1336,7 @@ mod stream_turn_tests {
                 &no_followups(),
                 |_prompt, _on_token| Err(std::io::Error::other("no model")),
                 |_inputs, _insert| Err(ThoughtError::Empty),
+                |_guard, _queued| {},
                 &NoRemotes,
                 &|_frame| {},
                 Duration::from_secs(30),
@@ -1397,6 +1399,7 @@ mod stream_turn_tests {
                     Ok("Hello".to_string())
                 },
                 |_inputs, _insert| Err(ThoughtError::Empty),
+                |_guard, _queued| {},
                 &NoRemotes,
                 &|_frame| {},
                 Duration::from_secs(30),
@@ -1478,6 +1481,7 @@ mod stream_turn_tests {
                 &no_followups(),
                 |_prompt, _on_token| Ok("hi from char".to_string()),
                 |_inputs, _insert| Err(ThoughtError::Empty),
+                |_guard, _queued| {},
                 &remotes,
                 &|_frame| {},
                 Duration::from_secs(30),
@@ -1559,6 +1563,7 @@ mod stream_turn_tests {
                 &no_followups(),
                 |_prompt, _on_token| Ok("hi from char".to_string()),
                 |_inputs, _insert| Err(ThoughtError::Empty),
+                |_guard, _queued| {},
                 &remotes,
                 &|_frame| {},
                 Duration::from_secs(30),
@@ -1622,6 +1627,7 @@ mod stream_turn_tests {
                 &no_followups(),
                 |_prompt, _on_token| Ok("hi".to_string()),
                 |_inputs, _insert| Err(ThoughtError::Empty),
+                |_guard, _queued| {},
                 &NoRemotes,
                 &|_frame| {},
                 Duration::from_secs(30),
@@ -1718,6 +1724,7 @@ mod stream_turn_tests {
                 &no_followups(),
                 |_prompt, _on_token| Ok("hi".to_string()),
                 |_inputs, _insert| Err(ThoughtError::Empty),
+                |_guard, _queued| {},
                 &NoRemotes,
                 &|_frame| {},
                 Duration::from_secs(30),
@@ -1785,6 +1792,7 @@ mod stream_turn_tests {
                 &no_followups(),
                 |_prompt, _on_token| Ok("hi".to_string()),
                 |_inputs, _insert| Err(ThoughtError::Empty),
+                |_guard, _queued| {},
                 &NoRemotes,
                 &|_frame| {},
                 Duration::from_secs(30),
@@ -1798,6 +1806,78 @@ mod stream_turn_tests {
         }
 
         assert!(chunks.iter().all(|c| c.compaction_draft_id.is_none()));
+    }
+
+    /// #221's AC 2 pinned at the wire level, not just `run_round`'s own
+    /// internal call order: every chunk `extract` could observe by draining
+    /// the channel from inside the closure is already the compaction-draft
+    /// chunk followed by the terminal `round_complete` chunk, proving both
+    /// went out over the SSE wire before extraction started.
+    #[test]
+    fn a_streamed_round_over_the_threshold_calls_extract_only_after_both_wire_chunks_are_sent() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = Arc::new(RecordingStore::new(None).with_compaction_tail(over_threshold_tail()));
+        let registry = ParticipantRegistry::solo("Alice", "Bob", None);
+        let pending = PendingTurn::begin(
+            &guard,
+            store.as_ref(),
+            1,
+            1,
+            "hello".to_string(),
+            registry.clone(),
+        )
+        .expect("insert should succeed");
+
+        let session_id = format!("test-{}", Uuid::new_v4());
+        let (stream, rx) = INFERENCE_OPTIMIZER.start_streaming_session(session_id);
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        let drain_rx = rx.clone();
+        let sequence: Arc<std::sync::Mutex<Vec<&'static str>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let extract_sequence = sequence.clone();
+
+        let thread_store = store.clone();
+        let handle = std::thread::spawn(move || {
+            stream_round(
+                guard,
+                pending,
+                stream,
+                thread_store.as_ref(),
+                solo_plan(),
+                &registry,
+                &no_followups(),
+                |_prompt, _on_token| Ok("hi".to_string()),
+                |_inputs, _insert| Err(ThoughtError::Empty),
+                |_guard, _queued| {
+                    // Runs on this same worker thread, strictly after
+                    // `run_round`'s `sink.round_complete` call: whatever is
+                    // already sitting in the channel at this instant is
+                    // everything that went out before extraction started.
+                    let mut rx = drain_rx.lock().unwrap();
+                    while let Ok(chunk) = rx.try_recv() {
+                        if chunk.compaction_draft_id.is_some() {
+                            extract_sequence.lock().unwrap().push("compaction_draft");
+                        }
+                        if chunk.event == StreamEvent::RoundComplete {
+                            extract_sequence.lock().unwrap().push("round_complete");
+                        }
+                    }
+                    extract_sequence.lock().unwrap().push("extract");
+                },
+                &NoRemotes,
+                &|_frame| {},
+                Duration::from_secs(30),
+            );
+        });
+        handle.join().expect("worker thread should not panic");
+
+        assert_eq!(
+            *sequence.lock().unwrap(),
+            vec!["compaction_draft", "round_complete", "extract"],
+            "both the compaction-draft and round_complete chunks must already \
+             be on the wire before extraction starts"
+        );
     }
 }
 
@@ -1940,6 +2020,11 @@ async fn prompt_message(
     let speakers = snapshot_speakers(&registry);
     let participant_names = participant_display_names(&speakers);
     let plan = plan_round(&prompt_message, &speakers.registry, &policy);
+    // Snapshotted here, not inside the blocking closure: the same registry
+    // `compaction_draft` snapshots for the same reason (#221) — a bot
+    // joining or dropping mid-extraction must not mutate the canon policy
+    // `spawn_extraction` runs against.
+    let registry_snapshot = speakers.registry.clone();
 
     let result = web::block(
         move || -> Result<(Option<String>, Option<i64>), TurnError> {
@@ -1994,6 +2079,13 @@ async fn prompt_message(
                     )
                 },
                 &mut host_thought_writer(speakers.clone()),
+                &mut |guard, queued| {
+                    crate::compaction::extract::spawn_extraction(
+                        guard,
+                        queued.draft_id,
+                        registry_snapshot.clone(),
+                    );
+                },
                 remotes.as_ref(),
                 broadcast.as_ref(),
                 timeout,
@@ -4610,11 +4702,14 @@ impl RoundSink for SseRoundSink {
 /// every path: a thin wrapper over [`run_round`] that owns the
 /// `StreamSession` through [`SseRoundSink`].
 ///
-/// Holds `turn_guard` until after the terminal chunk has gone out (`run_round`
-/// binds it first and drops it on return), meaning the turn slot reopens
-/// only once the client has already seen the reply settle or fail. A failed
-/// `host_generate` still ends the session (with an error chunk) and releases
-/// the slot.
+/// Holds `turn_guard` for the whole round exactly like `run_round` does: the
+/// terminal chunk (`sink.round_complete`, via `SseRoundSink`) always goes
+/// out before the slot changes hands, so the client sees the reply settle
+/// before extraction begins. The slot reopens when this function returns
+/// *unless* the round queued a compaction draft, in which case `run_round`
+/// hands the guard to `extract` instead (#221) — see its own doc. A failed
+/// `host_generate` still ends the session (with an error chunk) and
+/// releases the slot, since no draft is queued on that path.
 #[allow(clippy::too_many_arguments)] // see `run_round`'s identical allow
 fn stream_round(
     turn_guard: TurnGuard,
@@ -4629,6 +4724,7 @@ fn stream_round(
         &ThoughtInputs,
         &dyn Fn(NewRunningThought) -> rusqlite::Result<RunningThought>,
     ) -> Result<RunningThought, ThoughtError>,
+    mut extract: impl FnMut(TurnGuard, &QueuedDraft),
     remotes: &dyn RemoteGenerator,
     broadcast: &dyn Fn(ServerFrame),
     timeout: std::time::Duration,
@@ -4643,6 +4739,7 @@ fn stream_round(
         policy,
         &mut host_generate,
         &mut host_think,
+        &mut extract,
         remotes,
         broadcast,
         timeout,
@@ -4745,6 +4842,11 @@ async fn start_streaming_session(
     // With no mention and no registered joiners the plan is always `[char]`.
     let plan = plan_round(&user_message, &speakers.registry, &policy);
     let begin_registry = speakers.registry.clone();
+    // Snapshotted here, before `speakers` is moved into the generation
+    // thread below, for the same reason `prompt_message` snapshots its own
+    // copy (#221): a bot joining or dropping mid-extraction must not mutate
+    // the canon policy `spawn_extraction` runs against.
+    let registry_snapshot = speakers.registry.clone();
 
     // The generator reads recent messages back out of the database, so the
     // user's turn has to be persisted before generation starts. The turn
@@ -4802,6 +4904,13 @@ async fn start_streaming_session(
                     )
                 },
                 host_thought_writer(speakers.clone()),
+                |guard, queued| {
+                    crate::compaction::extract::spawn_extraction(
+                        guard,
+                        queued.draft_id,
+                        registry_snapshot.clone(),
+                    );
+                },
                 remotes.as_ref(),
                 broadcast.as_ref(),
                 timeout,

@@ -152,6 +152,33 @@ pub(crate) fn migrate_add_extraction_error(con: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Fails every `Draft` row whose `raw_model_output` is still `NULL` at
+/// process start (#221): such a row can only be an extraction that never
+/// ran — queued before this fix landed, or interrupted by a restart
+/// mid-`fill_draft` — since no extraction thread can be alive yet this
+/// early in startup. `pending_draft_on` treats any `Draft` row as pending
+/// regardless of `raw_model_output`, so leaving one behind wedges
+/// compaction for good (the bug #221 fixes elsewhere): every later
+/// automatic and manual trigger for that companion is refused until a
+/// human finds and discards it. Called from `Database::init` right after
+/// [`migrate_add_extraction_error`], so a database that already hit this
+/// bug before upgrading is healed on the very next startup.
+///
+/// Returns the number of rows healed, for `Database::init` to log.
+pub(crate) fn fail_orphaned_drafts_on(con: &Connection) -> Result<usize> {
+    let changed = con.execute(
+        "UPDATE compactions SET status = ?, extraction_error = ? \
+         WHERE status = ? AND raw_model_output IS NULL",
+        params![
+            &CompactionStatus::Failed as &dyn ToSql,
+            "extraction never ran (queued before the automatic-extraction fix, \
+             or interrupted by a restart); trigger a new draft",
+            &CompactionStatus::Draft as &dyn ToSql,
+        ],
+    )?;
+    Ok(changed)
+}
+
 /// Column list shared by every query that reads a full `compactions` row,
 /// in the order [`checkpoint_from_row`] expects.
 const CHECKPOINT_COLUMNS: &str = "id, companion_id, from_message_id, through_message_id, status, trigger, raw_model_output, summary, rolling_summary, attitude_ratings, needs_merge, created_at, committed_at, extraction_error";
@@ -1904,6 +1931,66 @@ mod tests {
         migrate_add_extraction_error(&con).unwrap();
         let id = insert_draft_on(&con, &a_draft()).unwrap();
         fail_draft_on(&con, id, "boom").unwrap();
+    }
+
+    /// #221's healing sweep: a `Draft` row whose `raw_model_output` is still
+    /// `NULL` at startup can only be an extraction that never ran (the bug
+    /// itself, or a restart mid-`fill_draft`), and `pending_draft_on`
+    /// otherwise treats it as pending forever, wedging every later trigger.
+    #[test]
+    fn fail_orphaned_drafts_on_heals_a_draft_stranded_with_no_extraction_result() {
+        let (_dir, con) = fresh_db();
+
+        // Stranded: `Draft`, `raw_model_output` still `NULL` -- exactly what
+        // the pre-#221 hook left behind.
+        let stranded_id = insert_draft_on(&con, &a_draft()).unwrap();
+
+        // Mid-review: `Draft`, but extraction already ran and filled it in.
+        // A normal reviewable draft, not a wedge -- must be left alone.
+        let reviewing_id = insert_draft_on(&con, &a_draft()).unwrap();
+        set_extraction_result_on(
+            &con,
+            reviewing_id,
+            Some("raw output".to_string()),
+            Some("summary".to_string()),
+            None,
+        )
+        .unwrap();
+
+        // Already terminal -- must be left alone.
+        let committed_id = insert_draft_on(&con, &a_draft()).unwrap();
+        set_extraction_result_on(
+            &con,
+            committed_id,
+            Some("raw output".to_string()),
+            Some("summary".to_string()),
+            None,
+        )
+        .unwrap();
+        update_status_on(&con, committed_id, CompactionStatus::Committed).unwrap();
+
+        let healed = fail_orphaned_drafts_on(&con).unwrap();
+        assert_eq!(healed, 1);
+
+        let stranded = get_checkpoint_on(&con, stranded_id).unwrap().unwrap();
+        assert_eq!(stranded.status, CompactionStatus::Failed);
+        assert!(stranded.extraction_error.is_some());
+
+        let reviewing = get_checkpoint_on(&con, reviewing_id).unwrap().unwrap();
+        assert_eq!(
+            reviewing.status,
+            CompactionStatus::Draft,
+            "a draft mid-review must be left alone"
+        );
+        assert!(reviewing.extraction_error.is_none());
+
+        let committed = get_checkpoint_on(&con, committed_id).unwrap().unwrap();
+        assert_eq!(committed.status, CompactionStatus::Committed);
+
+        // The only remaining `Draft` row is the one mid-review, so the
+        // trigger is free to queue a new draft again -- no permanent wedge.
+        let pending = pending_draft_on(&con, 1).unwrap().unwrap();
+        assert_eq!(pending.id, reviewing_id);
     }
 
     #[test]

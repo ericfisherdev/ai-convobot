@@ -1443,6 +1443,17 @@ impl Database {
         // extraction_error column (#208) on a compactions table that
         // predates it.
         crate::compaction::store::migrate_add_extraction_error(&con)?;
+        // Heal any `Draft`/`raw_model_output IS NULL` row stranded by a
+        // restart, or queued before #221 wired automatic extraction up at
+        // all: `pending_draft_on` would otherwise treat it as pending
+        // forever and wedge every later trigger for that companion.
+        let healed = crate::compaction::store::fail_orphaned_drafts_on(&con)?;
+        if healed > 0 {
+            println!(
+                "compaction: healed {} orphaned draft(s) with no extraction result at startup",
+                healed
+            );
+        }
 
         // Running thoughts table (#215): references `companion`, already
         // created above. `CREATE TABLE IF NOT EXISTS` is the whole

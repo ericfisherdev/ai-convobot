@@ -1354,6 +1354,15 @@ pub fn spawn_holding(
 /// never merely swallowed once a draft row is known: see
 /// [`run_extraction_job`]/[`fail_pending_draft`].
 ///
+/// Three production call sites (#221): `main.rs`'s `compaction_draft`
+/// (the manual route, which queues its own draft) and the `extract` seam
+/// `multiplayer::round::run_round` hands its `TurnGuard` to whenever its
+/// end-of-round compaction hook queues one — wired from both
+/// `prompt_message` and `start_streaming_session`. The joiner-side path
+/// (`multiplayer::joiner_compaction::run_joiner_extraction`) runs its own
+/// extraction directly against `JOINER_EXTRACTION` rather than through this
+/// function.
+///
 /// `registry` is a snapshot (`Clone`, owned, `Send`), not a live handle: the
 /// caller takes it from the same shared registry a round already snapshots
 /// (`main.rs`'s `snapshot_speakers(&registry).registry`), so a joined or

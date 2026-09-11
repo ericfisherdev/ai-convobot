@@ -681,6 +681,15 @@ impl RecordingStore {
         self
     }
 
+    /// Flips `draft_pending` on the current `compaction_tail`, for a test
+    /// that wants to simulate a pending draft being committed or discarded
+    /// mid-test (#221): the same thing `queue_compaction_draft` already does
+    /// to `true` on insert, mirroring what SQLite's `pending_draft_on` would
+    /// report once the draft it found has moved to a terminal status.
+    pub(crate) fn set_draft_pending(&self, pending: bool) {
+        self.compaction_tail.lock().unwrap().draft_pending = pending;
+    }
+
     /// Overrides what `thought_inputs` returns, for a test that wants
     /// `PendingTurn::think`/`multiplayer::round::run_round`'s thought hook
     /// to actually fire.
