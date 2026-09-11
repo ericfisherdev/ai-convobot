@@ -891,6 +891,55 @@ mod tests {
         );
     }
 
+    /// #220's ownership pin: applying #186's per-instance rule to thoughts,
+    /// the host writes only `char`'s own thought and never authors one on a
+    /// remote speaker's behalf, even though both `bot1` and `bot2` reply in
+    /// the same round. A joiner writing its own bot's thought is
+    /// `remote_generation.rs`'s own concern (#220); nothing about it is
+    /// wired through `run_round`'s `host_think`.
+    #[test]
+    fn a_round_with_remote_speakers_never_writes_a_thought_for_a_remote_speaker() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = RecordingStore::new(None).with_thought_inputs(thought_inputs_for_char());
+        let registry = registry_with_bots();
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), registry.clone())
+                .expect("insert should succeed");
+
+        let plan = RoundPlan::from_speakers([ParticipantId::CHAR, bot("bot1"), bot("bot2")]);
+        let remotes = FakeRemote::new(vec![
+            (bot("bot1"), Ok("hi from bot1")),
+            (bot("bot2"), Ok("hi from bot2")),
+        ]);
+        let mut sink = RecordingSink::default();
+
+        run_round(
+            guard,
+            pending,
+            plan,
+            &store,
+            &registry,
+            &no_followups(),
+            &mut |_prompt, _on_token| Ok("hi from char".to_string()),
+            &mut write_a_thought,
+            &remotes,
+            &|_frame| {},
+            Duration::from_secs(30),
+            &mut sink,
+        )
+        .expect("round should succeed");
+
+        let thoughts = store.thoughts.lock().unwrap();
+        assert_eq!(
+            thoughts.len(),
+            1,
+            "exactly one thought row for the whole round, char's own: {:?}",
+            *thoughts
+        );
+        assert_eq!(thoughts[0].speaker_id, ParticipantId::CHAR.to_string());
+    }
+
     #[test]
     fn a_failed_thought_generation_still_yields_the_full_round_with_no_row() {
         static SLOT: TurnSlot = TurnSlot::new();

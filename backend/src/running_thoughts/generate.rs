@@ -65,8 +65,8 @@ pub fn generate_thought(
 
 /// [`generate_thought`] over a [`RunningThoughtStore`]: `insert` then `get`
 /// (the store's `insert` returns only the id). What #217's regenerate loop
-/// calls with `SqliteRunningThoughtStore`.
-#[allow(dead_code)] // wired up by #217: reached once its regenerate loop calls this
+/// and #220's joiner thinker (`multiplayer::remote_generation`) both call
+/// with `SqliteRunningThoughtStore`.
 pub fn generate_thought_into(
     store: &dyn RunningThoughtStore,
     inputs: &ThoughtInputs,

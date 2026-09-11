@@ -29,12 +29,17 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::chat_turn::{SqliteTurnStore, TurnStore};
 use crate::compaction::context::{CompactionContext, QuoteLine};
 use crate::compaction::store::SqliteCompactionStore;
-use crate::database::{Message, USER_SPEAKER_ID};
-use crate::llm::{self, CompactionSource, InMemoryTranscript, PromptSpeakers};
+use crate::database::{Database, Message, USER_SPEAKER_ID};
+use crate::llm::{
+    self, CompactionSource, InMemoryTranscript, PromptSpeakers, ResidentCharacterModel,
+};
 use crate::multiplayer::joiner::{GenerateRequestHandler, JoinerHandle};
 use crate::multiplayer::joiner_compaction::{local_overlay, JoinerExtractionJob};
 use crate::multiplayer::protocol::{ClientFrame, ContinuityPayload, ParticipantSummary};
 use crate::participants::{AvatarRef, Participant, ParticipantId, ParticipantRegistry};
+use crate::running_thoughts::generate::generate_thought_into;
+use crate::running_thoughts::hook::{pending_thought_range, thought_inputs_for_range};
+use crate::running_thoughts::store::{RunningThoughtStore, SqliteRunningThoughtStore};
 use crate::turn_slot::ACTIVE_TURN;
 
 /// The joiner-side [`CompactionSource`] (#186): renders the host's
@@ -146,25 +151,35 @@ pub type RemoteGenerator = Arc<
     dyn Fn(&[Message], &PromptSpeakers, &mut dyn FnMut(&str)) -> io::Result<String> + Send + Sync,
 >;
 
+/// Writes this joiner's own bot's running thought (#220) for the round a
+/// `GenerateRequest` just carried, before its reply is generated. Same shape
+/// as [`RemoteGenerator`] minus the streaming callback — a thought is never
+/// streamed to the host, only ever written to this joiner's own local
+/// store — so a test can supply a recording stub with no model, exactly as
+/// `RemoteGenerator`'s own stub does.
+pub type Thinker = Arc<dyn Fn(&[Message], &PromptSpeakers) + Send + Sync>;
+
 /// The [`GenerateRequestHandler`] `main.rs` wires a joiner up with.
 pub struct LocalModelGeneration {
     companion_id: i32,
     self_id: ParticipantId,
     handle: JoinerHandle,
     generator: RemoteGenerator,
+    thinker: Thinker,
     extraction: JoinerExtractionJob,
 }
 
 impl LocalModelGeneration {
-    /// Takes any generator and extraction job. Used directly by this
-    /// module's own tests (a stub generator that emits fixed tokens with no
-    /// model loaded, and `joiner_compaction::noop_job()` when a test has no
+    /// Takes any generator, thinker and extraction job. Used directly by
+    /// this module's own tests (a stub generator/thinker that touch no
+    /// model, and `joiner_compaction::noop_job()` when a test has no
     /// interest in compaction) and by #136's two-instance test.
     pub fn new(
         companion_id: i32,
         self_id: ParticipantId,
         handle: JoinerHandle,
         generator: RemoteGenerator,
+        thinker: Thinker,
         extraction: JoinerExtractionJob,
     ) -> Self {
         LocalModelGeneration {
@@ -172,6 +187,7 @@ impl LocalModelGeneration {
             self_id,
             handle,
             generator,
+            thinker,
             extraction,
         }
     }
@@ -213,13 +229,26 @@ impl LocalModelGeneration {
                 )
             }
         });
+        let thinker: Thinker = Arc::new({
+            let self_id = self_id.clone();
+            move |transcript: &[Message], speakers: &PromptSpeakers| {
+                think_and_store(companion_id, &self_id, transcript, speakers);
+            }
+        });
         let extraction: JoinerExtractionJob = {
             let handle = handle.clone();
             Arc::new(move |request| {
                 crate::multiplayer::joiner_compaction::run_joiner_extraction(&handle, request);
             })
         };
-        LocalModelGeneration::new(companion_id, self_id, handle, generator, extraction)
+        LocalModelGeneration::new(
+            companion_id,
+            self_id,
+            handle,
+            generator,
+            thinker,
+            extraction,
+        )
     }
 
     /// The body of [`GenerateRequestHandler::handle`], returning the
@@ -267,6 +296,7 @@ impl LocalModelGeneration {
             }
         };
         let generator = Arc::clone(&self.generator);
+        let thinker = Arc::clone(&self.thinker);
         let extraction = Arc::clone(&self.extraction);
         let extraction_handle = self.handle.clone();
         let companion_id = self.companion_id;
@@ -282,6 +312,7 @@ impl LocalModelGeneration {
                     round_id,
                     transcript,
                     tx,
+                    |transcript| thinker(transcript, &speakers),
                     |transcript, on_token| generator(transcript, &speakers, on_token),
                     |transcript, reply| {
                         let store = SqliteTurnStore::new(Vec::new());
@@ -315,19 +346,30 @@ impl GenerateRequestHandler for LocalModelGeneration {
     }
 }
 
-/// Runs one joiner reply end to end on the calling thread: generates it
-/// (streaming a `Token` to `tx` for every `on_token` call), scores the
+/// Runs one joiner reply end to end on the calling thread: writes this
+/// joiner's own running thought about `transcript` (#220), generates the
+/// reply (streaming a `Token` to `tx` for every `on_token` call), scores the
 /// joiner's own attitude against it on success, then sends the terminal
 /// frame. A closed `tx` (the socket dropped mid-generation) is ignored
 /// exactly as the host's own `stream_round` ignores a hung-up SSE client:
 /// every send here is best-effort.
+///
+/// `think` takes no `Result`: it must already have swallowed its own
+/// failure (`LocalModelGeneration::with_local_model`'s production `think_and_store`
+/// logs and returns on every error path) — a thought that could not be
+/// written must never cost the user this reply, the same #216 rule now
+/// applied to a remote turn. Runs before `generate` and before the first
+/// `Token` frame is ever sent, on the same thread `try_handle` spawns after
+/// `ACTIVE_TURN` is already claimed.
 pub(crate) fn run_remote_turn(
     round_id: u64,
     transcript: Vec<Message>,
     tx: UnboundedSender<ClientFrame>,
+    think: impl FnOnce(&[Message]),
     generate: impl FnOnce(&[Message], &mut dyn FnMut(&str)) -> io::Result<String>,
     score: impl FnOnce(&[Message], &str),
 ) {
+    think(&transcript);
     let mut on_token = |token: &str| {
         let _ = tx.send(ClientFrame::Token {
             round_id,
@@ -366,6 +408,86 @@ fn score_attitude(store: &impl TurnStore, companion_id: i32, transcript: &[Messa
         return;
     };
     store.finish_turn(companion_id, USER_ID, &user_turn.content, reply);
+}
+
+/// Writes this joiner's own bot's running thought (#220) about `transcript`
+/// — the same `GenerateRequest.transcript` its reply is about to generate
+/// from, so a bot speaking after `char` in the same round writes its
+/// thought about `char`'s reply too. Applies #186's per-instance ownership
+/// rule to thoughts: a joiner only ever writes its own bot's row, with its
+/// own model, into its own local `running_thoughts` table (`speaker_id =
+/// self_id`, `companion_id`), reading `transcript` through
+/// [`InMemoryTranscript`] — never [`crate::llm::SqliteTranscript`], a
+/// joiner's `messages` table is not the chat.
+///
+/// A silent no-op when running thoughts are disabled, when
+/// [`pending_thought_range`] finds nothing new (this speaker's last thought
+/// already covers `transcript`'s newest id — the regenerate case), or on
+/// any failure: every error is logged and swallowed here, exactly as
+/// [`crate::chat_turn::PendingTurn::think`] does for the host, so a failed
+/// thought never costs this joiner its reply.
+fn think_and_store(
+    companion_id: i32,
+    self_id: &ParticipantId,
+    transcript: &[Message],
+    speakers: &PromptSpeakers,
+) {
+    let config = match Database::get_config() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("running thoughts: joiner failed to read config: {e}");
+            return;
+        }
+    };
+    if !config.running_thoughts_enabled {
+        return;
+    }
+
+    let store = SqliteRunningThoughtStore;
+    let latest = match store.latest_for(companion_id, self_id.as_str()) {
+        Ok(latest) => latest,
+        Err(e) => {
+            eprintln!("running thoughts: joiner failed to read its latest thought: {e}");
+            return;
+        }
+    };
+    let Some((from, through)) =
+        pending_thought_range(latest.map(|t| t.through_message_id), transcript)
+    else {
+        return;
+    };
+
+    let companion = match Database::get_companion_data() {
+        Ok(companion) => companion,
+        Err(e) => {
+            eprintln!("running thoughts: joiner failed to read its companion data: {e}");
+            return;
+        }
+    };
+    let inputs = match thought_inputs_for_range(
+        &store,
+        &InMemoryTranscript(transcript.to_vec()),
+        companion_id,
+        self_id,
+        from,
+        through,
+    ) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            eprintln!("running thoughts: joiner failed to build thought inputs: {e}");
+            return;
+        }
+    };
+
+    if let Err(e) = generate_thought_into(
+        &store,
+        &inputs,
+        &companion,
+        speakers,
+        &ResidentCharacterModel,
+    ) {
+        eprintln!("running thoughts: {e}");
+    }
 }
 
 /// The content of the newest `transcript` row from the user, or an empty
@@ -463,6 +585,7 @@ mod tests {
             7,
             transcript.clone(),
             tx,
+            |_transcript| {},
             |_transcript, on_token| {
                 on_token("hel");
                 on_token("lo");
@@ -505,6 +628,7 @@ mod tests {
             3,
             vec![sample_message(1, USER_SPEAKER_ID, "hi")],
             tx,
+            |_transcript| {},
             |_transcript, _on_token| Err(io::Error::other("model failed")),
             |_transcript, _reply| *scored.lock().unwrap() = true,
         );
@@ -517,6 +641,45 @@ mod tests {
             }]
         );
         assert!(!*scored.lock().unwrap(), "an error must never score");
+    }
+
+    #[test]
+    fn think_runs_before_generate_and_before_the_first_token_is_sent() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let order: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+        run_remote_turn(
+            1,
+            vec![sample_message(1, USER_SPEAKER_ID, "hi")],
+            tx,
+            |_transcript| order.lock().unwrap().push("think"),
+            |_transcript, on_token| {
+                order.lock().unwrap().push("generate");
+                on_token("hi");
+                Ok("hi".to_string())
+            },
+            |_transcript, _reply| order.lock().unwrap().push("score"),
+        );
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["think", "generate", "score"],
+            "the thought must be written before the reply is generated"
+        );
+        assert_eq!(
+            drain(&mut rx),
+            vec![
+                ClientFrame::Token {
+                    round_id: 1,
+                    text: "hi".to_string()
+                },
+                ClientFrame::ReplyComplete {
+                    round_id: 1,
+                    text: "hi".to_string()
+                },
+            ],
+            "thinking must never itself emit a frame"
+        );
     }
 
     // -- score_attitude: newest-user-row lookup and the no-user-row skip --
@@ -607,13 +770,20 @@ mod tests {
         Arc::new(RwLock::new(shared))
     }
 
+    /// A [`Thinker`] that writes nothing and records nothing, for a test
+    /// with no interest in thought generation.
+    fn noop_thinker() -> Thinker {
+        Arc::new(|_transcript, _speakers| {})
+    }
+
     // Every case below shares the process-wide `ACTIVE_TURN`, so they run as
     // one test function: two separate `#[test]`s touching the same global
     // would race under cargo's default parallel test execution.
     #[test]
     fn local_model_generation_claims_and_releases_the_shared_turn_slot() {
         // A pre-claimed slot: `try_handle` must report failure and spawn no
-        // thread at all, rather than generate while a local turn is live.
+        // thread at all, rather than generate — or think — while a local
+        // turn is live.
         let outer_guard = ACTIVE_TURN.try_claim().expect("slot should start free");
         let generation = LocalModelGeneration::new(
             1,
@@ -622,6 +792,7 @@ mod tests {
             Arc::new(|_transcript, _speakers, _on_token| {
                 panic!("must never generate while the slot is claimed")
             }),
+            Arc::new(|_transcript, _speakers| panic!("must never think while the slot is claimed")),
             crate::multiplayer::joiner_compaction::noop_job(),
         );
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -639,7 +810,10 @@ mod tests {
         drop(outer_guard);
 
         // The slot is free again: `try_handle` claims it, spawns the
-        // generation thread, and releases it once that thread joins.
+        // generation thread, invokes the injected thinker before the reply
+        // is generated, and releases the slot once that thread joins.
+        let thinker_calls: Arc<Mutex<Vec<Vec<i32>>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded_thoughts = Arc::clone(&thinker_calls);
         let generation = LocalModelGeneration::new(
             1,
             ParticipantId::parse("bot1").unwrap(),
@@ -647,6 +821,12 @@ mod tests {
             Arc::new(|_transcript, _speakers, on_token| {
                 on_token("hi");
                 Ok("hi".to_string())
+            }),
+            Arc::new(move |transcript, _speakers| {
+                recorded_thoughts
+                    .lock()
+                    .unwrap()
+                    .push(transcript.iter().map(|m| m.id).collect());
             }),
             crate::multiplayer::joiner_compaction::noop_job(),
         );
@@ -660,6 +840,11 @@ mod tests {
             .expect("generation thread should not panic");
 
         assert_eq!(
+            *thinker_calls.lock().unwrap(),
+            vec![vec![1]],
+            "try_handle should invoke the injected thinker with the request's transcript"
+        );
+        assert_eq!(
             drain(&mut rx),
             vec![
                 ClientFrame::Token {
@@ -670,7 +855,8 @@ mod tests {
                     round_id: 5,
                     text: "hi".to_string()
                 },
-            ]
+            ],
+            "thinking must never itself send a frame"
         );
         assert!(
             ACTIVE_TURN.try_claim().is_some(),
@@ -711,6 +897,7 @@ mod tests {
                 on_token("hi");
                 Ok("hi".to_string())
             }),
+            noop_thinker(),
             extraction,
         );
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -776,6 +963,7 @@ mod tests {
                 on_token("hi again");
                 Ok("hi again".to_string())
             }),
+            noop_thinker(),
             crate::multiplayer::joiner_compaction::noop_job(),
         );
         let (tx, mut rx) = mpsc::unbounded_channel();
