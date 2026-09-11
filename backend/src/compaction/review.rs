@@ -18,13 +18,32 @@ use serde::{Deserialize, Serialize};
 
 use crate::compaction::commit::{ReviewedDraft, ReviewedItem};
 use crate::compaction::types::{Checkpoint, Fact, FactCategory, FactDraft};
-use crate::compaction::validate::validate;
+use crate::compaction::validate::{validate, RejectReason};
 use crate::compaction::CitedMessage;
 
 /// The reviewed reason a struck item's [`FactDraft::rejected_reason`] is
 /// set to. `commit` (#175) trusts this value as given: it never re-derives
 /// "struck" from `accepted` itself, only from `rejected_reason.is_none()`.
 const STRUCK_AT_REVIEW: &str = "struck at review";
+
+/// Whether `reason` is one only `extract::to_fact_drafts` can set, because
+/// deriving it needs the range's participant table and a review request
+/// carries no such thing.
+///
+/// [`validate`] leaves a draft that already carries a reason alone, so
+/// clearing one of these on an `accepted: true` review would file the item
+/// with the category and subject the extractor could not determine —
+/// `promote_fact_on` writes neither, so an unattributable `state` item would
+/// go active with a `NULL` subject. Keeping the reason makes the accept come
+/// back as [`ReviewError::Rejected`] naming the original reason instead.
+/// Every other [`RejectReason`] is re-derivable by `validate`, and review
+/// clears those so an edited item gets a fresh verdict.
+fn is_set_only_at_extraction(reason: Option<&str>) -> bool {
+    reason.is_some_and(|reason| {
+        reason == RejectReason::UnknownSubject.to_string()
+            || reason == RejectReason::PrincipalAsPerson.to_string()
+    })
+}
 
 /// One item's review: `id` is the stored `Fact.id` (`CheckpointDetail.facts`
 /// carries it, so the frontend never invents one). `text` edits a
@@ -156,7 +175,9 @@ pub fn apply_review(
                 } else if let Some(text) = review.text {
                     fact_draft.text = text;
                 }
-                fact_draft.rejected_reason = None;
+                if !is_set_only_at_extraction(fact_draft.rejected_reason.as_deref()) {
+                    fact_draft.rejected_reason = None;
+                }
                 true
             }
         };
@@ -275,6 +296,70 @@ mod tests {
             text: None,
             quote: None,
         }
+    }
+
+    #[test]
+    fn accepting_an_item_the_extractor_could_not_attribute_does_not_un_reject_it() {
+        for reason in [
+            RejectReason::UnknownSubject,
+            RejectReason::PrincipalAsPerson,
+        ] {
+            let draft = a_draft_checkpoint(1);
+            let mut fact = a_fact(10, FactCategory::CompanionState, "feels at home", vec![1]);
+            fact.subject = None;
+            fact.rejected_reason = Some(reason.to_string());
+            let range = vec![cited(1, "user", "this place feels like home now")];
+            let request = CommitRequest {
+                items: vec![ItemReview {
+                    id: 10,
+                    accepted: true,
+                    // An edit that repairs the *text* still cannot tell
+                    // `validate` who the subject is: only the extractor had
+                    // the participant table.
+                    text: Some("Eric feels at home".to_string()),
+                    quote: None,
+                }],
+                summary: None,
+            };
+
+            let result = apply_review(&draft, vec![fact], request, &range, &[], &user_is_canon);
+
+            match result {
+                Err(ReviewError::Rejected(rejected)) => {
+                    assert!(
+                        rejected
+                            .iter()
+                            .any(|r| r.item_id == 10 && r.reason == reason.to_string()),
+                        "`{reason}` should come back on fact 10 with its original reason, \
+                         got {rejected:?}"
+                    );
+                }
+                other => panic!("accepting a `{reason}` item should be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn accepting_an_item_rejected_for_a_re_derivable_reason_still_clears_it() {
+        let draft = a_draft_checkpoint(1);
+        let mut fact = a_fact(10, FactCategory::KeyQuote, "not in any message", vec![1]);
+        fact.quote_speaker = Some("user".to_string());
+        fact.rejected_reason = Some(RejectReason::QuoteNotVerbatim.to_string());
+        let range = vec![cited(1, "user", "we moved in together")];
+        let request = CommitRequest {
+            items: vec![ItemReview {
+                id: 10,
+                accepted: true,
+                text: None,
+                quote: Some("we moved in together".to_string()),
+            }],
+            summary: None,
+        };
+
+        let reviewed = apply_review(&draft, vec![fact], request, &range, &[], &user_is_canon)
+            .expect("an edited quote that is now verbatim should pass");
+
+        assert!(reviewed.items[0].draft.rejected_reason.is_none());
     }
 
     #[test]
