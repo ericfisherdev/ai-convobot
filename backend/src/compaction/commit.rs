@@ -80,7 +80,11 @@ pub enum CommitError {
     OverBudget { needed: usize, budget: usize },
     /// The transaction failed; nothing was written. Also the mapping for
     /// `QueryReturnedNoRows` when a `fact_id` in the review does not belong
-    /// to the draft.
+    /// to the draft. Only ever returned for failures *before* the
+    /// checkpoint is durable — `store.commit_checkpoint`'s own doc comment
+    /// guarantees an `Err` from it means nothing committed, and every read
+    /// `commit` performs after that call succeeds is non-fatal instead of
+    /// mapped to this variant.
     Storage(rusqlite::Error),
 }
 
@@ -316,7 +320,11 @@ fn plan_commit(
 /// `compacted_through`, clears the message cache, then runs `deps.observers`
 /// with only the newly active facts. Does not claim `ACTIVE_TURN` itself —
 /// #179's handler holds it around this call since the production merger
-/// runs the model.
+/// runs the model. Once `store.commit_checkpoint` returns `Ok`, the commit
+/// is durable and this function no longer fails: the post-commit read-back
+/// of the new facts is non-fatal (an empty slice is fed to the observers
+/// instead, and the failure is logged), and each observer's own error is
+/// swallowed as documented on [`CommitObserver::on_committed`].
 pub fn commit(
     store: &dyn CompactionStore,
     review: ReviewedDraft,
@@ -380,11 +388,26 @@ pub fn commit(
 
     Database::clear_message_cache();
 
-    let new_active_facts: Vec<Fact> = store
-        .facts_for(draft_id)?
-        .into_iter()
-        .filter(|f| f.active)
-        .collect();
+    // The commit above is already durable — a failure reading the fresh
+    // fact rows back must not be reported as a failed commit (that would be
+    // the same defect class #226 fixed in `main.rs`'s
+    // `commit_reviewed_draft`). Feed the observers an empty slice instead
+    // and log it: `AttitudeRecalibrator` ignores `_facts` entirely, and
+    // `LtmObserver` still gets the real `superseded_ids` below, so
+    // recalibration and superseded-fact removal both still happen. Only
+    // the new facts themselves are missing from long-term memory until the
+    // index is rebuilt.
+    let new_active_facts: Vec<Fact> = match store.facts_for(draft_id) {
+        Ok(facts) => facts.into_iter().filter(|f| f.active).collect(),
+        Err(e) => {
+            eprintln!(
+                "compaction commit {draft_id}: committed, but reading back its facts for \
+                 observers failed: {e}; new facts will be missing from long-term memory until \
+                 POST /api/memory/longTerm/rebuild"
+            );
+            Vec::new()
+        }
+    };
 
     for observer in &deps.observers {
         if let Err(e) = observer.on_committed(&checkpoint, &new_active_facts, &superseded_ids) {
@@ -1646,6 +1669,264 @@ mod tests {
         );
 
         assert!(result.is_ok());
+    }
+
+    /// Wraps a [`RecordingStore`] so `facts_for` fails once `commit_checkpoint`
+    /// has already succeeded — everything else, including `facts_for` called
+    /// *before* the commit (`commit`'s own pre-commit read at the top of the
+    /// function), delegates straight through. Mirrors `RacyDiscardStore`'s
+    /// shape: only the methods needed to simulate the failure are special-
+    /// cased, every other method just forwards.
+    struct FailingFactsReadbackStore<'a> {
+        inner: &'a RecordingStore,
+        committed: std::cell::Cell<bool>,
+    }
+
+    impl CompactionStore for FailingFactsReadbackStore<'_> {
+        fn insert_draft(&self, draft: NewDraft) -> rusqlite::Result<i64> {
+            self.inner.insert_draft(draft)
+        }
+        fn get_checkpoint(&self, id: i64) -> rusqlite::Result<Option<Checkpoint>> {
+            self.inner.get_checkpoint(id)
+        }
+        fn pending_draft(&self, companion_id: i32) -> rusqlite::Result<Option<Checkpoint>> {
+            self.inner.pending_draft(companion_id)
+        }
+        fn list_checkpoints(&self, companion_id: i32) -> rusqlite::Result<Vec<Checkpoint>> {
+            self.inner.list_checkpoints(companion_id)
+        }
+        fn latest_committed(&self, companion_id: i32) -> rusqlite::Result<Option<Checkpoint>> {
+            self.inner.latest_committed(companion_id)
+        }
+        fn latest_committed_before(
+            &self,
+            companion_id: i32,
+            from_message_id: i32,
+        ) -> rusqlite::Result<Option<Checkpoint>> {
+            self.inner
+                .latest_committed_before(companion_id, from_message_id)
+        }
+        fn context_snapshot(
+            &self,
+            companion_id: i32,
+        ) -> rusqlite::Result<(Vec<Fact>, Option<i32>, Option<Checkpoint>)> {
+            self.inner.context_snapshot(companion_id)
+        }
+        fn update_status(&self, id: i64, status: CompactionStatus) -> rusqlite::Result<()> {
+            self.inner.update_status(id, status)
+        }
+        fn transition_status(
+            &self,
+            id: i64,
+            from: CompactionStatus,
+            to: CompactionStatus,
+        ) -> rusqlite::Result<()> {
+            self.inner.transition_status(id, from, to)
+        }
+        fn set_extraction_result(
+            &self,
+            id: i64,
+            raw_model_output: Option<String>,
+            summary: Option<String>,
+            attitude_ratings: Option<String>,
+        ) -> rusqlite::Result<()> {
+            self.inner
+                .set_extraction_result(id, raw_model_output, summary, attitude_ratings)
+        }
+        fn fail_draft(&self, id: i64, error: &str) -> rusqlite::Result<()> {
+            self.inner.fail_draft(id, error)
+        }
+        fn insert_facts(
+            &self,
+            compaction_id: i64,
+            facts: &[FactDraft],
+        ) -> rusqlite::Result<Vec<i64>> {
+            self.inner.insert_facts(compaction_id, facts)
+        }
+        fn active_facts(&self, companion_id: i32) -> rusqlite::Result<Vec<Fact>> {
+            self.inner.active_facts(companion_id)
+        }
+        fn facts_for(&self, compaction_id: i64) -> rusqlite::Result<Vec<Fact>> {
+            if self.committed.get() {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            self.inner.facts_for(compaction_id)
+        }
+        fn supersede(&self, fact_id: i64, by: i64) -> rusqlite::Result<()> {
+            self.inner.supersede(fact_id, by)
+        }
+        fn mark_stale_containing(
+            &self,
+            companion_id: i32,
+            message_id: i32,
+        ) -> rusqlite::Result<usize> {
+            self.inner.mark_stale_containing(companion_id, message_id)
+        }
+        fn oldest_stale_from(&self, companion_id: i32) -> rusqlite::Result<Option<i32>> {
+            self.inner.oldest_stale_from(companion_id)
+        }
+        fn compacted_through(&self, companion_id: i32) -> rusqlite::Result<Option<i32>> {
+            self.inner.compacted_through(companion_id)
+        }
+        fn set_compacted_through(
+            &self,
+            companion_id: i32,
+            through: Option<i32>,
+        ) -> rusqlite::Result<()> {
+            self.inner.set_compacted_through(companion_id, through)
+        }
+        fn pin(&self, message_id: i32) -> rusqlite::Result<()> {
+            self.inner.pin(message_id)
+        }
+        fn unpin(&self, message_id: i32) -> rusqlite::Result<()> {
+            self.inner.unpin(message_id)
+        }
+        fn pins(&self) -> rusqlite::Result<Vec<crate::compaction::types::Pin>> {
+            self.inner.pins()
+        }
+        fn commit_checkpoint(
+            &self,
+            record: crate::compaction::store::CommitRecord,
+        ) -> rusqlite::Result<Checkpoint> {
+            let checkpoint = self.inner.commit_checkpoint(record)?;
+            self.committed.set(true);
+            Ok(checkpoint)
+        }
+    }
+
+    #[test]
+    fn a_post_commit_facts_readback_failure_does_not_fail_the_already_successful_commit() {
+        let inner = RecordingStore::new();
+        let draft = FactDraft {
+            category: FactCategory::Milestone,
+            subject: None,
+            text: "a milestone".to_string(),
+            quote_speaker: None,
+            sources: vec![1],
+            replaces: vec![],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        };
+        let (draft_id, ids) = seed_draft(&inner, 1, std::slice::from_ref(&draft));
+
+        let observer = std::sync::Arc::new(RecordingObserver::default());
+        let deps = CommitDeps {
+            merger: Box::new(IdentityMerger::new()),
+            observers: vec![Box::new(ArcObserver(observer.clone()))],
+        };
+
+        let store = FailingFactsReadbackStore {
+            inner: &inner,
+            committed: std::cell::Cell::new(false),
+        };
+        let checkpoint = commit(
+            &store,
+            ReviewedDraft {
+                draft_id,
+                items: vec![accepted_item(
+                    ids[0],
+                    FactCategory::Milestone,
+                    "a milestone",
+                )],
+                summary: "s".to_string(),
+            },
+            &deps,
+            &budget(),
+        )
+        .unwrap();
+
+        assert_eq!(checkpoint.status, CompactionStatus::Committed);
+        assert_eq!(
+            inner.get_checkpoint(draft_id).unwrap().unwrap().status,
+            CompactionStatus::Committed
+        );
+        assert_eq!(inner.compacted_through(1).unwrap(), Some(10));
+
+        let calls = observer.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (_checkpoint, facts, _superseded) = &calls[0];
+        assert!(facts.is_empty());
+    }
+
+    #[test]
+    fn a_post_commit_facts_readback_failure_still_reports_superseded_ids_to_observers() {
+        let inner = RecordingStore::new();
+        let old_draft = FactDraft {
+            category: FactCategory::CompanionState,
+            subject: Some(FactSubject::Companion),
+            text: "is nervous".to_string(),
+            quote_speaker: None,
+            sources: vec![1],
+            replaces: vec![],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        };
+        let (old_draft_id, old_ids) = seed_draft(&inner, 1, std::slice::from_ref(&old_draft));
+        commit(
+            &inner,
+            ReviewedDraft {
+                draft_id: old_draft_id,
+                items: vec![accepted_item(
+                    old_ids[0],
+                    FactCategory::CompanionState,
+                    "is nervous",
+                )],
+                summary: "s1".to_string(),
+            },
+            &deps_with(IdentityMerger::new()),
+            &budget(),
+        )
+        .unwrap();
+
+        let new_draft = FactDraft {
+            category: FactCategory::CompanionState,
+            subject: Some(FactSubject::Companion),
+            text: "is confident now".to_string(),
+            quote_speaker: None,
+            sources: vec![2],
+            replaces: vec![old_ids[0]],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        };
+        let (new_draft_id, new_ids) =
+            seed_draft_with_range(&inner, 1, 11, 20, std::slice::from_ref(&new_draft));
+
+        let observer = std::sync::Arc::new(RecordingObserver::default());
+        let deps = CommitDeps {
+            merger: Box::new(IdentityMerger::new()),
+            observers: vec![Box::new(ArcObserver(observer.clone()))],
+        };
+        let store = FailingFactsReadbackStore {
+            inner: &inner,
+            committed: std::cell::Cell::new(false),
+        };
+        commit(
+            &store,
+            ReviewedDraft {
+                draft_id: new_draft_id,
+                items: vec![ReviewedItem {
+                    fact_id: new_ids[0],
+                    draft: new_draft,
+                    accepted: true,
+                }],
+                summary: "s2".to_string(),
+            },
+            &deps,
+            &budget(),
+        )
+        .unwrap();
+
+        let calls = observer.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (_checkpoint, facts, superseded) = &calls[0];
+        assert!(facts.is_empty());
+        assert_eq!(superseded, &vec![old_ids[0]]);
     }
 
     /// #181: a checkpoint whose range was marked `Stale` (an edit/delete
