@@ -136,6 +136,30 @@ fn reinsert_original(
     Ok(())
 }
 
+/// Re-inserts every row in `rows` exactly as captured, continuing past a
+/// failed re-insert rather than stopping at the first one -- `delete_from`
+/// already committed the deletes, so every row here is already gone from
+/// the store, and skipping the rest of the loop would lose them for good
+/// instead of just the one that failed to restore. Returns the first
+/// failure, if any (logged as it happens, since a caller reports at most
+/// one and the rest would otherwise go unrecorded).
+fn restore_all(
+    store: &dyn RunningThoughtStore,
+    rows: &[RunningThought],
+) -> Option<rusqlite::Error> {
+    let mut first_failure = None;
+    for remaining in rows {
+        if let Err(e) = reinsert_original(store, remaining) {
+            eprintln!(
+                "running thoughts: failed to restore the original for the round starting at message {}: {e}",
+                remaining.from_message_id
+            );
+            first_failure.get_or_insert(e);
+        }
+    }
+    first_failure
+}
+
 /// Rewrites every thought `request.speaker_id` owns whose `through_message_id`
 /// reaches at least `request.from_message_id`, in id order; every other
 /// speaker's thought in that same range is re-inserted unchanged (each
@@ -147,7 +171,10 @@ fn reinsert_original(
 ///    via `recent_for`) can never see a later round's stale thought while an
 ///    earlier one is being rewritten.
 /// 2. For each captured row, oldest first: a non-owned speaker's row is
-///    re-inserted as-is. An owned row announces `sink.thought_started`,
+///    re-inserted as-is (a failure here restores every later row via
+///    [`restore_all`] before reporting, same as step 3 — every row in
+///    `captured` is already deleted regardless of which branch reaches it).
+///    An owned row announces `sink.thought_started`,
 ///    reads fresh inputs over its own captured `[from_message_id,
 ///    through_message_id]` (never re-derived), and calls `generate`; success
 ///    reports `sink.thought_regenerated` and the row joins the chain the
@@ -188,7 +215,13 @@ pub fn regenerate_from(
     let mut regenerated = 0usize;
     for (index, original) in captured.iter().enumerate() {
         if original.speaker_id != request.speaker_id.as_str() {
-            reinsert_original(store, original).map_err(ThoughtRegenerateError::Store)?;
+            if let Err(e) = reinsert_original(store, original) {
+                // Same rule as the failure arm below: every row after this
+                // one is already deleted too, so restore them before
+                // reporting rather than losing them behind this one error.
+                let later_failure = restore_all(store, &captured[index + 1..]);
+                return Err(ThoughtRegenerateError::Store(later_failure.unwrap_or(e)));
+            }
             continue;
         }
 
@@ -261,17 +294,7 @@ pub fn regenerate_from(
                 // original `Inputs`/`Generate` error is what gets returned;
                 // a restore failure only replaces it when restoring itself
                 // failed, since that is the more urgent thing to report.
-                let mut restore_failure = None;
-                for remaining in &captured[index..] {
-                    if let Err(e) = reinsert_original(store, remaining) {
-                        eprintln!(
-                            "running thoughts: failed to restore the original for the round starting at message {}: {e}",
-                            remaining.from_message_id
-                        );
-                        restore_failure.get_or_insert(e);
-                    }
-                }
-                return Err(match restore_failure {
+                return Err(match restore_all(store, &captured[index..]) {
                     Some(e) => ThoughtRegenerateError::Store(e),
                     None => err,
                 });
@@ -723,6 +746,59 @@ mod tests {
             .iter()
             .find(|t| t.from_message_id == 7)
             .expect("round three must still be restored even though round two's restore failed");
+        assert_eq!(restored_three.text, "round three");
+    }
+
+    #[test]
+    fn a_failed_restore_of_a_non_owned_row_still_restores_every_later_row() {
+        // PR #227 review, round 3: the non-owned-speaker branch used `?`
+        // and returned immediately on a failed `reinsert_original`, losing
+        // every row after it -- the same bug the failure-arm test above
+        // pins, just in the other branch.
+        let store = FailingReinsertStore {
+            inner: RecordingStore::new(),
+            fails_for_text: "bot1's own note",
+        };
+        seed(&store.inner, "char", 1, 3, "round one");
+        store
+            .inner
+            .insert(NewRunningThought {
+                companion_id: 1,
+                speaker_id: "bot1".to_string(),
+                from_message_id: 4,
+                through_message_id: 6,
+                text: "bot1's own note".to_string(),
+                edited: false,
+            })
+            .unwrap();
+        seed(&store.inner, "char", 7, 9, "round three");
+
+        let err = regenerate_from(
+            &store,
+            &mut |speaker, from, through| Ok(inputs_of(speaker, from, through)),
+            &mut always_succeeds(),
+            &a_request(1),
+            &mut RecordingSink::default(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ThoughtRegenerateError::Store(_)));
+
+        let after = store.list(1).unwrap();
+        assert!(
+            after
+                .iter()
+                .any(|t| t.from_message_id == 1 && t.text.contains("fresh note")),
+            "round one (owned by char, first in the loop) should still have regenerated"
+        );
+        assert!(
+            !after.iter().any(|t| t.speaker_id == "bot1"),
+            "bot1's row's own restore failed, so it is genuinely gone"
+        );
+        let restored_three = after
+            .iter()
+            .find(|t| t.from_message_id == 7)
+            .expect("round three must still be restored even though bot1's restore failed");
         assert_eq!(restored_three.text, "round three");
     }
 }
