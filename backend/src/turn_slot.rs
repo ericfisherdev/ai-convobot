@@ -74,17 +74,21 @@ pub static JOINER_EXTRACTION: TurnSlot = TurnSlot::new();
 /// where one process is ever only one joiner), so `cargo test`'s default
 /// parallelism can otherwise make two unrelated tests' real generations
 /// contend for the same slot: `remote_generation.rs`'s own
-/// `local_model_generation_claims_and_releases_the_shared_turn_slot` and
-/// every real host-and-joiner test in `multiplayer::two_instance_tests`
-/// must all acquire this lock before touching `ACTIVE_TURN`, not a lock
-/// private to either file, or the two can still race each other.
+/// `local_model_generation_claims_and_releases_the_shared_turn_slot`, every
+/// real host-and-joiner test in `multiplayer::two_instance_tests`, and
+/// `main.rs`'s `thoughts_route_tests::edit_and_delete_409_while_a_turn_is_in_flight_without_touching_the_store`
+/// (#217) must all acquire this lock before touching `ACTIVE_TURN`, not a
+/// lock private to any one file, or any pair of them can still race each
+/// other. One lock for the whole crate on purpose (PR #227 review, round 2):
+/// two separate test-only locks guarding the same `ACTIVE_TURN` would not
+/// actually serialise tests that each took a different one.
 ///
 /// A `tokio::sync::Mutex`, not `std::sync::Mutex`: the async
-/// `#[actix_web::test]`s in `two_instance_tests.rs` hold the guard across
-/// several `.await` points (a whole real round), which clippy's
-/// `await_holding_lock` correctly refuses for a std lock. The plain,
-/// synchronous `#[test]` in `remote_generation.rs` uses
-/// [`tokio::sync::Mutex::blocking_lock`] instead, which is safe there
+/// `#[actix_web::test]`s in `two_instance_tests.rs` and `main.rs` hold the
+/// guard across several `.await` points (a whole real round, or a
+/// `call_service`), which clippy's `await_holding_lock` correctly refuses
+/// for a std lock. The plain, synchronous `#[test]` in `remote_generation.rs`
+/// uses [`tokio::sync::Mutex::blocking_lock`] instead, which is safe there
 /// precisely because that test runs with no tokio runtime of its own.
 #[cfg(test)]
 pub(crate) static ACTIVE_TURN_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

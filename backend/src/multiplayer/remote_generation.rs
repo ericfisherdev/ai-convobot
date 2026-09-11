@@ -940,7 +940,8 @@ mod tests {
     // would race under cargo's default parallel test execution. Also holds
     // `turn_slot::ACTIVE_TURN_TEST_LOCK` for the whole function, so this
     // test can never race `multiplayer::two_instance_tests`'s real
-    // host-and-joiner tests for the same global slot either.
+    // host-and-joiner tests, or `main.rs`'s `thoughts_route_tests` (#217),
+    // for the same global slot either.
     #[test]
     fn local_model_generation_claims_and_releases_the_shared_turn_slot() {
         let _serial = crate::turn_slot::ACTIVE_TURN_TEST_LOCK.blocking_lock();
