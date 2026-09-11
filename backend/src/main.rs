@@ -3182,12 +3182,17 @@ mod thoughts_route_tests {
     // reaching `SqliteRunningThoughtStore` (a real store call would need
     // `Database::init()`, which this unit test never runs), which is
     // exactly what pins the check as the very first thing each handler
-    // does. Folded into one test function, like `remote_generation.rs`'s
-    // identical `ACTIVE_TURN` test: it is a single process-wide static, so
-    // two separate `#[test]`s touching it would race under cargo's default
-    // parallel test execution.
+    // does. `ACTIVE_TURN` is one process-wide static shared across the whole
+    // bin crate, so this test also holds `turn_slot::ACTIVE_TURN_TEST_LOCK`
+    // for its whole body (PR #227 review, round 2): without it, this test
+    // would race `remote_generation.rs`'s and `two_instance_tests`'s own
+    // direct `ACTIVE_TURN` claims under cargo's default parallel test
+    // execution. One lock shared by every direct claimant in the crate, not
+    // one private to this module -- two separate locks guarding the same
+    // `ACTIVE_TURN` would not actually serialise against each other.
     #[actix_web::test]
     async fn edit_and_delete_409_while_a_turn_is_in_flight_without_touching_the_store() {
+        let _serial = crate::turn_slot::ACTIVE_TURN_TEST_LOCK.lock().await;
         let guard = ACTIVE_TURN.try_claim().expect("slot should start free");
 
         let app =
