@@ -148,13 +148,45 @@ fn render_thought_block(header: &str, notes: &[RunningThought]) -> String {
     block
 }
 
+/// Trims a capped completion back to its last sentence boundary (#235), so
+/// a thought that hit `THOUGHT_MAX_TOKENS` is never stored mid-word. Keeps
+/// any closing quote/bracket that immediately follows the terminator (`He
+/// said "fine."` stays whole). When `text` has no `. ! ? …`, it is returned
+/// unchanged: an abrupt run-on beats dropping the only note the model wrote,
+/// and this is the invariant `clean_thought` relies on to never turn a
+/// non-empty completion into `None` because of this step.
+fn trim_to_last_sentence_boundary(text: &str) -> &str {
+    let Some(idx) = text.rfind(['.', '!', '?', '…']) else {
+        return text;
+    };
+    let terminator_len = text[idx..].chars().next().map_or(1, char::len_utf8);
+    let mut end = idx + terminator_len;
+    for c in text[end..].chars() {
+        if matches!(c, '"' | '\'' | '”' | '’' | ')' | ']') {
+            end += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    &text[..end]
+}
+
 /// Cleans one raw thought-generation completion: trims surrounding
 /// whitespace, cuts at the first blank line (the model sometimes continues
-/// past its one note into a second paragraph or a reply), and strips a
-/// leading `"{self_name}:"` self-attribution or a surrounding quote wrapper
-/// the model sometimes adds. `None` for an empty result, so the caller never
-/// stores a blank note.
-pub fn clean_thought(raw: &str, self_name: &str) -> Option<String> {
+/// past its one note into a second paragraph or a reply), strips a leading
+/// `"{self_name}:"` self-attribution, strips a surrounding quote wrapper the
+/// model sometimes adds, then — last, so it can never re-expose a wrapper
+/// quote the previous step already removed — trims a capped completion to
+/// its last sentence boundary (#235; skipped when the blank-line cut
+/// already kept a naturally-finished paragraph). Running the quote strip
+/// before the cap trim is what lets a *closing* quote that follows the
+/// sentence boundary survive: at strip time it is not yet at the string's
+/// edge, so `trim_matches` leaves it alone, and the cap trim afterwards
+/// keeps it as part of the kept sentence. `None` for an empty result, so
+/// the caller never stores a blank note; `trim_to_last_sentence_boundary`
+/// never empties a non-empty input, so that branch is reachable only by
+/// inputs that were already empty before the cap trim.
+pub fn clean_thought(raw: &str, self_name: &str, hit_token_cap: bool) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -162,6 +194,7 @@ pub fn clean_thought(raw: &str, self_name: &str) -> Option<String> {
 
     // Cut at the first blank line.
     let cut = trimmed.split("\n\n").next().unwrap_or(trimmed).trim();
+    let paragraph_finished_naturally = cut.len() != trimmed.len();
 
     let prefix = format!("{self_name}:");
     let without_name = cut
@@ -170,7 +203,13 @@ pub fn clean_thought(raw: &str, self_name: &str) -> Option<String> {
         .unwrap_or(cut);
 
     let unquoted = without_name.trim_matches(|c: char| matches!(c, '"' | '\'' | '“' | '”'));
-    let cleaned = unquoted.trim();
+
+    let cap_trimmed = if hit_token_cap && !paragraph_finished_naturally {
+        trim_to_last_sentence_boundary(unquoted)
+    } else {
+        unquoted
+    };
+    let cleaned = cap_trimmed.trim();
 
     if cleaned.is_empty() {
         None
@@ -317,19 +356,23 @@ mod tests {
 
     #[test]
     fn clean_thought_on_blank_input_is_none() {
-        assert_eq!(clean_thought("", "Bob"), None);
-        assert_eq!(clean_thought("   ", "Bob"), None);
+        assert_eq!(clean_thought("", "Bob", false), None);
+        assert_eq!(clean_thought("   ", "Bob", false), None);
     }
 
     #[test]
     fn clean_thought_on_a_double_newline_only_input_is_none() {
-        assert_eq!(clean_thought("\n\n", "Bob"), None);
+        assert_eq!(clean_thought("\n\n", "Bob", false), None);
     }
 
     #[test]
     fn clean_thought_cuts_at_the_first_blank_line() {
         assert_eq!(
-            clean_thought("This is my note.\n\nUser: something else entirely", "Bob"),
+            clean_thought(
+                "This is my note.\n\nUser: something else entirely",
+                "Bob",
+                false
+            ),
             Some("This is my note.".to_string())
         );
     }
@@ -337,7 +380,7 @@ mod tests {
     #[test]
     fn clean_thought_strips_a_leading_name_prefix_and_quotes() {
         assert_eq!(
-            clean_thought("Bob: \"I feel like today went well.\"", "Bob"),
+            clean_thought("Bob: \"I feel like today went well.\"", "Bob", false),
             Some("I feel like today went well.".to_string())
         );
     }
@@ -345,8 +388,84 @@ mod tests {
     #[test]
     fn clean_thought_leaves_a_note_with_an_internal_colon_alone() {
         assert_eq!(
-            clean_thought("She said: I should trust her more.", "Bob"),
+            clean_thought("She said: I should trust her more.", "Bob", false),
             Some("She said: I should trust her more.".to_string())
+        );
+    }
+
+    #[test]
+    fn clean_thought_trims_a_capped_completion_to_the_last_sentence_boundary() {
+        assert_eq!(
+            clean_thought(
+                "I trust her now. She seems to be worried about",
+                "Bob",
+                true
+            ),
+            Some("I trust her now.".to_string())
+        );
+    }
+
+    #[test]
+    fn clean_thought_on_a_capped_completion_keeps_a_closing_quote_after_the_terminator() {
+        assert_eq!(
+            clean_thought("She said \"I'm fine.\" I wonder ab", "Bob", true),
+            Some("She said \"I'm fine.\"".to_string())
+        );
+    }
+
+    #[test]
+    fn clean_thought_on_a_capped_completion_with_no_boundary_is_left_unchanged_not_dropped() {
+        assert_eq!(
+            clean_thought(
+                "one long run-on that never ends and keeps going ab",
+                "Bob",
+                true
+            ),
+            Some("one long run-on that never ends and keeps going ab".to_string())
+        );
+    }
+
+    #[test]
+    fn clean_thought_on_an_uncapped_completion_with_no_terminal_punctuation_is_unchanged() {
+        assert_eq!(
+            clean_thought(
+                "this note just trails off without punctuation",
+                "Bob",
+                false
+            ),
+            Some("this note just trails off without punctuation".to_string())
+        );
+    }
+
+    #[test]
+    fn clean_thought_trims_a_capped_multi_byte_completion_at_the_last_terminator() {
+        assert_eq!(
+            clean_thought(
+                "Elle m'a dit « ça va ». Je pense qu'elle est inquiète à propos",
+                "Bob",
+                true
+            ),
+            Some("Elle m'a dit « ça va ».".to_string())
+        );
+    }
+
+    #[test]
+    fn clean_thought_trims_a_capped_completion_at_a_horizontal_ellipsis() {
+        assert_eq!(
+            clean_thought(
+                "She trailed off mid-thought… and then kept going ab",
+                "Bob",
+                true
+            ),
+            Some("She trailed off mid-thought…".to_string())
+        );
+    }
+
+    #[test]
+    fn clean_thought_does_not_cap_trim_a_paragraph_that_already_ended_naturally() {
+        assert_eq!(
+            clean_thought("Done thinking\n\nMore words that got cut ab", "Bob", true),
+            Some("Done thinking".to_string())
         );
     }
 }

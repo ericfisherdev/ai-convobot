@@ -2152,6 +2152,15 @@ impl Extractor for FakeExtractor {
     }
 }
 
+/// The result of one [`CharacterModel::complete_in_character`] call.
+pub struct CharacterCompletion {
+    pub text: String,
+    /// True when `max_tokens` ended generation rather than the model's own
+    /// EOG token (#235): derived from `run_decode`'s token count, never
+    /// inferred from the text.
+    pub hit_token_cap: bool,
+}
+
 /// One short in-character completion on the *chat* model, for the running
 /// thought (#216). Distinct from [`Extractor`] on purpose: that seam prefers
 /// the configured extraction model and samples greedily; a thought is
@@ -2166,7 +2175,7 @@ pub trait CharacterModel {
         system: &str,
         user: &str,
         max_tokens: usize,
-    ) -> std::io::Result<String>;
+    ) -> std::io::Result<CharacterCompletion>;
 }
 
 /// Production [`CharacterModel`]: always `RESIDENT_MODEL`, never
@@ -2181,7 +2190,7 @@ impl CharacterModel for ResidentCharacterModel {
         system: &str,
         user: &str,
         max_tokens: usize,
-    ) -> std::io::Result<String> {
+    ) -> std::io::Result<CharacterCompletion> {
         let _generation_guard = GENERATION_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2244,12 +2253,18 @@ impl CharacterModel for ResidentCharacterModel {
             &mut |_piece| true,
         )?;
 
+        let hit_token_cap = tokens_generated >= max_tokens;
         println!(
-            "💭 Thought: {} prompt tokens, {} generated",
-            prompt_token_count, tokens_generated
+            "💭 Thought: {} prompt tokens, {} generated{}",
+            prompt_token_count,
+            tokens_generated,
+            if hit_token_cap { " (capped)" } else { "" }
         );
 
-        Ok(text)
+        Ok(CharacterCompletion {
+            text,
+            hit_token_cap,
+        })
     }
 }
 
@@ -2258,15 +2273,44 @@ impl CharacterModel for ResidentCharacterModel {
 /// run, and pops pre-supplied outputs in call order. Never runs a model.
 #[cfg(test)]
 pub(crate) struct FakeCharacterModel {
-    outputs: Mutex<std::collections::VecDeque<std::io::Result<String>>>,
+    outputs: Mutex<std::collections::VecDeque<std::io::Result<CharacterCompletion>>>,
     pub prompts: Mutex<Vec<(String, String)>>,
 }
 
 #[cfg(test)]
 impl FakeCharacterModel {
+    /// Every output is a natural stop (`hit_token_cap: false`).
     pub fn returning(outputs: impl IntoIterator<Item = std::io::Result<String>>) -> Self {
         Self {
-            outputs: Mutex::new(outputs.into_iter().collect()),
+            outputs: Mutex::new(
+                outputs
+                    .into_iter()
+                    .map(|r| {
+                        r.map(|text| CharacterCompletion {
+                            text,
+                            hit_token_cap: false,
+                        })
+                    })
+                    .collect(),
+            ),
+            prompts: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Every output is reported as having hit `THOUGHT_MAX_TOKENS` (#235).
+    pub fn returning_capped(outputs: impl IntoIterator<Item = std::io::Result<String>>) -> Self {
+        Self {
+            outputs: Mutex::new(
+                outputs
+                    .into_iter()
+                    .map(|r| {
+                        r.map(|text| CharacterCompletion {
+                            text,
+                            hit_token_cap: true,
+                        })
+                    })
+                    .collect(),
+            ),
             prompts: Mutex::new(Vec::new()),
         }
     }
@@ -2279,7 +2323,7 @@ impl CharacterModel for FakeCharacterModel {
         system: &str,
         user: &str,
         _max_tokens: usize,
-    ) -> std::io::Result<String> {
+    ) -> std::io::Result<CharacterCompletion> {
         self.prompts
             .lock()
             .unwrap()
