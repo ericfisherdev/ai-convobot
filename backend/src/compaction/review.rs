@@ -149,7 +149,7 @@ struct Pending {
 /// [`ReviewError::UnknownItem`], checked before any other work.
 pub fn apply_review(
     draft: &Checkpoint,
-    facts: Vec<Fact>,
+    facts: &[Fact],
     request: CommitRequest,
     range: &[CitedMessage],
     active: &[Fact],
@@ -165,7 +165,7 @@ pub fn apply_review(
     }
 
     let mut pending: Vec<Pending> = Vec::with_capacity(facts.len());
-    for fact in &facts {
+    for fact in facts {
         let mut fact_draft = fact_to_draft(fact);
         let revalidate = match reviews.remove(&fact.id) {
             None => false,
@@ -240,12 +240,47 @@ pub fn apply_review(
     })
 }
 
+/// Which parts of a review differ from what extraction stored (#225): the
+/// accepted fact ids whose reviewed `text` is not the stored `text`, and
+/// whether the reviewed summary is not the stored summary. Built by
+/// [`review_edits`]; a struck item can never appear in `fact_ids` since
+/// [`apply_review`] ignores its `text`/`quote` and keeps the stored text.
+#[derive(Debug, Clone, Default)]
+pub struct ReviewEdits {
+    pub summary: bool,
+    pub fact_ids: HashSet<i64>,
+}
+
+/// Compares `reviewed` against what extraction stored (`draft`/`stored`) to
+/// find the edits [`recheck_candidates`] must re-judge even when they were
+/// never flagged (#225). Exact string comparison — a whitespace-only edit
+/// costs one extra judge call, which is simpler and safer than normalising.
+pub fn review_edits(draft: &Checkpoint, stored: &[Fact], reviewed: &ReviewedDraft) -> ReviewEdits {
+    let stored_text: HashMap<i64, &str> = stored.iter().map(|f| (f.id, f.text.as_str())).collect();
+    let fact_ids = reviewed
+        .items
+        .iter()
+        .filter(|item| item.accepted)
+        .filter(|item| stored_text.get(&item.fact_id) != Some(&item.draft.text.as_str()))
+        .map(|item| item.fact_id)
+        .collect();
+
+    let stored_summary = draft.summary.clone().unwrap_or_default();
+    ReviewEdits {
+        summary: reviewed.summary != stored_summary,
+        fact_ids,
+    }
+}
+
 /// The candidates a commit must re-judge against the current covering
-/// thoughts (#219): the reviewed summary, if `flagged` names it
-/// (`fact_id: None`), plus every accepted item whose fact id `flagged`
-/// names. A flagged item the user struck at review is not re-judged — it is
-/// already inactive and cannot be committed either way. Empty when nothing
-/// was flagged (the common case), so the caller makes no model call.
+/// thoughts (#219, widened by #225): the reviewed summary, if `flagged`
+/// names it (`fact_id: None`) or `edits.summary` is set, plus every
+/// accepted item whose fact id `flagged` names or `edits.fact_ids` names. A
+/// flagged item the user struck at review is not re-judged — it is already
+/// inactive and cannot be committed either way. An item that is both
+/// flagged and edited is pushed exactly once. Empty when nothing was
+/// flagged and nothing was edited (the common case), so the caller makes no
+/// model call.
 ///
 /// Each returned `Candidate`'s text is the *reviewed* text — an edited
 /// item's or summary's fix is exactly what gets judged, the same "the user
@@ -255,10 +290,11 @@ pub fn apply_review(
 pub fn recheck_candidates<'a>(
     reviewed: &'a ReviewedDraft,
     flagged: &[StoredContradiction],
+    edits: &ReviewEdits,
 ) -> Vec<(Option<i64>, Candidate<'a>)> {
     let mut candidates = Vec::new();
 
-    if flagged.iter().any(|row| row.fact_id.is_none()) {
+    if edits.summary || flagged.iter().any(|row| row.fact_id.is_none()) {
         candidates.push((
             None,
             Candidate {
@@ -270,7 +306,9 @@ pub fn recheck_candidates<'a>(
 
     let flagged_fact_ids: HashSet<i64> = flagged.iter().filter_map(|row| row.fact_id).collect();
     for item in &reviewed.items {
-        if item.accepted && flagged_fact_ids.contains(&item.fact_id) {
+        if item.accepted
+            && (flagged_fact_ids.contains(&item.fact_id) || edits.fact_ids.contains(&item.fact_id))
+        {
             candidates.push((
                 Some(item.fact_id),
                 Candidate {
@@ -399,7 +437,7 @@ mod tests {
                 summary: None,
             };
 
-            let result = apply_review(&draft, vec![fact], request, &range, &[], &user_is_canon);
+            let result = apply_review(&draft, &[fact], request, &range, &[], &user_is_canon);
 
             match result {
                 Err(ReviewError::Rejected(rejected)) => {
@@ -433,7 +471,7 @@ mod tests {
             summary: None,
         };
 
-        let reviewed = apply_review(&draft, vec![fact], request, &range, &[], &user_is_canon)
+        let reviewed = apply_review(&draft, &[fact], request, &range, &[], &user_is_canon)
             .expect("an edited quote that is now verbatim should pass");
 
         assert!(reviewed.items[0].draft.rejected_reason.is_none());
@@ -454,7 +492,7 @@ mod tests {
             summary: None,
         };
 
-        let reviewed = apply_review(&draft, facts, request, &range, &[], &user_is_canon).unwrap();
+        let reviewed = apply_review(&draft, &facts, request, &range, &[], &user_is_canon).unwrap();
 
         assert_eq!(reviewed.items.len(), 1);
         assert_eq!(reviewed.items[0].fact_id, 10);
@@ -476,7 +514,7 @@ mod tests {
             summary: None,
         };
 
-        let reviewed = apply_review(&draft, facts, request, &range, &[], &user_is_canon).unwrap();
+        let reviewed = apply_review(&draft, &facts, request, &range, &[], &user_is_canon).unwrap();
 
         assert_eq!(
             reviewed.items.iter().map(|i| i.fact_id).collect::<Vec<_>>(),
@@ -504,7 +542,7 @@ mod tests {
             summary: None,
         };
 
-        let err = apply_review(&draft, facts, request, &range, &[], &user_is_canon).unwrap_err();
+        let err = apply_review(&draft, &facts, request, &range, &[], &user_is_canon).unwrap_err();
 
         match err {
             ReviewError::Rejected(items) => {
@@ -526,7 +564,7 @@ mod tests {
             summary: None,
         };
 
-        let err = apply_review(&draft, facts, request, &range, &[], &user_is_canon).unwrap_err();
+        let err = apply_review(&draft, &facts, request, &range, &[], &user_is_canon).unwrap_err();
 
         assert_eq!(err, ReviewError::UnknownItem(999));
     }
@@ -546,7 +584,7 @@ mod tests {
             summary: None,
         };
 
-        let reviewed = apply_review(&draft, facts, request, &range, &[], &user_is_canon).unwrap();
+        let reviewed = apply_review(&draft, &facts, request, &range, &[], &user_is_canon).unwrap();
 
         assert!(!reviewed.items[0].accepted);
         assert_eq!(
@@ -565,7 +603,7 @@ mod tests {
             summary: None,
         };
 
-        let reviewed = apply_review(&draft, facts, request, &[], &[], &user_is_canon).unwrap();
+        let reviewed = apply_review(&draft, &facts, request, &[], &[], &user_is_canon).unwrap();
 
         assert_eq!(reviewed.summary, "stored summary");
     }
@@ -600,14 +638,18 @@ mod tests {
         }
     }
 
+    fn no_edits() -> ReviewEdits {
+        ReviewEdits::default()
+    }
+
     #[test]
-    fn recheck_candidates_is_empty_when_nothing_was_flagged() {
+    fn recheck_candidates_is_empty_when_nothing_was_flagged_and_nothing_was_edited() {
         let reviewed = ReviewedDraft {
             draft_id: 1,
             items: vec![a_reviewed_item(10, "a fact", true)],
             summary: "a summary".to_string(),
         };
-        assert!(recheck_candidates(&reviewed, &[]).is_empty());
+        assert!(recheck_candidates(&reviewed, &[], &no_edits()).is_empty());
     }
 
     #[test]
@@ -619,7 +661,7 @@ mod tests {
         };
         let flagged = vec![a_stored_contradiction(Some(10))];
 
-        assert!(recheck_candidates(&reviewed, &flagged).is_empty());
+        assert!(recheck_candidates(&reviewed, &flagged, &no_edits()).is_empty());
     }
 
     #[test]
@@ -631,7 +673,7 @@ mod tests {
         };
         let flagged = vec![a_stored_contradiction(Some(10))];
 
-        let candidates = recheck_candidates(&reviewed, &flagged);
+        let candidates = recheck_candidates(&reviewed, &flagged, &no_edits());
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].0, Some(10));
@@ -647,7 +689,64 @@ mod tests {
         };
         let flagged = vec![a_stored_contradiction(None)];
 
-        let candidates = recheck_candidates(&reviewed, &flagged);
+        let candidates = recheck_candidates(&reviewed, &flagged, &no_edits());
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, None);
+        assert_eq!(candidates[0].1.text, "the reviewed summary");
+    }
+
+    #[test]
+    fn recheck_candidates_includes_an_edited_item_that_was_never_flagged() {
+        let reviewed = ReviewedDraft {
+            draft_id: 1,
+            items: vec![a_reviewed_item(10, "the edited text", true)],
+            summary: "a summary".to_string(),
+        };
+        let edits = ReviewEdits {
+            summary: false,
+            fact_ids: HashSet::from([10]),
+        };
+
+        let candidates = recheck_candidates(&reviewed, &[], &edits);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, Some(10));
+        assert_eq!(candidates[0].1.text, "the edited text");
+    }
+
+    #[test]
+    fn recheck_candidates_pushes_a_flagged_and_edited_item_once() {
+        let reviewed = ReviewedDraft {
+            draft_id: 1,
+            items: vec![a_reviewed_item(10, "the edited text", true)],
+            summary: "a summary".to_string(),
+        };
+        let flagged = vec![a_stored_contradiction(Some(10))];
+        let edits = ReviewEdits {
+            summary: false,
+            fact_ids: HashSet::from([10]),
+        };
+
+        let candidates = recheck_candidates(&reviewed, &flagged, &edits);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, Some(10));
+    }
+
+    #[test]
+    fn recheck_candidates_includes_an_edited_summary_that_was_never_flagged() {
+        let reviewed = ReviewedDraft {
+            draft_id: 1,
+            items: vec![],
+            summary: "the reviewed summary".to_string(),
+        };
+        let edits = ReviewEdits {
+            summary: true,
+            fact_ids: HashSet::new(),
+        };
+
+        let candidates = recheck_candidates(&reviewed, &[], &edits);
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].0, None);
@@ -662,7 +761,7 @@ mod tests {
             summary: "a summary".to_string(),
         };
         let flagged = vec![a_stored_contradiction(Some(10))];
-        let keys = recheck_candidates(&reviewed, &flagged);
+        let keys = recheck_candidates(&reviewed, &flagged, &no_edits());
         let found = vec![Contradiction {
             candidate: keys[0].1.key,
             thought_id: 42,
@@ -685,7 +784,7 @@ mod tests {
             summary: "the reviewed summary".to_string(),
         };
         let flagged = vec![a_stored_contradiction(None)];
-        let keys = recheck_candidates(&reviewed, &flagged);
+        let keys = recheck_candidates(&reviewed, &flagged, &no_edits());
         let found = vec![Contradiction {
             candidate: keys[0].1.key,
             thought_id: 3,
@@ -697,5 +796,92 @@ mod tests {
 
         assert_eq!(rejections.len(), 1);
         assert_eq!(rejections[0].item_id, None);
+    }
+
+    // --- review_edits (#225) ---
+
+    #[test]
+    fn review_edits_is_empty_for_an_untouched_review() {
+        let draft = a_draft_checkpoint(1);
+        let stored = vec![a_fact(10, FactCategory::Milestone, "a fact", vec![1])];
+        let reviewed = ReviewedDraft {
+            draft_id: 1,
+            items: vec![a_reviewed_item(10, "a fact", true)],
+            summary: "stored summary".to_string(),
+        };
+
+        let edits = review_edits(&draft, &stored, &reviewed);
+
+        assert!(!edits.summary);
+        assert!(edits.fact_ids.is_empty());
+    }
+
+    #[test]
+    fn review_edits_names_an_accepted_item_whose_text_changed() {
+        let draft = a_draft_checkpoint(1);
+        let stored = vec![a_fact(10, FactCategory::Milestone, "a fact", vec![1])];
+        let reviewed = ReviewedDraft {
+            draft_id: 1,
+            items: vec![a_reviewed_item(10, "a changed fact", true)],
+            summary: "stored summary".to_string(),
+        };
+
+        let edits = review_edits(&draft, &stored, &reviewed);
+
+        assert_eq!(edits.fact_ids, HashSet::from([10]));
+    }
+
+    #[test]
+    fn review_edits_ignores_a_struck_item() {
+        let draft = a_draft_checkpoint(1);
+        let stored = vec![a_fact(10, FactCategory::Milestone, "a fact", vec![1])];
+        let range = vec![cited(1, "user", "a fact")];
+        let request = CommitRequest {
+            items: vec![ItemReview {
+                id: 10,
+                accepted: false,
+                // Ignored by `apply_review` for a struck item, so this must
+                // not register as an edit either.
+                text: Some("a changed fact".to_string()),
+                quote: None,
+            }],
+            summary: None,
+        };
+        let reviewed = apply_review(&draft, &stored, request, &range, &[], &user_is_canon)
+            .expect("striking an item never fails validation");
+
+        let edits = review_edits(&draft, &stored, &reviewed);
+
+        assert!(edits.fact_ids.is_empty());
+    }
+
+    #[test]
+    fn review_edits_treats_an_omitted_or_identical_summary_as_unedited() {
+        let draft = a_draft_checkpoint(1);
+        for summary in [None, Some("stored summary".to_string())] {
+            let reviewed = ReviewedDraft {
+                draft_id: 1,
+                items: vec![],
+                summary: summary.unwrap_or_else(|| draft.summary.clone().unwrap_or_default()),
+            };
+
+            let edits = review_edits(&draft, &[], &reviewed);
+
+            assert!(!edits.summary);
+        }
+    }
+
+    #[test]
+    fn review_edits_treats_a_changed_summary_as_edited() {
+        let draft = a_draft_checkpoint(1);
+        let reviewed = ReviewedDraft {
+            draft_id: 1,
+            items: vec![],
+            summary: "a new summary".to_string(),
+        };
+
+        let edits = review_edits(&draft, &[], &reviewed);
+
+        assert!(edits.summary);
     }
 }

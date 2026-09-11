@@ -828,7 +828,7 @@ Conversation compaction (#171-#186): a checkpoint rolls a run of messages into a
 
 - **URL:** `/compaction/{id}/commit`
 - **Method:** `POST`
-- **Description:** Applies the reviewed edits onto the draft's stored facts, re-validates whatever was touched, and promotes the result: the checkpoint flips to `committed`, its facts become active, and the companion's `compacted_through` advances. Claims the turn slot for the duration, since folding the rolling summary may run the model. If an earlier check flagged this draft against the companion's own curated running thoughts (#219), commit first re-judges exactly those flagged candidates (the reviewed summary and/or accepted facts) against the *current* covering thoughts — accepting a flagged item at review does not by itself clear it, the same way an `UnknownSubject`/`PrincipalAsPerson` rejection cannot; only a fresh clean verdict lets the commit proceed.
+- **Description:** Applies the reviewed edits onto the draft's stored facts, re-validates whatever was touched, and promotes the result: the checkpoint flips to `committed`, its facts become active, and the companion's `compacted_through` advances. Claims the turn slot for the duration, since folding the rolling summary may run the model. If an earlier check flagged this draft against the companion's own curated running thoughts (#219), or the review edits the summary or an accepted fact's text (#225), commit first re-judges those candidates (the reviewed summary and/or accepted facts, flagged or edited) against the *current* covering thoughts — accepting a flagged item at review does not by itself clear it, the same way an `UnknownSubject`/`PrincipalAsPerson` rejection cannot; only a fresh clean verdict lets the commit proceed.
 - **Path Parameters:**
   - `id` (integer): the draft's id.
 - **Request Body:**
@@ -839,7 +839,7 @@ Conversation compaction (#171-#186): a checkpoint rolls a run of messages into a
   - Body: the committed checkpoint's `CheckpointSummary`.
   - Status: 404 Not Found — `id` does not name a draft.
   - Status: 409 Conflict — a turn is already in flight, or the checkpoint is not a pending draft (already committed/discarded, or still extracting).
-  - Status: 422 Unprocessable Entity — an `accepted: true` item still fails validation after the edit, or the commit-time re-check (#219) still finds a contradiction; body: an array of `{ item_id, reason }`, where `item_id: null` (re-check only) names the summary rather than a fact. Also returned (body `{ needed, budget }`) when the accepted overlay/rule items alone would exceed the compaction token slice.
+  - Status: 422 Unprocessable Entity — an `accepted: true` item still fails validation after the edit, or the commit-time re-check finds a contradiction on a previously-flagged or edited item or summary (#219, #225); body: an array of `{ item_id, reason }`, where `item_id: null` (re-check only) names the summary rather than a fact. Also returned (body `{ needed, budget }`) when the accepted overlay/rule items alone would exceed the compaction token slice.
   - Status: 503 Service Unavailable — the commit-time contradiction re-check's judge model errored (#219); nothing was committed. Fail-closed on purpose: a judge failure never silently lets a flagged draft through.
 - **Example Request:**
   ```http

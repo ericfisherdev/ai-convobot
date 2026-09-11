@@ -58,10 +58,11 @@ use crate::compaction::contradiction::{
 };
 use crate::compaction::hook::QueuedDraft;
 use crate::compaction::review::{
-    apply_review, recheck_candidates, rejections_from, CommitRequest, RejectedItem, ReviewError,
+    apply_review, recheck_candidates, rejections_from, review_edits, CommitRequest, RejectedItem,
+    ReviewError,
 };
 use crate::compaction::store::{CompactionStore, SqliteCompactionStore};
-use crate::compaction::types::{Checkpoint, CompactionTrigger};
+use crate::compaction::types::{Checkpoint, CompactionTrigger, Fact};
 use crate::compaction::view::{
     CheckpointDetail, CheckpointSummary, CompactionListing, DraftQueued, PendingDraftSummary,
     PromptResponse,
@@ -2620,11 +2621,15 @@ impl CompactionCommitError {
 /// `previously_flagged` set instead of the one that still applies.
 #[derive(Debug, PartialEq)]
 enum RecheckDecision {
-    /// Nothing was previously flagged (`rows: None`, no model call, nothing
-    /// to write either way), or the recheck came back clean -- every
-    /// previously-flagged item was struck/edited away, or the fresh judge
-    /// found nothing (`rows: Some(_)`, possibly empty, replacing the stale
-    /// rows once the commit succeeds).
+    /// `rows: None` covers two cases with nothing to write: nothing was
+    /// previously flagged and nothing was edited (no model call at all), or
+    /// nothing was previously flagged but an edit triggered a model call
+    /// that came back clean (nothing previously flagged means nothing to
+    /// clear either way, #225). Otherwise the recheck came back clean with
+    /// something previously flagged -- every previously-flagged item was
+    /// struck/edited away, or the fresh judge found nothing (`rows:
+    /// Some(_)`, possibly empty, replacing the stale rows once the commit
+    /// succeeds).
     Proceed {
         rows: Option<Vec<StoredContradiction>>,
     },
@@ -2639,34 +2644,38 @@ enum RecheckDecision {
     },
 }
 
-/// Re-judges a draft's previously-flagged items against the *current*
-/// covering thoughts (#219: accepting a flagged item at review does not
-/// clear the contradiction check the way a re-derivable `RejectReason`
-/// does -- the only way past it is a fresh clean verdict, since the user may
-/// have fixed the text, or fixed/deleted the wrong thought). No model call
-/// when nothing was ever flagged, or nothing flagged is still an accepted
-/// candidate. Decides what should happen to the stored rows without writing
-/// anything -- see [`RecheckDecision`] and [`commit_reviewed_draft`].
+/// Re-judges a draft's previously-flagged items, plus any item or summary
+/// the review edited (#225), against the *current* covering thoughts (#219:
+/// accepting a flagged item at review does not clear the contradiction
+/// check the way a re-derivable `RejectReason` does -- the only way past it
+/// is a fresh clean verdict, since the user may have fixed the text, or
+/// fixed/deleted the wrong thought). No model call when nothing was ever
+/// flagged and nothing was edited. Decides what should happen to the stored
+/// rows without writing anything -- see [`RecheckDecision`] and
+/// [`commit_reviewed_draft`].
 fn recheck_contradictions(
     contradiction_store: &dyn ContradictionStore,
     thoughts: &dyn CoveringThoughts,
     extractor: &impl llm::Extractor,
     checkpoint: &Checkpoint,
+    stored_facts: &[Fact],
     reviewed: &ReviewedDraft,
 ) -> Result<RecheckDecision, CompactionCommitError> {
     let previously_flagged = contradiction_store.contradictions_for(checkpoint.id)?;
-    if previously_flagged.is_empty() {
-        return Ok(RecheckDecision::Proceed { rows: None });
-    }
-
-    let recheck = recheck_candidates(reviewed, &previously_flagged);
+    let edits = review_edits(checkpoint, stored_facts, reviewed);
+    let recheck = recheck_candidates(reviewed, &previously_flagged, &edits);
     if recheck.is_empty() {
-        // Every flagged item was struck at review, edited away, or the
-        // covering thought was deleted -- nothing left to re-judge, so the
-        // stale rows are cleared rather than left to haunt a future review
-        // card.
+        // Nothing to re-judge: either nothing was ever flagged and nothing
+        // was edited (no rows to write either way), or every flagged item
+        // was struck at review, edited away, or the covering thought was
+        // deleted -- in which case the stale rows are cleared rather than
+        // left to haunt a future review card.
         return Ok(RecheckDecision::Proceed {
-            rows: Some(Vec::new()),
+            rows: if previously_flagged.is_empty() {
+                None
+            } else {
+                Some(Vec::new())
+            },
         });
     }
 
@@ -2698,7 +2707,14 @@ fn recheck_contradictions(
 
     if fresh.is_empty() {
         Ok(RecheckDecision::Proceed {
-            rows: Some(fresh_rows),
+            // Nothing to clear when nothing was previously flagged -- an
+            // edit-only recheck that comes back clean should not cost a
+            // pointless post-commit write of an empty row set (#225).
+            rows: if previously_flagged.is_empty() {
+                None
+            } else {
+                Some(fresh_rows)
+            },
         })
     } else {
         Ok(RecheckDecision::Reject {
@@ -2734,6 +2750,7 @@ fn commit_reviewed_draft(
     thoughts: &dyn CoveringThoughts,
     extractor: &impl llm::Extractor,
     checkpoint: &Checkpoint,
+    stored_facts: &[Fact],
     reviewed: ReviewedDraft,
     deps: &CommitDeps<'_>,
     budget: &CommitBudget,
@@ -2743,6 +2760,7 @@ fn commit_reviewed_draft(
         thoughts,
         extractor,
         checkpoint,
+        stored_facts,
         &reviewed,
     )?;
 
@@ -2825,7 +2843,7 @@ async fn compaction_commit(
             companion_name: companion_view.name.clone(),
         };
         let is_canon = |speaker_id: &str| speakers.is_canon(speaker_id);
-        let reviewed = apply_review(&checkpoint, facts, request, &range, &active, &is_canon)
+        let reviewed = apply_review(&checkpoint, &facts, request, &range, &active, &is_canon)
             .map_err(CompactionCommitError::Review)?;
 
         let loaded_config = Database::get_config()?;
@@ -2844,6 +2862,7 @@ async fn compaction_commit(
             &SqliteRunningThoughtStore,
             &llm::ResidentExtractor,
             &checkpoint,
+            &facts,
             reviewed,
             &deps,
             &budget,
@@ -2929,8 +2948,10 @@ mod compaction_commit_recheck_tests {
     }
 
     /// Seeds a `Draft` checkpoint with one accepted fact, returning the
-    /// checkpoint and that fact's stored id.
-    fn seed(store: &RecordingStore, text: &str) -> (Checkpoint, i64) {
+    /// checkpoint, that fact's stored id, and the stored facts themselves
+    /// (`recheck_contradictions`/`commit_reviewed_draft`'s `stored_facts`
+    /// argument, #225).
+    fn seed(store: &RecordingStore, text: &str) -> (Checkpoint, i64, Vec<Fact>) {
         let draft_id = store
             .insert_draft(NewDraft {
                 companion_id: 1,
@@ -2941,9 +2962,15 @@ mod compaction_commit_recheck_tests {
             })
             .unwrap();
         let ids = store.insert_facts(draft_id, &[a_fact_draft(text)]).unwrap();
-        (store.get_checkpoint(draft_id).unwrap().unwrap(), ids[0])
+        let checkpoint = store.get_checkpoint(draft_id).unwrap().unwrap();
+        let stored_facts = store.facts_for(draft_id).unwrap();
+        (checkpoint, ids[0], stored_facts)
     }
 
+    /// Builds a `ReviewedDraft` for `checkpoint`'s single seeded fact.
+    /// `summary` matches the checkpoint's own stored summary (`seed` never
+    /// sets one, so `None` -> `""`) so a test that isn't exercising a
+    /// summary edit doesn't accidentally register as one (#225).
     fn reviewed_for(checkpoint: &Checkpoint, fact_id: i64, text: &str) -> ReviewedDraft {
         ReviewedDraft {
             draft_id: checkpoint.id,
@@ -2952,7 +2979,7 @@ mod compaction_commit_recheck_tests {
                 draft: a_fact_draft(text),
                 accepted: true,
             }],
-            summary: "a summary".to_string(),
+            summary: checkpoint.summary.clone().unwrap_or_default(),
         }
     }
 
@@ -2968,7 +2995,7 @@ mod compaction_commit_recheck_tests {
     #[test]
     fn nothing_previously_flagged_proceeds_with_no_write_and_no_model_call() {
         let store = RecordingStore::new();
-        let (checkpoint, fact_id) = seed(&store, "loves dogs");
+        let (checkpoint, fact_id, stored_facts) = seed(&store, "loves dogs");
         let contradiction_store = RecordingContradictionStore::new();
         let thoughts = FixedThoughts(Vec::new());
         let extractor = FakeExtractor::returning([]);
@@ -2979,6 +3006,7 @@ mod compaction_commit_recheck_tests {
             &thoughts,
             &extractor,
             &checkpoint,
+            &stored_facts,
             &reviewed,
         )
         .unwrap();
@@ -2990,7 +3018,7 @@ mod compaction_commit_recheck_tests {
     #[test]
     fn a_flagged_item_struck_at_review_clears_the_stale_rows_without_a_model_call() {
         let store = RecordingStore::new();
-        let (checkpoint, fact_id) = seed(&store, "loves dogs");
+        let (checkpoint, fact_id, stored_facts) = seed(&store, "loves dogs");
         let contradiction_store = RecordingContradictionStore::new();
         contradiction_store
             .replace_contradictions(checkpoint.id, &[a_flagged_row(fact_id)])
@@ -3009,7 +3037,7 @@ mod compaction_commit_recheck_tests {
                 },
                 accepted: false,
             }],
-            summary: "a summary".to_string(),
+            summary: checkpoint.summary.clone().unwrap_or_default(),
         };
 
         let decision = recheck_contradictions(
@@ -3017,6 +3045,7 @@ mod compaction_commit_recheck_tests {
             &thoughts,
             &extractor,
             &checkpoint,
+            &stored_facts,
             &reviewed,
         )
         .unwrap();
@@ -3033,7 +3062,8 @@ mod compaction_commit_recheck_tests {
     #[test]
     fn a_clean_recheck_proceeds_with_fresh_empty_rows() {
         let store = RecordingStore::new();
-        let (checkpoint, fact_id) = seed(&store, "loves dogs, no longer scared of them");
+        let (checkpoint, fact_id, stored_facts) =
+            seed(&store, "loves dogs, no longer scared of them");
         let contradiction_store = RecordingContradictionStore::new();
         contradiction_store
             .replace_contradictions(checkpoint.id, &[a_flagged_row(fact_id)])
@@ -3052,6 +3082,7 @@ mod compaction_commit_recheck_tests {
             &thoughts,
             &extractor,
             &checkpoint,
+            &stored_facts,
             &reviewed,
         )
         .unwrap();
@@ -3067,7 +3098,7 @@ mod compaction_commit_recheck_tests {
     #[test]
     fn a_recheck_that_still_contradicts_rejects_and_keeps_the_fresh_rows() {
         let store = RecordingStore::new();
-        let (checkpoint, fact_id) = seed(&store, "loves dogs");
+        let (checkpoint, fact_id, stored_facts) = seed(&store, "loves dogs");
         let contradiction_store = RecordingContradictionStore::new();
         contradiction_store
             .replace_contradictions(checkpoint.id, &[a_flagged_row(fact_id)])
@@ -3087,6 +3118,7 @@ mod compaction_commit_recheck_tests {
             &thoughts,
             &extractor,
             &checkpoint,
+            &stored_facts,
             &reviewed,
         )
         .unwrap();
@@ -3102,6 +3134,165 @@ mod compaction_commit_recheck_tests {
         }
     }
 
+    /// #225: nothing was ever flagged for this draft, but the review edits
+    /// the fact's text into something that now contradicts a covering
+    /// thought -- the same shape as
+    /// `a_rejected_recheck_persists_the_fresh_rows_without_ever_calling_commit`,
+    /// but for an edit rather than a previously-flagged item.
+    #[test]
+    fn an_edit_to_a_never_flagged_item_is_re_judged_and_rejected_when_it_contradicts() {
+        let store = RecordingStore::new();
+        let (checkpoint, fact_id, stored_facts) = seed(&store, "afraid of dogs");
+        let contradiction_store = RecordingContradictionStore::new();
+        let thoughts = FixedThoughts(vec![CuratedThought {
+            id: 1,
+            text: "the companion is afraid of dogs".to_string(),
+            edited: false,
+        }]);
+        let extractor = FakeExtractor::returning([Ok(
+            r#"{"contradictions":[{"candidate":0,"thought":0,"quote":"loves dogs"}]}"#.to_string(),
+        )]);
+        // Never flagged at extraction time; the review edits the text into
+        // something that now contradicts the covering thought.
+        let reviewed = reviewed_for(&checkpoint, fact_id, "loves dogs");
+
+        let err = commit_reviewed_draft(
+            &store,
+            &contradiction_store,
+            &thoughts,
+            &extractor,
+            &checkpoint,
+            &stored_facts,
+            reviewed,
+            &deps(),
+            &budget(),
+        )
+        .unwrap_err();
+
+        match err {
+            CompactionCommitError::Review(ReviewError::Rejected(rejections)) => {
+                assert_eq!(rejections.len(), 1);
+                assert_eq!(rejections[0].item_id, Some(fact_id));
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        let stored = contradiction_store
+            .contradictions_for(checkpoint.id)
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].fact_id, Some(fact_id));
+        // The draft was never committed.
+        assert_eq!(
+            store.get_checkpoint(checkpoint.id).unwrap().unwrap().status,
+            crate::compaction::types::CompactionStatus::Draft
+        );
+    }
+
+    /// #225: same as above, but the edit is to the summary rather than a
+    /// fact -- `rejections[0].item_id` names the summary with `None`, the
+    /// same convention `rejections_from` already uses for a flagged summary.
+    #[test]
+    fn an_edited_summary_that_was_never_flagged_is_re_judged() {
+        let store = RecordingStore::new();
+        let (checkpoint, fact_id, stored_facts) = seed(&store, "loves dogs");
+        let contradiction_store = RecordingContradictionStore::new();
+        let thoughts = FixedThoughts(vec![CuratedThought {
+            id: 1,
+            text: "the companion is afraid of dogs".to_string(),
+            edited: false,
+        }]);
+        let extractor = FakeExtractor::returning([Ok(
+            r#"{"contradictions":[{"candidate":0,"thought":0,"quote":"loves dogs"}]}"#.to_string(),
+        )]);
+        let reviewed = ReviewedDraft {
+            draft_id: checkpoint.id,
+            items: vec![ReviewedItem {
+                fact_id,
+                draft: a_fact_draft("loves dogs"),
+                accepted: true,
+            }],
+            summary: "the companion loves dogs now".to_string(),
+        };
+
+        let err = commit_reviewed_draft(
+            &store,
+            &contradiction_store,
+            &thoughts,
+            &extractor,
+            &checkpoint,
+            &stored_facts,
+            reviewed,
+            &deps(),
+            &budget(),
+        )
+        .unwrap_err();
+
+        match err {
+            CompactionCommitError::Review(ReviewError::Rejected(rejections)) => {
+                assert_eq!(rejections.len(), 1);
+                assert_eq!(rejections[0].item_id, None);
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    /// #225's "no extra model call" narrowing, pin 1: an edit with nothing
+    /// previously flagged still costs one judge call (the trade this issue
+    /// accepts), but a clean verdict with nothing to clear writes nothing.
+    #[test]
+    fn a_clean_edit_with_nothing_previously_flagged_proceeds_with_no_write() {
+        let store = RecordingStore::new();
+        let (checkpoint, fact_id, stored_facts) = seed(&store, "loves dogs");
+        let contradiction_store = RecordingContradictionStore::new();
+        let thoughts = FixedThoughts(vec![CuratedThought {
+            id: 1,
+            text: "the companion is afraid of dogs".to_string(),
+            edited: false,
+        }]);
+        let extractor = FakeExtractor::returning([Ok(r#"{"contradictions":[]}"#.to_string())]);
+        let reviewed = reviewed_for(&checkpoint, fact_id, "loves dogs even more now");
+
+        let decision = recheck_contradictions(
+            &contradiction_store,
+            &thoughts,
+            &extractor,
+            &checkpoint,
+            &stored_facts,
+            &reviewed,
+        )
+        .unwrap();
+
+        assert_eq!(decision, RecheckDecision::Proceed { rows: None });
+        assert_eq!(extractor.prompts.lock().unwrap().len(), 1);
+    }
+
+    /// #225's "no extra model call" narrowing, pin 2: an edit on a draft
+    /// with no covering thoughts in range still makes no model call --
+    /// `contradiction::check`'s empty-thoughts short-circuit covers it, the
+    /// same guarantee AC 3 pins.
+    #[test]
+    fn an_edit_with_no_covering_thoughts_makes_no_model_call() {
+        let store = RecordingStore::new();
+        let (checkpoint, fact_id, stored_facts) = seed(&store, "loves dogs");
+        let contradiction_store = RecordingContradictionStore::new();
+        let thoughts = FixedThoughts(Vec::new());
+        let extractor = FakeExtractor::returning([]);
+        let reviewed = reviewed_for(&checkpoint, fact_id, "loves dogs even more now");
+
+        let decision = recheck_contradictions(
+            &contradiction_store,
+            &thoughts,
+            &extractor,
+            &checkpoint,
+            &stored_facts,
+            &reviewed,
+        )
+        .unwrap();
+
+        assert_eq!(decision, RecheckDecision::Proceed { rows: None });
+        assert!(extractor.prompts.lock().unwrap().is_empty());
+    }
+
     /// The commit-order regression itself (#226): a commit that fails after
     /// the recheck decided to clear the stale rows must leave those rows
     /// exactly as they were -- not cleared, not overwritten. `budget()` with
@@ -3112,7 +3303,8 @@ mod compaction_commit_recheck_tests {
     #[test]
     fn a_commit_that_fails_after_a_clean_recheck_leaves_the_stale_rows_untouched() {
         let store = RecordingStore::new();
-        let (checkpoint, fact_id) = seed(&store, "loves dogs, no longer scared of them");
+        let (checkpoint, fact_id, stored_facts) =
+            seed(&store, "loves dogs, no longer scared of them");
         let contradiction_store = RecordingContradictionStore::new();
         let stale_rows = vec![a_flagged_row(fact_id)];
         contradiction_store
@@ -3134,6 +3326,7 @@ mod compaction_commit_recheck_tests {
             &thoughts,
             &extractor,
             &checkpoint,
+            &stored_facts,
             reviewed,
             &deps(),
             &failing_budget,
@@ -3160,7 +3353,8 @@ mod compaction_commit_recheck_tests {
     #[test]
     fn a_successful_commit_after_a_clean_recheck_clears_the_stale_rows() {
         let store = RecordingStore::new();
-        let (checkpoint, fact_id) = seed(&store, "loves dogs, no longer scared of them");
+        let (checkpoint, fact_id, stored_facts) =
+            seed(&store, "loves dogs, no longer scared of them");
         let contradiction_store = RecordingContradictionStore::new();
         contradiction_store
             .replace_contradictions(checkpoint.id, &[a_flagged_row(fact_id)])
@@ -3179,6 +3373,7 @@ mod compaction_commit_recheck_tests {
             &thoughts,
             &extractor,
             &checkpoint,
+            &stored_facts,
             reviewed,
             &deps(),
             &budget(),
@@ -3198,7 +3393,7 @@ mod compaction_commit_recheck_tests {
     #[test]
     fn a_rejected_recheck_persists_the_fresh_rows_without_ever_calling_commit() {
         let store = RecordingStore::new();
-        let (checkpoint, fact_id) = seed(&store, "loves dogs");
+        let (checkpoint, fact_id, stored_facts) = seed(&store, "loves dogs");
         let contradiction_store = RecordingContradictionStore::new();
         contradiction_store
             .replace_contradictions(checkpoint.id, &[a_flagged_row(fact_id)])
@@ -3219,6 +3414,7 @@ mod compaction_commit_recheck_tests {
             &thoughts,
             &extractor,
             &checkpoint,
+            &stored_facts,
             reviewed,
             &deps(),
             &budget(),
@@ -3276,7 +3472,8 @@ mod compaction_commit_recheck_tests {
     #[test]
     fn a_post_commit_row_write_failure_does_not_fail_the_already_successful_commit() {
         let store = RecordingStore::new();
-        let (checkpoint, fact_id) = seed(&store, "loves dogs, no longer scared of them");
+        let (checkpoint, fact_id, stored_facts) =
+            seed(&store, "loves dogs, no longer scared of them");
         let contradiction_store = FailingContradictionStore {
             previously_flagged: vec![a_flagged_row(fact_id)],
         };
@@ -3294,6 +3491,7 @@ mod compaction_commit_recheck_tests {
             &thoughts,
             &extractor,
             &checkpoint,
+            &stored_facts,
             reviewed,
             &deps(),
             &budget(),
