@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::compaction::contradiction::StoredContradiction;
 use crate::compaction::extract::AttitudeRatings;
 use crate::compaction::types::{
     Checkpoint, CompactionStatus, CompactionTrigger, Fact, FactCategory, FactSubject,
@@ -172,6 +173,27 @@ pub struct AttitudePreview {
     pub blended: Option<CompanionAttitude>,
 }
 
+/// One `compaction_contradictions` row (#219), as the review card needs it:
+/// `fact_id: None` names the checkpoint's summary rather than a fact.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContradictionView {
+    pub fact_id: Option<i64>,
+    pub thought_id: i64,
+    pub thought_text: String,
+    pub quote: String,
+}
+
+impl From<&StoredContradiction> for ContradictionView {
+    fn from(row: &StoredContradiction) -> Self {
+        ContradictionView {
+            fact_id: row.fact_id,
+            thought_id: row.thought_id,
+            thought_text: row.thought_text.clone(),
+            quote: row.quote.clone(),
+        }
+    }
+}
+
 /// `GET /api/compaction/{id}`'s body: a [`CheckpointSummary`] plus
 /// everything the review card needs that summary alone does not carry.
 #[derive(Debug, Clone, Serialize)]
@@ -183,19 +205,24 @@ pub struct CheckpointDetail {
     pub rolling_summary: Option<String>,
     pub facts: Vec<FactView>,
     pub attitude: AttitudePreview,
+    /// The checkpoint's contradictions against the companion's own curated
+    /// running thoughts (#219), if any: a `fact_id: null` entry names the
+    /// summary, every other entry names one of `facts` above.
+    pub contradictions: Vec<ContradictionView>,
 }
 
 impl CheckpointDetail {
-    /// Builds the detail view: `checkpoint`/`facts` come straight from the
-    /// store, `current_attitude` is the companion's live attitude toward
-    /// the user (`Database::get_attitude`, seeded if the row does not exist
-    /// yet). `rated` is parsed from the checkpoint's own
+    /// Builds the detail view: `checkpoint`/`facts`/`contradictions` come
+    /// straight from the store, `current_attitude` is the companion's live
+    /// attitude toward the user (`Database::get_attitude`, seeded if the
+    /// row does not exist yet). `rated` is parsed from the checkpoint's own
     /// `attitude_ratings` JSON; a malformed or absent value is `None`
     /// rather than a hard error, since the attitude preview is advisory.
     pub fn new(
         checkpoint: &Checkpoint,
         facts: &[Fact],
         current_attitude: CompanionAttitude,
+        contradictions: &[StoredContradiction],
     ) -> Self {
         let rated = checkpoint
             .attitude_ratings
@@ -212,6 +239,7 @@ impl CheckpointDetail {
                 rated,
                 blended: None,
             },
+            contradictions: contradictions.iter().map(ContradictionView::from).collect(),
         }
     }
 }

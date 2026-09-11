@@ -60,7 +60,10 @@ const currentAttitude = {
   created_at: '2024-01-01',
 };
 
-const aDraft = (facts: CompactionFact[]): CheckpointDetail => ({
+const aDraft = (
+  facts: CompactionFact[],
+  contradictions: CheckpointDetail['contradictions'] = []
+): CheckpointDetail => ({
   id: 1,
   from_message_id: 1,
   through_message_id: 10,
@@ -78,6 +81,7 @@ const aDraft = (facts: CompactionFact[]): CheckpointDetail => ({
     rated: null,
     blended: null,
   },
+  contradictions,
 });
 
 const noop = () => {};
@@ -106,6 +110,64 @@ describe('CompactionDraftCard', () => {
     expect(screen.getByText('Rule')).toBeInTheDocument();
     expect(screen.getByText('Person')).toBeInTheDocument();
     expect(screen.queryByText('Backstory')).not.toBeInTheDocument();
+  });
+
+  it('shows both the flagged thought and the quoted words for a summary contradiction (#219)', () => {
+    const draft = aDraft([aFact({ id: 1, category: 'milestone' })], [
+      {
+        fact_id: null,
+        thought_id: 12,
+        thought_text: 'He stitched my wounds; he was not hurt',
+        quote: "tended to each other's wounds",
+      },
+    ]);
+
+    render(
+      <CompactionDraftCard
+        draft={draft}
+        messagesSinceDraft={0}
+        busy={false}
+        onCommit={noop}
+        onDiscard={noop}
+        onJumpToMessage={noop}
+        serverRejections={[]}
+      />
+    );
+
+    expect(screen.getByText(/He stitched my wounds; he was not hurt/)).toBeInTheDocument();
+    expect(screen.getByText(/tended to each other's wounds/)).toBeInTheDocument();
+    // The Commit button stays enabled -- the server is the gate, per #219's
+    // design (a flagged summary is surfaced, never blocked client-side).
+    expect(screen.getByRole('button', { name: 'Commit' })).not.toBeDisabled();
+  });
+
+  it('shows a flagged item\'s contradiction detail beneath its own reason (#219)', () => {
+    const draft = aDraft(
+      [aFact({ id: 2, category: 'milestone', text: 'has traveled far from the coast before', rejected_reason: 'contradicts running thought 9' })],
+      [
+        {
+          fact_id: 2,
+          thought_id: 9,
+          thought_text: 'Vi has never left the coast',
+          quote: 'has traveled far from the coast before',
+        },
+      ]
+    );
+
+    render(
+      <CompactionDraftCard
+        draft={draft}
+        messagesSinceDraft={0}
+        busy={false}
+        onCommit={noop}
+        onDiscard={noop}
+        onJumpToMessage={noop}
+        serverRejections={[]}
+      />
+    );
+
+    expect(screen.getByText('contradicts running thought 9')).toBeInTheDocument();
+    expect(screen.getByText(/Vi has never left the coast/)).toBeInTheDocument();
   });
 
   it('unchecking an item then committing calls onCommit with that item accepted: false', async () => {
