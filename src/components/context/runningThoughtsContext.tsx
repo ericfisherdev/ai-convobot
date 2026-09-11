@@ -89,6 +89,14 @@ export const RunningThoughtsProvider: React.FC<RunningThoughtsProviderProps> = (
         toast.error(body.reason);
         return false;
       }
+      // `thought_edit` claims `ACTIVE_TURN` and 409s with a plain-text
+      // reason while a reply is streaming -- toast that reason rather than
+      // falling into the generic `!response.ok` branch below, which would
+      // surface the bare status code instead.
+      if (response.status === 409) {
+        toast.error(await response.text());
+        return false;
+      }
       if (!response.ok) {
         throw new Error(`PATCH /api/thoughts/${id} returned ${response.status}`);
       }
@@ -105,6 +113,12 @@ export const RunningThoughtsProvider: React.FC<RunningThoughtsProviderProps> = (
   const deleteThought = useCallback(async (id: number): Promise<boolean> => {
     try {
       const response = await fetch(`/api/thoughts/${id}`, { method: 'DELETE' });
+      // Same as `editThought` above: `thought_delete` also claims
+      // `ACTIVE_TURN` and 409s with a plain-text reason.
+      if (response.status === 409) {
+        toast.error(await response.text());
+        return false;
+      }
       if (!response.ok) {
         throw new Error(`DELETE /api/thoughts/${id} returned ${response.status}`);
       }
@@ -156,7 +170,12 @@ export const RunningThoughtsProvider: React.FC<RunningThoughtsProviderProps> = (
           throw new Error(`POST /api/thoughts/regenerate returned ${response.status}`);
         }
 
-        setThoughts((prev) => prev.filter((t) => t.from_message_id < fromMessageId));
+        // Mirrors `SqliteRunningThoughtStore::delete_from`'s own predicate
+        // (`through_message_id >= from_message_id`), not `from_message_id`:
+        // a row whose range spans `fromMessageId` (from < fromMessageId <=
+        // through) is deleted server-side too, and keeping it here would
+        // disagree with what the backend just did.
+        setThoughts((prev) => prev.filter((t) => t.through_message_id < fromMessageId));
         setRegenerating({ fromMessageId, rewritten: 0 });
 
         let streamState = initialRoundStreamState();
@@ -201,6 +220,13 @@ export const RunningThoughtsProvider: React.FC<RunningThoughtsProviderProps> = (
           // `ChatWindow.promptMessage` applies to `/api/prompt/stream`.
           throw new Error('regeneration ended without completing');
         }
+        // `regenerate_from` (backend) re-inserts every non-owned speaker's
+        // row in the deleted range unchanged, under a new id, without
+        // emitting a sink event for any of them -- the stream only carries
+        // this instance's own rewritten rows. Resync from the source of
+        // truth so those reappear instead of staying dropped until an
+        // unrelated reload.
+        await refresh();
       } catch (error) {
         console.error(error);
         toast.error(`Error while regenerating running thoughts: ${error}`);
@@ -215,9 +241,10 @@ export const RunningThoughtsProvider: React.FC<RunningThoughtsProviderProps> = (
   // Waits for `ConfigProvider`'s own fetch to resolve before the first
   // `refresh()`: `isJoiner` (and so `refresh`'s 409 handling) is not known
   // yet on the very first render, and firing early would risk toasting a
-  // 409 this instance is actually a joiner for. `refresh`'s identity
-  // changes when `isJoiner` becomes known, which is exactly what re-runs
-  // this effect once -- not on every later config change.
+  // 409 this instance is actually a joiner for. `configContext?.config` is a
+  // new object on every `ConfigProvider` fetch (including a later config
+  // save), so this effect -- and so `refresh()` -- reruns then too; that is
+  // a harmless extra GET, not something this effect tries to avoid.
   useEffect(() => {
     if (!configContext?.config) return;
     refresh();
