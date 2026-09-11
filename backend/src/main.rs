@@ -1,4 +1,4 @@
-use actix_web::{delete, get, post, put, web, App, HttpResponse, HttpServer};
+use actix_web::{delete, get, patch, post, put, web, App, HttpResponse, HttpServer};
 use futures_util::StreamExt as _;
 mod database;
 use database::{
@@ -18,10 +18,12 @@ mod model_metadata;
 use crate::llm::{
     assemble_prompt, prompt, prompt_streaming, CompactionSource, InMemoryTranscript,
     PromptSpeakers, ResidentCharacterModel, SqliteCompaction, SqliteThoughts, SqliteTranscript,
-    ThoughtSource,
+    ThoughtSource, TranscriptSource,
 };
 use crate::running_thoughts::generate::{generate_thought, ThoughtError};
+use crate::running_thoughts::hook::thought_inputs_for_range;
 use crate::running_thoughts::prompt::ThoughtInputs;
+use crate::running_thoughts::regenerate::{regenerate_from, RegenerateRequest, RegenerateSink};
 use crate::running_thoughts::types::{NewRunningThought, RunningThought};
 use uuid::Uuid;
 mod context_manager;
@@ -64,7 +66,7 @@ use crate::compaction::view::{
 };
 use crate::compaction::{CitedMessage, SoloSpeakers, SpeakerInfo};
 use crate::context_manager::ContextManager;
-use crate::running_thoughts::store::SqliteRunningThoughtStore;
+use crate::running_thoughts::store::{RunningThoughtStore, SqliteRunningThoughtStore};
 mod multiplayer;
 mod participants;
 mod paths;
@@ -78,7 +80,7 @@ use crate::multiplayer::join_throttle::JoinThrottle;
 use crate::multiplayer::joiner::{JoinerHandle, JoinerIdentity, JoinerShared};
 use crate::multiplayer::protocol::ServerFrame;
 use crate::multiplayer::remote_bots::RemoteBots;
-use crate::multiplayer::remote_generation::LocalModelGeneration;
+use crate::multiplayer::remote_generation::{registry_from_participants, LocalModelGeneration};
 use crate::multiplayer::remote_generator::SocketRemoteGenerator;
 use crate::multiplayer::round::{
     plan_round, regenerate_reply, regenerate_target, run_round, NoRemotes, NoopSink,
@@ -2753,6 +2755,389 @@ fn require_known_message(id: i32) -> Result<(), HttpResponse> {
     }
 }
 
+//              Running thoughts
+//
+// Unlike the compaction routes above (host owns checkpoints), a joiner owns
+// its own bot's thoughts -- `multiplayer::remote_generation` writes them
+// into the joiner's *local* `running_thoughts` table under
+// `JoinerShared::companion_id`/`participant_id` -- so none of the four
+// routes below call `reject_if_joiner`; all four serve the local table in
+// every multiplayer mode. `Database::get_companion_id()` is the right
+// companion id in every mode: `JoinerShared::companion_id` is that same
+// call, cached at startup.
+
+/// `GET /api/thoughts`'s whole body, oldest first (transcript order).
+#[derive(Debug, Clone, serde::Serialize)]
+struct ThoughtListing {
+    thoughts: Vec<RunningThought>,
+}
+
+/// Every thought for this instance's own companion, every speaker.
+#[get("/api/thoughts")]
+async fn thoughts_list() -> HttpResponse {
+    let listing = off_worker(
+        "Error while getting running thoughts",
+        || -> rusqlite::Result<ThoughtListing> {
+            let companion_id = Database::get_companion_id()?;
+            Ok(ThoughtListing {
+                thoughts: SqliteRunningThoughtStore.list(companion_id)?,
+            })
+        },
+    )
+    .await;
+
+    match listing {
+        Ok(listing) => HttpResponse::Ok().json(listing),
+        Err(response) => response,
+    }
+}
+
+#[derive(Deserialize)]
+struct ThoughtEdit {
+    text: String,
+}
+
+/// `422` when `text` (already trimmed) is empty; the compaction commit
+/// route's `{ "reason": .. }` 422 shape.
+#[allow(clippy::result_large_err)] // see `off_worker`'s identical `#[allow]`
+fn require_nonempty_thought_text(text: &str) -> Result<(), HttpResponse> {
+    if text.is_empty() {
+        return Err(HttpResponse::UnprocessableEntity()
+            .json(serde_json::json!({ "reason": "text must not be empty" })));
+    }
+    Ok(())
+}
+
+/// Shared by [`thought_edit`]/[`thought_delete`]: `Ok(value)` passes
+/// `value` through; `QueryReturnedNoRows` becomes a `404` naming
+/// `thought_id`, anything else a `500`. Mirrors `require_known_message`'s
+/// shape for the pin routes. `log_verb` is the plain form for the server
+/// log ("edit", "delete"); `body_gerund` is the `-ing` form for the 500
+/// body, since neither reliably derives from the other in English.
+#[allow(clippy::result_large_err)] // see `off_worker`'s identical `#[allow]`
+fn thought_lookup_result<T>(
+    log_verb: &str,
+    body_gerund: &str,
+    thought_id: i64,
+    result: rusqlite::Result<T>,
+) -> Result<T, HttpResponse> {
+    result.map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => {
+            HttpResponse::NotFound().body(format!("running thought {} not found", thought_id))
+        }
+        e => {
+            println!(
+                "Failed to {} running thought {}: {}",
+                log_verb, thought_id, e
+            );
+            HttpResponse::InternalServerError().body(format!(
+                "Error while {} the running thought, check logs for more information",
+                body_gerund
+            ))
+        }
+    })
+}
+
+/// Rewrites one thought's text and marks it `edited`, so the generator (and
+/// #218's panel) can tell the user's own words apart from the model's.
+#[patch("/api/thoughts/{id}")]
+async fn thought_edit(id: web::Path<i64>, received: web::Json<ThoughtEdit>) -> HttpResponse {
+    let thought_id = *id;
+    let text = received.into_inner().text.trim().to_string();
+    if let Err(response) = require_nonempty_thought_text(&text) {
+        return response;
+    }
+
+    let result = web::block(move || -> rusqlite::Result<RunningThought> {
+        SqliteRunningThoughtStore.update_text(thought_id, &text)?;
+        SqliteRunningThoughtStore
+            .get(thought_id)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)
+    })
+    .await;
+
+    match result {
+        Ok(inner) => match thought_lookup_result("edit", "editing", thought_id, inner) {
+            Ok(thought) => HttpResponse::Ok().json(thought),
+            Err(response) => response,
+        },
+        Err(blocking) => {
+            println!(
+                "Failed to edit running thought {}: blocking task failed: {}",
+                thought_id, blocking
+            );
+            HttpResponse::InternalServerError()
+                .body("Error while editing the running thought, check logs for more information")
+        }
+    }
+}
+
+/// Deletes one thought outright (not the same as regenerating it: this
+/// leaves nothing behind for that round).
+#[delete("/api/thoughts/{id}")]
+async fn thought_delete(id: web::Path<i64>) -> HttpResponse {
+    let thought_id = *id;
+    let result = web::block(move || SqliteRunningThoughtStore.delete(thought_id)).await;
+
+    match result {
+        Ok(inner) => match thought_lookup_result("delete", "deleting", thought_id, inner) {
+            Ok(()) => HttpResponse::Ok().body(format!("Thought deleted at id {}!", thought_id)),
+            Err(response) => response,
+        },
+        Err(blocking) => {
+            println!(
+                "Failed to delete running thought {}: blocking task failed: {}",
+                thought_id, blocking
+            );
+            HttpResponse::InternalServerError()
+                .body("Error while deleting the running thought, check logs for more information")
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RegenerateThoughtsRequest {
+    from_message_id: i32,
+}
+
+/// The [`RegenerateSink`] that drives `/api/thoughts/regenerate`'s SSE
+/// session, mirroring [`SseRoundSink`]'s shape: `thought_started`/
+/// `thought_regenerated` forward as `StreamChunk::thought_started`/
+/// `StreamChunk::thought`, and the handler itself ends the session with
+/// `round_complete` or a terminal `error` chunk once [`regenerate_from`]
+/// returns.
+struct SseThoughtSink {
+    stream: Option<StreamSession>,
+    request_id: String,
+    count: usize,
+}
+
+impl SseThoughtSink {
+    fn new(stream: StreamSession) -> Self {
+        let request_id = stream.id().to_string();
+        SseThoughtSink {
+            stream: Some(stream),
+            request_id,
+            count: 0,
+        }
+    }
+
+    fn finish_ok(mut self) {
+        if let Some(stream) = self.stream.take() {
+            stream.finish(StreamChunk::round_complete(
+                self.request_id,
+                Some(self.count),
+            ));
+        }
+    }
+
+    fn finish_with_error(mut self, error_message: String) {
+        if let Some(stream) = self.stream.take() {
+            stream.finish(StreamChunk::error(
+                self.request_id,
+                error_message,
+                Some(self.count),
+            ));
+        }
+    }
+}
+
+impl RegenerateSink for SseThoughtSink {
+    fn thought_started(&mut self, speaker: &ParticipantId) {
+        if let Some(stream) = &self.stream {
+            let _ = stream.send(StreamChunk::thought_started(
+                self.request_id.clone(),
+                speaker,
+            ));
+        }
+    }
+
+    fn thought_regenerated(&mut self, thought: &RunningThought) {
+        self.count += 1;
+        if let Some(stream) = &self.stream {
+            let _ = stream.send(StreamChunk::thought(
+                self.request_id.clone(),
+                thought,
+                self.count,
+            ));
+        }
+    }
+}
+
+/// Rewrites every thought this instance's own speaker owns from
+/// `from_message_id` forward, streaming each rewritten thought as it lands
+/// (SSE, the same wire shape section 6.3 uses). Claims [`ACTIVE_TURN`]
+/// itself and runs [`regenerate_from`] on its own thread: unlike #216's
+/// live-round generation (which writes a thought from inside a turn already
+/// holding the slot), regenerate has no turn to ride on, so it is the one
+/// that claims it -- which is exactly what keeps a chat turn or a
+/// compaction commit from starting mid-rewrite.
+#[post("/api/thoughts/regenerate")]
+async fn thoughts_regenerate(
+    received: web::Json<RegenerateThoughtsRequest>,
+    registry: web::Data<RwLock<ParticipantRegistry>>,
+    joiner: Option<web::Data<JoinerHandle>>,
+) -> HttpResponse {
+    let from_message_id = received.into_inner().from_message_id;
+
+    let (companion_id, running_thoughts_enabled) = match off_worker(
+        "Error while getting companion data",
+        || -> rusqlite::Result<(i32, bool)> {
+            let companion_id = Database::get_companion_id()?;
+            let running_thoughts_enabled = Database::get_config()?.running_thoughts_enabled;
+            Ok((companion_id, running_thoughts_enabled))
+        },
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    if !running_thoughts_enabled {
+        return HttpResponse::Conflict().body(
+            "running thoughts are disabled; enable them in Memory settings before regenerating",
+        );
+    }
+
+    let Some(turn_guard) = ACTIVE_TURN.try_claim() else {
+        return HttpResponse::Conflict()
+            .body("A reply is still being generated; wait for it to finish before sending another message");
+    };
+
+    // Speaker, transcript source and prompt speakers all come from the
+    // mirror in `joiner` mode (a joiner can only regenerate rounds still in
+    // its own mirror, the same limitation #186 already accepts for joiner
+    // extraction) and from the live registry/database otherwise.
+    let (speaker, transcript, speakers): (
+        ParticipantId,
+        Box<dyn TranscriptSource + Send>,
+        PromptSpeakers,
+    ) = match &joiner {
+        Some(handle) => {
+            let shared = handle.read().unwrap_or_else(|p| p.into_inner());
+            let speaker = shared.participant_id.clone();
+            let registry_snapshot = registry_from_participants(&shared.participants);
+            let mirrored = shared.transcript.snapshot();
+            drop(shared);
+            let speakers = PromptSpeakers {
+                registry: registry_snapshot,
+                self_id: speaker.clone(),
+            };
+            (speaker, Box::new(InMemoryTranscript(mirrored)), speakers)
+        }
+        None => (
+            ParticipantId::CHAR,
+            Box::new(SqliteTranscript),
+            snapshot_speakers(&registry),
+        ),
+    };
+
+    let (stream, rx) =
+        INFERENCE_OPTIMIZER.start_streaming_session(format!("thoughts-{}", Uuid::new_v4()));
+
+    let spawn_result = std::thread::Builder::new()
+        .name("thought-regeneration".into())
+        .spawn(move || {
+            let _turn_guard = turn_guard;
+            let store = SqliteRunningThoughtStore;
+            let mut inputs_for = |speaker: &ParticipantId, from: i32, through: i32| {
+                thought_inputs_for_range(
+                    &store,
+                    transcript.as_ref(),
+                    companion_id,
+                    speaker,
+                    from,
+                    through,
+                )
+            };
+            let mut generate = host_thought_writer(speakers);
+            let request = RegenerateRequest {
+                companion_id,
+                speaker_id: speaker,
+                from_message_id,
+            };
+            let mut sink = SseThoughtSink::new(stream);
+            match regenerate_from(&store, &mut inputs_for, &mut generate, &request, &mut sink) {
+                Ok(_regenerated) => sink.finish_ok(),
+                Err(e) => sink.finish_with_error(e.to_string()),
+            }
+        });
+    // A failed spawn drops the closure immediately, which drops `stream` and
+    // `turn_guard` right here: the session still ends with a terminal error
+    // chunk (via `StreamSession`'s `Drop`) and the turn slot is still
+    // released, same as `start_streaming_session`'s identical fallback.
+    if let Err(e) = spawn_result {
+        eprintln!("Failed to spawn thought-regeneration thread: {}", e);
+    }
+
+    sse_response(rx)
+}
+
+#[cfg(test)]
+mod thoughts_route_tests {
+    use super::*;
+    use crate::running_thoughts::regenerate::ThoughtRegenerateError;
+    use actix_web::body::to_bytes;
+    use actix_web::http::StatusCode;
+
+    #[actix_web::test]
+    async fn nonempty_thought_text_passes_through() {
+        assert!(require_nonempty_thought_text("a note").is_ok());
+    }
+
+    #[actix_web::test]
+    async fn empty_thought_text_is_a_422_naming_the_reason() {
+        let response =
+            require_nonempty_thought_text("").expect_err("empty text should be rejected");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body()).await.unwrap();
+        assert_eq!(body, r#"{"reason":"text must not be empty"}"#);
+    }
+
+    #[actix_web::test]
+    async fn an_unknown_thought_id_maps_to_a_404_naming_the_id() {
+        let response = thought_lookup_result::<()>(
+            "edit",
+            "editing",
+            42,
+            Err(rusqlite::Error::QueryReturnedNoRows),
+        )
+        .expect_err("an unknown id should 404");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body()).await.unwrap();
+        assert_eq!(body, "running thought 42 not found");
+    }
+
+    #[actix_web::test]
+    async fn any_other_lookup_failure_is_a_500_with_the_gerund_in_the_body() {
+        let response = thought_lookup_result::<()>(
+            "delete",
+            "deleting",
+            7,
+            Err(rusqlite::Error::InvalidQuery),
+        )
+        .expect_err("a real failure should 500");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body()).await.unwrap();
+        assert_eq!(
+            body,
+            "Error while deleting the running thought, check logs for more information"
+        );
+    }
+
+    // `ThoughtRegenerateError`'s `Display` is what `thoughts_regenerate`
+    // sends out as the terminal SSE `error` chunk's message, so its exact
+    // wording is pinned here rather than only inside
+    // `running_thoughts::regenerate`'s own tests.
+    #[test]
+    fn nothing_to_regenerate_names_itself_in_the_error_chunk_text() {
+        assert_eq!(
+            ThoughtRegenerateError::NothingToRegenerate.to_string(),
+            "there is nothing to regenerate from that message"
+        );
+    }
+}
+
 //              Config
 
 #[get("/api/config")]
@@ -3617,6 +4002,33 @@ fn stream_round(
     }
 }
 
+/// Turns a `StreamChunk` receiver into the `text/event-stream` response both
+/// `/api/prompt/stream` and `/api/thoughts/regenerate` return, so the wire
+/// framing (`data: <json>\n\n` per chunk) lives in one place rather than
+/// being copied between the two handlers.
+fn sse_response(rx: tokio::sync::mpsc::UnboundedReceiver<StreamChunk>) -> HttpResponse {
+    let event_stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        let chunk = rx.recv().await?;
+        // JSON-encoding the chunk keeps newlines inside a token from being read
+        // as SSE record separators.
+        let payload = match serde_json::to_string(&chunk) {
+            Ok(payload) => payload,
+            Err(e) => {
+                eprintln!("Failed to serialize stream chunk: {}", e);
+                return None;
+            }
+        };
+        let bytes = web::Bytes::from(format!("data: {}\n\n", payload));
+        Some((Ok::<web::Bytes, actix_web::Error>(bytes), rx))
+    });
+
+    HttpResponse::Ok()
+        .content_type("text/event-stream")
+        .append_header(("Cache-Control", "no-cache"))
+        .append_header(("X-Accel-Buffering", "no"))
+        .streaming(event_stream)
+}
+
 /// Streams a reply token by token as Server-Sent Events.
 ///
 /// Each event carries a `StreamChunk` as JSON. The final event has
@@ -3751,26 +4163,7 @@ async fn start_streaming_session(
         eprintln!("Failed to spawn streaming generation thread: {}", e);
     }
 
-    let event_stream = futures_util::stream::unfold(rx, |mut rx| async move {
-        let chunk = rx.recv().await?;
-        // JSON-encoding the chunk keeps newlines inside a token from being read
-        // as SSE record separators.
-        let payload = match serde_json::to_string(&chunk) {
-            Ok(payload) => payload,
-            Err(e) => {
-                eprintln!("Failed to serialize stream chunk: {}", e);
-                return None;
-            }
-        };
-        let bytes = web::Bytes::from(format!("data: {}\n\n", payload));
-        Some((Ok::<web::Bytes, actix_web::Error>(bytes), rx))
-    });
-
-    HttpResponse::Ok()
-        .content_type("text/event-stream")
-        .append_header(("Cache-Control", "no-cache"))
-        .append_header(("X-Accel-Buffering", "no"))
-        .streaming(event_stream)
+    sse_response(rx)
 }
 
 #[get("/api/inference/stats")]
@@ -4427,6 +4820,10 @@ async fn main() -> std::io::Result<()> {
             .service(compaction_discard)
             .service(message_pin)
             .service(message_unpin)
+            .service(thoughts_list)
+            .service(thought_edit)
+            .service(thought_delete)
+            .service(thoughts_regenerate)
     });
     if let Some(workers) = configured_workers() {
         server = server.workers(workers);
