@@ -151,11 +151,18 @@ fn reinsert_original(
 ///    reads fresh inputs over its own captured `[from_message_id,
 ///    through_message_id]` (never re-derived), and calls `generate`; success
 ///    reports `sink.thought_regenerated` and the row joins the chain the
-///    next `inputs_for` call reads via `recent_for`.
+///    next `inputs_for` call reads via `recent_for`. An empty `round` (every
+///    message in the window is gone, or the round predates a joiner's
+///    mirror) is treated as a failure rather than run through the model, so
+///    the restore path below runs instead of replacing the note with one
+///    generated from nothing.
 /// 3. A failure re-inserts every row from the failed one onward (inclusive)
 ///    exactly as captured — so a failed run loses at most the one thought it
 ///    was rewriting — and returns the error. Rows already regenerated stay
-///    regenerated.
+///    regenerated. Restoring continues past a single failed re-insert (the
+///    rows are already deleted; skipping the rest would lose them for
+///    good), and only replaces the reported error when a restore itself
+///    fails.
 ///
 /// Returns the count of thoughts actually regenerated (excludes untouched
 /// re-inserts of other speakers' rows).
@@ -196,6 +203,27 @@ pub fn regenerate_from(
             source,
         })
         .and_then(|inputs| {
+            // An empty round is treated as a failure, not run through the
+            // model: `thought_inputs_for_range` returns `Ok` with `round:
+            // vec![]` when nothing resolves in the captured window (every
+            // message in it was deleted since the original was written, or
+            // — on a joiner — the round predates the mirror), and generating
+            // from a blank "What just happened:" section would silently
+            // replace a real note with one the model invented from nothing.
+            // Routing it through the same `Inputs` variant runs the restore
+            // path below exactly as a genuine read failure would.
+            if inputs.round.is_empty() {
+                return Err(ThoughtRegenerateError::Inputs {
+                    from_message_id: original.from_message_id,
+                    source: io::Error::other(format!(
+                        "no messages remain in [{}, {}]",
+                        original.from_message_id, original.through_message_id
+                    )),
+                });
+            }
+            Ok(inputs)
+        })
+        .and_then(|inputs| {
             // Caught, not just propagated: `llama-cpp-2`'s
             // `LlamaModel::load_from_file` panics (rather than returning
             // `Err`) in a debug build when the configured GGUF path does not
@@ -225,11 +253,28 @@ pub fn regenerate_from(
             Err(err) => {
                 // This row and every one after it (owned or not) never got a
                 // fresh generation attempt; restore them all exactly as
-                // captured before reporting the failure.
+                // captured before reporting the failure. `delete_from`
+                // already committed the deletes, so one failed re-insert
+                // here must not stop the rest of the loop from running --
+                // that would lose every later captured row permanently
+                // instead of just the one this run was rewriting. The
+                // original `Inputs`/`Generate` error is what gets returned;
+                // a restore failure only replaces it when restoring itself
+                // failed, since that is the more urgent thing to report.
+                let mut restore_failure = None;
                 for remaining in &captured[index..] {
-                    reinsert_original(store, remaining).map_err(ThoughtRegenerateError::Store)?;
+                    if let Err(e) = reinsert_original(store, remaining) {
+                        eprintln!(
+                            "running thoughts: failed to restore the original for the round starting at message {}: {e}",
+                            remaining.from_message_id
+                        );
+                        restore_failure.get_or_insert(e);
+                    }
                 }
-                return Err(err);
+                return Err(match restore_failure {
+                    Some(e) => ThoughtRegenerateError::Store(e),
+                    None => err,
+                });
             }
         }
     }
@@ -263,12 +308,22 @@ mod tests {
         }
     }
 
+    /// A one-message round, not an empty one: `regenerate_from` treats an
+    /// empty `round` as a failure (a captured range whose messages are all
+    /// gone), so a helper other tests build ordinary success-path inputs
+    /// from must not accidentally produce one.
     fn inputs_of(speaker: &ParticipantId, from: i32, through: i32) -> ThoughtInputs {
         ThoughtInputs {
             companion_id: 1,
             speaker_id: speaker.clone(),
             previous: vec![],
-            round: vec![],
+            round: vec![crate::database::Message {
+                id: from,
+                ai: false,
+                speaker_id: "user".to_string(),
+                content: "the round's own content".to_string(),
+                created_at: String::new(),
+            }],
             from_message_id: from,
             through_message_id: through,
         }
@@ -502,5 +557,172 @@ mod tests {
         let after = store.list(1).unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].text, "keep me");
+    }
+
+    #[test]
+    fn an_empty_round_is_a_failure_that_restores_the_original_instead_of_generating_from_nothing() {
+        let store = RecordingStore::new();
+        seed(&store, "char", 1, 3, "first note");
+        seed(&store, "char", 4, 6, "second note");
+
+        let err = regenerate_from(
+            &store,
+            &mut |speaker, from, through| {
+                // The second round's messages are gone: an empty `round`,
+                // the same shape `thought_inputs_for_range` returns when
+                // nothing resolves in the window.
+                let mut inputs = inputs_of(speaker, from, through);
+                if from == 4 {
+                    inputs.round = vec![];
+                }
+                Ok(inputs)
+            },
+            &mut always_succeeds(),
+            &a_request(1),
+            &mut RecordingSink::default(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ThoughtRegenerateError::Inputs {
+                from_message_id: 4,
+                ..
+            }
+        ));
+
+        let after = store.list(1).unwrap();
+        assert_eq!(after.len(), 2);
+        assert!(after
+            .iter()
+            .any(|t| t.from_message_id == 1 && t.text.contains("fresh note")));
+        let restored = after.iter().find(|t| t.from_message_id == 4).unwrap();
+        assert_eq!(restored.text, "second note");
+        assert!(!restored.edited);
+    }
+
+    /// A [`RunningThoughtStore`] wrapping a [`RecordingStore`] whose
+    /// `insert` fails for one marked piece of text, everything else
+    /// delegated straight through -- the minimal seam needed to exercise a
+    /// restore failure without touching real SQLite.
+    struct FailingReinsertStore {
+        inner: RecordingStore,
+        fails_for_text: &'static str,
+    }
+
+    impl RunningThoughtStore for FailingReinsertStore {
+        fn insert(&self, thought: NewRunningThought) -> rusqlite::Result<i64> {
+            if thought.text == self.fails_for_text {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            self.inner.insert(thought)
+        }
+
+        fn get(&self, id: i64) -> rusqlite::Result<Option<RunningThought>> {
+            self.inner.get(id)
+        }
+
+        fn list(&self, companion_id: i32) -> rusqlite::Result<Vec<RunningThought>> {
+            self.inner.list(companion_id)
+        }
+
+        fn recent_for(
+            &self,
+            companion_id: i32,
+            speaker_id: &str,
+            limit: usize,
+        ) -> rusqlite::Result<Vec<RunningThought>> {
+            self.inner.recent_for(companion_id, speaker_id, limit)
+        }
+
+        fn latest_for(
+            &self,
+            companion_id: i32,
+            speaker_id: &str,
+        ) -> rusqlite::Result<Option<RunningThought>> {
+            self.inner.latest_for(companion_id, speaker_id)
+        }
+
+        fn in_range(
+            &self,
+            companion_id: i32,
+            from: i32,
+            through: i32,
+        ) -> rusqlite::Result<Vec<RunningThought>> {
+            self.inner.in_range(companion_id, from, through)
+        }
+
+        fn update_text(&self, id: i64, text: &str) -> rusqlite::Result<()> {
+            self.inner.update_text(id, text)
+        }
+
+        fn delete(&self, id: i64) -> rusqlite::Result<()> {
+            self.inner.delete(id)
+        }
+
+        fn delete_from(
+            &self,
+            companion_id: i32,
+            message_id: i32,
+        ) -> rusqlite::Result<Vec<RunningThought>> {
+            self.inner.delete_from(companion_id, message_id)
+        }
+    }
+
+    #[test]
+    fn a_failed_restore_still_restores_every_other_row_instead_of_stopping_at_the_first_failure() {
+        let store = FailingReinsertStore {
+            inner: RecordingStore::new(),
+            fails_for_text: "round two",
+        };
+        seed(&store.inner, "char", 1, 3, "round one");
+        seed(&store.inner, "char", 4, 6, "round two");
+        seed(&store.inner, "char", 7, 9, "round three");
+
+        // The first row regenerates; the second's generation itself fails,
+        // triggering the restore path. Restoring "round two" fails (the
+        // seam above), but "round three" must still come back.
+        let err = regenerate_from(
+            &store,
+            &mut |speaker, from, through| Ok(inputs_of(speaker, from, through)),
+            &mut |inputs, insert| {
+                if inputs.from_message_id == 4 {
+                    return Err(ThoughtError::Generate(io::Error::other("model failed")));
+                }
+                insert(NewRunningThought {
+                    companion_id: inputs.companion_id,
+                    speaker_id: inputs.speaker_id.to_string(),
+                    from_message_id: inputs.from_message_id,
+                    through_message_id: inputs.through_message_id,
+                    text: "fresh".to_string(),
+                    edited: false,
+                })
+                .map_err(ThoughtError::Store)
+            },
+            &a_request(1),
+            &mut RecordingSink::default(),
+        )
+        .unwrap_err();
+
+        // The restore failure is what gets reported, not the original
+        // `Generate` error it happened while handling.
+        assert!(matches!(err, ThoughtRegenerateError::Store(_)));
+
+        let after = store.list(1).unwrap();
+        assert!(
+            after
+                .iter()
+                .any(|t| t.from_message_id == 1 && t.text == "fresh"),
+            "round one should still have regenerated"
+        );
+        assert!(
+            !after.iter().any(|t| t.from_message_id == 4),
+            "round two's restore failed, so it is genuinely gone"
+        );
+        let restored_three = after
+            .iter()
+            .find(|t| t.from_message_id == 7)
+            .expect("round three must still be restored even though round two's restore failed");
+        assert_eq!(restored_three.text, "round three");
     }
 }
