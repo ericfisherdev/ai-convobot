@@ -46,7 +46,12 @@ use crate::chat_turn::{PendingTurn, PersistedReply, SqliteTurnStore, TurnStore};
 mod compaction;
 mod running_thoughts;
 use crate::compaction::commit::{CommitBudget, CommitError};
-use crate::compaction::review::{apply_review, CommitRequest, ReviewError};
+use crate::compaction::contradiction::{
+    check as check_contradictions, ContradictionStore, CoveringThoughts, SqliteContradictionStore,
+};
+use crate::compaction::review::{
+    apply_review, recheck_candidates, rejections_from, CommitRequest, ReviewError,
+};
 use crate::compaction::store::{CompactionStore, SqliteCompactionStore};
 use crate::compaction::types::{Checkpoint, CompactionTrigger};
 use crate::compaction::view::{
@@ -55,6 +60,7 @@ use crate::compaction::view::{
 };
 use crate::compaction::{CitedMessage, SoloSpeakers, SpeakerInfo};
 use crate::context_manager::ContextManager;
+use crate::running_thoughts::store::SqliteRunningThoughtStore;
 mod multiplayer;
 mod participants;
 mod paths;
@@ -2369,10 +2375,12 @@ async fn compaction_detail(
         };
         let facts = store.facts_for(checkpoint.id)?;
         let current_attitude = current_user_attitude(checkpoint.companion_id, user_id)?;
+        let contradictions = SqliteContradictionStore.contradictions_for(checkpoint.id)?;
         Ok(Some(CheckpointDetail::new(
             &checkpoint,
             &facts,
             current_attitude,
+            &contradictions,
         )))
     })
     .await;
@@ -2406,6 +2414,10 @@ async fn compaction_detail(
 enum CompactionCommitError {
     Review(ReviewError),
     Commit(CommitError),
+    /// #219: the commit-time contradiction re-check's judge model errored.
+    /// Fail-closed: silently committing on a judge failure would defeat the
+    /// feature, so this is a `503`, not a swallowed warning.
+    Recheck(std::io::Error),
 }
 
 impl From<CommitError> for CompactionCommitError {
@@ -2431,6 +2443,12 @@ impl CompactionCommitError {
                 HttpResponse::UnprocessableEntity().json(items)
             }
             CompactionCommitError::Commit(err) => commit_error_response(err),
+            CompactionCommitError::Recheck(err) => {
+                eprintln!("compaction commit: contradiction re-check failed: {err}");
+                HttpResponse::ServiceUnavailable().body(
+                    "Error re-checking the draft against the companion's curated notes, check logs for more information",
+                )
+            }
         }
     }
 }
@@ -2492,6 +2510,63 @@ async fn compaction_commit(
         let is_canon = |speaker_id: &str| speakers.is_canon(speaker_id);
         let reviewed = apply_review(&checkpoint, facts, request, &range, &active, &is_canon)
             .map_err(CompactionCommitError::Review)?;
+
+        // #219: accepting a flagged item at review does not clear the
+        // contradiction check the way a re-derivable `RejectReason` does --
+        // the only way past it is a fresh clean verdict against the
+        // *current* covering thoughts (the user may have fixed the text, or
+        // fixed/deleted the wrong thought). No model call when nothing was
+        // ever flagged, or nothing flagged is still an accepted candidate.
+        let previously_flagged = SqliteContradictionStore.contradictions_for(checkpoint.id)?;
+        if !previously_flagged.is_empty() {
+            let recheck = recheck_candidates(&reviewed, &previously_flagged);
+            if recheck.is_empty() {
+                // Every flagged item was struck at review, edited away, or
+                // the covering thought was deleted -- nothing left to
+                // re-judge, so the stale rows are cleared rather than left
+                // to haunt a future review card.
+                SqliteContradictionStore.replace_contradictions(checkpoint.id, &[])?;
+            } else {
+                let current_thoughts = SqliteRunningThoughtStore
+                    .covering(
+                        checkpoint.companion_id,
+                        checkpoint.from_message_id,
+                        checkpoint.through_message_id,
+                    )
+                    .map_err(CompactionCommitError::from)?;
+                let judge_candidates: Vec<_> = recheck.iter().map(|(_, c)| *c).collect();
+                let fresh = check_contradictions(
+                    &llm::ResidentExtractor,
+                    &current_thoughts,
+                    &judge_candidates,
+                )
+                .map_err(CompactionCommitError::Recheck)?;
+
+                let fresh_rows: Vec<_> = fresh
+                    .iter()
+                    .filter_map(|hit| {
+                        recheck
+                            .iter()
+                            .find(|(_, c)| c.key == hit.candidate)
+                            .map(|(fact_id, _)| {
+                                crate::compaction::contradiction::StoredContradiction {
+                                    fact_id: *fact_id,
+                                    thought_id: hit.thought_id,
+                                    thought_text: hit.thought_text.clone(),
+                                    quote: hit.quote.clone(),
+                                }
+                            })
+                    })
+                    .collect();
+                SqliteContradictionStore.replace_contradictions(checkpoint.id, &fresh_rows)?;
+
+                if !fresh.is_empty() {
+                    return Err(CompactionCommitError::Review(ReviewError::Rejected(
+                        rejections_from(&fresh, &recheck),
+                    )));
+                }
+            }
+        }
 
         let loaded_config = Database::get_config()?;
         let compaction_slice_tokens = ContextManager::new(loaded_config).compaction_token_budget;

@@ -151,6 +151,9 @@ function ItemRow({
           {reason && (
             <p className="text-[10px] text-destructive mt-1">{reason}</p>
           )}
+          {item.contradiction && (
+            <p className="text-[10px] text-destructive mt-1">{item.contradiction}</p>
+          )}
           <div className="flex items-center gap-1 mt-1 flex-wrap">
             {item.fact.sources.map((sourceId) => (
               <button
@@ -237,8 +240,14 @@ export function CompactionDraftCard({
     // still the same rejection from the earlier failed attempt), so this
     // effect would run again against the user's already-corrected state.
     // The uncontrolled path (internal `useState`, used by `CompactionNotice`'s
-    // read-only dialog) has no such owner and keeps applying it here.
-    if (onStateChange) return;
+    // read-only dialog) has no such owner and keeps applying it here -- but
+    // only when there is something to apply. `CompactionNotice` always
+    // passes a permanent `[]` (its dialog never attempts a commit), and
+    // `applyServerRejection(prev, [])` is not a no-op: it unconditionally
+    // recomputes `summaryReason` (#219), which would erase the seed
+    // `initialReviewState` already read from `draft.contradictions` the
+    // instant this effect ran, well before any real commit attempt existed.
+    if (onStateChange || serverRejections.length === 0) return;
     applyUpdate((prev) => applyServerRejection(prev, serverRejections));
     // Only re-run when `serverRejections` (or the controlled/uncontrolled
     // mode itself) actually changes -- `applyUpdate` is omitted from the
@@ -297,6 +306,9 @@ export function CompactionDraftCard({
             disabled={readOnly}
             className="text-xs"
           />
+          {state.summaryReason && (
+            <p className="text-[10px] text-destructive mt-1">{state.summaryReason}</p>
+          )}
         </div>
 
         <div>

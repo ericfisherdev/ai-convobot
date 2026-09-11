@@ -17,6 +17,9 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::compaction::commit::{ReviewedDraft, ReviewedItem};
+use crate::compaction::contradiction::{
+    Candidate, CandidateKey, Contradiction, StoredContradiction,
+};
 use crate::compaction::types::{Checkpoint, Fact, FactCategory, FactDraft};
 use crate::compaction::validate::{validate, RejectReason};
 use crate::compaction::CitedMessage;
@@ -69,12 +72,15 @@ pub struct CommitRequest {
     pub summary: Option<String>,
 }
 
-/// One item [`apply_review`] rejected while re-validating an `accepted:
-/// true` edit. `item_id` (not `id`) matches the field name the frontend's
-/// `useCompaction().commit` reads off the `422` body.
+/// One item [`apply_review`] (or #219's commit-time re-check) rejected.
+/// `item_id` (not `id`) matches the field name the frontend's
+/// `useCompaction().commit` reads off the `422` body. `None` names the
+/// checkpoint's summary rather than a fact — only the re-check can produce
+/// that; `apply_review` itself never rejects the summary, so every
+/// `RejectedItem` it builds carries `Some`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RejectedItem {
-    pub item_id: i64,
+    pub item_id: Option<i64>,
     pub reason: String,
 }
 
@@ -207,7 +213,7 @@ pub fn apply_review(
         .filter(|p| p.revalidate)
         .filter_map(|p| {
             p.draft.rejected_reason.as_ref().map(|reason| RejectedItem {
-                item_id: p.fact_id,
+                item_id: Some(p.fact_id),
                 reason: reason.clone(),
             })
         })
@@ -232,6 +238,77 @@ pub fn apply_review(
             .summary
             .unwrap_or_else(|| draft.summary.clone().unwrap_or_default()),
     })
+}
+
+/// The candidates a commit must re-judge against the current covering
+/// thoughts (#219): the reviewed summary, if `flagged` names it
+/// (`fact_id: None`), plus every accepted item whose fact id `flagged`
+/// names. A flagged item the user struck at review is not re-judged — it is
+/// already inactive and cannot be committed either way. Empty when nothing
+/// was flagged (the common case), so the caller makes no model call.
+///
+/// Each returned `Candidate`'s text is the *reviewed* text — an edited
+/// item's or summary's fix is exactly what gets judged, the same "the user
+/// fixed the text" remedy the design doc describes — and its `key` is
+/// unique only within this call's own slice (used by [`rejections_from`] to
+/// map a verdict back); it carries no meaning to the caller beyond that.
+pub fn recheck_candidates<'a>(
+    reviewed: &'a ReviewedDraft,
+    flagged: &[StoredContradiction],
+) -> Vec<(Option<i64>, Candidate<'a>)> {
+    let mut candidates = Vec::new();
+
+    if flagged.iter().any(|row| row.fact_id.is_none()) {
+        candidates.push((
+            None,
+            Candidate {
+                key: CandidateKey::Summary,
+                text: &reviewed.summary,
+            },
+        ));
+    }
+
+    let flagged_fact_ids: HashSet<i64> = flagged.iter().filter_map(|row| row.fact_id).collect();
+    for item in &reviewed.items {
+        if item.accepted && flagged_fact_ids.contains(&item.fact_id) {
+            candidates.push((
+                Some(item.fact_id),
+                Candidate {
+                    key: CandidateKey::Fact(candidates.len()),
+                    text: &item.draft.text,
+                },
+            ));
+        }
+    }
+
+    candidates
+}
+
+/// Maps [`recheck_candidates`]'s fresh verdicts back to [`RejectedItem`]s:
+/// `item_id: None` for a contradicted summary, `Some(fact_id)` for a
+/// contradicted fact. `keys` must be the exact slice `recheck_candidates`
+/// returned (or built the same way) — a `Contradiction::candidate` this
+/// module didn't hand out has nothing to map back to and is silently
+/// dropped, which cannot happen when `found` comes from
+/// `contradiction::check` run over `keys`' own candidates.
+pub fn rejections_from(
+    found: &[Contradiction],
+    keys: &[(Option<i64>, Candidate<'_>)],
+) -> Vec<RejectedItem> {
+    found
+        .iter()
+        .filter_map(|hit| {
+            keys.iter()
+                .find(|(_, candidate)| candidate.key == hit.candidate)
+                .map(|(item_id, _)| RejectedItem {
+                    item_id: *item_id,
+                    reason: RejectReason::ContradictsThought {
+                        thought_id: hit.thought_id,
+                    }
+                    .to_string(),
+                })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -329,7 +406,7 @@ mod tests {
                     assert!(
                         rejected
                             .iter()
-                            .any(|r| r.item_id == 10 && r.reason == reason.to_string()),
+                            .any(|r| r.item_id == Some(10) && r.reason == reason.to_string()),
                         "`{reason}` should come back on fact 10 with its original reason, \
                          got {rejected:?}"
                     );
@@ -432,7 +509,7 @@ mod tests {
         match err {
             ReviewError::Rejected(items) => {
                 assert_eq!(items.len(), 1);
-                assert_eq!(items[0].item_id, 10);
+                assert_eq!(items[0].item_id, Some(10));
                 assert!(items[0].reason.contains("verbatim"));
             }
             other => panic!("expected Rejected, got {other:?}"),
@@ -491,5 +568,134 @@ mod tests {
         let reviewed = apply_review(&draft, facts, request, &[], &[], &user_is_canon).unwrap();
 
         assert_eq!(reviewed.summary, "stored summary");
+    }
+
+    // --- recheck_candidates / rejections_from (#219) ---
+
+    fn a_reviewed_item(fact_id: i64, text: &str, accepted: bool) -> ReviewedItem {
+        ReviewedItem {
+            fact_id,
+            accepted,
+            draft: FactDraft {
+                category: FactCategory::Milestone,
+                subject: None,
+                text: text.to_string(),
+                quote_speaker: None,
+                sources: vec![1],
+                replaces: vec![],
+                relation_to: None,
+                relation: None,
+                canon: true,
+                rejected_reason: None,
+            },
+        }
+    }
+
+    fn a_stored_contradiction(fact_id: Option<i64>) -> StoredContradiction {
+        StoredContradiction {
+            fact_id,
+            thought_id: 7,
+            thought_text: "the companion's own note".to_string(),
+            quote: "the conflicting words".to_string(),
+        }
+    }
+
+    #[test]
+    fn recheck_candidates_is_empty_when_nothing_was_flagged() {
+        let reviewed = ReviewedDraft {
+            draft_id: 1,
+            items: vec![a_reviewed_item(10, "a fact", true)],
+            summary: "a summary".to_string(),
+        };
+        assert!(recheck_candidates(&reviewed, &[]).is_empty());
+    }
+
+    #[test]
+    fn recheck_candidates_skips_a_flagged_item_struck_at_review() {
+        let reviewed = ReviewedDraft {
+            draft_id: 1,
+            items: vec![a_reviewed_item(10, "a fact", false)],
+            summary: "a summary".to_string(),
+        };
+        let flagged = vec![a_stored_contradiction(Some(10))];
+
+        assert!(recheck_candidates(&reviewed, &flagged).is_empty());
+    }
+
+    #[test]
+    fn recheck_candidates_uses_the_reviewed_text_for_a_flagged_accepted_item() {
+        let reviewed = ReviewedDraft {
+            draft_id: 1,
+            items: vec![a_reviewed_item(10, "the edited text", true)],
+            summary: "a summary".to_string(),
+        };
+        let flagged = vec![a_stored_contradiction(Some(10))];
+
+        let candidates = recheck_candidates(&reviewed, &flagged);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, Some(10));
+        assert_eq!(candidates[0].1.text, "the edited text");
+    }
+
+    #[test]
+    fn recheck_candidates_includes_the_summary_when_it_was_flagged() {
+        let reviewed = ReviewedDraft {
+            draft_id: 1,
+            items: vec![],
+            summary: "the reviewed summary".to_string(),
+        };
+        let flagged = vec![a_stored_contradiction(None)];
+
+        let candidates = recheck_candidates(&reviewed, &flagged);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, None);
+        assert_eq!(candidates[0].1.text, "the reviewed summary");
+    }
+
+    #[test]
+    fn rejections_from_maps_a_fresh_verdict_back_to_its_fact_id() {
+        let reviewed = ReviewedDraft {
+            draft_id: 1,
+            items: vec![a_reviewed_item(10, "the edited text", true)],
+            summary: "a summary".to_string(),
+        };
+        let flagged = vec![a_stored_contradiction(Some(10))];
+        let keys = recheck_candidates(&reviewed, &flagged);
+        let found = vec![Contradiction {
+            candidate: keys[0].1.key,
+            thought_id: 42,
+            thought_text: "the companion's own note".to_string(),
+            quote: "the conflicting words".to_string(),
+        }];
+
+        let rejections = rejections_from(&found, &keys);
+
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0].item_id, Some(10));
+        assert!(rejections[0].reason.contains("42"));
+    }
+
+    #[test]
+    fn rejections_from_maps_a_summary_verdict_to_item_id_none() {
+        let reviewed = ReviewedDraft {
+            draft_id: 1,
+            items: vec![],
+            summary: "the reviewed summary".to_string(),
+        };
+        let flagged = vec![a_stored_contradiction(None)];
+        let keys = recheck_candidates(&reviewed, &flagged);
+        let found = vec![Contradiction {
+            candidate: keys[0].1.key,
+            thought_id: 3,
+            thought_text: "the companion's own note".to_string(),
+            quote: "the conflicting words".to_string(),
+        }];
+
+        let rejections = rejections_from(&found, &keys);
+
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0].item_id, None);
     }
 }

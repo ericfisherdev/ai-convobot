@@ -3,6 +3,7 @@ import {
   applyServerRejection,
   editItemQuote,
   editItemText,
+  editSummary,
   groupByCategory,
   initialReviewState,
   toggleAccepted,
@@ -27,7 +28,11 @@ const aFact = (overrides: Partial<CompactionFact> = {}): CompactionFact => ({
   ...overrides,
 });
 
-const aDraft = (facts: CompactionFact[], summary = 'a summary'): CheckpointDetail => ({
+const aDraft = (
+  facts: CompactionFact[],
+  summary = 'a summary',
+  contradictions: CheckpointDetail['contradictions'] = []
+): CheckpointDetail => ({
   id: 1,
   from_message_id: 1,
   through_message_id: 10,
@@ -45,6 +50,7 @@ const aDraft = (facts: CompactionFact[], summary = 'a summary'): CheckpointDetai
     rated: null,
     blended: null,
   },
+  contradictions,
 });
 
 describe('compactionReview', () => {
@@ -64,6 +70,49 @@ describe('compactionReview', () => {
 
       expect(state.summary).toBe('stored summary');
       expect(state.items[0].quote).toBe('never go to the lake alone');
+    });
+
+    it('seeds summaryReason from a summary-level contradiction, naming the thought and its quote (#219)', () => {
+      const state = initialReviewState(
+        aDraft([], 'they tended to each other\'s wounds', [
+          {
+            fact_id: null,
+            thought_id: 12,
+            thought_text: 'He stitched my wounds; he was not hurt',
+            quote: "tended to each other's wounds",
+          },
+        ])
+      );
+
+      expect(state.summaryReason).toContain('12');
+      expect(state.summaryReason).toContain('He stitched my wounds; he was not hurt');
+      expect(state.summaryReason).toContain("tended to each other's wounds");
+    });
+
+    it('seeds an item\'s contradiction detail when its fact_id is flagged (#219)', () => {
+      const flagged = aFact({ id: 30, text: 'has traveled far from the coast before' });
+      const untouched = aFact({ id: 31 });
+      const state = initialReviewState(
+        aDraft([flagged, untouched], 'a summary', [
+          {
+            fact_id: 30,
+            thought_id: 9,
+            thought_text: 'Vi has never left the coast',
+            quote: 'has traveled far from the coast before',
+          },
+        ])
+      );
+
+      const flaggedItem = state.items.find((i) => i.fact.id === 30);
+      const untouchedItem = state.items.find((i) => i.fact.id === 31);
+      expect(flaggedItem?.contradiction).toContain('Vi has never left the coast');
+      expect(untouchedItem?.contradiction).toBeNull();
+      expect(state.summaryReason).toBeNull();
+    });
+
+    it('leaves summaryReason null with no contradictions at all', () => {
+      const state = initialReviewState(aDraft([aFact()]));
+      expect(state.summaryReason).toBeNull();
     });
   });
 
@@ -153,6 +202,46 @@ describe('compactionReview', () => {
 
       state = applyServerRejection(state, []);
       expect(state.items[0].serverReason).toBeNull();
+    });
+
+    it('routes an item_id: null entry to summaryReason and strikes no item (#219)', () => {
+      const fact = aFact({ id: 40 });
+      let state = initialReviewState(aDraft([fact]));
+
+      state = applyServerRejection(state, [
+        { item_id: null, reason: 'contradicts running thought 12' },
+      ]);
+
+      expect(state.summaryReason).toBe('contradicts running thought 12');
+      expect(state.items[0].serverReason).toBeNull();
+      expect(state.items[0].accepted).toBe(true);
+    });
+
+    it('clears a stale summaryReason once a later attempt no longer rejects the summary', () => {
+      let state = initialReviewState(aDraft([]));
+      state = applyServerRejection(state, [
+        { item_id: null, reason: 'contradicts running thought 3' },
+      ]);
+      expect(state.summaryReason).toBe('contradicts running thought 3');
+
+      state = applyServerRejection(state, []);
+      expect(state.summaryReason).toBeNull();
+    });
+  });
+
+  describe('editSummary', () => {
+    it('clears summaryReason when the user edits the summary (#219)', () => {
+      const state = initialReviewState(
+        aDraft([], 'stale summary', [
+          { fact_id: null, thought_id: 1, thought_text: 'a note', quote: 'stale summary' },
+        ])
+      );
+      expect(state.summaryReason).not.toBeNull();
+
+      const edited = editSummary(state, 'a corrected summary');
+
+      expect(edited.summaryReason).toBeNull();
+      expect(edited.summary).toBe('a corrected summary');
     });
   });
 

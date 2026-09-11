@@ -94,6 +94,23 @@ pub(crate) fn create_tables(con: &Connection) -> Result<()> {
         )",
         [],
     )?;
+    // #219: one row per contradiction `compaction::contradiction::check`
+    // found between a curated running thought and this draft's summary
+    // (`fact_id IS NULL`) or one of its facts. No foreign key on
+    // `thought_id`: the thought may be edited or deleted (or #217's
+    // regenerate may rewrite its id entirely) after this row is written, so
+    // `thought_text` snapshots what the judge actually saw.
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS compaction_contradictions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            compaction_id INTEGER NOT NULL REFERENCES compactions(id) ON DELETE CASCADE,
+            fact_id INTEGER REFERENCES compaction_facts(id) ON DELETE CASCADE,
+            thought_id INTEGER NOT NULL,
+            thought_text TEXT NOT NULL,
+            quote TEXT NOT NULL
+        )",
+        [],
+    )?;
     con.execute(
         "CREATE INDEX IF NOT EXISTS idx_compaction_facts_compaction ON compaction_facts(compaction_id, active)",
         [],

@@ -41,6 +41,7 @@ impl SpeakerInfo for RegistrySpeakers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compaction::contradiction::TestThoughtCheck;
     use crate::compaction::extract::fill_draft;
     use crate::compaction::fixtures::synthetic_range;
     use crate::compaction::store::{CompactionStore, RecordingStore};
@@ -166,8 +167,17 @@ mod tests {
         let extractor = FakeExtractor::returning(vec![Ok(output)]);
         let speakers = RegistrySpeakers(registry_with_vex());
 
-        fill_draft(&store, &extractor, &draft, &range, &speakers, usize::MAX)
-            .expect("fill_draft should succeed");
+        let no_check = TestThoughtCheck::none();
+        fill_draft(
+            &store,
+            &extractor,
+            &draft,
+            &range,
+            &speakers,
+            usize::MAX,
+            &no_check.check(),
+        )
+        .expect("fill_draft should succeed");
 
         let facts = store.facts_for(draft_id).unwrap();
 

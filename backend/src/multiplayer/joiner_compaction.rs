@@ -36,6 +36,7 @@ use std::sync::Arc;
 use crate::compaction::commit::{
     commit, CommitBudget, CommitDeps, CommitObserver, ReviewedDraft, ReviewedItem,
 };
+use crate::compaction::contradiction::{SqliteContradictionStore, ThoughtCheck};
 use crate::compaction::extract::{fill_draft, spawn_holding};
 use crate::compaction::merge::LlmSummaryMerger;
 use crate::compaction::registry_speakers::RegistrySpeakers;
@@ -49,6 +50,7 @@ use crate::llm::ResidentExtractor;
 use crate::multiplayer::joiner::JoinerHandle;
 use crate::multiplayer::protocol::ContinuityPayload;
 use crate::participants::{ParticipantId, ParticipantRegistry};
+use crate::running_thoughts::store::SqliteRunningThoughtStore;
 use crate::turn_slot::JOINER_EXTRACTION;
 
 /// Why a joiner-committed item that would otherwise be active is instead
@@ -365,6 +367,13 @@ pub(crate) fn run_joiner_extraction(handle: &JoinerHandle, request: JoinerExtrac
     };
 
     let speakers = RegistrySpeakers(registry);
+    // A joiner's bot keeps its own thoughts locally (#220), but until that
+    // isolation lands the shared production pair is the correct default
+    // here too: the same store this joiner would read from either way.
+    let check = ThoughtCheck {
+        thoughts: &SqliteRunningThoughtStore,
+        store: &SqliteContradictionStore,
+    };
     if let Err(e) = fill_draft(
         &store,
         &ResidentExtractor,
@@ -372,6 +381,7 @@ pub(crate) fn run_joiner_extraction(handle: &JoinerHandle, request: JoinerExtrac
         &cited,
         &speakers,
         overlay_budget_tokens,
+        &check,
     ) {
         eprintln!("joiner compaction ({self_id}): extraction failed for draft {draft_id}: {e}");
         // `fill_draft` already discards the draft itself for the error

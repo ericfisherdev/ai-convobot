@@ -112,11 +112,23 @@
 //! Recall at prompt-assembly time now fills `CompactionContext::
 //! recalled_facts` (`llm.rs::assemble_prompt`) instead of being appended
 //! after the persona.
+//!
+//! `contradiction.rs` (#219) is what gives running thoughts (#214/#215)
+//! their purpose: `check` runs a checkpoint's summary and accepted facts
+//! past the companion's own curated `running_thoughts` for the range,
+//! through the same `Extractor` seam `extract.rs` already has. A fact the
+//! judge flags gets its own `validate::RejectReason::ContradictsThought` and
+//! is stored inactive like any other rejection; a flagged summary is
+//! recorded (`compaction_contradictions`, `fact_id: NULL`) and blocks
+//! `POST /api/compaction/{id}/commit` until a re-check against the current
+//! thoughts comes back clean. `extract::fill_draft` is the one caller, via
+//! the `ThoughtCheck` bundle this module exposes.
 #![allow(dead_code)]
 
 pub mod attitude;
 pub mod commit;
 pub mod context;
+pub mod contradiction;
 /// Measurement only, never compiled into the binary: the extraction eval
 /// harness (`cargo test ... compaction::eval::extraction_eval`).
 #[cfg(test)]

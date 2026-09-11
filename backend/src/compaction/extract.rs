@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use crate::compaction::contradiction::{self, SqliteContradictionStore, ThoughtCheck};
 use crate::compaction::registry_speakers::RegistrySpeakers;
 use crate::compaction::store::{CompactionStore, SqliteCompactionStore};
 use crate::compaction::types::{
@@ -20,6 +21,7 @@ use crate::context_manager::ContextManager;
 use crate::database::Database;
 use crate::llm::{Extractor, ResidentExtractor};
 use crate::participants::ParticipantRegistry;
+use crate::running_thoughts::store::SqliteRunningThoughtStore;
 use crate::turn_slot::TurnGuard;
 
 /// The model's extraction output, one JSON object per compacted range.
@@ -800,7 +802,7 @@ ws ::= [ \n\t]{0,20}
 /// found at depth 0 that isn't immediately followed (modulo whitespace and
 /// `#` comment lines) by a new `name ::=` rule or the end of the grammar.
 #[cfg(test)]
-fn check_gbnf_rule_boundaries(gbnf: &str) -> Result<(), String> {
+pub(crate) fn check_gbnf_rule_boundaries(gbnf: &str) -> Result<(), String> {
     fn rule_starts_or_grammar_ends(rest: &str) -> bool {
         let mut s = rest;
         loop {
@@ -1160,6 +1162,7 @@ pub fn fill_draft(
     range: &[CitedMessage],
     speakers: &dyn SpeakerInfo,
     overlay_budget_tokens: usize,
+    check: &ThoughtCheck<'_>,
 ) -> Result<(), DraftError> {
     if draft.status != CompactionStatus::Draft || draft.raw_model_output.is_some() {
         return Err(DraftError::DraftNotPending(draft.id));
@@ -1220,7 +1223,49 @@ pub fn fill_draft(
         .active_facts(draft.companion_id)
         .map_err(DraftError::Store)?;
     let is_canon = |speaker_id: &str| speakers.is_canon(speaker_id);
-    let validated = validate(drafts, range, &active, &is_canon);
+    let mut validated = validate(drafts, range, &active, &is_canon);
+
+    // #219: check the summary and every still-accepted item against the
+    // companion's own curated running thoughts covering this draft's range,
+    // before the overlay budget is enforced (a fact this flags is stored
+    // rejected either way, so it must never count toward that budget).
+    let thoughts = check
+        .thoughts
+        .covering(
+            draft.companion_id,
+            draft.from_message_id,
+            draft.through_message_id,
+        )
+        .map_err(DraftError::Store)?;
+    let summary_candidate = contradiction::Candidate {
+        key: contradiction::CandidateKey::Summary,
+        text: &merged.summary,
+    };
+    let mut candidates = vec![summary_candidate];
+    for (i, item) in validated.iter().enumerate() {
+        if item.rejected_reason.is_none() {
+            candidates.push(contradiction::Candidate {
+                key: contradiction::CandidateKey::Fact(i),
+                text: &item.text,
+            });
+        }
+    }
+    let found =
+        contradiction::check(extractor, &thoughts, &candidates).map_err(DraftError::Model)?;
+    let mut summary_contradiction: Option<contradiction::Contradiction> = None;
+    for hit in &found {
+        match hit.candidate {
+            contradiction::CandidateKey::Summary => summary_contradiction = Some(hit.clone()),
+            contradiction::CandidateKey::Fact(i) => {
+                validated[i].rejected_reason = Some(
+                    RejectReason::ContradictsThought {
+                        thought_id: hit.thought_id,
+                    }
+                    .to_string(),
+                );
+            }
+        }
+    }
 
     if let Err(needed) = overlays_fit(&validated, overlay_budget_tokens) {
         discard_draft(
@@ -1247,8 +1292,37 @@ pub fn fill_draft(
             Some(attitude_json),
         )
         .map_err(DraftError::Store)?;
-    store
+    let ids = store
         .insert_facts(draft.id, &validated)
+        .map_err(DraftError::Store)?;
+
+    // #219: snapshot the judge's verdict against the rows it now has real
+    // ids for. `replace_contradictions` always runs (even with an empty
+    // `rows`), so a re-run of `fill_draft` (there is none in production
+    // today, but nothing else here assumes it) never leaves a stale row
+    // behind.
+    let mut contradiction_rows = Vec::new();
+    if let Some(hit) = &summary_contradiction {
+        contradiction_rows.push(contradiction::StoredContradiction {
+            fact_id: None,
+            thought_id: hit.thought_id,
+            thought_text: hit.thought_text.clone(),
+            quote: hit.quote.clone(),
+        });
+    }
+    for hit in &found {
+        if let contradiction::CandidateKey::Fact(i) = hit.candidate {
+            contradiction_rows.push(contradiction::StoredContradiction {
+                fact_id: Some(ids[i]),
+                thought_id: hit.thought_id,
+                thought_text: hit.thought_text.clone(),
+                quote: hit.quote.clone(),
+            });
+        }
+    }
+    check
+        .store
+        .replace_contradictions(draft.id, &contradiction_rows)
         .map_err(DraftError::Store)?;
 
     Ok(())
@@ -1436,6 +1510,10 @@ fn run_extraction(
     // for the overlay/rule items this draft's facts will render into.
     let overlay_budget_tokens = ContextManager::new(config).token_budget.total * 15 / 100;
 
+    let check = ThoughtCheck {
+        thoughts: &SqliteRunningThoughtStore,
+        store: &SqliteContradictionStore,
+    };
     fill_draft(
         store,
         &ResidentExtractor,
@@ -1443,6 +1521,7 @@ fn run_extraction(
         &range,
         &speakers,
         overlay_budget_tokens,
+        &check,
     )
     .map_err(|e| e.to_string())
 }
@@ -2025,8 +2104,17 @@ mod tests {
                 Ok(include_str!("fixtures/bad_draft.json").to_string()),
             ]);
 
-        fill_draft(&store, &extractor, &draft, &range, &speakers, usize::MAX)
-            .expect("fill_draft should succeed");
+        let no_check = contradiction::TestThoughtCheck::none();
+        fill_draft(
+            &store,
+            &extractor,
+            &draft,
+            &range,
+            &speakers,
+            usize::MAX,
+            &no_check.check(),
+        )
+        .expect("fill_draft should succeed");
 
         let updated = store.get_checkpoint(draft.id).unwrap().unwrap();
         assert_eq!(updated.status, CompactionStatus::Draft);
@@ -2051,8 +2139,17 @@ mod tests {
                 Ok(include_str!("fixtures/bad_draft.json").to_string()),
             ]);
 
-        fill_draft(&store, &extractor, &draft, &range, &speakers, usize::MAX)
-            .expect("fill_draft should succeed");
+        let no_check = contradiction::TestThoughtCheck::none();
+        fill_draft(
+            &store,
+            &extractor,
+            &draft,
+            &range,
+            &speakers,
+            usize::MAX,
+            &no_check.check(),
+        )
+        .expect("fill_draft should succeed");
 
         assert_eq!(extractor.prompts.lock().unwrap().len(), 1);
     }
@@ -2068,8 +2165,17 @@ mod tests {
             Ok("still not json".to_string()),
         ]);
 
-        let err = fill_draft(&store, &extractor, &draft, &range, &speakers, usize::MAX)
-            .expect_err("garbage twice should fail");
+        let no_check = contradiction::TestThoughtCheck::none();
+        let err = fill_draft(
+            &store,
+            &extractor,
+            &draft,
+            &range,
+            &speakers,
+            usize::MAX,
+            &no_check.check(),
+        )
+        .expect_err("garbage twice should fail");
         assert!(matches!(err, DraftError::Unparseable { .. }));
 
         let updated = store.get_checkpoint(draft.id).unwrap().unwrap();
@@ -2104,8 +2210,17 @@ mod tests {
         let speakers = fixture_speakers();
         let extractor = FakeExtractor::returning(Vec::<std::io::Result<String>>::new());
 
-        let err = fill_draft(&store, &extractor, &draft, &range, &speakers, usize::MAX)
-            .expect_err("a draft with raw_model_output already set must be rejected");
+        let no_check = contradiction::TestThoughtCheck::none();
+        let err = fill_draft(
+            &store,
+            &extractor,
+            &draft,
+            &range,
+            &speakers,
+            usize::MAX,
+            &no_check.check(),
+        )
+        .expect_err("a draft with raw_model_output already set must be rejected");
         assert!(matches!(err, DraftError::DraftNotPending(id) if id == draft_id));
         assert!(store.facts_for(draft_id).unwrap().is_empty());
         assert_eq!(extractor.prompts.lock().unwrap().len(), 0);
@@ -2123,8 +2238,17 @@ mod tests {
         let speakers = fixture_speakers();
         let extractor = FakeExtractor::returning(Vec::<std::io::Result<String>>::new());
 
-        let err = fill_draft(&store, &extractor, &draft, &[], &speakers, usize::MAX)
-            .expect_err("an empty range should be discarded, not extracted");
+        let no_check = contradiction::TestThoughtCheck::none();
+        let err = fill_draft(
+            &store,
+            &extractor,
+            &draft,
+            &[],
+            &speakers,
+            usize::MAX,
+            &no_check.check(),
+        )
+        .expect_err("an empty range should be discarded, not extracted");
         assert!(matches!(err, DraftError::EmptyRange(id) if id == draft.id));
 
         let updated = store.get_checkpoint(draft.id).unwrap().unwrap();
@@ -2145,13 +2269,206 @@ mod tests {
                 Ok(include_str!("fixtures/bad_draft.json").to_string()),
             ]);
 
-        let err = fill_draft(&store, &extractor, &draft, &range, &speakers, 0)
-            .expect_err("zero overlay budget should discard the draft");
+        let no_check = contradiction::TestThoughtCheck::none();
+        let err = fill_draft(
+            &store,
+            &extractor,
+            &draft,
+            &range,
+            &speakers,
+            0,
+            &no_check.check(),
+        )
+        .expect_err("zero overlay budget should discard the draft");
         assert!(matches!(err, DraftError::OverlayBudget { .. }));
 
         let updated = store.get_checkpoint(draft.id).unwrap().unwrap();
         assert_eq!(updated.status, CompactionStatus::Discarded);
         assert!(store.facts_for(draft.id).unwrap().is_empty());
+    }
+
+    // --- fill_draft x contradiction (#219) ---
+
+    /// A two-item `state` extraction output referencing real synthetic-range
+    /// sources: index 0 is about Eric (the user), index 1 about Vi (the
+    /// companion) — `to_fact_drafts` puts `state` items first, in order, so
+    /// these land at `Fact(0)`/`Fact(1)` respectively once accepted.
+    fn two_state_items_output() -> String {
+        r#"{
+            "state": [
+                {"text": "Eric moved into a lighthouse on the coast", "sources": [46], "replaces": []},
+                {"text": "Vi has traveled far from the coast before", "sources": [46], "replaces": []}
+            ],
+            "milestones": [], "backstory": [], "open_threads": [], "rules": [], "people": [], "key_quotes": [],
+            "summary": "Eric and Vi are settling into a new lighthouse home.",
+            "attitude": {"trust":0,"love":0,"fear":0,"anger":0,"joy":0,"sorrow":0,"suspicion":0,"gratitude":0}
+        }"#
+        .to_string()
+    }
+
+    #[test]
+    fn with_no_covering_thoughts_the_extractor_sees_exactly_the_same_calls_as_before_219() {
+        let store = RecordingStore::new();
+        let range = synthetic_range();
+        let draft = a_pending_draft(&store, &range);
+        let speakers = fixture_speakers();
+        let extractor = FakeExtractor::returning(vec![Ok(two_state_items_output())]);
+        let no_check = contradiction::TestThoughtCheck::none();
+
+        fill_draft(
+            &store,
+            &extractor,
+            &draft,
+            &range,
+            &speakers,
+            usize::MAX,
+            &no_check.check(),
+        )
+        .expect("fill_draft should succeed");
+
+        // Exactly the one extraction call -- the contradiction judge never
+        // ran because there were no covering thoughts (AC 4).
+        assert_eq!(extractor.prompts.lock().unwrap().len(), 1);
+        assert!(no_check.stored_for(draft.id).is_empty());
+        assert!(store.facts_for(draft.id).unwrap().iter().all(|f| f.active));
+    }
+
+    #[test]
+    fn a_covering_thought_contradicting_one_fact_rejects_only_that_fact_and_is_recorded() {
+        let store = RecordingStore::new();
+        let range = synthetic_range();
+        let draft = a_pending_draft(&store, &range);
+        let speakers = fixture_speakers();
+        let extractor = FakeExtractor::returning(vec![
+            Ok(two_state_items_output()),
+            // Candidates in this draft are `[Summary, Fact(0) "Eric ...",
+            // Fact(1) "Vi ..."]`, one batch, so candidate index 2 is the Vi
+            // item.
+            // `to_fact_drafts` strips the declaring name off a `state`
+            // item's stored text (see `strip_leading_name`), so the
+            // verbatim quote the judge names must match the *stored* text,
+            // not the original "Vi has traveled ..." extraction text.
+            Ok(r#"{"contradictions": [{"candidate": 2, "thought": 0, "quote": "has traveled far from the coast before"}]}"#.to_string()),
+        ]);
+        let thoughts =
+            contradiction::TestThoughtCheck::with_thoughts(vec![contradiction::CuratedThought {
+                id: 99,
+                text: "Vi has never left the coast".to_string(),
+                edited: false,
+            }]);
+
+        fill_draft(
+            &store,
+            &extractor,
+            &draft,
+            &range,
+            &speakers,
+            usize::MAX,
+            &thoughts.check(),
+        )
+        .expect("fill_draft should succeed");
+
+        let updated = store.get_checkpoint(draft.id).unwrap().unwrap();
+        assert_eq!(updated.status, CompactionStatus::Draft);
+
+        let facts = store.facts_for(draft.id).unwrap();
+        let vi_fact = facts
+            .iter()
+            .find(|f| f.text.contains("traveled far"))
+            .expect("the flagged item should still be stored");
+        assert!(!vi_fact.active);
+        assert!(vi_fact
+            .rejected_reason
+            .as_deref()
+            .unwrap()
+            .starts_with(crate::compaction::validate::CONTRADICTS_THOUGHT_PREFIX));
+
+        let eric_fact = facts
+            .iter()
+            .find(|f| f.text.contains("lighthouse on the coast"))
+            .expect("the untouched item should still be stored");
+        assert!(eric_fact.active, "only the flagged item should be affected");
+
+        let stored = thoughts.stored_for(draft.id);
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].fact_id, Some(vi_fact.id));
+        assert_eq!(stored[0].thought_id, 99);
+    }
+
+    #[test]
+    fn a_covering_thought_contradicting_the_summary_leaves_the_draft_reviewable() {
+        let store = RecordingStore::new();
+        let range = synthetic_range();
+        let draft = a_pending_draft(&store, &range);
+        let speakers = fixture_speakers();
+        let extractor = FakeExtractor::returning(vec![
+            Ok(two_state_items_output()),
+            Ok(r#"{"contradictions": [{"candidate": 0, "thought": 0, "quote": "settling into a new lighthouse home"}]}"#.to_string()),
+        ]);
+        let thoughts =
+            contradiction::TestThoughtCheck::with_thoughts(vec![contradiction::CuratedThought {
+                id: 5,
+                text: "they are still living out of boxes at the old apartment".to_string(),
+                edited: true,
+            }]);
+
+        fill_draft(
+            &store,
+            &extractor,
+            &draft,
+            &range,
+            &speakers,
+            usize::MAX,
+            &thoughts.check(),
+        )
+        .expect("fill_draft should succeed");
+
+        // The summary contradiction never discards or rejects anything at
+        // fill_draft time -- it is only stored for the review card and
+        // commit-time re-check (#219 design: the summary reject path lives
+        // at commit, not extraction).
+        let updated = store.get_checkpoint(draft.id).unwrap().unwrap();
+        assert_eq!(updated.status, CompactionStatus::Draft);
+        assert!(updated.summary.is_some());
+        assert!(store.facts_for(draft.id).unwrap().iter().all(|f| f.active));
+
+        let stored = thoughts.stored_for(draft.id);
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].fact_id, None);
+        assert_eq!(stored[0].thought_id, 5);
+    }
+
+    #[test]
+    fn a_judge_model_error_fails_closed_without_inserting_facts_or_rows() {
+        let store = RecordingStore::new();
+        let range = synthetic_range();
+        let draft = a_pending_draft(&store, &range);
+        let speakers = fixture_speakers();
+        let extractor = FakeExtractor::returning(vec![
+            Ok(two_state_items_output()),
+            Err(std::io::Error::other("simulated judge failure")),
+        ]);
+        let thoughts =
+            contradiction::TestThoughtCheck::with_thoughts(vec![contradiction::CuratedThought {
+                id: 1,
+                text: "irrelevant".to_string(),
+                edited: false,
+            }]);
+
+        let err = fill_draft(
+            &store,
+            &extractor,
+            &draft,
+            &range,
+            &speakers,
+            usize::MAX,
+            &thoughts.check(),
+        )
+        .expect_err("a judge model error should fail, not silently commit");
+        assert!(matches!(err, DraftError::Model(_)));
+
+        assert!(store.facts_for(draft.id).unwrap().is_empty());
+        assert!(thoughts.stored_for(draft.id).is_empty());
     }
 
     // --- fail_pending_draft (#208) ---
@@ -2660,8 +2977,17 @@ mod tests {
             "simulated model load failure",
         ))]);
 
-        let err = fill_draft(&store, &extractor, &draft, &range, &speakers, usize::MAX)
-            .expect_err("a model error should fail, not silently succeed");
+        let no_check = contradiction::TestThoughtCheck::none();
+        let err = fill_draft(
+            &store,
+            &extractor,
+            &draft,
+            &range,
+            &speakers,
+            usize::MAX,
+            &no_check.check(),
+        )
+        .expect_err("a model error should fail, not silently succeed");
         assert!(matches!(err, DraftError::Model(_)));
 
         // `fill_draft` alone (what this test exercises directly, since

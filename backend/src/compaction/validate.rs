@@ -51,7 +51,20 @@ pub enum RejectReason {
     /// [`RejectReason::UnknownSubject`], set by `extract::to_fact_drafts`,
     /// which is where the range's names are known.
     PrincipalAsPerson,
+    /// The item's text contradicts one of the companion's own curated
+    /// running thoughts (#219) covering this checkpoint's range — the model
+    /// judge in `contradiction::check` quoted the conflicting words. Never
+    /// set by [`validate`] itself: only `extract::fill_draft`'s
+    /// contradiction step has the judge's verdict and the range's thoughts.
+    ContradictsThought { thought_id: i64 },
 }
+
+/// The fixed prefix [`RejectReason::ContradictsThought`]'s `Display` starts
+/// with, so a caller holding only the stored string (never the enum) can
+/// still recognise the reason by prefix — the same string-compare approach
+/// `review.rs::is_set_only_at_extraction` uses for `UnknownSubject`/
+/// `PrincipalAsPerson`.
+pub const CONTRADICTS_THOUGHT_PREFIX: &str = "contradicts running thought";
 
 impl fmt::Display for RejectReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -81,6 +94,9 @@ impl fmt::Display for RejectReason {
             }
             RejectReason::PrincipalAsPerson => {
                 write!(f, "people item names a participant, not a third party")
+            }
+            RejectReason::ContradictsThought { thought_id } => {
+                write!(f, "{CONTRADICTS_THOUGHT_PREFIX} {thought_id}")
             }
         }
     }
@@ -830,5 +846,13 @@ mod tests {
         let mut rejected = a_draft(FactCategory::Rule, "a rejected rule", vec![46]);
         rejected.rejected_reason = Some("test".to_string());
         assert_eq!(overlays_fit(&[rejected], 0), Ok(()));
+    }
+
+    #[test]
+    fn contradicts_thought_display_starts_with_its_fixed_prefix_and_carries_the_thought_id() {
+        let reason = RejectReason::ContradictsThought { thought_id: 42 };
+        let rendered = reason.to_string();
+        assert!(rendered.starts_with(CONTRADICTS_THOUGHT_PREFIX));
+        assert!(rendered.contains("42"));
     }
 }

@@ -101,6 +101,16 @@ export interface AttitudePreview {
     blended: AttitudeData | null;
 }
 
+// One contradiction against a curated running thought (#219), mirroring the
+// backend's `compaction::view::ContradictionView`. `fact_id: null` names the
+// checkpoint's summary rather than one of `CheckpointDetail.facts`.
+export interface ContradictionView {
+    fact_id: number | null;
+    thought_id: number;
+    thought_text: string;
+    quote: string;
+}
+
 // `GET /api/compaction/{id}`'s body, mirroring the backend's
 // `compaction::view::CheckpointDetail` (its `#[serde(flatten)] summary`
 // field flattens onto this same object).
@@ -110,6 +120,7 @@ export interface CheckpointDetail extends CheckpointSummary {
     rolling_summary: string | null;
     facts: CompactionFact[];
     attitude: AttitudePreview;
+    contradictions: ContradictionView[];
 }
 
 // One item's review, mirroring the backend's `compaction::review::ItemReview`
@@ -130,9 +141,12 @@ export interface CompactionDraftReview {
     summary?: string;
 }
 
-// One item `apply_review` rejected, mirroring the backend's
-// `compaction::review::RejectedItem` — the `422` body shape.
+// One item `apply_review` (or #219's commit-time re-check) rejected,
+// mirroring the backend's `compaction::review::RejectedItem` — the `422`
+// body shape. `item_id: null` names the checkpoint's summary rather than a
+// fact; only the re-check produces that -- a plain `apply_review` rejection
+// always carries a fact id.
 export interface RejectedItem {
-    item_id: number;
+    item_id: number | null;
     reason: string;
 }
