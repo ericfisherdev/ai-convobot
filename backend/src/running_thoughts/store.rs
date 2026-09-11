@@ -21,7 +21,7 @@
 //! below, which is what the #215 acceptance criteria ask for.
 #![allow(dead_code)]
 
-use rusqlite::{params, Connection, Error, OptionalExtension, Result, Row};
+use rusqlite::{params, Connection, Error, OptionalExtension, Result, Row, TransactionBehavior};
 
 use crate::database::{get_current_date, Database};
 use crate::running_thoughts::types::{NewRunningThought, RunningThought};
@@ -341,7 +341,16 @@ impl RunningThoughtStore for SqliteRunningThoughtStore {
 
     fn delete_from(&self, companion_id: i32, message_id: i32) -> Result<Vec<RunningThought>> {
         let mut con = Database::open()?;
-        let tx = con.transaction()?;
+        // `Immediate`, not the default `Deferred`: `delete_from_on` reads
+        // before it writes, so a deferred transaction starts as a read and
+        // only upgrades to a write lock at the `DELETE`. Under WAL, a
+        // concurrent writer that commits in between can make that upgrade
+        // fail with `SQLITE_BUSY_SNAPSHOT` (the busy timeout does not retry
+        // a write-upgrade rejection), which would abort the `DELETE`
+        // without ever returning a mismatched row set. Taking the write
+        // lock up front avoids the race entirely, matching every other
+        // select-then-write transaction in `database.rs`.
+        let tx = con.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let deleted = delete_from_on(&tx, companion_id, message_id)?;
         tx.commit()?;
         Ok(deleted)
