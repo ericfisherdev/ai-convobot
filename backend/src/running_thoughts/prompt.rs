@@ -148,25 +148,45 @@ fn render_thought_block(header: &str, notes: &[RunningThought]) -> String {
     block
 }
 
+/// A closing quote or bracket, in any script the thought generator might
+/// write in: ASCII/curly quotes, French/CJK closing guillemets, brackets.
+fn is_closing_mark(c: char) -> bool {
+    matches!(c, '"' | '\'' | '”' | '’' | '»' | '」' | '』' | ')' | ']')
+}
+
 /// Trims a capped completion back to its last sentence boundary (#235), so
 /// a thought that hit `THOUGHT_MAX_TOKENS` is never stored mid-word. Keeps
-/// any closing quote/bracket that immediately follows the terminator (`He
-/// said "fine."` stays whole). When `text` has no `. ! ? …`, it is returned
-/// unchanged: an abrupt run-on beats dropping the only note the model wrote,
-/// and this is the invariant `clean_thought` relies on to never turn a
-/// non-empty completion into `None` because of this step.
+/// any run of closing quotes/brackets that immediately follows the
+/// terminator (`He said "fine."` stays whole; so does a stacked
+/// `("fine.")`), including one separated from the terminator by a single
+/// space, the French convention around a closing guillemet (`ça va. »`).
+/// When `text` has no `. ! ? …`, it is returned unchanged: an abrupt run-on
+/// beats dropping the only note the model wrote, and this is the invariant
+/// `clean_thought` relies on to never turn a non-empty completion into
+/// `None` because of this step.
 fn trim_to_last_sentence_boundary(text: &str) -> &str {
     let Some(idx) = text.rfind(['.', '!', '?', '…']) else {
         return text;
     };
     let terminator_len = text[idx..].chars().next().map_or(1, char::len_utf8);
     let mut end = idx + terminator_len;
-    for c in text[end..].chars() {
-        if matches!(c, '"' | '\'' | '”' | '’' | ')' | ']') {
-            end += c.len_utf8();
-        } else {
+    loop {
+        let rest = &text[end..];
+        let Some(c) = rest.chars().next() else {
             break;
+        };
+        if is_closing_mark(c) {
+            end += c.len_utf8();
+            continue;
         }
+        if c.is_whitespace() {
+            let after_whitespace = &rest[c.len_utf8()..];
+            if after_whitespace.chars().next().is_some_and(is_closing_mark) {
+                end += c.len_utf8();
+                continue;
+            }
+        }
+        break;
     }
     &text[..end]
 }
@@ -438,6 +458,26 @@ mod tests {
     }
 
     #[test]
+    fn clean_thought_on_an_uncapped_completion_never_trims_even_when_a_boundary_exists() {
+        // Unlike the case above, this input DOES have a sentence boundary
+        // partway through, so it would be trimmed if the `hit_token_cap`
+        // guard were dropped or ignored. `hit_token_cap: false` must leave
+        // it alone.
+        assert_eq!(
+            clean_thought("I trust her now. She seems to be worried", "Bob", false),
+            Some("I trust her now. She seems to be worried".to_string())
+        );
+    }
+
+    #[test]
+    fn clean_thought_on_a_capped_completion_keeps_stacked_closing_brackets_and_quotes() {
+        assert_eq!(
+            clean_thought("She said (\"fine.\") and then ab", "Bob", true),
+            Some("She said (\"fine.\")".to_string())
+        );
+    }
+
+    #[test]
     fn clean_thought_trims_a_capped_multi_byte_completion_at_the_last_terminator() {
         assert_eq!(
             clean_thought(
@@ -446,6 +486,17 @@ mod tests {
                 true
             ),
             Some("Elle m'a dit « ça va ».".to_string())
+        );
+    }
+
+    #[test]
+    fn clean_thought_on_a_capped_completion_keeps_a_closing_guillemet_after_a_space() {
+        // French typographic convention puts a space before a closing
+        // guillemet, so the terminator and the closer are not literally
+        // adjacent.
+        assert_eq!(
+            clean_thought("Elle a dit « ça va. » Je pense ab", "Bob", true),
+            Some("Elle a dit « ça va. »".to_string())
         );
     }
 
