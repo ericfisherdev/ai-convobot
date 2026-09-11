@@ -33,12 +33,13 @@ import { ParticipantsStrip } from "./multiplayer/ParticipantsStrip";
 import { JoinerBanner } from "./multiplayer/JoinerBanner";
 import {
     initialRoundStreamState,
-    parseStreamChunk,
+    readStreamChunks,
     reduceStreamChunk,
-    splitSseRecords,
     StreamEffect,
 } from "../lib/roundStream";
 import { scrollToMessage } from "../lib/messageAnchors";
+import { useRunningThoughts } from "./context/runningThoughtsContext";
+import { RunningThoughtsPanel } from "./thoughts/RunningThoughtsPanel";
 
 const ChatWindow = () => {
   const companionDataContext = useCompanionData();
@@ -50,6 +51,7 @@ const ChatWindow = () => {
   const { draftReady, pendingDraft } = useCompaction();
   const { session } = useSession();
   const { status, refreshParticipants } = useParticipants();
+  const { beginPending, receiveThought, dropPending } = useRunningThoughts();
 
   const [userMessage, setUserMessage] = useState('');
   const [companionMessage, setCompanionMessage] = useState('');
@@ -134,9 +136,6 @@ const ChatWindow = () => {
         throw new Error(`Streaming request failed with status ${response.status}`);
       }
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
       let streamState = initialRoundStreamState();
       let streamErrorMessage: string | null = null;
 
@@ -181,14 +180,13 @@ const ChatWindow = () => {
               awaitedDraftScrollIdRef.current = effect.draftId;
               break;
             case 'thought_started':
-              // #218 renders the pending-thought indicator this announces.
+              beginPending(effect.speakerId);
               break;
             case 'thought':
-              // #218 renders the companion's running thoughts panel from
-              // `state.thoughts`; nothing to do here yet.
+              receiveThought(effect.thought);
               break;
             case 'thought_dropped':
-              // #218 removes its pending-thought indicator for this speaker.
+              dropPending();
               break;
             case 'round_complete':
               // A bot may have dropped mid-round; pick that up immediately
@@ -202,24 +200,10 @@ const ChatWindow = () => {
         }
       };
 
-      // Server-Sent Events arrive as "data: {json}\n\n" records, and a single
-      // read can contain a partial record, so hold the remainder in a buffer.
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const { records, rest } = splitSseRecords(buffer);
-        buffer = rest;
-
-        for (const record of records) {
-          const chunk = parseStreamChunk(record);
-          if (!chunk) continue;
-
-          const { state: nextState, effects } = reduceStreamChunk(streamState, chunk, nextTempId);
-          streamState = nextState;
-          applyStreamEffects(effects);
-        }
+      for await (const chunk of readStreamChunks(response.body)) {
+        const { state: nextState, effects } = reduceStreamChunk(streamState, chunk, nextTempId);
+        streamState = nextState;
+        applyStreamEffects(effects);
       }
 
       if (streamErrorMessage) {
@@ -241,6 +225,7 @@ const ChatWindow = () => {
 
     } catch (error) {
       console.error('Error sending message:', error);
+      dropPending();
       refreshMessages();
       refreshParticipants();
       toast.error(`Error while sending a message: ${error}`);
@@ -295,9 +280,10 @@ const ChatWindow = () => {
 
     return (
         <main className={cn(
-          "h-full flex flex-col",
+          "h-full flex flex-col lg:flex-row",
           isStandalone && "mobile-safe-area"
         )}>
+        <div className="flex-1 min-h-0 min-w-0 flex flex-col">
           {/* Header - responsive layout */}
           <div className={cn(
             "flex items-center justify-between p-4 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60",
@@ -400,6 +386,8 @@ const ChatWindow = () => {
           {session && session.user_id !== null && (
             <AttitudeSummaryBar companionId={session.companion_id} userId={session.user_id} />
           )}
+        </div>
+        <RunningThoughtsPanel className="lg:w-80 xl:w-96 lg:border-l max-h-[40vh] lg:max-h-none" />
         </main>
     )
 }

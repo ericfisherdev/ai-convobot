@@ -2,11 +2,13 @@ import { describe, it, expect } from 'vitest'
 import {
   initialRoundStreamState,
   parseStreamChunk,
+  readStreamChunks,
   reduceStreamChunk,
   splitSseRecords,
   RoundStreamState,
   StreamEffect,
 } from '../roundStream'
+import { StreamChunk } from '../../components/interfaces/Message'
 
 // Encodes chunks the way `/api/prompt/stream` does, then feeds them through
 // `parseStreamChunk`/`reduceStreamChunk` exactly as `ChatWindow.tsx` does,
@@ -221,5 +223,62 @@ describe('roundStream', () => {
     ])
 
     expect(effects.some(e => e.type === 'thought_dropped')).toBe(false)
+  })
+
+  it('an unrecognised event returns the state unchanged and no effects instead of throwing', () => {
+    const state = initialRoundStreamState()
+    const chunk = {
+      request_id: 'r1',
+      // A newer backend's event this build does not know about yet.
+      event: 'thought_regenerated' as unknown as StreamChunk['event'],
+      content: '',
+      is_complete: false,
+      speaker_id: 'char',
+    }
+
+    const result = reduceStreamChunk(state, chunk, () => -1)
+
+    expect(result).toEqual({ state, effects: [] })
+  })
+})
+
+describe('readStreamChunks', () => {
+  // Encodes each record the way `/api/prompt/stream` does, then splits the
+  // whole byte sequence at `splitAt` -- mid-record when it falls inside one
+  // -- across two separate `read()` results, the same partial-record
+  // scenario `splitSseRecords`'s `rest` handles.
+  function streamOf(chunks: unknown[], splitAt: number): ReadableStream<Uint8Array> {
+    const encoder = new TextEncoder()
+    const bytes = encoder.encode(chunks.map(c => `data: ${JSON.stringify(c)}\n\n`).join(''))
+    const first = bytes.slice(0, splitAt)
+    const second = bytes.slice(splitAt)
+    return new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(first)
+        controller.enqueue(second)
+        controller.close()
+      },
+    })
+  }
+
+  it('reassembles a record split across two reads', async () => {
+    const chunks = [
+      { request_id: 'r1', event: 'reply_started', content: '', is_complete: false, speaker_id: 'char' },
+      { request_id: 'r1', event: 'reply_complete', content: 'hi', is_complete: false, speaker_id: 'char', message_id: 1 },
+    ]
+    const encoder = new TextEncoder()
+    const wholeLength = encoder.encode(`data: ${JSON.stringify(chunks[0])}\n\n`).length
+
+    // Split partway through the first record's bytes, not on a boundary.
+    const body = streamOf(chunks, wholeLength - 5)
+
+    const received: StreamChunk[] = []
+    for await (const chunk of readStreamChunks(body)) {
+      received.push(chunk)
+    }
+
+    expect(received).toHaveLength(2)
+    expect(received[0]).toMatchObject({ event: 'reply_started', speaker_id: 'char' })
+    expect(received[1]).toMatchObject({ event: 'reply_complete', content: 'hi', message_id: 1 })
   })
 })

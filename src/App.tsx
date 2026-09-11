@@ -7,6 +7,7 @@ import ChatWindow from './components/ChatWindow'
 import { PWAInstallPrompt } from './components/mobile/PWAInstallPrompt'
 import { MessagesProvider } from './components/context/messageContext'
 import { CompactionProvider } from './components/context/compactionContext'
+import { RunningThoughtsProvider } from './components/context/runningThoughtsContext'
 import { UserDataProvider } from './components/context/userContext'
 import { CompanionDataProvider } from './components/context/companionContext'
 import { ConfigProvider } from './components/context/configContext'
@@ -31,9 +32,11 @@ function App() {
                   <SessionProvider>
                     <MessagesProvider>
                       <CompactionProvider>
-                        <div className='max-container'>
-                          <ChatWindow />
-                        </div>
+                        <RunningThoughtsProvider>
+                          <div className='max-container'>
+                            <ChatWindow />
+                          </div>
+                        </RunningThoughtsProvider>
                       </CompactionProvider>
                       <Toaster />
                       <PWAInstallPrompt />
