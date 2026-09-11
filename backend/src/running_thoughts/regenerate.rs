@@ -219,8 +219,18 @@ pub fn regenerate_from(
                 // Same rule as the failure arm below: every row after this
                 // one is already deleted too, so restore them before
                 // reporting rather than losing them behind this one error.
-                let later_failure = restore_all(store, &captured[index + 1..]);
-                return Err(ThoughtRegenerateError::Store(later_failure.unwrap_or(e)));
+                // This row's own failure is logged here, in the same format
+                // `restore_all` uses for each of its own: only one error is
+                // ever returned, and `e` is the first one chronologically,
+                // so it is the one reported -- a later restore failure
+                // still runs (for its own side effects) but must not
+                // silently swallow this one.
+                eprintln!(
+                    "running thoughts: failed to restore the original for the round starting at message {}: {e}",
+                    original.from_message_id
+                );
+                restore_all(store, &captured[index + 1..]);
+                return Err(ThoughtRegenerateError::Store(e));
             }
             continue;
         }
@@ -630,12 +640,12 @@ mod tests {
     /// restore failure without touching real SQLite.
     struct FailingReinsertStore {
         inner: RecordingStore,
-        fails_for_text: &'static str,
+        fails_for_texts: &'static [&'static str],
     }
 
     impl RunningThoughtStore for FailingReinsertStore {
         fn insert(&self, thought: NewRunningThought) -> rusqlite::Result<i64> {
-            if thought.text == self.fails_for_text {
+            if self.fails_for_texts.contains(&thought.text.as_str()) {
                 return Err(rusqlite::Error::InvalidQuery);
             }
             self.inner.insert(thought)
@@ -696,7 +706,7 @@ mod tests {
     fn a_failed_restore_still_restores_every_other_row_instead_of_stopping_at_the_first_failure() {
         let store = FailingReinsertStore {
             inner: RecordingStore::new(),
-            fails_for_text: "round two",
+            fails_for_texts: &["round two"],
         };
         seed(&store.inner, "char", 1, 3, "round one");
         seed(&store.inner, "char", 4, 6, "round two");
@@ -757,7 +767,7 @@ mod tests {
         // pins, just in the other branch.
         let store = FailingReinsertStore {
             inner: RecordingStore::new(),
-            fails_for_text: "bot1's own note",
+            fails_for_texts: &["bot1's own note"],
         };
         seed(&store.inner, "char", 1, 3, "round one");
         store
@@ -800,5 +810,62 @@ mod tests {
             .find(|t| t.from_message_id == 7)
             .expect("round three must still be restored even though bot1's restore failed");
         assert_eq!(restored_three.text, "round three");
+    }
+
+    #[test]
+    fn when_a_non_owned_rows_restore_and_a_later_restore_both_fail_the_non_owned_rows_error_is_reported(
+    ) {
+        // PR #227 review, round 4: the non-owned-speaker branch's own
+        // failure (`e`) was discarded unlogged whenever the subsequent
+        // `restore_all(&captured[index + 1..])` call also failed --
+        // `later_failure.unwrap_or(e)` silently prefers the later error.
+        // `e` is chronologically first, so it is the one that must be
+        // logged and returned; `round three`'s own failure still needs
+        // `restore_all` to run (for its own side effects/logging) even
+        // though this row's error is what gets reported.
+        let store = FailingReinsertStore {
+            inner: RecordingStore::new(),
+            fails_for_texts: &["bot1's own note", "round three"],
+        };
+        seed(&store.inner, "char", 1, 3, "round one");
+        store
+            .inner
+            .insert(NewRunningThought {
+                companion_id: 1,
+                speaker_id: "bot1".to_string(),
+                from_message_id: 4,
+                through_message_id: 6,
+                text: "bot1's own note".to_string(),
+                edited: false,
+            })
+            .unwrap();
+        seed(&store.inner, "char", 7, 9, "round three");
+
+        let err = regenerate_from(
+            &store,
+            &mut |speaker, from, through| Ok(inputs_of(speaker, from, through)),
+            &mut always_succeeds(),
+            &a_request(1),
+            &mut RecordingSink::default(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ThoughtRegenerateError::Store(_)));
+
+        let after = store.list(1).unwrap();
+        assert!(
+            after
+                .iter()
+                .any(|t| t.from_message_id == 1 && t.text.contains("fresh note")),
+            "round one should still have regenerated"
+        );
+        assert!(
+            !after.iter().any(|t| t.speaker_id == "bot1"),
+            "bot1's row's own restore failed, so it is genuinely gone"
+        );
+        assert!(
+            !after.iter().any(|t| t.from_message_id == 7),
+            "round three's restore also failed, so it is genuinely gone too"
+        );
     }
 }
