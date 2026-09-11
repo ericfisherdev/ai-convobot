@@ -51,12 +51,13 @@ mod chat_turn;
 use crate::chat_turn::{PendingTurn, PersistedReply, SqliteTurnStore, TurnStore};
 mod compaction;
 mod running_thoughts;
-use crate::compaction::commit::{CommitBudget, CommitError};
+use crate::compaction::commit::{CommitBudget, CommitDeps, CommitError, ReviewedDraft};
 use crate::compaction::contradiction::{
     check as check_contradictions, ContradictionStore, CoveringThoughts, SqliteContradictionStore,
+    StoredContradiction,
 };
 use crate::compaction::review::{
-    apply_review, recheck_candidates, rejections_from, CommitRequest, ReviewError,
+    apply_review, recheck_candidates, rejections_from, CommitRequest, RejectedItem, ReviewError,
 };
 use crate::compaction::store::{CompactionStore, SqliteCompactionStore};
 use crate::compaction::types::{Checkpoint, CompactionTrigger};
@@ -2472,6 +2473,7 @@ async fn compaction_detail(
 }
 
 /// Why `POST /api/compaction/{id}/commit` could not commit a draft.
+#[derive(Debug)]
 enum CompactionCommitError {
     Review(ReviewError),
     Commit(CommitError),
@@ -2512,6 +2514,152 @@ impl CompactionCommitError {
             }
         }
     }
+}
+
+/// What #219's commit-time recheck decided about a draft's
+/// `compaction_contradictions` rows, without writing anything itself: only
+/// [`Reject`](RecheckDecision::Reject)'s `rows` are safe to persist
+/// immediately, since that branch never reaches `commit::commit`.
+/// [`Proceed`](RecheckDecision::Proceed)'s `rows` must wait until the commit
+/// that follows has returned `Ok` -- writing them first (as the code did
+/// before #226) leaves a draft that fails to commit with its
+/// previously-flagged rows already cleared or overwritten, so a later
+/// review/commit of the same draft reads an empty or stale-fresh
+/// `previously_flagged` set instead of the one that still applies.
+#[derive(Debug, PartialEq)]
+enum RecheckDecision {
+    /// Nothing was previously flagged (`rows: None`, no model call, nothing
+    /// to write either way), or the recheck came back clean -- every
+    /// previously-flagged item was struck/edited away, or the fresh judge
+    /// found nothing (`rows: Some(_)`, possibly empty, replacing the stale
+    /// rows once the commit succeeds).
+    Proceed {
+        rows: Option<Vec<StoredContradiction>>,
+    },
+    /// The recheck still found a contradiction against the *current*
+    /// covering thoughts: `rows` are the fresh verdicts and `rejections`
+    /// names what to reject the commit request with. The draft is not
+    /// committed on this branch, so there is no commit outcome for the
+    /// write to race.
+    Reject {
+        rows: Vec<StoredContradiction>,
+        rejections: Vec<RejectedItem>,
+    },
+}
+
+/// Re-judges a draft's previously-flagged items against the *current*
+/// covering thoughts (#219: accepting a flagged item at review does not
+/// clear the contradiction check the way a re-derivable `RejectReason`
+/// does -- the only way past it is a fresh clean verdict, since the user may
+/// have fixed the text, or fixed/deleted the wrong thought). No model call
+/// when nothing was ever flagged, or nothing flagged is still an accepted
+/// candidate. Decides what should happen to the stored rows without writing
+/// anything -- see [`RecheckDecision`] and [`commit_reviewed_draft`].
+fn recheck_contradictions(
+    contradiction_store: &dyn ContradictionStore,
+    thoughts: &dyn CoveringThoughts,
+    extractor: &impl llm::Extractor,
+    checkpoint: &Checkpoint,
+    reviewed: &ReviewedDraft,
+) -> Result<RecheckDecision, CompactionCommitError> {
+    let previously_flagged = contradiction_store.contradictions_for(checkpoint.id)?;
+    if previously_flagged.is_empty() {
+        return Ok(RecheckDecision::Proceed { rows: None });
+    }
+
+    let recheck = recheck_candidates(reviewed, &previously_flagged);
+    if recheck.is_empty() {
+        // Every flagged item was struck at review, edited away, or the
+        // covering thought was deleted -- nothing left to re-judge, so the
+        // stale rows are cleared rather than left to haunt a future review
+        // card.
+        return Ok(RecheckDecision::Proceed {
+            rows: Some(Vec::new()),
+        });
+    }
+
+    let current_thoughts = thoughts
+        .covering(
+            checkpoint.companion_id,
+            checkpoint.from_message_id,
+            checkpoint.through_message_id,
+        )
+        .map_err(CompactionCommitError::from)?;
+    let judge_candidates: Vec<_> = recheck.iter().map(|(_, c)| *c).collect();
+    let fresh = check_contradictions(extractor, &current_thoughts, &judge_candidates)
+        .map_err(CompactionCommitError::Recheck)?;
+
+    let fresh_rows: Vec<_> = fresh
+        .iter()
+        .filter_map(|hit| {
+            recheck
+                .iter()
+                .find(|(_, c)| c.key == hit.candidate)
+                .map(|(fact_id, _)| StoredContradiction {
+                    fact_id: *fact_id,
+                    thought_id: hit.thought_id,
+                    thought_text: hit.thought_text.clone(),
+                    quote: hit.quote.clone(),
+                })
+        })
+        .collect();
+
+    if fresh.is_empty() {
+        Ok(RecheckDecision::Proceed {
+            rows: Some(fresh_rows),
+        })
+    } else {
+        Ok(RecheckDecision::Reject {
+            rejections: rejections_from(&fresh, &recheck),
+            rows: fresh_rows,
+        })
+    }
+}
+
+/// Runs [`recheck_contradictions`] and, only when it decides to
+/// [`Proceed`](RecheckDecision::Proceed), attempts
+/// [`crate::compaction::commit::commit`] -- persisting that decision's rows
+/// (if any) *after* the commit succeeds, not before, so a commit that fails
+/// (planning or storage) leaves the draft's previously-flagged rows exactly
+/// as they were (#226). A [`Reject`](RecheckDecision::Reject) decision's
+/// rows are persisted immediately, since that branch never calls
+/// `commit::commit`.
+#[allow(clippy::too_many_arguments)]
+fn commit_reviewed_draft(
+    store: &dyn CompactionStore,
+    contradiction_store: &dyn ContradictionStore,
+    thoughts: &dyn CoveringThoughts,
+    extractor: &impl llm::Extractor,
+    checkpoint: &Checkpoint,
+    reviewed: ReviewedDraft,
+    deps: &CommitDeps<'_>,
+    budget: &CommitBudget,
+) -> Result<Checkpoint, CompactionCommitError> {
+    let decision = recheck_contradictions(
+        contradiction_store,
+        thoughts,
+        extractor,
+        checkpoint,
+        &reviewed,
+    )?;
+
+    let write_after_commit = match decision {
+        RecheckDecision::Reject { rows, rejections } => {
+            contradiction_store.replace_contradictions(checkpoint.id, &rows)?;
+            return Err(CompactionCommitError::Review(ReviewError::Rejected(
+                rejections,
+            )));
+        }
+        RecheckDecision::Proceed { rows } => rows,
+    };
+
+    let committed = crate::compaction::commit::commit(store, reviewed, deps, budget)?;
+
+    if let Some(rows) = write_after_commit {
+        contradiction_store.replace_contradictions(checkpoint.id, &rows)?;
+    }
+
+    Ok(committed)
 }
 
 /// Reviews and commits a pending draft: `request` edits/strikes the stored
@@ -2572,63 +2720,6 @@ async fn compaction_commit(
         let reviewed = apply_review(&checkpoint, facts, request, &range, &active, &is_canon)
             .map_err(CompactionCommitError::Review)?;
 
-        // #219: accepting a flagged item at review does not clear the
-        // contradiction check the way a re-derivable `RejectReason` does --
-        // the only way past it is a fresh clean verdict against the
-        // *current* covering thoughts (the user may have fixed the text, or
-        // fixed/deleted the wrong thought). No model call when nothing was
-        // ever flagged, or nothing flagged is still an accepted candidate.
-        let previously_flagged = SqliteContradictionStore.contradictions_for(checkpoint.id)?;
-        if !previously_flagged.is_empty() {
-            let recheck = recheck_candidates(&reviewed, &previously_flagged);
-            if recheck.is_empty() {
-                // Every flagged item was struck at review, edited away, or
-                // the covering thought was deleted -- nothing left to
-                // re-judge, so the stale rows are cleared rather than left
-                // to haunt a future review card.
-                SqliteContradictionStore.replace_contradictions(checkpoint.id, &[])?;
-            } else {
-                let current_thoughts = SqliteRunningThoughtStore
-                    .covering(
-                        checkpoint.companion_id,
-                        checkpoint.from_message_id,
-                        checkpoint.through_message_id,
-                    )
-                    .map_err(CompactionCommitError::from)?;
-                let judge_candidates: Vec<_> = recheck.iter().map(|(_, c)| *c).collect();
-                let fresh = check_contradictions(
-                    &llm::ResidentExtractor,
-                    &current_thoughts,
-                    &judge_candidates,
-                )
-                .map_err(CompactionCommitError::Recheck)?;
-
-                let fresh_rows: Vec<_> = fresh
-                    .iter()
-                    .filter_map(|hit| {
-                        recheck
-                            .iter()
-                            .find(|(_, c)| c.key == hit.candidate)
-                            .map(|(fact_id, _)| {
-                                crate::compaction::contradiction::StoredContradiction {
-                                    fact_id: *fact_id,
-                                    thought_id: hit.thought_id,
-                                    thought_text: hit.thought_text.clone(),
-                                    quote: hit.quote.clone(),
-                                }
-                            })
-                    })
-                    .collect();
-                SqliteContradictionStore.replace_contradictions(checkpoint.id, &fresh_rows)?;
-
-                if !fresh.is_empty() {
-                    return Err(CompactionCommitError::Review(ReviewError::Rejected(
-                        rejections_from(&fresh, &recheck),
-                    )));
-                }
-            }
-        }
-
         let loaded_config = Database::get_config()?;
         let compaction_slice_tokens = ContextManager::new(loaded_config).compaction_token_budget;
         let budget = CommitBudget {
@@ -2639,8 +2730,16 @@ async fn compaction_commit(
         };
         let user_id = 1; // Default user ID
         let deps = crate::compaction::production_commit_deps(&llm::ResidentExtractor, user_id);
-        let committed = crate::compaction::commit::commit(&store, reviewed, &deps, &budget)?;
-        Ok(committed)
+        commit_reviewed_draft(
+            &store,
+            &SqliteContradictionStore,
+            &SqliteRunningThoughtStore,
+            &llm::ResidentExtractor,
+            &checkpoint,
+            reviewed,
+            &deps,
+            &budget,
+        )
     })
     .await;
 
@@ -2656,6 +2755,382 @@ async fn compaction_commit(
                 "Error while committing the compaction draft, check logs for more information",
             )
         }
+    }
+}
+
+/// #226: `recheck_contradictions`/`commit_reviewed_draft` decide *what* to
+/// persist to `compaction_contradictions` and *when*, entirely against
+/// fakes -- no real database, no model. `RecordingStore` stands in for
+/// `SqliteCompactionStore`, `RecordingContradictionStore` for
+/// `SqliteContradictionStore`, `FixedThoughts` for
+/// `SqliteRunningThoughtStore`, and `FakeExtractor` for
+/// `llm::ResidentExtractor`.
+#[cfg(test)]
+mod compaction_commit_recheck_tests {
+    use super::*;
+    use crate::compaction::commit::{MergeError, ReviewedItem, SummaryMerger};
+    use crate::compaction::contradiction::{
+        CuratedThought, FixedThoughts, RecordingContradictionStore,
+    };
+    use crate::compaction::store::RecordingStore;
+    use crate::compaction::types::{FactCategory, NewDraft};
+    use crate::llm::FakeExtractor;
+
+    struct IdentityMerger;
+
+    impl SummaryMerger for IdentityMerger {
+        fn merge(&self, rolling: &str, _budget_tokens: usize) -> Result<String, MergeError> {
+            Ok(rolling.to_string())
+        }
+    }
+
+    fn deps() -> CommitDeps<'static> {
+        CommitDeps {
+            merger: Box::new(IdentityMerger),
+            observers: Vec::new(),
+        }
+    }
+
+    fn budget() -> CommitBudget {
+        CommitBudget {
+            compaction_slice_tokens: 10_000,
+            rolling_summary_tokens: 1_000,
+            user_name: "Eric".to_string(),
+            companion_name: "Vi".to_string(),
+        }
+    }
+
+    // `UserState`, not `Milestone`: only `UserState`/`CompanionState`/`Rule`
+    // facts feed `overlays_and_rules_fit`'s "never trimmed" block
+    // (`CompactionContext::from_facts`), which
+    // `a_commit_that_fails_after_a_clean_recheck_leaves_the_stale_rows_untouched`
+    // below needs a zero-token budget to actually overflow.
+    fn a_fact_draft(text: &str) -> crate::compaction::types::FactDraft {
+        crate::compaction::types::FactDraft {
+            category: FactCategory::UserState,
+            subject: None,
+            text: text.to_string(),
+            quote_speaker: None,
+            sources: vec![1],
+            replaces: vec![],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        }
+    }
+
+    /// Seeds a `Draft` checkpoint with one accepted fact, returning the
+    /// checkpoint and that fact's stored id.
+    fn seed(store: &RecordingStore, text: &str) -> (Checkpoint, i64) {
+        let draft_id = store
+            .insert_draft(NewDraft {
+                companion_id: 1,
+                from_message_id: 1,
+                through_message_id: 10,
+                trigger: CompactionTrigger::Threshold,
+                raw_model_output: Some("raw".to_string()),
+            })
+            .unwrap();
+        let ids = store.insert_facts(draft_id, &[a_fact_draft(text)]).unwrap();
+        (store.get_checkpoint(draft_id).unwrap().unwrap(), ids[0])
+    }
+
+    fn reviewed_for(checkpoint: &Checkpoint, fact_id: i64, text: &str) -> ReviewedDraft {
+        ReviewedDraft {
+            draft_id: checkpoint.id,
+            items: vec![ReviewedItem {
+                fact_id,
+                draft: a_fact_draft(text),
+                accepted: true,
+            }],
+            summary: "a summary".to_string(),
+        }
+    }
+
+    fn a_flagged_row(fact_id: i64) -> StoredContradiction {
+        StoredContradiction {
+            fact_id: Some(fact_id),
+            thought_id: 1,
+            thought_text: "the companion is afraid of dogs".to_string(),
+            quote: "loves dogs".to_string(),
+        }
+    }
+
+    #[test]
+    fn nothing_previously_flagged_proceeds_with_no_write_and_no_model_call() {
+        let store = RecordingStore::new();
+        let (checkpoint, fact_id) = seed(&store, "loves dogs");
+        let contradiction_store = RecordingContradictionStore::new();
+        let thoughts = FixedThoughts(Vec::new());
+        let extractor = FakeExtractor::returning([]);
+        let reviewed = reviewed_for(&checkpoint, fact_id, "loves dogs");
+
+        let decision = recheck_contradictions(
+            &contradiction_store,
+            &thoughts,
+            &extractor,
+            &checkpoint,
+            &reviewed,
+        )
+        .unwrap();
+
+        assert!(matches!(decision, RecheckDecision::Proceed { rows: None }));
+        assert!(extractor.prompts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_flagged_item_struck_at_review_clears_the_stale_rows_without_a_model_call() {
+        let store = RecordingStore::new();
+        let (checkpoint, fact_id) = seed(&store, "loves dogs");
+        let contradiction_store = RecordingContradictionStore::new();
+        contradiction_store
+            .replace_contradictions(checkpoint.id, &[a_flagged_row(fact_id)])
+            .unwrap();
+        let thoughts = FixedThoughts(Vec::new());
+        let extractor = FakeExtractor::returning([]);
+        // The flagged fact is struck at review, not an accepted candidate.
+        let reviewed = ReviewedDraft {
+            draft_id: checkpoint.id,
+            items: vec![ReviewedItem {
+                fact_id,
+                draft: {
+                    let mut draft = a_fact_draft("loves dogs");
+                    draft.rejected_reason = Some("struck at review".to_string());
+                    draft
+                },
+                accepted: false,
+            }],
+            summary: "a summary".to_string(),
+        };
+
+        let decision = recheck_contradictions(
+            &contradiction_store,
+            &thoughts,
+            &extractor,
+            &checkpoint,
+            &reviewed,
+        )
+        .unwrap();
+
+        assert_eq!(
+            decision,
+            RecheckDecision::Proceed {
+                rows: Some(Vec::new())
+            }
+        );
+        assert!(extractor.prompts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_clean_recheck_proceeds_with_fresh_empty_rows() {
+        let store = RecordingStore::new();
+        let (checkpoint, fact_id) = seed(&store, "loves dogs, no longer scared of them");
+        let contradiction_store = RecordingContradictionStore::new();
+        contradiction_store
+            .replace_contradictions(checkpoint.id, &[a_flagged_row(fact_id)])
+            .unwrap();
+        let thoughts = FixedThoughts(vec![CuratedThought {
+            id: 1,
+            text: "the companion is afraid of dogs".to_string(),
+            edited: false,
+        }]);
+        // No contradictions in the judge's output.
+        let extractor = FakeExtractor::returning([Ok(r#"{"contradictions":[]}"#.to_string())]);
+        let reviewed = reviewed_for(&checkpoint, fact_id, "loves dogs, no longer scared of them");
+
+        let decision = recheck_contradictions(
+            &contradiction_store,
+            &thoughts,
+            &extractor,
+            &checkpoint,
+            &reviewed,
+        )
+        .unwrap();
+
+        assert_eq!(
+            decision,
+            RecheckDecision::Proceed {
+                rows: Some(Vec::new())
+            }
+        );
+    }
+
+    #[test]
+    fn a_recheck_that_still_contradicts_rejects_and_keeps_the_fresh_rows() {
+        let store = RecordingStore::new();
+        let (checkpoint, fact_id) = seed(&store, "loves dogs");
+        let contradiction_store = RecordingContradictionStore::new();
+        contradiction_store
+            .replace_contradictions(checkpoint.id, &[a_flagged_row(fact_id)])
+            .unwrap();
+        let thoughts = FixedThoughts(vec![CuratedThought {
+            id: 1,
+            text: "the companion is afraid of dogs".to_string(),
+            edited: false,
+        }]);
+        let extractor = FakeExtractor::returning([Ok(
+            r#"{"contradictions":[{"candidate":0,"thought":0,"quote":"loves dogs"}]}"#.to_string(),
+        )]);
+        let reviewed = reviewed_for(&checkpoint, fact_id, "loves dogs");
+
+        let decision = recheck_contradictions(
+            &contradiction_store,
+            &thoughts,
+            &extractor,
+            &checkpoint,
+            &reviewed,
+        )
+        .unwrap();
+
+        match decision {
+            RecheckDecision::Reject { rows, rejections } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].fact_id, Some(fact_id));
+                assert_eq!(rejections.len(), 1);
+                assert_eq!(rejections[0].item_id, Some(fact_id));
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    /// The commit-order regression itself (#226): a commit that fails after
+    /// the recheck decided to clear the stale rows must leave those rows
+    /// exactly as they were -- not cleared, not overwritten. `budget()` with
+    /// a zero token slice forces `commit::commit`'s `overlays_and_rules_fit`
+    /// guard to fail before it ever calls `store.commit_checkpoint`, the
+    /// same "commit planning fails after the recheck ran" scenario the
+    /// issue describes.
+    #[test]
+    fn a_commit_that_fails_after_a_clean_recheck_leaves_the_stale_rows_untouched() {
+        let store = RecordingStore::new();
+        let (checkpoint, fact_id) = seed(&store, "loves dogs, no longer scared of them");
+        let contradiction_store = RecordingContradictionStore::new();
+        let stale_rows = vec![a_flagged_row(fact_id)];
+        contradiction_store
+            .replace_contradictions(checkpoint.id, &stale_rows)
+            .unwrap();
+        let thoughts = FixedThoughts(vec![CuratedThought {
+            id: 1,
+            text: "the companion is afraid of dogs".to_string(),
+            edited: false,
+        }]);
+        let extractor = FakeExtractor::returning([Ok(r#"{"contradictions":[]}"#.to_string())]);
+        let reviewed = reviewed_for(&checkpoint, fact_id, "loves dogs, no longer scared of them");
+        let mut failing_budget = budget();
+        failing_budget.compaction_slice_tokens = 0;
+
+        let err = commit_reviewed_draft(
+            &store,
+            &contradiction_store,
+            &thoughts,
+            &extractor,
+            &checkpoint,
+            reviewed,
+            &deps(),
+            &failing_budget,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CompactionCommitError::Commit(CommitError::OverBudget { .. })
+        ));
+        assert_eq!(
+            contradiction_store
+                .contradictions_for(checkpoint.id)
+                .unwrap(),
+            stale_rows
+        );
+        // The draft itself was never touched either.
+        assert_eq!(
+            store.get_checkpoint(checkpoint.id).unwrap().unwrap().status,
+            crate::compaction::types::CompactionStatus::Draft
+        );
+    }
+
+    #[test]
+    fn a_successful_commit_after_a_clean_recheck_clears_the_stale_rows() {
+        let store = RecordingStore::new();
+        let (checkpoint, fact_id) = seed(&store, "loves dogs, no longer scared of them");
+        let contradiction_store = RecordingContradictionStore::new();
+        contradiction_store
+            .replace_contradictions(checkpoint.id, &[a_flagged_row(fact_id)])
+            .unwrap();
+        let thoughts = FixedThoughts(vec![CuratedThought {
+            id: 1,
+            text: "the companion is afraid of dogs".to_string(),
+            edited: false,
+        }]);
+        let extractor = FakeExtractor::returning([Ok(r#"{"contradictions":[]}"#.to_string())]);
+        let reviewed = reviewed_for(&checkpoint, fact_id, "loves dogs, no longer scared of them");
+
+        let committed = commit_reviewed_draft(
+            &store,
+            &contradiction_store,
+            &thoughts,
+            &extractor,
+            &checkpoint,
+            reviewed,
+            &deps(),
+            &budget(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            committed.status,
+            crate::compaction::types::CompactionStatus::Committed
+        );
+        assert!(contradiction_store
+            .contradictions_for(checkpoint.id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_rejected_recheck_persists_the_fresh_rows_without_ever_calling_commit() {
+        let store = RecordingStore::new();
+        let (checkpoint, fact_id) = seed(&store, "loves dogs");
+        let contradiction_store = RecordingContradictionStore::new();
+        contradiction_store
+            .replace_contradictions(checkpoint.id, &[a_flagged_row(fact_id)])
+            .unwrap();
+        let thoughts = FixedThoughts(vec![CuratedThought {
+            id: 1,
+            text: "the companion is afraid of dogs".to_string(),
+            edited: false,
+        }]);
+        let extractor = FakeExtractor::returning([Ok(
+            r#"{"contradictions":[{"candidate":0,"thought":0,"quote":"loves dogs"}]}"#.to_string(),
+        )]);
+        let reviewed = reviewed_for(&checkpoint, fact_id, "loves dogs");
+
+        let err = commit_reviewed_draft(
+            &store,
+            &contradiction_store,
+            &thoughts,
+            &extractor,
+            &checkpoint,
+            reviewed,
+            &deps(),
+            &budget(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            CompactionCommitError::Review(ReviewError::Rejected(_))
+        ));
+        let stored = contradiction_store
+            .contradictions_for(checkpoint.id)
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].fact_id, Some(fact_id));
+        // The draft was never committed.
+        assert_eq!(
+            store.get_checkpoint(checkpoint.id).unwrap().unwrap().status,
+            crate::compaction::types::CompactionStatus::Draft
+        );
     }
 }
 
