@@ -154,16 +154,30 @@ fn is_closing_mark(c: char) -> bool {
     matches!(c, '"' | '\'' | '”' | '’' | '»' | '」' | '』' | ')' | ']')
 }
 
+/// A closer that is unambiguous even when a space precedes it. `"` and `'`
+/// are excluded: in English they open a quotation at least as often as
+/// they close one, so a space followed by one of them is the start of the
+/// *next* sentence (`"Fine," she said`), not a closer for the one just cut.
+/// Only used for the whitespace-crossing step below; a closer immediately
+/// adjacent to the terminator (no space) is unambiguous regardless of which
+/// mark it is, since nothing legitimately opens a quote there.
+fn is_unambiguous_closing_mark(c: char) -> bool {
+    is_closing_mark(c) && !matches!(c, '"' | '\'')
+}
+
 /// Trims a capped completion back to its last sentence boundary (#235), so
 /// a thought that hit `THOUGHT_MAX_TOKENS` is never stored mid-word. Keeps
 /// any run of closing quotes/brackets that immediately follows the
 /// terminator (`He said "fine."` stays whole; so does a stacked
-/// `("fine.")`), including one separated from the terminator by a single
-/// space, the French convention around a closing guillemet (`ça va. »`).
-/// When `text` has no `. ! ? …`, it is returned unchanged: an abrupt run-on
-/// beats dropping the only note the model wrote, and this is the invariant
-/// `clean_thought` relies on to never turn a non-empty completion into
-/// `None` because of this step.
+/// `("fine.")`), and one separated from the terminator by a single space
+/// when that mark cannot also be an opener — the French convention around
+/// a closing guillemet (`ça va. »`). A space before an ASCII `"`/`'`
+/// is never crossed, since that pair usually opens the next sentence
+/// (`I trust her now. "Fine," she said` must cut after `now.`, not swallow
+/// the opening quote). When `text` has no `. ! ? …`, it is returned
+/// unchanged: an abrupt run-on beats dropping the only note the model
+/// wrote, and this is the invariant `clean_thought` relies on to never
+/// turn a non-empty completion into `None` because of this step.
 fn trim_to_last_sentence_boundary(text: &str) -> &str {
     let Some(idx) = text.rfind(['.', '!', '?', '…']) else {
         return text;
@@ -181,7 +195,11 @@ fn trim_to_last_sentence_boundary(text: &str) -> &str {
         }
         if c.is_whitespace() {
             let after_whitespace = &rest[c.len_utf8()..];
-            if after_whitespace.chars().next().is_some_and(is_closing_mark) {
+            if after_whitespace
+                .chars()
+                .next()
+                .is_some_and(is_unambiguous_closing_mark)
+            {
                 end += c.len_utf8();
                 continue;
             }
@@ -497,6 +515,26 @@ mod tests {
         assert_eq!(
             clean_thought("Elle a dit « ça va. » Je pense ab", "Bob", true),
             Some("Elle a dit « ça va. »".to_string())
+        );
+    }
+
+    #[test]
+    fn clean_thought_on_a_capped_completion_does_not_cross_a_space_before_an_ascii_quote() {
+        // Unlike a guillemet, a space before an ASCII quote almost always
+        // opens the *next* sentence rather than closing the one just cut,
+        // so the trim must stop at the terminator and leave the quote for
+        // the (dropped) remainder.
+        assert_eq!(
+            clean_thought(
+                "I trust her now. \"Fine,\" she said, but she seems ab",
+                "Bob",
+                true
+            ),
+            Some("I trust her now.".to_string())
+        );
+        assert_eq!(
+            clean_thought("I trust her. 'Tis a fine thing ab", "Bob", true),
+            Some("I trust her.".to_string())
         );
     }
 
