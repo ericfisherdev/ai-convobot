@@ -268,6 +268,14 @@ pub fn run_round(
 
     let mut host_reply: Option<PersistedReply> = None;
     let mut replies: Vec<PersistedReply> = Vec::new();
+    // `schedule_follow_ups` only excludes the *current* speaker, so a
+    // follow-up mention chain (`max_followup_depth > 1`) can re-add `char`
+    // at a later depth within the same round. The thought is about the
+    // round that closed before `char`'s *first* turn; a re-entrant turn
+    // must not repeat it (a second `thought_started`/`thought` pair, and a
+    // second row spanning a bogus range starting after the first thought's
+    // own `through_message_id`).
+    let mut host_thought_written = false;
 
     while let Some(next) = plan.next_speaker() {
         let speaker = &next.id;
@@ -280,10 +288,13 @@ pub fn run_round(
             // failure still emits `thought_started` — the client treats
             // this speaker's `reply_started` as the end of the pending
             // state — but never `thought_written`, and leaves no row.
-            if let Some(inputs) = pending.thought_inputs(store, speaker) {
-                sink.thought_started(speaker);
-                if let Some(thought) = pending.think(store, &inputs, &mut *host_think) {
-                    sink.thought_written(&thought);
+            if !host_thought_written {
+                host_thought_written = true;
+                if let Some(inputs) = pending.thought_inputs(store, speaker) {
+                    sink.thought_started(speaker);
+                    if let Some(thought) = pending.think(store, &inputs, &mut *host_think) {
+                        sink.thought_written(&thought);
+                    }
                 }
             }
 
@@ -1013,6 +1024,69 @@ mod tests {
             .events
             .iter()
             .any(|e| matches!(e, SinkEvent::ThoughtStarted(_) | SinkEvent::Thought(..))));
+    }
+
+    #[test]
+    fn a_follow_up_mention_that_re_adds_char_does_not_repeat_the_thought() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = RecordingStore::new(None).with_thought_inputs(thought_inputs_for_char());
+        let registry = registry_with_bots();
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), registry.clone())
+                .expect("insert should succeed");
+
+        let policy = RoutingPolicy {
+            max_followup_depth: 1,
+        };
+        // No mention in the user's message: the default plan (char, then
+        // every connected bot in join order, #131) all at depth 0.
+        let plan = plan_round("hello", &registry, &policy);
+        // bot1's reply mentions `@char`, which `schedule_follow_ups` re-adds
+        // at depth 1 since `char` is no longer pending by then (#131/#132) —
+        // the exact scenario the thought hook must not repeat for.
+        let remotes = FakeRemote::new(vec![
+            (bot("bot1"), Ok("@char thanks!")),
+            (bot("bot2"), Ok("hi from bot2")),
+        ]);
+        let mut sink = RecordingSink::default();
+
+        let outcome = run_round(
+            guard,
+            pending,
+            plan,
+            &store,
+            &registry,
+            &policy,
+            &mut |_prompt, _on_token| Ok("hi from char".to_string()),
+            &mut write_a_thought,
+            &remotes,
+            &|_frame| {},
+            Duration::from_secs(30),
+            &mut sink,
+        )
+        .expect("round should succeed");
+
+        // `char` really did speak twice (its scheduled follow-up turn), but
+        // the thought is about the round before its *first* turn only.
+        assert_eq!(
+            outcome
+                .replies
+                .iter()
+                .filter(|r| r.speaker_id == ParticipantId::CHAR)
+                .count(),
+            2,
+            "char should have a follow-up turn from bot1's @char mention"
+        );
+        assert_eq!(store.thoughts.lock().unwrap().len(), 1);
+        assert_eq!(
+            sink.events
+                .iter()
+                .filter(|e| matches!(e, SinkEvent::ThoughtStarted(_) | SinkEvent::Thought(..)))
+                .count(),
+            2,
+            "exactly one ThoughtStarted/Thought pair, not one per char turn"
+        );
     }
 
     #[test]

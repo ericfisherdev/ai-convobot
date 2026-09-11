@@ -5658,6 +5658,24 @@ mod tests {
         );
     }
 
+    /// Regression guard for the running-thoughts `usize::MAX` bug (#216
+    /// review): `usize` binds to SQLite's `LIMIT` through rusqlite's
+    /// checked `i64` conversion, which rejects `usize::MAX` on a 64-bit
+    /// host with `ToSqlConversionFailure`. `running_thoughts::hook::
+    /// thought_range` uses `i64::MAX as usize` as its "no limit" sentinel
+    /// instead; this pins that such a value binds without erroring.
+    #[test]
+    fn get_x_messages_after_accepts_a_limit_as_large_as_i64_max() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        insert_message_row(&con, USER_SPEAKER_ID, "one");
+
+        let result = Database::get_x_messages_after_on(&con, None, i64::MAX as usize).unwrap();
+
+        assert_eq!(result.len(), 1);
+    }
+
     #[test]
     fn pop_latest_bot_reply_invalidates_the_message_cache() {
         let dir = tempfile::TempDir::new().unwrap();
