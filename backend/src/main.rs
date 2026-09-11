@@ -2624,6 +2624,17 @@ fn recheck_contradictions(
 /// as they were (#226). A [`Reject`](RecheckDecision::Reject) decision's
 /// rows are persisted immediately, since that branch never calls
 /// `commit::commit`.
+///
+/// Once `commit::commit` has returned `Ok`, the checkpoint is already
+/// `Committed` -- durably, with its transaction landed, the message cache
+/// cleared, and observers run. A failure writing the deferred rows past that
+/// point is logged and swallowed rather than propagated with `?`, the same
+/// rule `commit::commit` itself applies to its own observers: this call has
+/// already succeeded, so reporting it as a commit failure would tell the
+/// caller to retry a checkpoint that no longer accepts one (a retry lands on
+/// `CommitError::DraftNotPending`), with no way to reconcile the stale
+/// `compaction_contradictions` rows from the response alone. Those rows are
+/// at worst cosmetic on the detail card once the draft is no longer pending.
 #[allow(clippy::too_many_arguments)]
 fn commit_reviewed_draft(
     store: &dyn CompactionStore,
@@ -2656,7 +2667,12 @@ fn commit_reviewed_draft(
     let committed = crate::compaction::commit::commit(store, reviewed, deps, budget)?;
 
     if let Some(rows) = write_after_commit {
-        contradiction_store.replace_contradictions(checkpoint.id, &rows)?;
+        if let Err(e) = contradiction_store.replace_contradictions(checkpoint.id, &rows) {
+            eprintln!(
+                "compaction commit {}: committed, but replacing compaction_contradictions rows failed: {e}",
+                checkpoint.id
+            );
+        }
     }
 
     Ok(committed)
@@ -3130,6 +3146,75 @@ mod compaction_commit_recheck_tests {
         assert_eq!(
             store.get_checkpoint(checkpoint.id).unwrap().unwrap().status,
             crate::compaction::types::CompactionStatus::Draft
+        );
+    }
+
+    /// A fixed `previously_flagged` answer, but `replace_contradictions`
+    /// always fails -- standing in for `SqliteContradictionStore` hitting a
+    /// busy/locked database or an I/O error on the deferred post-commit
+    /// write.
+    struct FailingContradictionStore {
+        previously_flagged: Vec<StoredContradiction>,
+    }
+
+    impl ContradictionStore for FailingContradictionStore {
+        fn replace_contradictions(
+            &self,
+            _compaction_id: i64,
+            _rows: &[StoredContradiction],
+        ) -> rusqlite::Result<()> {
+            Err(rusqlite::Error::InvalidQuery)
+        }
+
+        fn contradictions_for(
+            &self,
+            _compaction_id: i64,
+        ) -> rusqlite::Result<Vec<StoredContradiction>> {
+            Ok(self.previously_flagged.clone())
+        }
+    }
+
+    /// #226 review (esfisher): by the time `commit_reviewed_draft` reaches
+    /// the deferred write, `commit::commit` has already returned `Ok` --
+    /// the checkpoint is durably `Committed`. A failure persisting the
+    /// deferred rows past that point must not turn into a reported commit
+    /// failure (a retry would only find `DraftNotPending`, with no path to
+    /// reconcile the stale rows); it is swallowed the same way
+    /// `commit::commit` swallows an observer failure.
+    #[test]
+    fn a_post_commit_row_write_failure_does_not_fail_the_already_successful_commit() {
+        let store = RecordingStore::new();
+        let (checkpoint, fact_id) = seed(&store, "loves dogs, no longer scared of them");
+        let contradiction_store = FailingContradictionStore {
+            previously_flagged: vec![a_flagged_row(fact_id)],
+        };
+        let thoughts = FixedThoughts(vec![CuratedThought {
+            id: 1,
+            text: "the companion is afraid of dogs".to_string(),
+            edited: false,
+        }]);
+        let extractor = FakeExtractor::returning([Ok(r#"{"contradictions":[]}"#.to_string())]);
+        let reviewed = reviewed_for(&checkpoint, fact_id, "loves dogs, no longer scared of them");
+
+        let committed = commit_reviewed_draft(
+            &store,
+            &contradiction_store,
+            &thoughts,
+            &extractor,
+            &checkpoint,
+            reviewed,
+            &deps(),
+            &budget(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            committed.status,
+            crate::compaction::types::CompactionStatus::Committed
+        );
+        assert_eq!(
+            store.get_checkpoint(checkpoint.id).unwrap().unwrap().status,
+            crate::compaction::types::CompactionStatus::Committed
         );
     }
 }
