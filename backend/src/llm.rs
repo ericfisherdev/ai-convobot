@@ -592,21 +592,6 @@ impl ThoughtSource for SqliteThoughts {
     }
 }
 
-/// A [`ThoughtSource`] with no thoughts: what the joiner (#220, which writes
-/// its own bot's notes with its own model and store) and every existing
-/// test passes.
-pub struct NoThoughts;
-
-impl ThoughtSource for NoThoughts {
-    fn recent(
-        &self,
-        _companion_id: i32,
-        _config: &ConfigView,
-    ) -> std::io::Result<Vec<RunningThought>> {
-        Ok(vec![])
-    }
-}
-
 /// An owned, `Clone + Send` snapshot of who is in the chat and which of them
 /// the current turn is generating for. Owned so it can move into
 /// `web::block` closures and the `stream-generation` thread without holding
