@@ -67,6 +67,28 @@ pub static ACTIVE_TURN: TurnSlot = TurnSlot::new();
 /// one frame that queued it.
 pub static JOINER_EXTRACTION: TurnSlot = TurnSlot::new();
 
+/// Serialises every test in the crate that claims [`ACTIVE_TURN`] directly,
+/// against every other such test.
+///
+/// `ACTIVE_TURN` is a process-wide static by design (it mirrors production,
+/// where one process is ever only one joiner), so `cargo test`'s default
+/// parallelism can otherwise make two unrelated tests' real generations
+/// contend for the same slot: `remote_generation.rs`'s own
+/// `local_model_generation_claims_and_releases_the_shared_turn_slot` and
+/// every real host-and-joiner test in `multiplayer::two_instance_tests`
+/// must all acquire this lock before touching `ACTIVE_TURN`, not a lock
+/// private to either file, or the two can still race each other.
+///
+/// A `tokio::sync::Mutex`, not `std::sync::Mutex`: the async
+/// `#[actix_web::test]`s in `two_instance_tests.rs` hold the guard across
+/// several `.await` points (a whole real round), which clippy's
+/// `await_holding_lock` correctly refuses for a std lock. The plain,
+/// synchronous `#[test]` in `remote_generation.rs` uses
+/// [`tokio::sync::Mutex::blocking_lock`] instead, which is safe there
+/// precisely because that test runs with no tokio runtime of its own.
+#[cfg(test)]
+pub(crate) static ACTIVE_TURN_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::TurnSlot;

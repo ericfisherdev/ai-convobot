@@ -21,6 +21,10 @@ pub enum ThoughtError {
     Empty,
     /// The store rejected the insert (or the follow-up read of it).
     Store(rusqlite::Error),
+    /// Reading this speaker's chained context or the round's own messages
+    /// failed — the seam-based half of building a [`ThoughtInputs`]
+    /// (`running_thoughts::hook::thought_inputs_for_range`).
+    Inputs(std::io::Error),
 }
 
 impl std::fmt::Display for ThoughtError {
@@ -29,6 +33,7 @@ impl std::fmt::Display for ThoughtError {
             ThoughtError::Generate(e) => write!(f, "thought generation failed: {e}"),
             ThoughtError::Empty => write!(f, "the model produced an empty thought"),
             ThoughtError::Store(e) => write!(f, "failed to persist the thought: {e}"),
+            ThoughtError::Inputs(e) => write!(f, "failed to read thought inputs: {e}"),
         }
     }
 }
@@ -64,9 +69,9 @@ pub fn generate_thought(
 }
 
 /// [`generate_thought`] over a [`RunningThoughtStore`]: `insert` then `get`
-/// (the store's `insert` returns only the id). What #217's regenerate loop
-/// and #220's joiner thinker (`multiplayer::remote_generation`) both call
-/// with `SqliteRunningThoughtStore`.
+/// (the store's `insert` returns only the id). What #220's joiner thinker
+/// (`multiplayer::remote_generation::think_into`) calls with
+/// `SqliteRunningThoughtStore`.
 pub fn generate_thought_into(
     store: &dyn RunningThoughtStore,
     inputs: &ThoughtInputs,

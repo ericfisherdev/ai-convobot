@@ -63,21 +63,18 @@ use crate::turn_slot::TurnSlot;
 const COMPANION_ID: i32 = 1;
 const USER_ID: i32 = 1;
 
-/// Serialises every `#[actix_web::test]` in this file against the others.
-///
-/// Every test here spins up a real joiner (`LocalModelGeneration`), which
-/// claims `turn_slot::ACTIVE_TURN` — a process-wide static, by design (it
-/// mirrors production, where one process is ever only one joiner) — for the
-/// duration of each `GenerateRequest` it answers. `cargo test` runs
-/// `#[test]`s concurrently by default, so two of these tests' real joiners
-/// can otherwise contend for that same global slot and one gets a spurious
-/// `ReplyFailed { reason: "a local turn is in progress" }`, exactly the
-/// hazard `remote_generation.rs`'s own tests fold into one `#[test]` fn to
-/// avoid (see its doc comment). An async-aware `tokio::sync::Mutex`, not
-/// `std::sync::Mutex`: every test here holds the guard across several
-/// `.await` points (the whole real host-and-joiner round), which clippy's
-/// `await_holding_lock` correctly refuses for a std lock.
-static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// Every `#[actix_web::test]` in this file spins up a real joiner
+// (`LocalModelGeneration`), which claims `turn_slot::ACTIVE_TURN` — a
+// process-wide static, by design (it mirrors production, where one process
+// is ever only one joiner) — for the duration of each `GenerateRequest` it
+// answers. `cargo test` runs `#[test]`s concurrently by default, so two of
+// these tests' real joiners, or one of these and `remote_generation.rs`'s
+// own `local_model_generation_claims_and_releases_the_shared_turn_slot`
+// (same test binary, same static), can otherwise contend for that global
+// slot and one gets a spurious `ReplyFailed { reason: "a local turn is in
+// progress" }`. Every test below acquires `turn_slot::ACTIVE_TURN_TEST_LOCK`
+// — shared with that other file, not a lock private to this one — as its
+// first line, so the two can never race each other either.
 
 /// A [`HostConfigSource`] that reports a fixed password, always in `Host`
 /// mode — this file never exercises a mode change, only the join handshake
@@ -404,7 +401,7 @@ async fn run_one_round(
 
 #[actix_web::test]
 async fn a_full_round_runs_over_a_real_socket_between_a_host_and_a_joiner() {
-    let _serial = TEST_LOCK.lock().await;
+    let _serial = crate::turn_slot::ACTIVE_TURN_TEST_LOCK.lock().await;
     let host = HostHandle::start("test-secret").await;
     let bot1 = ParticipantId::parse("bot1").expect("valid id");
 
@@ -509,7 +506,7 @@ async fn a_full_round_runs_over_a_real_socket_between_a_host_and_a_joiner() {
 
 #[actix_web::test]
 async fn a_disconnected_bot_is_skipped_and_the_round_still_completes() {
-    let _serial = TEST_LOCK.lock().await;
+    let _serial = crate::turn_slot::ACTIVE_TURN_TEST_LOCK.lock().await;
     let host = HostHandle::start("test-secret").await;
     let bot1 = ParticipantId::parse("bot1").expect("valid id");
 
@@ -674,7 +671,7 @@ async fn wait_for_generate_request(
 /// reset) carries neither, unchanged from before #182.
 #[actix_web::test]
 async fn a_committed_checkpoint_ships_continuity_and_a_trimmed_transcript_to_the_joiner() {
-    let _serial = TEST_LOCK.lock().await;
+    let _serial = crate::turn_slot::ACTIVE_TURN_TEST_LOCK.lock().await;
     let host = HostHandle::start("test-secret").await;
     let bot1 = ParticipantId::parse("bot1").expect("valid id");
 
@@ -848,7 +845,7 @@ async fn a_committed_checkpoint_ships_continuity_and_a_trimmed_transcript_to_the
 /// one.
 #[actix_web::test]
 async fn a_joiner_writes_its_own_thought_once_and_a_regenerate_does_not_repeat_it() {
-    let _serial = TEST_LOCK.lock().await;
+    let _serial = crate::turn_slot::ACTIVE_TURN_TEST_LOCK.lock().await;
     let host = HostHandle::start("test-secret").await;
     let bot1 = ParticipantId::parse("bot1").expect("valid id");
 

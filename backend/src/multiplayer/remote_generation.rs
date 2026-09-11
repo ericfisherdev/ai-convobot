@@ -29,17 +29,19 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::chat_turn::{SqliteTurnStore, TurnStore};
 use crate::compaction::context::{CompactionContext, QuoteLine};
 use crate::compaction::store::SqliteCompactionStore;
-use crate::database::{Database, Message, USER_SPEAKER_ID};
+use crate::database::{CompanionView, Database, Message, USER_SPEAKER_ID};
 use crate::llm::{
-    self, CompactionSource, InMemoryTranscript, PromptSpeakers, ResidentCharacterModel,
+    self, CharacterModel, CompactionSource, InMemoryTranscript, PromptSpeakers,
+    ResidentCharacterModel, SqliteThoughts,
 };
 use crate::multiplayer::joiner::{GenerateRequestHandler, JoinerHandle};
 use crate::multiplayer::joiner_compaction::{local_overlay, JoinerExtractionJob};
 use crate::multiplayer::protocol::{ClientFrame, ContinuityPayload, ParticipantSummary};
 use crate::participants::{AvatarRef, Participant, ParticipantId, ParticipantRegistry};
-use crate::running_thoughts::generate::generate_thought_into;
+use crate::running_thoughts::generate::{generate_thought_into, ThoughtError};
 use crate::running_thoughts::hook::{pending_thought_range, thought_inputs_for_range};
 use crate::running_thoughts::store::{RunningThoughtStore, SqliteRunningThoughtStore};
+use crate::running_thoughts::types::RunningThought;
 use crate::turn_slot::ACTIVE_TURN;
 
 /// The joiner-side [`CompactionSource`] (#186): renders the host's
@@ -213,6 +215,7 @@ impl LocalModelGeneration {
     ) -> Self {
         let generator: RemoteGenerator = Arc::new({
             let handle = handle.clone();
+            let self_id = self_id.clone();
             move |transcript: &[Message],
                   speakers: &PromptSpeakers,
                   on_token: &mut dyn FnMut(&str)| {
@@ -225,7 +228,7 @@ impl LocalModelGeneration {
                     &InMemoryTranscript(transcript.to_vec()),
                     speakers,
                     &source,
-                    &llm::NoThoughts,
+                    &joiner_reply_thoughts(&self_id),
                 )
             }
         });
@@ -410,22 +413,34 @@ fn score_attitude(store: &impl TurnStore, companion_id: i32, transcript: &[Messa
     store.finish_turn(companion_id, USER_ID, &user_turn.content, reply);
 }
 
+/// The [`llm::ThoughtSource`] this joiner's own reply reads from: its own
+/// bot's chain, scoped by `self_id` — never `char`'s or another bot's. Split
+/// out as its own function so the wiring (which id `with_local_model` feeds
+/// `SqliteThoughts`) is testable without a model or a real `Database`; the
+/// scoping itself (`SqliteThoughts::recent` -> `RunningThoughtStore::recent_for`)
+/// is already covered by `running_thoughts::store`'s own tests.
+fn joiner_reply_thoughts(self_id: &ParticipantId) -> SqliteThoughts {
+    SqliteThoughts {
+        speaker: self_id.clone(),
+    }
+}
+
 /// Writes this joiner's own bot's running thought (#220) about `transcript`
 /// — the same `GenerateRequest.transcript` its reply is about to generate
 /// from, so a bot speaking after `char` in the same round writes its
-/// thought about `char`'s reply too. Applies #186's per-instance ownership
-/// rule to thoughts: a joiner only ever writes its own bot's row, with its
-/// own model, into its own local `running_thoughts` table (`speaker_id =
-/// self_id`, `companion_id`), reading `transcript` through
-/// [`InMemoryTranscript`] — never [`crate::llm::SqliteTranscript`], a
-/// joiner's `messages` table is not the chat.
+/// thought about `char`'s reply too, and its own reply in turn reads that
+/// thought back through [`joiner_reply_thoughts`]. Applies #186's
+/// per-instance ownership rule to thoughts: a joiner only ever writes its
+/// own bot's row, with its own model, into its own local `running_thoughts`
+/// table (`speaker_id = self_id`, `companion_id`).
 ///
-/// A silent no-op when running thoughts are disabled, when
-/// [`pending_thought_range`] finds nothing new (this speaker's last thought
-/// already covers `transcript`'s newest id — the regenerate case), or on
-/// any failure: every error is logged and swallowed here, exactly as
-/// [`crate::chat_turn::PendingTurn::think`] does for the host, so a failed
-/// thought never costs this joiner its reply.
+/// The `Database`-touching wrapper around [`think_into`], which is where the
+/// actual `latest_for` -> [`pending_thought_range`] -> [`generate_thought_into`]
+/// sequence lives, seam-based and unit-tested. A silent no-op when running
+/// thoughts are disabled, when reading the config or the companion's own
+/// data fails, or on any [`ThoughtError`] `think_into` returns: every error
+/// is logged and swallowed here, exactly as [`crate::chat_turn::PendingTurn::think`]
+/// does for the host, so a failed thought never costs this joiner its reply.
 fn think_and_store(
     companion_id: i32,
     self_id: &ParticipantId,
@@ -443,20 +458,6 @@ fn think_and_store(
         return;
     }
 
-    let store = SqliteRunningThoughtStore;
-    let latest = match store.latest_for(companion_id, self_id.as_str()) {
-        Ok(latest) => latest,
-        Err(e) => {
-            eprintln!("running thoughts: joiner failed to read its latest thought: {e}");
-            return;
-        }
-    };
-    let Some((from, through)) =
-        pending_thought_range(latest.map(|t| t.through_message_id), transcript)
-    else {
-        return;
-    };
-
     let companion = match Database::get_companion_data() {
         Ok(companion) => companion,
         Err(e) => {
@@ -464,30 +465,57 @@ fn think_and_store(
             return;
         }
     };
-    let inputs = match thought_inputs_for_range(
-        &store,
-        &InMemoryTranscript(transcript.to_vec()),
+
+    if let Err(e) = think_into(
+        &SqliteRunningThoughtStore,
         companion_id,
         self_id,
-        from,
-        through,
-    ) {
-        Ok(inputs) => inputs,
-        Err(e) => {
-            eprintln!("running thoughts: joiner failed to build thought inputs: {e}");
-            return;
-        }
-    };
-
-    if let Err(e) = generate_thought_into(
-        &store,
-        &inputs,
+        transcript,
         &companion,
         speakers,
         &ResidentCharacterModel,
     ) {
         eprintln!("running thoughts: {e}");
     }
+}
+
+/// The seam-based half of [`think_and_store`]: `store.latest_for` ->
+/// [`pending_thought_range`] -> [`thought_inputs_for_range`] ->
+/// [`generate_thought_into`], with no `Database` reads of its own — a test
+/// drives it with `running_thoughts::store::RecordingStore` and
+/// `llm::FakeCharacterModel`, the same doubles `generate.rs`'s own tests
+/// use. `Ok(None)` (not an error) is [`pending_thought_range`]'s "nothing
+/// new" case, e.g. a regenerate that resends a transcript whose newest id
+/// this speaker already covered.
+fn think_into(
+    store: &dyn RunningThoughtStore,
+    companion_id: i32,
+    self_id: &ParticipantId,
+    transcript: &[Message],
+    companion: &CompanionView,
+    speakers: &PromptSpeakers,
+    model: &dyn CharacterModel,
+) -> Result<Option<RunningThought>, ThoughtError> {
+    let latest = store
+        .latest_for(companion_id, self_id.as_str())
+        .map_err(ThoughtError::Store)?;
+    let Some((from, through)) =
+        pending_thought_range(latest.map(|t| t.through_message_id), transcript)
+    else {
+        return Ok(None);
+    };
+
+    let inputs = thought_inputs_for_range(
+        store,
+        &InMemoryTranscript(transcript.to_vec()),
+        companion_id,
+        self_id,
+        from,
+        through,
+    )
+    .map_err(ThoughtError::Inputs)?;
+
+    generate_thought_into(store, &inputs, companion, speakers, model).map(Some)
 }
 
 /// The content of the newest `transcript` row from the user, or an empty
@@ -549,9 +577,12 @@ pub(crate) fn registry_from_participants(
 mod tests {
     use super::*;
     use crate::chat_turn::RecordingStore;
+    use crate::llm::FakeCharacterModel;
     use crate::multiplayer::joiner::JoinerShared;
     use crate::multiplayer::protocol::AvatarUpload;
     use crate::participants::ParticipantKind;
+    use crate::running_thoughts::store::RecordingStore as RecordingThoughtStore;
+    use crate::running_thoughts::types::NewRunningThought;
     use std::sync::{Mutex, RwLock};
     use tokio::sync::mpsc;
 
@@ -571,6 +602,134 @@ mod tests {
             frames.push(frame);
         }
         frames
+    }
+
+    // -- joiner_reply_thoughts: which speaker a joiner's own reply reads --
+
+    #[test]
+    fn joiner_reply_thoughts_scopes_by_this_joiners_own_id_not_char() {
+        let self_id = ParticipantId::parse("bot1").unwrap();
+
+        let source = joiner_reply_thoughts(&self_id);
+
+        assert_eq!(source.speaker, self_id);
+        assert_ne!(source.speaker, ParticipantId::CHAR);
+    }
+
+    // -- think_into: the joiner's own thought-writing seam, no model or Database --
+
+    fn a_companion() -> CompanionView {
+        CompanionView {
+            name: "Ada".to_string(),
+            persona: "a curious, upbeat persona".to_string(),
+            example_dialogue: String::new(),
+            first_message: String::new(),
+            long_term_mem: 0,
+            short_term_mem: 0,
+            roleplay: false,
+            dialogue_tuning: false,
+            avatar_path: String::new(),
+        }
+    }
+
+    fn bot1_speakers() -> PromptSpeakers {
+        PromptSpeakers {
+            registry: ParticipantRegistry::solo("Alice", "Bob", None),
+            self_id: ParticipantId::parse("bot1").unwrap(),
+        }
+    }
+
+    fn a_prior_thought(speaker_id: &ParticipantId, through: i32) -> NewRunningThought {
+        NewRunningThought {
+            companion_id: 1,
+            speaker_id: speaker_id.to_string(),
+            from_message_id: 1,
+            through_message_id: through,
+            text: "an earlier note".to_string(),
+            edited: false,
+        }
+    }
+
+    #[test]
+    fn think_into_skips_a_regenerate_over_a_range_this_speaker_already_covered() {
+        let store = RecordingThoughtStore::new();
+        let bot1 = ParticipantId::parse("bot1").unwrap();
+        store.insert(a_prior_thought(&bot1, 2)).unwrap();
+        let transcript = vec![
+            sample_message(1, USER_SPEAKER_ID, "hi"),
+            sample_message(2, "char", "hello"),
+        ];
+        let model = FakeCharacterModel::returning(Vec::<io::Result<String>>::new());
+
+        let result = think_into(
+            &store,
+            1,
+            &bot1,
+            &transcript,
+            &a_companion(),
+            &bot1_speakers(),
+            &model,
+        )
+        .expect("reading state and skipping must not itself error");
+
+        assert_eq!(
+            result, None,
+            "bot1 already covered through id 2, so nothing new"
+        );
+    }
+
+    #[test]
+    fn think_into_is_not_suppressed_by_another_speakers_prior_row() {
+        let store = RecordingThoughtStore::new();
+        let bot1 = ParticipantId::parse("bot1").unwrap();
+        // char has a prior note over the same range; bot1 has never thought.
+        store
+            .insert(a_prior_thought(&ParticipantId::CHAR, 2))
+            .unwrap();
+        let transcript = vec![
+            sample_message(1, USER_SPEAKER_ID, "hi"),
+            sample_message(2, "char", "hello"),
+        ];
+        let model = FakeCharacterModel::returning([Ok("I'm glad they said hi.".to_string())]);
+
+        let result = think_into(
+            &store,
+            1,
+            &bot1,
+            &transcript,
+            &a_companion(),
+            &bot1_speakers(),
+            &model,
+        )
+        .expect("generation should succeed")
+        .expect("bot1 has never thought yet, so a row should be written");
+
+        assert_eq!(result.speaker_id, bot1.to_string());
+        assert_eq!((result.from_message_id, result.through_message_id), (1, 2));
+    }
+
+    #[test]
+    fn think_into_with_no_prior_row_writes_one_under_this_speakers_own_id() {
+        let store = RecordingThoughtStore::new();
+        let bot1 = ParticipantId::parse("bot1").unwrap();
+        let transcript = vec![sample_message(1, USER_SPEAKER_ID, "hi")];
+        let model = FakeCharacterModel::returning([Ok("bot1's own first note".to_string())]);
+
+        let result = think_into(
+            &store,
+            1,
+            &bot1,
+            &transcript,
+            &a_companion(),
+            &bot1_speakers(),
+            &model,
+        )
+        .expect("generation should succeed")
+        .expect("no prior row, so a thought should be written");
+
+        assert_eq!(result.speaker_id, bot1.to_string());
+        assert_eq!(result.text, "bot1's own first note");
+        assert_eq!((result.from_message_id, result.through_message_id), (1, 1));
     }
 
     // -- run_remote_turn: pure frame sequencing, no model, no socket --
@@ -778,9 +937,14 @@ mod tests {
 
     // Every case below shares the process-wide `ACTIVE_TURN`, so they run as
     // one test function: two separate `#[test]`s touching the same global
-    // would race under cargo's default parallel test execution.
+    // would race under cargo's default parallel test execution. Also holds
+    // `turn_slot::ACTIVE_TURN_TEST_LOCK` for the whole function, so this
+    // test can never race `multiplayer::two_instance_tests`'s real
+    // host-and-joiner tests for the same global slot either.
     #[test]
     fn local_model_generation_claims_and_releases_the_shared_turn_slot() {
+        let _serial = crate::turn_slot::ACTIVE_TURN_TEST_LOCK.blocking_lock();
+
         // A pre-claimed slot: `try_handle` must report failure and spawn no
         // thread at all, rather than generate — or think — while a local
         // turn is live.
