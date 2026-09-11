@@ -1029,8 +1029,11 @@ pub trait CompactionStore {
     /// `compaction::commit::commit` builds the [`CommitRecord`]; this
     /// method only applies it. `QueryReturnedNoRows` if `record.draft_id`
     /// or any id it references is unknown; otherwise the underlying
-    /// `rusqlite::Error`. A mid-way error rolls back every mutation,
-    /// including already-applied promotions.
+    /// `rusqlite::Error`. An `Err` here always means the transaction did
+    /// not commit — nothing durable happened, including the already-applied
+    /// promotions — because the production impl reads the committed row
+    /// back on the transaction itself, before committing it, rather than
+    /// after.
     fn commit_checkpoint(&self, record: CommitRecord) -> Result<Checkpoint>;
 }
 
@@ -1220,8 +1223,20 @@ impl CompactionStore for SqliteCompactionStore {
             record.through_message_id,
         )?;
         set_compacted_through_on(&tx, record.companion_id, Some(record.through_message_id))?;
+        // Read the committed row back on the transaction itself, before
+        // `tx.commit()`: reading it on the bare connection afterward would
+        // mean a read failure (or an unreachable `QueryReturnedNoRows`) is
+        // indistinguishable from a transaction failure to every caller, even
+        // though the mutations above are already durable at that point. On
+        // this side of `tx.commit()`, `Transaction`'s `Deref<Target =
+        // Connection>` still applies, so `get_checkpoint_on(&tx, ..)`
+        // composes the same way the other `_on` calls above do, and a
+        // failure here drops `tx` without committing, which rusqlite's
+        // default `DropBehavior::Rollback` rolls back in full.
+        let committed =
+            get_checkpoint_on(&tx, record.draft_id)?.ok_or(Error::QueryReturnedNoRows)?;
         tx.commit()?;
-        get_checkpoint_on(&con, record.draft_id)?.ok_or(Error::QueryReturnedNoRows)
+        Ok(committed)
     }
 }
 
