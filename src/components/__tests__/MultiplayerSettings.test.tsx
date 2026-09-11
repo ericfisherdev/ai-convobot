@@ -35,6 +35,7 @@ const baseConfig: ConfigInterface = {
   compaction_model_path: null,
   heuristic_person_detection: true,
   compaction_attitude_weight: 0.5,
+  running_thoughts_enabled: false,
 }
 
 describe('MultiplayerSettings', () => {

@@ -28,6 +28,11 @@ use crate::compaction::types::CompactionTrigger;
 use crate::database::{CompanionAttitude, Database, Message, NewMessage};
 use crate::multiplayer::protocol::ContinuityPayload;
 use crate::participants::{normalise_mentions, ParticipantId, ParticipantRegistry};
+use crate::running_thoughts::generate::ThoughtError;
+use crate::running_thoughts::hook::thought_inputs_on;
+use crate::running_thoughts::prompt::ThoughtInputs;
+use crate::running_thoughts::store::{RunningThoughtStore, SqliteRunningThoughtStore};
+use crate::running_thoughts::types::{NewRunningThought, RunningThought};
 use crate::turn_slot::TurnGuard;
 
 /// The persistence seam between [`PendingTurn`] and the database, so the
@@ -107,6 +112,20 @@ pub trait TurnStore {
     /// loop, so every remote speaker in the round sees the same checkpoint
     /// even if a background job commits mid-round.
     fn continuity(&self) -> rusqlite::Result<Option<ContinuityPayload>>;
+
+    /// What a round's host-companion thought (#216) should be generated
+    /// from, read once per round before `char`'s reply: `None` when running
+    /// thoughts are disabled, so the caller never announces or runs a
+    /// generation.
+    fn thought_inputs(
+        &self,
+        companion_id: i32,
+        speaker: &ParticipantId,
+        through_message_id: i32,
+    ) -> rusqlite::Result<Option<ThoughtInputs>>;
+
+    /// Persists one running thought and returns the stored row.
+    fn store_thought(&self, thought: NewRunningThought) -> rusqlite::Result<RunningThought>;
 }
 
 /// The production [`TurnStore`], backed by `companion_database.db`.
@@ -198,6 +217,21 @@ impl TurnStore for SqliteTurnStore {
             .compacted_through
             .is_some()
             .then(|| ContinuityPayload::from(ctx)))
+    }
+
+    fn thought_inputs(
+        &self,
+        companion_id: i32,
+        speaker: &ParticipantId,
+        through_message_id: i32,
+    ) -> rusqlite::Result<Option<ThoughtInputs>> {
+        thought_inputs_on(companion_id, speaker, through_message_id)
+    }
+
+    fn store_thought(&self, thought: NewRunningThought) -> rusqlite::Result<RunningThought> {
+        let store = SqliteRunningThoughtStore;
+        let id = store.insert(thought)?;
+        store.get(id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
     }
 }
 
@@ -478,6 +512,50 @@ impl PendingTurn {
         self.companion_id
     }
 
+    /// This round's host-companion thought inputs (#216), or `None` when
+    /// running thoughts are disabled or the read failed (logged here so
+    /// neither caller has to). Read once per round, before `speaker`'s
+    /// reply.
+    pub fn thought_inputs(
+        &self,
+        store: &impl TurnStore,
+        speaker: &ParticipantId,
+    ) -> Option<ThoughtInputs> {
+        match store.thought_inputs(self.companion_id, speaker, self.user_message_id) {
+            Ok(inputs) => inputs,
+            Err(e) => {
+                eprintln!("running thoughts: failed to read inputs: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Runs `write` (the model-facing generation closure — production hands
+    /// this `generate::generate_thought` already bound to the persona,
+    /// speakers and `ResidentCharacterModel`) over `inputs`, handing it
+    /// `store.store_thought` as the insert closure. Every [`ThoughtError`]
+    /// is logged and returns `None`, so **the reply proceeds either way**
+    /// and there is never a partial row. Never consumes `self`: `reply` and
+    /// `finish` still follow.
+    pub fn think(
+        &self,
+        store: &impl TurnStore,
+        inputs: &ThoughtInputs,
+        write: impl FnOnce(
+            &ThoughtInputs,
+            &dyn Fn(NewRunningThought) -> rusqlite::Result<RunningThought>,
+        ) -> Result<RunningThought, ThoughtError>,
+    ) -> Option<RunningThought> {
+        let insert = |thought: NewRunningThought| store.store_thought(thought);
+        match write(inputs, &insert) {
+            Ok(thought) => Some(thought),
+            Err(e) => {
+                eprintln!("running thoughts: {}", e);
+                None
+            }
+        }
+    }
+
     /// Generates one speaker's reply and persists it.
     ///
     /// The generated text is normalised to `@id` mention form (`self.registry`)
@@ -553,6 +631,13 @@ pub(crate) struct RecordingStore {
     /// `chat_turn` and `round` test — none of which calls `set_continuity`
     /// — keeps passing exactly as before #182.
     continuity: std::sync::Mutex<Option<ContinuityPayload>>,
+    /// What `thought_inputs` returns. Defaults to `None`, so every existing
+    /// `chat_turn`/`round`/`main.rs` test — none of which calls
+    /// `with_thought_inputs` — keeps passing untouched (running thoughts
+    /// off by default).
+    thought_inputs: std::sync::Mutex<Option<ThoughtInputs>>,
+    /// Every thought `store_thought` has persisted, in call order.
+    pub(crate) thoughts: std::sync::Mutex<Vec<RunningThought>>,
 }
 
 #[cfg(test)]
@@ -577,6 +662,8 @@ impl RecordingStore {
             }),
             queued_drafts: std::sync::Mutex::new(Vec::new()),
             continuity: std::sync::Mutex::new(None),
+            thought_inputs: std::sync::Mutex::new(None),
+            thoughts: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -591,6 +678,14 @@ impl RecordingStore {
     /// `multiplayer::round::run_round`'s compaction hook to actually fire.
     pub(crate) fn with_compaction_tail(self, view: CompactionTailView) -> Self {
         *self.compaction_tail.lock().unwrap() = view;
+        self
+    }
+
+    /// Overrides what `thought_inputs` returns, for a test that wants
+    /// `PendingTurn::think`/`multiplayer::round::run_round`'s thought hook
+    /// to actually fire.
+    pub(crate) fn with_thought_inputs(self, inputs: ThoughtInputs) -> Self {
+        *self.thought_inputs.lock().unwrap() = Some(inputs);
         self
     }
 
@@ -682,6 +777,32 @@ impl TurnStore for RecordingStore {
 
     fn continuity(&self) -> rusqlite::Result<Option<ContinuityPayload>> {
         Ok(self.continuity.lock().unwrap().clone())
+    }
+
+    fn thought_inputs(
+        &self,
+        _companion_id: i32,
+        _speaker: &ParticipantId,
+        _through_message_id: i32,
+    ) -> rusqlite::Result<Option<ThoughtInputs>> {
+        Ok(self.thought_inputs.lock().unwrap().clone())
+    }
+
+    fn store_thought(&self, thought: NewRunningThought) -> rusqlite::Result<RunningThought> {
+        let mut thoughts = self.thoughts.lock().unwrap();
+        let id = thoughts.len() as i64 + 1;
+        let stored = RunningThought {
+            id,
+            companion_id: thought.companion_id,
+            speaker_id: thought.speaker_id,
+            from_message_id: thought.from_message_id,
+            through_message_id: thought.through_message_id,
+            text: thought.text,
+            edited: thought.edited,
+            created_at: String::new(),
+        };
+        thoughts.push(stored.clone());
+        Ok(stored)
     }
 }
 
@@ -818,5 +939,102 @@ mod tests {
             *store.finished.lock().unwrap(),
             vec![("hello".to_string(), "reply".to_string())]
         );
+    }
+
+    fn a_thought_inputs() -> ThoughtInputs {
+        ThoughtInputs {
+            companion_id: 1,
+            speaker_id: ParticipantId::CHAR,
+            previous: vec![],
+            round: vec![],
+            from_message_id: 1,
+            through_message_id: 1,
+        }
+    }
+
+    #[test]
+    fn thought_inputs_is_none_by_default() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = RecordingStore::new(None);
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), solo_registry())
+                .expect("insert should succeed");
+
+        assert!(pending
+            .thought_inputs(&store, &ParticipantId::CHAR)
+            .is_none());
+    }
+
+    #[test]
+    fn think_on_success_stores_exactly_one_row() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = RecordingStore::new(None).with_thought_inputs(a_thought_inputs());
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), solo_registry())
+                .expect("insert should succeed");
+        let inputs = pending
+            .thought_inputs(&store, &ParticipantId::CHAR)
+            .expect("thought inputs should be set");
+
+        let thought = pending.think(&store, &inputs, |inputs, insert| {
+            insert(NewRunningThought {
+                companion_id: inputs.companion_id,
+                speaker_id: inputs.speaker_id.to_string(),
+                from_message_id: inputs.from_message_id,
+                through_message_id: inputs.through_message_id,
+                text: "a note".to_string(),
+                edited: false,
+            })
+            .map_err(ThoughtError::Store)
+        });
+
+        assert_eq!(thought.map(|t| t.text), Some("a note".to_string()));
+        assert_eq!(store.thoughts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn think_on_a_generate_error_stores_nothing_and_returns_none() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = RecordingStore::new(None).with_thought_inputs(a_thought_inputs());
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), solo_registry())
+                .expect("insert should succeed");
+        let inputs = pending
+            .thought_inputs(&store, &ParticipantId::CHAR)
+            .expect("thought inputs should be set");
+
+        let thought = pending.think(&store, &inputs, |_inputs, _insert| {
+            Err(crate::running_thoughts::generate::ThoughtError::Generate(
+                std::io::Error::other("no model loaded"),
+            ))
+        });
+
+        assert!(thought.is_none());
+        assert!(store.thoughts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn think_on_a_store_error_is_logged_and_returns_none() {
+        static SLOT: TurnSlot = TurnSlot::new();
+        let guard = SLOT.try_claim().expect("slot should be free");
+        let store = RecordingStore::new(None).with_thought_inputs(a_thought_inputs());
+        let pending =
+            PendingTurn::begin(&guard, &store, 1, 1, "hello".to_string(), solo_registry())
+                .expect("insert should succeed");
+        let inputs = pending
+            .thought_inputs(&store, &ParticipantId::CHAR)
+            .expect("thought inputs should be set");
+
+        let thought = pending.think(&store, &inputs, |_inputs, _insert| {
+            Err(crate::running_thoughts::generate::ThoughtError::Store(
+                rusqlite::Error::QueryReturnedNoRows,
+            ))
+        });
+
+        assert!(thought.is_none());
+        assert!(store.thoughts.lock().unwrap().is_empty());
     }
 }

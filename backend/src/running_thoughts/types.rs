@@ -2,7 +2,6 @@
 //! later pure module (#216's generation, if it needs one) can depend on the
 //! shape without pulling in rusqlite-backed code, matching
 //! `compaction::types`.
-#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 

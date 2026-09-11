@@ -21,6 +21,11 @@ use crate::multiplayer::protocol::ContinuityPayload;
 use crate::participants::{
     expand_placeholders, render_mentions, Participant, ParticipantId, ParticipantRegistry,
 };
+use crate::running_thoughts::prompt::{
+    render_reply_block, REPLY_THOUGHTS_BUDGET_SHARE, REPLY_THOUGHTS_LIMIT,
+};
+use crate::running_thoughts::store::{RunningThoughtStore, SqliteRunningThoughtStore};
+use crate::running_thoughts::types::RunningThought;
 use crate::system_memory::SystemMemoryDetector;
 
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -172,7 +177,11 @@ fn join_names(names: &[&str]) -> String {
 /// `blocks` (#174's rendered compaction context) is spliced in the same way:
 /// user overlay directly after the user's own persona, companion overlay/
 /// rules/story-so-far/recent-detail/pins directly after the companion's own
-/// persona, every empty field adding no component. `Default`/`Auto` and
+/// persona, every empty field adding no component. `thoughts_block` (#216's
+/// rendered running-thoughts block) lands directly after `companion_overlay`
+/// and before `rules` in every branch — the companion's own beliefs sit with
+/// its persona, ahead of the story blocks — and adds no component when
+/// empty, the same as every compaction block. `Default`/`Auto` and
 /// `Mistral` move the marker that used to end the companion-persona
 /// component (`<START>` / `[/INST]\n<s>[INST]\n`) to the front of the
 /// example-dialogue component instead, so the new blocks land before it
@@ -200,6 +209,7 @@ fn build_base_components(
     attitude_context: &str,
     speakers: &PromptSpeakers,
     blocks: &RenderedBlocks,
+    thoughts_block: &str,
 ) -> Vec<String> {
     let participants = &speakers.registry;
     let user_name = speakers.user_name();
@@ -249,6 +259,9 @@ fn build_base_components(
         if !blocks.companion_overlay.is_empty() {
             components.push(blocks.companion_overlay.clone());
         }
+        if !thoughts_block.is_empty() {
+            components.push(thoughts_block.to_string());
+        }
         if !blocks.rules.is_empty() {
             components.push(blocks.rules.clone());
         }
@@ -285,6 +298,9 @@ fn build_base_components(
         }
         if !blocks.companion_overlay.is_empty() {
             components.push(blocks.companion_overlay.clone());
+        }
+        if !thoughts_block.is_empty() {
+            components.push(thoughts_block.to_string());
         }
         if !blocks.rules.is_empty() {
             components.push(blocks.rules.clone());
@@ -344,6 +360,9 @@ fn build_base_components(
         if !blocks.companion_overlay.is_empty() {
             components.push(blocks.companion_overlay.clone());
         }
+        if !thoughts_block.is_empty() {
+            components.push(thoughts_block.to_string());
+        }
         if !blocks.rules.is_empty() {
             components.push(blocks.rules.clone());
         }
@@ -377,12 +396,14 @@ fn build_base_components(
 /// # Errors
 /// Propagates model load, tokenization and decode failures as
 /// `std::io::ErrorKind::Other`.
+#[allow(clippy::too_many_arguments)]
 pub fn prompt(
     prompt: &str,
     companion_id: i32,
     transcript: &dyn TranscriptSource,
     speakers: &PromptSpeakers,
     compaction: &dyn CompactionSource,
+    thoughts: &dyn ThoughtSource,
 ) -> Result<String, std::io::Error> {
     generate(
         prompt,
@@ -391,6 +412,7 @@ pub fn prompt(
         transcript,
         speakers,
         compaction,
+        thoughts,
     )
 }
 
@@ -402,6 +424,7 @@ pub fn prompt(
 /// # Errors
 /// Propagates model load, tokenization and decode failures as
 /// `std::io::ErrorKind::Other`.
+#[allow(clippy::too_many_arguments)]
 pub fn prompt_streaming(
     prompt: &str,
     companion_id: i32,
@@ -409,6 +432,7 @@ pub fn prompt_streaming(
     transcript: &dyn TranscriptSource,
     speakers: &PromptSpeakers,
     compaction: &dyn CompactionSource,
+    thoughts: &dyn ThoughtSource,
 ) -> Result<String, std::io::Error> {
     generate(
         prompt,
@@ -417,6 +441,7 @@ pub fn prompt_streaming(
         transcript,
         speakers,
         compaction,
+        thoughts,
     )
 }
 
@@ -528,6 +553,60 @@ impl CompactionSource for SqliteCompaction {
     }
 }
 
+/// Where a turn's recent running thoughts (#216) come from — mirrors
+/// [`CompactionSource`]'s split between a real database and a fixed, empty
+/// value.
+pub trait ThoughtSource {
+    /// # Errors
+    /// Returns `std::io::ErrorKind::Other` if the underlying read fails.
+    fn recent(
+        &self,
+        companion_id: i32,
+        config: &ConfigView,
+    ) -> std::io::Result<Vec<RunningThought>>;
+}
+
+/// The production [`ThoughtSource`]: `speaker`'s chained thoughts through
+/// [`SqliteRunningThoughtStore`]. Takes the turn's own `ConfigView` rather
+/// than reading it again, so this can never race `PUT /api/config` and see a
+/// different flag value than the rest of the turn.
+pub struct SqliteThoughts {
+    pub speaker: ParticipantId,
+}
+
+impl ThoughtSource for SqliteThoughts {
+    fn recent(
+        &self,
+        companion_id: i32,
+        config: &ConfigView,
+    ) -> std::io::Result<Vec<RunningThought>> {
+        if !config.running_thoughts_enabled {
+            return Ok(vec![]);
+        }
+        SqliteRunningThoughtStore
+            .recent_for(companion_id, self.speaker.as_str(), REPLY_THOUGHTS_LIMIT)
+            .map_err(|e| {
+                eprintln!("Error while loading running thoughts: {}", e);
+                std::io::Error::other("Error while loading running thoughts")
+            })
+    }
+}
+
+/// A [`ThoughtSource`] with no thoughts: what the joiner (#220, which writes
+/// its own bot's notes with its own model and store) and every existing
+/// test passes.
+pub struct NoThoughts;
+
+impl ThoughtSource for NoThoughts {
+    fn recent(
+        &self,
+        _companion_id: i32,
+        _config: &ConfigView,
+    ) -> std::io::Result<Vec<RunningThought>> {
+        Ok(vec![])
+    }
+}
+
 /// An owned, `Clone + Send` snapshot of who is in the chat and which of them
 /// the current turn is generating for. Owned so it can move into
 /// `web::block` closures and the `stream-generation` thread without holding
@@ -598,6 +677,12 @@ pub struct AssembledPrompt {
     /// to before this field existed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuity: Option<ContinuityPayload>,
+    /// The running-thoughts block (#216) folded into `system_prompt`, empty
+    /// when the flag is off or there are no thoughts yet. `skip_serializing_if`
+    /// keeps `GET /api/debug/prompt`'s JSON shape byte-identical while the
+    /// flag is off.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub running_thoughts: String,
 }
 
 /// The result of rendering a message history for one turn.
@@ -715,8 +800,13 @@ fn render_history(
 /// could see a different template or token budget than the one the reply is
 /// rendered with.
 ///
+/// `thoughts` is the companion's recent running thoughts (#216), newest
+/// last; empty renders no block at all, which is what keeps the disabled
+/// path byte-identical.
+///
 /// # Errors
 /// Propagates user and companion load failures as `std::io::ErrorKind::Other`.
+#[allow(clippy::too_many_arguments)]
 pub fn assemble_prompt(
     user_message: &str,
     companion_id: i32,
@@ -725,6 +815,7 @@ pub fn assemble_prompt(
     transcript: &dyn TranscriptSource,
     speakers: &PromptSpeakers,
     compaction: &CompactionContext,
+    thoughts: &[RunningThought],
 ) -> Result<AssembledPrompt, std::io::Error> {
     let user: UserView = match Database::get_user_data() {
         Ok(user) => user,
@@ -886,6 +977,19 @@ pub fn assemble_prompt(
         );
     }
 
+    // Render the running-thoughts block (#216) against its own share of the
+    // compaction slice, same rationale as the attitude/compaction blocks
+    // above: built before `base_components` so it lands inside the system
+    // portion. Empty `thoughts` renders `""`, adding no component below.
+    let thoughts_budget =
+        (context_manager.compaction_token_budget as f32 * REPLY_THOUGHTS_BUDGET_SHARE) as usize;
+    let thoughts_block = render_reply_block(
+        thoughts,
+        speakers.self_name(),
+        speakers.user_name(),
+        thoughts_budget,
+    );
+
     // Build base prompt components.
     // Auto renders through the model's own chat template, so its system content
     // must be plain prose; the Mistral branch below would embed [INST] markers.
@@ -898,6 +1002,7 @@ pub fn assemble_prompt(
         &attitude_context,
         speakers,
         &compaction_blocks,
+        &thoughts_block,
     );
 
     base_prompt = base_components.join("");
@@ -937,6 +1042,7 @@ pub fn assemble_prompt(
         compaction: compaction_blocks,
         compacted_through: compaction.compacted_through,
         continuity: None,
+        running_thoughts: thoughts_block,
     })
 }
 
@@ -1381,6 +1487,23 @@ fn run_decode(
     Ok((generated, tokens_generated))
 }
 
+/// The sampler chain both a reply (`generate`) and a running thought
+/// (`ResidentCharacterModel::complete_in_character`, #216) sample with, so
+/// the two can never drift apart. The old `llm` crate hid this behind
+/// `InferenceParameters::default()`; llama.cpp requires an explicit chain,
+/// so these values reproduce a conventional chat preset.
+fn reply_sampler(model: &LlamaModel, seed: u32) -> LlamaSampler {
+    LlamaSampler::chain_simple([
+        LlamaSampler::penalties(model.n_vocab(), 64, 1.1, 0.0, 0.0),
+        LlamaSampler::top_k(40),
+        LlamaSampler::top_p(0.9, 1),
+        LlamaSampler::min_p(0.05, 1),
+        LlamaSampler::temp(0.8),
+        LlamaSampler::dist(seed),
+    ])
+}
+
+#[allow(clippy::too_many_arguments)]
 fn generate(
     prompt: &str,
     companion_id: i32,
@@ -1388,6 +1511,7 @@ fn generate(
     transcript: &dyn TranscriptSource,
     speakers: &PromptSpeakers,
     compaction: &dyn CompactionSource,
+    thoughts: &dyn ThoughtSource,
 ) -> Result<String, std::io::Error> {
     let _generation_guard = GENERATION_LOCK
         .lock()
@@ -1426,6 +1550,7 @@ fn generate(
 
     println!("🚀 Generating AI response with optimized session...");
     let compaction_context = compaction.context(companion_id)?;
+    let recent_thoughts = thoughts.recent(companion_id, &config)?;
     let assembled = assemble_prompt(
         prompt,
         companion_id,
@@ -1434,6 +1559,7 @@ fn generate(
         transcript,
         speakers,
         &compaction_context,
+        &recent_thoughts,
     )?;
     let AssembledPrompt {
         system_prompt: base_prompt,
@@ -1441,6 +1567,7 @@ fn generate(
         attitude_context,
         managed_messages,
         compaction: compaction_blocks,
+        running_thoughts,
         ..
     } = assembled;
     // Built from the config passed into `assemble_prompt`, so the budgets below
@@ -1448,9 +1575,10 @@ fn generate(
     let context_manager = ContextManager::new(config.clone());
 
     // Calculate token usage for memory management. base_prompt already
-    // contains the attitude text and the rendered compaction blocks (both
-    // were folded into base_components above), so they are subtracted back
-    // out here to avoid double counting them as system tokens.
+    // contains the attitude text, the rendered compaction blocks and the
+    // running-thoughts block (all three were folded into base_components
+    // above), so they are subtracted back out here to avoid double counting
+    // them as system tokens.
     let attitude_tokens = ContextManager::estimate_tokens(&attitude_context);
     let compaction_tokens = ContextManager::estimate_tokens(&format!(
         "{}{}{}{}{}{}",
@@ -1460,7 +1588,7 @@ fn generate(
         compaction_blocks.story_so_far,
         compaction_blocks.recent_detail,
         compaction_blocks.pins,
-    ));
+    )) + ContextManager::estimate_tokens(&running_thoughts);
     let system_tokens = ContextManager::estimate_tokens(&base_prompt)
         .saturating_sub(attitude_tokens)
         .saturating_sub(compaction_tokens);
@@ -1504,19 +1632,9 @@ fn generate(
         tracker.start_session(session_id.clone(), model_config.clone(), input_tokens);
     }
 
-    // The old `llm` crate hid sampling behind InferenceParameters::default().
-    // llama.cpp requires an explicit sampler chain, so these values reproduce
-    // a conventional chat preset.
     let seed = sampler_seed();
     println!("🎲 Sampler seed: {}", seed);
-    let mut sampler = LlamaSampler::chain_simple([
-        LlamaSampler::penalties(model.n_vocab(), 64, 1.1, 0.0, 0.0),
-        LlamaSampler::top_k(40),
-        LlamaSampler::top_p(0.9, 1),
-        LlamaSampler::min_p(0.05, 1),
-        LlamaSampler::temp(0.8),
-        LlamaSampler::dist(seed),
-    ]);
+    let mut sampler = reply_sampler(&model, seed);
 
     // Size the KV cache from the budget the ContextManager already computed.
     let context_size = context_manager.token_budget.total.max(512) as u32;
@@ -2049,6 +2167,146 @@ impl Extractor for FakeExtractor {
     }
 }
 
+/// One short in-character completion on the *chat* model, for the running
+/// thought (#216). Distinct from [`Extractor`] on purpose: that seam prefers
+/// the configured extraction model and samples greedily; a thought is
+/// subjective and in-voice, so it runs on `RESIDENT_MODEL` with the same
+/// sampler chain [`generate`] uses for replies.
+pub trait CharacterModel {
+    /// # Errors
+    /// Propagates model load, tokenization and decode failures as
+    /// `std::io::ErrorKind::Other`.
+    fn complete_in_character(
+        &self,
+        system: &str,
+        user: &str,
+        max_tokens: usize,
+    ) -> std::io::Result<String>;
+}
+
+/// Production [`CharacterModel`]: always `RESIDENT_MODEL`, never
+/// `RESIDENT_EXTRACTOR` — a thought is written in the companion's own voice,
+/// so it must run on the same model (and see the same LoRA/template
+/// behaviour) as a reply.
+pub struct ResidentCharacterModel;
+
+impl CharacterModel for ResidentCharacterModel {
+    fn complete_in_character(
+        &self,
+        system: &str,
+        user: &str,
+        max_tokens: usize,
+    ) -> std::io::Result<String> {
+        let _generation_guard = GENERATION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let config = Database::get_config().map_err(|e| {
+            std::io::Error::other(format!("config unavailable while writing a thought: {e}"))
+        })?;
+        let backend = llama_backend()?;
+        let (model, _) = RESIDENT_MODEL.get_or_load(ModelKey::from_config(&config), |_| {
+            load_chat_model(backend, &config)
+        })?;
+
+        // Rendered through the model's own template, same fallback shape as
+        // `run_extraction`: not fatal, since a plain system+user join still
+        // produces a usable prompt.
+        let rendered = match apply_gguf_chat_template(&model, system, &[(false, user.to_string())])
+        {
+            Ok(rendered) => rendered,
+            Err(e) => {
+                eprintln!("⚠️ Thought template unavailable ({e}), using the raw prompt");
+                format!("{system}\n\n{user}\n")
+            }
+        };
+
+        let prompt_tokens = model
+            .str_to_token(&rendered, AddBos::Always)
+            .map_err(|e| std::io::Error::other(format!("failed to tokenize prompt: {}", e)))?;
+        let prompt_token_count = prompt_tokens.len();
+        // Sized the same way `run_extraction` sizes its own context: rounded
+        // up to 256, capped at the chat model's own token budget.
+        let window = ContextManager::new(config.clone()).token_budget.total;
+        let n_ctx = (prompt_token_count + max_tokens)
+            .next_multiple_of(256)
+            .min(window.max(256));
+
+        let cpu_cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let context_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(n_ctx as u32))
+            .with_n_batch(N_BATCH)
+            .with_n_threads(cpu_cores as i32)
+            .with_n_threads_batch(cpu_cores as i32);
+        let mut llama_context = model
+            .new_context(backend, context_params)
+            .map_err(|e| std::io::Error::other(format!("failed to create llama context: {}", e)))?;
+
+        let seed = sampler_seed();
+        let mut sampler = reply_sampler(&model, seed);
+
+        // Counting-only callback: a thought is not the turn's reply, so
+        // neither `INFERENCE_TRACKER` nor `INFERENCE_OPTIMIZER` (which
+        // measure replies) are touched here.
+        let (text, tokens_generated) = run_decode(
+            &model,
+            &mut llama_context,
+            &mut sampler,
+            &prompt_tokens,
+            max_tokens,
+            &mut |_piece| true,
+        )?;
+
+        println!(
+            "💭 Thought: {} prompt tokens, {} generated",
+            prompt_token_count, tokens_generated
+        );
+
+        Ok(text)
+    }
+}
+
+/// A canned [`CharacterModel`] for other modules' tests (#216's
+/// generation pass): records every `(system, user)` prompt it is asked to
+/// run, and pops pre-supplied outputs in call order. Never runs a model.
+#[cfg(test)]
+pub(crate) struct FakeCharacterModel {
+    outputs: Mutex<std::collections::VecDeque<std::io::Result<String>>>,
+    pub prompts: Mutex<Vec<(String, String)>>,
+}
+
+#[cfg(test)]
+impl FakeCharacterModel {
+    pub fn returning(outputs: impl IntoIterator<Item = std::io::Result<String>>) -> Self {
+        Self {
+            outputs: Mutex::new(outputs.into_iter().collect()),
+            prompts: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl CharacterModel for FakeCharacterModel {
+    fn complete_in_character(
+        &self,
+        system: &str,
+        user: &str,
+        _max_tokens: usize,
+    ) -> std::io::Result<String> {
+        self.prompts
+            .lock()
+            .unwrap()
+            .push((system.to_string(), user.to_string()));
+        self.outputs
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| Err(std::io::Error::other("FakeCharacterModel: no more outputs")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2136,6 +2394,7 @@ mod tests {
             ATTITUDE_MARKER,
             &solo_speakers(),
             &RenderedBlocks::default(),
+            "",
         );
         let joined = components.join("");
         let start_index = joined
@@ -2155,6 +2414,7 @@ mod tests {
             ATTITUDE_MARKER,
             &solo_speakers(),
             &RenderedBlocks::default(),
+            "",
         );
         let joined = components.join("");
         let start_index = joined
@@ -2174,6 +2434,7 @@ mod tests {
             ATTITUDE_MARKER,
             &solo_speakers(),
             &RenderedBlocks::default(),
+            "",
         );
         let joined = components.join("");
         let inst_index = joined
@@ -2193,6 +2454,7 @@ mod tests {
             ATTITUDE_MARKER,
             &solo_speakers(),
             &RenderedBlocks::default(),
+            "",
         );
         let joined = components.join("");
         let inst_index = joined
@@ -2212,6 +2474,7 @@ mod tests {
             ATTITUDE_MARKER,
             &solo_speakers(),
             &RenderedBlocks::default(),
+            "",
         );
         let without_attitude = build_base_components(
             &PromptTemplate::Default,
@@ -2222,6 +2485,7 @@ mod tests {
             "",
             &solo_speakers(),
             &RenderedBlocks::default(),
+            "",
         );
         assert_eq!(with_attitude.len(), without_attitude.len() + 1);
         assert!(!without_attitude.join("").contains(ATTITUDE_MARKER));
@@ -2239,6 +2503,7 @@ mod tests {
             "",
             &speakers,
             &RenderedBlocks::default(),
+            "",
         );
         let joined = components.join("");
         assert!(joined.contains("Alice, Ada and Bob"));
@@ -2256,6 +2521,7 @@ mod tests {
             "",
             &solo_speakers(),
             &RenderedBlocks::default(),
+            "",
         );
         let joined = components.join("");
         assert!(joined.contains("TestUser and TestCompanion"));
@@ -2489,6 +2755,7 @@ mod tests {
             compaction_model_path: None,
             heuristic_person_detection: true,
             compaction_attitude_weight: 0.5,
+            running_thoughts_enabled: false,
         }
     }
 
@@ -2712,6 +2979,7 @@ ws ::= [ \n]*"#;
                     ATTITUDE_MARKER,
                     &speakers,
                     &RenderedBlocks::default(),
+                    "",
                 )
                 .join("");
                 assert_eq!(legacy, updated, "{name} template regressed");
@@ -2768,17 +3036,24 @@ ws ::= [ \n]*"#;
         );
     }
 
-    const OVERLAY_FIRST_ORDER: [&str; 6] = [
+    /// The running-thoughts block (#216) `assemble_prompt` passes as
+    /// `build_base_components`'s `thoughts_block` argument in the tests
+    /// below, standing in for `render_reply_block`'s own output.
+    const THOUGHTS_MARKER: &str = "THOUGHTS_MARKER\n";
+
+    const OVERLAY_FIRST_ORDER: [&str; 7] = [
         "USER_OVERLAY_MARKER",
         "COMPANION_OVERLAY_MARKER",
+        "THOUGHTS_MARKER",
         "RULES_MARKER",
         "STORY_MARKER",
         "RECENT_MARKER",
         "PINS_MARKER",
     ];
 
-    const USER_OVERLAY_LAST_ORDER: [&str; 6] = [
+    const USER_OVERLAY_LAST_ORDER: [&str; 7] = [
         "COMPANION_OVERLAY_MARKER",
+        "THOUGHTS_MARKER",
         "RULES_MARKER",
         "STORY_MARKER",
         "RECENT_MARKER",
@@ -2797,6 +3072,7 @@ ws ::= [ \n]*"#;
             "",
             &solo_speakers(),
             &marker_blocks(),
+            THOUGHTS_MARKER,
         )
         .join("");
         assert_markers_increasing_and_before(&joined, &OVERLAY_FIRST_ORDER, "<START>");
@@ -2813,6 +3089,7 @@ ws ::= [ \n]*"#;
             "",
             &solo_speakers(),
             &marker_blocks(),
+            THOUGHTS_MARKER,
         )
         .join("");
         assert_markers_increasing_and_before(&joined, &OVERLAY_FIRST_ORDER, "<START>");
@@ -2829,6 +3106,7 @@ ws ::= [ \n]*"#;
             "",
             &solo_speakers(),
             &marker_blocks(),
+            THOUGHTS_MARKER,
         )
         .join("");
         assert_markers_increasing_and_before(&joined, &USER_OVERLAY_LAST_ORDER, "[/INST]");
@@ -2845,6 +3123,7 @@ ws ::= [ \n]*"#;
             "",
             &solo_speakers(),
             &marker_blocks(),
+            THOUGHTS_MARKER,
         )
         .join("");
         assert_markers_increasing_and_before(&joined, &OVERLAY_FIRST_ORDER, "[/INST]");

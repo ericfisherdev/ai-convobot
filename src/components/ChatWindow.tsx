@@ -180,6 +180,16 @@ const ChatWindow = () => {
               draftReady(effect.draftId);
               awaitedDraftScrollIdRef.current = effect.draftId;
               break;
+            case 'thought_started':
+              // #218 renders the pending-thought indicator this announces.
+              break;
+            case 'thought':
+              // #218 renders the companion's running thoughts panel from
+              // `state.thoughts`; nothing to do here yet.
+              break;
+            case 'thought_dropped':
+              // #218 removes its pending-thought indicator for this speaker.
+              break;
             case 'round_complete':
               // A bot may have dropped mid-round; pick that up immediately
               // rather than waiting for the next poll tick.

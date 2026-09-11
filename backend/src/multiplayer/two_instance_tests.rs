@@ -50,6 +50,7 @@ use crate::multiplayer::round::{plan_round, run_round, RoundOutcome, RoundPlan, 
 use crate::multiplayer::routing::RoutingPolicy;
 use crate::participants::ParticipantId;
 use crate::participants::ParticipantRegistry;
+use crate::running_thoughts::generate::ThoughtError;
 use crate::turn_slot::TurnSlot;
 
 /// The fixed companion/user ids every round in this file scores against —
@@ -316,6 +317,7 @@ async fn run_one_round(
             &registry_snapshot,
             &policy,
             &mut host_gen,
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
             &remotes,
             &broadcast,
             timeout,
@@ -661,6 +663,7 @@ async fn a_committed_checkpoint_ships_continuity_and_a_trimmed_transcript_to_the
             &mut |_prompt: &str, _on_token: &mut dyn FnMut(&str)| -> io::Result<String> {
                 panic!("char should never be asked to speak in this test")
             },
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
             &remotes,
             &broadcast,
             Duration::from_secs(5),
@@ -726,6 +729,7 @@ async fn a_committed_checkpoint_ships_continuity_and_a_trimmed_transcript_to_the
             &mut |_prompt: &str, _on_token: &mut dyn FnMut(&str)| -> io::Result<String> {
                 panic!("char should never be asked to speak in this test")
             },
+            &mut |_inputs, _insert| Err(ThoughtError::Empty),
             &remotes,
             &broadcast,
             Duration::from_secs(5),

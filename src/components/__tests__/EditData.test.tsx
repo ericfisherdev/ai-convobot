@@ -48,6 +48,7 @@ const FULL_CONFIG = {
   compaction_model_path: null,
   heuristic_person_detection: true,
   compaction_attitude_weight: 0.5,
+  running_thoughts_enabled: false,
 }
 
 describe('EditData Component', () => {
@@ -208,5 +209,6 @@ describe('EditData Component', () => {
     expect(body).toHaveProperty('compaction_attitude_weight')
     expect(body).toHaveProperty('compaction_model_path')
     expect(body).toHaveProperty('heuristic_person_detection')
+    expect(body).toHaveProperty('running_thoughts_enabled')
   })
 })

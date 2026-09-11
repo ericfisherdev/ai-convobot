@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use crate::attitude_formatter::AttitudeDelta;
 use crate::database::CompanionAttitude;
 use crate::participants::ParticipantId;
+use crate::running_thoughts::types::RunningThought;
 
 /// Post-turn attitude state, carried by the stream's attitude chunk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,7 +28,9 @@ pub struct AttitudeStreamUpdate {
 /// `content` to the current speaker's bubble (or, when `attitude` is set
 /// instead, carries the attitude update and no content); `ReplyComplete`
 /// replaces the current bubble's content with the sanitized `content` and
-/// carries `message_id`; `RoundComplete` and `Error` are the two terminal
+/// carries `message_id`; `ThoughtStarted` (#216) announces that `speaker_id`
+/// is about to write its running thought about the round that just closed,
+/// before its reply; `RoundComplete` and `Error` are the two terminal
 /// events (`is_complete: true`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +38,7 @@ pub enum StreamEvent {
     ReplyStarted,
     Token,
     ReplyComplete,
+    ThoughtStarted,
     RoundComplete,
     Error,
 }
@@ -56,8 +60,12 @@ pub enum StreamEvent {
 /// `is_complete` is `true` only on `round_complete` and `error`, so a
 /// client that only tracks that field still terminates correctly.
 ///
-/// `message_id`, `error`, `attitude` and `compaction_draft_id` are omitted
-/// when `None`.
+/// `message_id`, `error`, `attitude`, `compaction_draft_id` and `thought` are
+/// omitted when `None`.
+///
+/// Wire order for a speaker with running thoughts enabled (#216):
+/// `thought_started`, then (on success) the `thought` chunk, then that
+/// speaker's `reply_started`. With the flag off, neither chunk is ever sent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamChunk {
     pub request_id: String,
@@ -82,6 +90,11 @@ pub struct StreamChunk {
     /// `GET /api/compaction/{id}` without waiting for a page refresh.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub compaction_draft_id: Option<i64>,
+    /// Set only on the `thought` chunk (#216): the just-generated running
+    /// thought, in the same shape #217's `GET /api/thoughts` rows use — no
+    /// separate view struct.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub thought: Option<RunningThought>,
 }
 
 impl StreamChunk {
@@ -98,6 +111,7 @@ impl StreamChunk {
             error: None,
             attitude: None,
             compaction_draft_id: None,
+            thought: None,
         }
     }
 
@@ -114,6 +128,7 @@ impl StreamChunk {
             error: None,
             attitude: None,
             compaction_draft_id: None,
+            thought: None,
         }
     }
 
@@ -136,6 +151,7 @@ impl StreamChunk {
             error: None,
             attitude: None,
             compaction_draft_id: None,
+            thought: None,
         }
     }
 
@@ -153,6 +169,7 @@ impl StreamChunk {
             error: None,
             attitude: Some(update),
             compaction_draft_id: None,
+            thought: None,
         }
     }
 
@@ -172,6 +189,45 @@ impl StreamChunk {
             error: None,
             attitude: None,
             compaction_draft_id: Some(draft_id),
+            thought: None,
+        }
+    }
+
+    /// Announces that `speaker` (the host companion) is about to write its
+    /// running thought about the round that just closed, before its reply
+    /// (#216). Empty `content`, `is_complete: false`.
+    pub fn thought_started(request_id: String, speaker: &ParticipantId) -> Self {
+        StreamChunk {
+            request_id,
+            event: StreamEvent::ThoughtStarted,
+            content: String::new(),
+            is_complete: false,
+            token_count: None,
+            speaker_id: speaker.as_str().to_string(),
+            message_id: None,
+            error: None,
+            attitude: None,
+            compaction_draft_id: None,
+            thought: None,
+        }
+    }
+
+    /// The just-generated running thought (#216): a `token`-event chunk
+    /// with empty content, `speaker_id` from the row, and `thought` set —
+    /// the same short-circuit shape as `attitude`/`compaction_draft_id`.
+    pub fn thought(request_id: String, thought: &RunningThought, count: usize) -> Self {
+        StreamChunk {
+            request_id,
+            event: StreamEvent::Token,
+            content: String::new(),
+            is_complete: false,
+            token_count: Some(count),
+            speaker_id: thought.speaker_id.clone(),
+            message_id: None,
+            error: None,
+            attitude: None,
+            compaction_draft_id: None,
+            thought: Some(thought.clone()),
         }
     }
 
@@ -188,6 +244,7 @@ impl StreamChunk {
             error: None,
             attitude: None,
             compaction_draft_id: None,
+            thought: None,
         }
     }
 
@@ -205,6 +262,7 @@ impl StreamChunk {
             error: Some(message),
             attitude: None,
             compaction_draft_id: None,
+            thought: None,
         }
     }
 }
@@ -464,5 +522,46 @@ mod tests {
 
     fn dummy_chunk(session_id: &str) -> StreamChunk {
         StreamChunk::round_complete(session_id.to_string(), Some(1))
+    }
+
+    fn a_running_thought() -> RunningThought {
+        RunningThought {
+            id: 7,
+            companion_id: 1,
+            speaker_id: "char".to_string(),
+            from_message_id: 1,
+            through_message_id: 3,
+            text: "I think they're excited about the trip.".to_string(),
+            edited: false,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn thought_started_chunk_pins_its_json_keys() {
+        let chunk = StreamChunk::thought_started("req-1".to_string(), &ParticipantId::CHAR);
+        let value = serde_json::to_value(&chunk).unwrap();
+
+        assert_eq!(value["event"], "thought_started");
+        assert_eq!(value["speaker_id"], "char");
+        assert_eq!(value["content"], "");
+        assert_eq!(value["is_complete"], false);
+        assert!(value.get("thought").is_none());
+    }
+
+    #[test]
+    fn thought_chunk_pins_its_json_keys_and_carries_the_running_thought() {
+        let thought = a_running_thought();
+        let chunk = StreamChunk::thought("req-1".to_string(), &thought, 3);
+        let value = serde_json::to_value(&chunk).unwrap();
+
+        assert_eq!(value["event"], "token");
+        assert_eq!(value["speaker_id"], "char");
+        assert_eq!(value["content"], "");
+        assert_eq!(value["thought"]["id"], 7);
+        assert_eq!(
+            value["thought"]["text"],
+            "I think they're excited about the trip."
+        );
     }
 }

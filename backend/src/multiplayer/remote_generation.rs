@@ -209,6 +209,7 @@ impl LocalModelGeneration {
                     &InMemoryTranscript(transcript.to_vec()),
                     speakers,
                     &source,
+                    &llm::NoThoughts,
                 )
             }
         });

@@ -177,6 +177,20 @@ export function MemorySettings({ config, onChange }: MemorySettingsProps) {
         />
       </div>
 
+      <div className="flex items-center justify-between">
+        <FieldLabel
+          htmlFor="runningThoughtsEnabled"
+          tooltip="After each round, the companion writes a short private note about what it took from it, and replies in light of that note"
+        >
+          Running thoughts
+        </FieldLabel>
+        <Switch
+          id="runningThoughtsEnabled"
+          checked={config.running_thoughts_enabled}
+          onCheckedChange={(checked) => onChange({ ...config, running_thoughts_enabled: checked })}
+        />
+      </div>
+
       <div className="space-y-2 border-t pt-4">
         <LlmModelSelector
           id="compaction-model-select"

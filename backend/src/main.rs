@@ -17,8 +17,12 @@ mod model_cache;
 mod model_metadata;
 use crate::llm::{
     assemble_prompt, prompt, prompt_streaming, CompactionSource, InMemoryTranscript,
-    PromptSpeakers, SqliteCompaction, SqliteTranscript,
+    PromptSpeakers, ResidentCharacterModel, SqliteCompaction, SqliteThoughts, SqliteTranscript,
+    ThoughtSource,
 };
+use crate::running_thoughts::generate::{generate_thought, ThoughtError};
+use crate::running_thoughts::prompt::ThoughtInputs;
+use crate::running_thoughts::types::{NewRunningThought, RunningThought};
 use uuid::Uuid;
 mod context_manager;
 mod inference_optimizer;
@@ -1278,6 +1282,23 @@ mod stream_turn_tests {
         ) -> rusqlite::Result<Option<crate::multiplayer::protocol::ContinuityPayload>> {
             self.inner.continuity()
         }
+
+        fn thought_inputs(
+            &self,
+            companion_id: i32,
+            speaker: &ParticipantId,
+            through_message_id: i32,
+        ) -> rusqlite::Result<Option<crate::running_thoughts::prompt::ThoughtInputs>> {
+            self.inner
+                .thought_inputs(companion_id, speaker, through_message_id)
+        }
+
+        fn store_thought(
+            &self,
+            thought: crate::running_thoughts::types::NewRunningThought,
+        ) -> rusqlite::Result<crate::running_thoughts::types::RunningThought> {
+            self.inner.store_thought(thought)
+        }
     }
 
     #[test]
@@ -1310,6 +1331,7 @@ mod stream_turn_tests {
                 &registry,
                 &no_followups(),
                 |_prompt, _on_token| Err(std::io::Error::other("no model")),
+                |_inputs, _insert| Err(ThoughtError::Empty),
                 &NoRemotes,
                 &|_frame| {},
                 Duration::from_secs(30),
@@ -1371,6 +1393,7 @@ mod stream_turn_tests {
                     on_token("lo");
                     Ok("Hello".to_string())
                 },
+                |_inputs, _insert| Err(ThoughtError::Empty),
                 &NoRemotes,
                 &|_frame| {},
                 Duration::from_secs(30),
@@ -1451,6 +1474,7 @@ mod stream_turn_tests {
                 &registry,
                 &no_followups(),
                 |_prompt, _on_token| Ok("hi from char".to_string()),
+                |_inputs, _insert| Err(ThoughtError::Empty),
                 &remotes,
                 &|_frame| {},
                 Duration::from_secs(30),
@@ -1531,6 +1555,7 @@ mod stream_turn_tests {
                 &registry,
                 &no_followups(),
                 |_prompt, _on_token| Ok("hi from char".to_string()),
+                |_inputs, _insert| Err(ThoughtError::Empty),
                 &remotes,
                 &|_frame| {},
                 Duration::from_secs(30),
@@ -1593,6 +1618,7 @@ mod stream_turn_tests {
                 &registry,
                 &no_followups(),
                 |_prompt, _on_token| Ok("hi".to_string()),
+                |_inputs, _insert| Err(ThoughtError::Empty),
                 &NoRemotes,
                 &|_frame| {},
                 Duration::from_secs(30),
@@ -1688,6 +1714,7 @@ mod stream_turn_tests {
                 &registry,
                 &no_followups(),
                 |_prompt, _on_token| Ok("hi".to_string()),
+                |_inputs, _insert| Err(ThoughtError::Empty),
                 &NoRemotes,
                 &|_frame| {},
                 Duration::from_secs(30),
@@ -1754,6 +1781,7 @@ mod stream_turn_tests {
                 &registry,
                 &no_followups(),
                 |_prompt, _on_token| Ok("hi".to_string()),
+                |_inputs, _insert| Err(ThoughtError::Empty),
                 &NoRemotes,
                 &|_frame| {},
                 Duration::from_secs(30),
@@ -1809,6 +1837,30 @@ fn round_remotes(
         )
     } else {
         (Box::new(NoRemotes), Box::new(|_frame| {}))
+    }
+}
+
+/// Builds the production host-companion thought writer (#216): the one
+/// place the real persona and character model are assembled for
+/// `chat_turn::PendingTurn::think`. `prompt_message` and
+/// `start_streaming_session` (through `stream_round`) pass this as
+/// `run_round`'s `host_think`; #217's regenerate handler is its third
+/// caller.
+fn host_thought_writer(
+    speakers: PromptSpeakers,
+) -> impl FnMut(
+    &ThoughtInputs,
+    &dyn Fn(NewRunningThought) -> rusqlite::Result<RunningThought>,
+) -> Result<RunningThought, ThoughtError> {
+    move |inputs, insert| {
+        let companion_data = Database::get_companion_data().map_err(ThoughtError::Store)?;
+        generate_thought(
+            inputs,
+            &companion_data,
+            &speakers,
+            &ResidentCharacterModel,
+            insert,
+        )
     }
 }
 
@@ -1933,8 +1985,12 @@ async fn prompt_message(
                         &SqliteTranscript,
                         &speakers,
                         &SqliteCompaction,
+                        &SqliteThoughts {
+                            speaker: ParticipantId::CHAR,
+                        },
                     )
                 },
+                &mut host_thought_writer(speakers.clone()),
                 remotes.as_ref(),
                 broadcast.as_ref(),
                 timeout,
@@ -2085,6 +2141,9 @@ async fn regenerate_prompt(
                     &SqliteTranscript,
                     &speakers,
                     &SqliteCompaction,
+                    &SqliteThoughts {
+                        speaker: ParticipantId::CHAR,
+                    },
                 )
             },
             remotes.as_ref(),
@@ -2906,6 +2965,9 @@ async fn inspect_prompt(
             }
         };
         let transcript_source = InMemoryTranscript(transcript);
+        // A joiner writes no running thoughts of its own on the host's
+        // behalf (#220 gives it its own bot's notes and model); the block
+        // this inspection would show is always empty.
         return match assemble_prompt(
             query.prompt.as_deref().unwrap_or(""),
             companion_id,
@@ -2914,6 +2976,7 @@ async fn inspect_prompt(
             &transcript_source,
             &speakers,
             &compaction_context,
+            &[],
         ) {
             Ok(mut assembled) => {
                 assembled.continuity = continuity;
@@ -2949,6 +3012,18 @@ async fn inspect_prompt(
     };
 
     let speakers = snapshot_speakers(&registry);
+    let recent_thoughts = match (SqliteThoughts {
+        speaker: ParticipantId::CHAR,
+    })
+    .recent(companion_id, &config_view)
+    {
+        Ok(thoughts) => thoughts,
+        Err(e) => {
+            println!("Failed to load running thoughts: {}", e);
+            return HttpResponse::InternalServerError()
+                .body("Error while loading running thoughts, check logs for more information");
+        }
+    };
     match assemble_prompt(
         query.prompt.as_deref().unwrap_or(""),
         companion_id,
@@ -2957,6 +3032,7 @@ async fn inspect_prompt(
         &SqliteTranscript,
         &speakers,
         &compaction_context,
+        &recent_thoughts,
     ) {
         Ok(assembled) => HttpResponse::Ok().json(assembled),
         Err(e) => {
@@ -3449,6 +3525,26 @@ impl RoundSink for SseRoundSink {
         }
     }
 
+    fn thought_started(&mut self, speaker: &ParticipantId) {
+        if let Some(stream) = &self.stream {
+            let _ = stream.send(StreamChunk::thought_started(
+                self.request_id.clone(),
+                speaker,
+            ));
+        }
+    }
+
+    fn thought_written(&mut self, thought: &RunningThought) {
+        self.token_count += 1;
+        if let Some(stream) = &self.stream {
+            let _ = stream.send(StreamChunk::thought(
+                self.request_id.clone(),
+                thought,
+                self.token_count,
+            ));
+        }
+    }
+
     fn round_complete(&mut self, attitude: Option<&(CompanionAttitude, CompanionAttitude)>) {
         let Some(stream) = self.stream.take() else {
             return;
@@ -3492,6 +3588,10 @@ fn stream_round(
     registry: &ParticipantRegistry,
     policy: &RoutingPolicy,
     mut host_generate: impl FnMut(&str, &mut dyn FnMut(&str)) -> std::io::Result<String>,
+    mut host_think: impl FnMut(
+        &ThoughtInputs,
+        &dyn Fn(NewRunningThought) -> rusqlite::Result<RunningThought>,
+    ) -> Result<RunningThought, ThoughtError>,
     remotes: &dyn RemoteGenerator,
     broadcast: &dyn Fn(ServerFrame),
     timeout: std::time::Duration,
@@ -3505,6 +3605,7 @@ fn stream_round(
         registry,
         policy,
         &mut host_generate,
+        &mut host_think,
         remotes,
         broadcast,
         timeout,
@@ -3631,8 +3732,12 @@ async fn start_streaming_session(
                         &SqliteTranscript,
                         &speakers,
                         &SqliteCompaction,
+                        &SqliteThoughts {
+                            speaker: ParticipantId::CHAR,
+                        },
                     )
                 },
+                host_thought_writer(speakers.clone()),
                 remotes.as_ref(),
                 broadcast.as_ref(),
                 timeout,
