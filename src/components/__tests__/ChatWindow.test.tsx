@@ -170,16 +170,29 @@ describe('ChatWindow Component', () => {
     expect(textarea).toBeInTheDocument()
   })
 
-  it('sizes the composer to at least 5 rows with room to grow beyond that minimum', () => {
+  it('grows the composer with content up to the 240px ceiling, never below the 5-row minimum', async () => {
+    const user = userEvent.setup()
+
     render(
       <MockProviders>
         <ChatWindow />
       </MockProviders>
     )
 
-    const textarea = screen.getByRole('textbox')
+    // jsdom never lays out content, so scrollHeight stays 0 unless stubbed
+    // per element. Stubbing the instance (not the shared prototype) avoids
+    // leaking a broken accessor into every other test that renders a
+    // textarea.
+    const textarea = screen.getByRole('textbox') as HTMLTextAreaElement
     expect(textarea).toHaveClass('min-h-[120px]')
-    expect(textarea).toHaveClass('max-h-[240px]')
+
+    Object.defineProperty(textarea, 'scrollHeight', { configurable: true, value: 120 })
+    await user.type(textarea, ' ')
+    expect(textarea.style.height).toBe('120px')
+
+    Object.defineProperty(textarea, 'scrollHeight', { configurable: true, value: 400 })
+    await user.type(textarea, 'a')
+    expect(textarea.style.height).toBe('240px')
   })
 
   it('shows send button', () => {
