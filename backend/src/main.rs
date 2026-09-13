@@ -4586,8 +4586,18 @@ async fn clear_running_thoughts() -> HttpResponse {
 /// itself does: without it, a checkpoint committing concurrently could
 /// write a fact into the tantivy index in the gap between this handler's
 /// own clear and its rebuild, and the rebuild would then wipe it back out.
+///
+/// Rejects a joiner like every other `/api/compaction/*` route (review
+/// finding on #240): compaction lives on the host, so a joiner has nothing
+/// of its own to clear, and without this gate the handler would run
+/// against the joiner's own empty tables and then rebuild its tantivy
+/// index down to zero facts.
 #[delete("/api/compaction/clear")]
-async fn clear_compaction() -> HttpResponse {
+async fn clear_compaction(joiner: Option<web::Data<JoinerHandle>>) -> HttpResponse {
+    if let Some(response) = reject_if_joiner(&joiner) {
+        return response;
+    }
+
     let Some(turn_guard) = ACTIVE_TURN.try_claim() else {
         return HttpResponse::Conflict().body(
             "A reply is still being generated; wait for it to finish before clearing compaction history",
