@@ -867,9 +867,23 @@ Conversation compaction (#171-#186): a checkpoint rolls a run of messages into a
 
 See section 1.7/1.8 for the pin/unpin routes, which live under `/message/{id}/pin` rather than `/compaction` since they act on a message, not a checkpoint.
 
+#### 8.6 Clear compaction history
+
+- **URL:** `/compaction/clear`
+- **Method:** `DELETE`
+- **Description:** Deletes every compaction row for the companion -- checkpoints, extracted facts, and contradiction flags -- and resets the compacted-through cutoff, then rebuilds the long-term memory index so a cleared fact stops surfacing in prompts (#238). Unlike `DELETE /message` (section 1.2), which also clears compaction as part of wiping the whole chat, this clears compaction history on its own and never touches `messages`. Claims the turn slot for its whole run, the same way `POST /memory/longTerm/rebuild` (section 5.3) does, so a checkpoint committing concurrently cannot write a fact into the index in the gap between the clear and the rebuild.
+- **Response:**
+  - Status: 200 OK
+  - Body: `Compaction history cleared and long term memory rebuilt from {n} facts`
+  - Status: 409 Conflict — a turn is already in flight; wait for it to finish before clearing.
+- **Example Request:**
+  ```http
+  DELETE /compaction/clear
+  ```
+
 ### 9. Running thoughts
 
-A running thought (#214-#220) is a companion-authored, first-person memory note written per exchange, distinct from a compaction checkpoint's extracted facts. Unlike section 8's compaction routes (host-only, `409` in `joiner` mode), every route below serves **this instance's own local table** in every multiplayer mode: on a joiner, that will be its own bot's thoughts once #220 lands writing them; today a joiner's table is simply empty, and these four routes already serve it correctly.
+A running thought (#214-#220) is a companion-authored, first-person memory note written per exchange, distinct from a compaction checkpoint's extracted facts. Unlike section 8's compaction routes (host-only, `409` in `joiner` mode), every route below serves **this instance's own local table** in every multiplayer mode: on a joiner, that will be its own bot's thoughts once #220 lands writing them; today a joiner's table is simply empty, and these five routes already serve it correctly.
 
 #### 9.1 List running thoughts
 
@@ -949,6 +963,20 @@ A running thought (#214-#220) is a companion-authored, first-person memory note 
 - **Notes:**
   - Editing or deleting a chat message never touches an existing running thought (#214): a thought records what the companion took from an exchange at the time, and does not become false because the source text changed later. Only an explicit call to this route rewrites one.
 
+#### 9.5 Clear all running thoughts
+
+- **URL:** `/thoughts/clear`
+- **Method:** `DELETE`
+- **Description:** Deletes every running thought for the companion (#238). Unlike `DELETE /message` (section 1.2), which deliberately leaves this table alone, this is the only way to drop a stale thought once the conversation it came from is gone — a thought otherwise keeps feeding the reply prompt after the chat log it was about has been cleared. Claims the turn slot, so a clear cannot run while a reply is being generated.
+- **Response:**
+  - Status: 200 OK
+  - Body: `Cleared {n} running thoughts!`
+  - Status: 409 Conflict — a turn is already in flight; wait for it to finish before clearing.
+- **Example Request:**
+  ```http
+  DELETE /thoughts/clear
+  ```
+
 ## Route index
 
 Endpoint sections above cover the core messaging, companion, user, configuration, memory and prompting routes. The table below lists every route the backend registers, including those not yet written up in full. It is generated from the handler attributes in `backend/src/main.rs`.
@@ -970,6 +998,7 @@ Endpoint sections above cover the core messaging, companion, user, configuration
 | `GET` | `/api/companion/characterJson` |
 | `POST` | `/api/companion/characterJson` |
 | `GET` | `/api/compaction` |
+| `DELETE` | `/api/compaction/clear` |
 | `POST` | `/api/compaction/draft` |
 | `GET` | `/api/compaction/{id}` |
 | `POST` | `/api/compaction/{id}/commit` |
@@ -1010,6 +1039,7 @@ Endpoint sections above cover the core messaging, companion, user, configuration
 | `GET` | `/api/persons` |
 | `POST` | `/api/persons/cleanup-duplicates` |
 | `POST` | `/api/persons/cleanup-invalid` |
+| `DELETE` | `/api/persons/clear` |
 | `POST` | `/api/persons/detect` |
 | `GET` | `/api/persons/{name}` |
 | `POST` | `/api/prompt` |
@@ -1022,6 +1052,7 @@ Endpoint sections above cover the core messaging, companion, user, configuration
 | `POST` | `/api/session/{session_id}/end` |
 | `GET` | `/api/session/stats/summary` |
 | `GET` | `/api/thoughts` |
+| `DELETE` | `/api/thoughts/clear` |
 | `PATCH` | `/api/thoughts/{id}` |
 | `DELETE` | `/api/thoughts/{id}` |
 | `POST` | `/api/thoughts/regenerate` |

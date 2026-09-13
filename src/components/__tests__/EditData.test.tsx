@@ -7,17 +7,22 @@ import { CompanionDataProvider } from '../context/companionContext'
 import { ConfigProvider } from '../context/configContext'
 import { MessagesProvider } from '../context/messageContext'
 import { CompactionProvider } from '../context/compactionContext'
+import { RunningThoughtsProvider } from '../context/runningThoughtsContext'
 
 // `MemorySettings` (the Memory tab) reads `useCompaction()`, which itself
 // reads `useMessages()`, so `CompactionProvider` must sit inside
-// `MessagesProvider`, matching `App.tsx`'s nesting order.
+// `MessagesProvider`; `EditData` itself also reads `useRunningThoughts()`
+// (#238's "Clear running thoughts" button), which reads `useConfigData()` --
+// matching `App.tsx`'s nesting order.
 const MockProviders: React.FC<{ children: React.ReactNode }> = ({ children }) => (
   <UserDataProvider>
     <CompanionDataProvider>
       <ConfigProvider>
         <MessagesProvider>
           <CompactionProvider>
-            {children}
+            <RunningThoughtsProvider>
+              {children}
+            </RunningThoughtsProvider>
           </CompactionProvider>
         </MessagesProvider>
       </ConfigProvider>
@@ -210,5 +215,77 @@ describe('EditData Component', () => {
     expect(body).toHaveProperty('compaction_model_path')
     expect(body).toHaveProperty('heuristic_person_detection')
     expect(body).toHaveProperty('running_thoughts_enabled')
+  })
+
+  // #238: each new clear button opens a confirm dialog. `DialogTrigger`
+  // renders its own `<button>` around the `<Button>` child rather than
+  // merging with it (no `asChild` here, matching every other trigger in
+  // this file), so two elements already share the trigger's accessible
+  // name before the dialog even opens; `getAllByRole(...)[0]` opens it,
+  // and once open the dialog's own confirm button is the last match.
+  // Confirming calls the route and refreshes the panel that route's data
+  // feeds.
+  it('clears running thoughts and refreshes the thoughts panel', async () => {
+    const user = userEvent.setup()
+
+    render(
+      <MockProviders>
+        <EditData />
+      </MockProviders>
+    )
+
+    await user.click(screen.getAllByRole('button', { name: 'Clear running thoughts' })[0])
+    const confirmButtons = await screen.findAllByRole('button', { name: 'Clear running thoughts' })
+    await user.click(confirmButtons[confirmButtons.length - 1])
+
+    const mockFetch = fetch as unknown as ReturnType<typeof vi.fn>
+    await waitFor(() => {
+      expect(mockFetch).toHaveBeenCalledWith('/api/thoughts/clear', expect.objectContaining({ method: 'DELETE' }))
+    })
+    // The initial mount already issued one `GET /api/thoughts` for
+    // `RunningThoughtsProvider`'s own load; a successful clear must issue a
+    // second one to drop the now-deleted rows from the panel.
+    const thoughtGets = mockFetch.mock.calls.filter(call => call[0] === '/api/thoughts')
+    expect(thoughtGets.length).toBeGreaterThan(1)
+  })
+
+  it('clears compaction history and refreshes the compaction checkpoints', async () => {
+    const user = userEvent.setup()
+
+    render(
+      <MockProviders>
+        <EditData />
+      </MockProviders>
+    )
+
+    await user.click(screen.getAllByRole('button', { name: 'Clear compaction history' })[0])
+    const confirmButtons = await screen.findAllByRole('button', { name: 'Clear compaction history' })
+    await user.click(confirmButtons[confirmButtons.length - 1])
+
+    const mockFetch = fetch as unknown as ReturnType<typeof vi.fn>
+    await waitFor(() => {
+      expect(mockFetch).toHaveBeenCalledWith('/api/compaction/clear', expect.objectContaining({ method: 'DELETE' }))
+    })
+    const compactionGets = mockFetch.mock.calls.filter(call => call[0] === '/api/compaction')
+    expect(compactionGets.length).toBeGreaterThan(1)
+  })
+
+  it('clears known people', async () => {
+    const user = userEvent.setup()
+
+    render(
+      <MockProviders>
+        <EditData />
+      </MockProviders>
+    )
+
+    await user.click(screen.getAllByRole('button', { name: 'Clear known people' })[0])
+    const confirmButtons = await screen.findAllByRole('button', { name: 'Clear known people' })
+    await user.click(confirmButtons[confirmButtons.length - 1])
+
+    const mockFetch = fetch as unknown as ReturnType<typeof vi.fn>
+    await waitFor(() => {
+      expect(mockFetch).toHaveBeenCalledWith('/api/persons/clear', expect.objectContaining({ method: 'DELETE' }))
+    })
   })
 })

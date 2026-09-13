@@ -21,6 +21,9 @@
 //! wire them in turn, hence the per-item `#[allow(dead_code)]` below instead
 //! of a blanket one. Every method is already exercised by the unit tests in
 //! this module, which is what the #215 acceptance criteria ask for.
+//!
+//! `clear` (#238's "Clear running thoughts" button) is wired in immediately,
+//! so it carries no `#[allow(dead_code)]`.
 
 use rusqlite::{params, Connection, Error, OptionalExtension, Result, Row, TransactionBehavior};
 
@@ -249,6 +252,19 @@ pub(crate) fn delete_from_on(
     Ok(deleted)
 }
 
+/// Deletes every thought (any speaker) for `companion_id`. Returns the
+/// number of rows removed. Used by #238's "Clear running thoughts" button:
+/// `erase_messages` deliberately leaves this table alone (see the module
+/// doc above), so a stale note from a wiped conversation would otherwise
+/// keep steering replies after the conversation it came from is gone, and
+/// nothing else clears it for the caller.
+pub(crate) fn clear_on(con: &Connection, companion_id: i32) -> Result<usize> {
+    con.execute(
+        "DELETE FROM running_thoughts WHERE companion_id = ?",
+        params![companion_id],
+    )
+}
+
 /// The persistence seam for running thoughts. See each `_on` helper above
 /// for the SQL and error conventions this mirrors one-for-one.
 pub trait RunningThoughtStore {
@@ -290,6 +306,10 @@ pub trait RunningThoughtStore {
     /// message_id`, in one transaction, and returns the deleted rows in id
     /// order.
     fn delete_from(&self, companion_id: i32, message_id: i32) -> Result<Vec<RunningThought>>;
+
+    /// Deletes every thought (any speaker) for `companion_id`. Returns the
+    /// number of rows removed.
+    fn clear(&self, companion_id: i32) -> Result<usize>;
 }
 
 /// Production [`RunningThoughtStore`], opening `Database::open()` per call,
@@ -357,6 +377,11 @@ impl RunningThoughtStore for SqliteRunningThoughtStore {
         let deleted = delete_from_on(&tx, companion_id, message_id)?;
         tx.commit()?;
         Ok(deleted)
+    }
+
+    fn clear(&self, companion_id: i32) -> Result<usize> {
+        let con = Database::open()?;
+        clear_on(&con, companion_id)
     }
 }
 
@@ -504,6 +529,13 @@ impl RunningThoughtStore for RecordingStore {
         let mut removed = removed;
         removed.sort_by_key(|t| t.id);
         Ok(removed)
+    }
+
+    fn clear(&self, companion_id: i32) -> Result<usize> {
+        let mut thoughts = self.thoughts.lock().unwrap();
+        let before = thoughts.len();
+        thoughts.retain(|t| t.companion_id != companion_id);
+        Ok(before - thoughts.len())
     }
 }
 
@@ -865,5 +897,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![id2]
         );
+    }
+
+    #[test]
+    fn clear_on_deletes_every_thought_for_the_companion_and_leaves_other_companions_alone() {
+        let (_dir, con) = fresh_db();
+        insert_on(&con, &a_thought(1, 2)).unwrap();
+        insert_on(&con, &a_thought(3, 4)).unwrap();
+        let other_companion = NewRunningThought {
+            companion_id: 2,
+            ..a_thought(1, 2)
+        };
+        let other_id = insert_on(&con, &other_companion).unwrap();
+
+        let removed = clear_on(&con, 1).unwrap();
+
+        assert_eq!(removed, 2);
+        assert!(list_on(&con, 1).unwrap().is_empty());
+        assert!(get_on(&con, other_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn recording_store_clear_removes_only_the_given_companions_thoughts() {
+        let store = RecordingStore::new();
+        let id1 = store.insert(a_thought(1, 2)).unwrap();
+        let other_companion = NewRunningThought {
+            companion_id: 2,
+            ..a_thought(1, 2)
+        };
+        let other_id = store.insert(other_companion).unwrap();
+
+        let removed = store.clear(1).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(store.get(id1).unwrap().is_none());
+        assert!(store.get(other_id).unwrap().is_some());
     }
 }

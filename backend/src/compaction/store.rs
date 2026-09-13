@@ -727,6 +727,43 @@ pub(crate) fn clear_all_on(con: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Deletes every compaction row for `companion_id` -- contradictions,
+/// facts, then checkpoints -- and resets its `compacted_through` cutoff to
+/// `NULL`, so the next compaction starts fresh instead of skipping messages
+/// a now-deleted checkpoint used to cover. Used by #238's "Clear compaction
+/// history" button. Unlike [`clear_all_on`] this never touches `messages`
+/// or `pinned_messages`: clearing chat and clearing compaction history are
+/// independently triggerable.
+///
+/// Contradictions before facts before checkpoints, matching the foreign
+/// key dependency order [`clear_all_on`] documents (`ON DELETE CASCADE`
+/// would clean these up on its own, but the explicit order keeps this
+/// correct independent of that). `compaction_facts.superseded_by` is a
+/// self-referencing foreign key with no `ON DELETE` action, but that is
+/// still safe here: SQLite checks an immediate foreign key constraint once
+/// per statement, not once per row, so the single `DELETE` below -- which
+/// removes every matching fact, both ends of any `superseded_by` chain
+/// included -- never trips it, the same reasoning [`clear_all_on`]'s own
+/// unscoped `DELETE FROM compaction_facts` already relies on.
+pub(crate) fn clear_history_on(con: &Connection, companion_id: i32) -> Result<()> {
+    con.execute(
+        "DELETE FROM compaction_contradictions WHERE compaction_id IN
+            (SELECT id FROM compactions WHERE companion_id = ?)",
+        params![companion_id],
+    )?;
+    con.execute(
+        "DELETE FROM compaction_facts WHERE compaction_id IN
+            (SELECT id FROM compactions WHERE companion_id = ?)",
+        params![companion_id],
+    )?;
+    con.execute(
+        "DELETE FROM compactions WHERE companion_id = ?",
+        params![companion_id],
+    )?;
+    set_compacted_through_on(con, companion_id, None)?;
+    Ok(())
+}
+
 /// One promoted fact: the stored row named by `fact_id` (one of #185's
 /// `fill_draft` rows) gets its reviewed content and verdict written back in
 /// place. #175's commit never inserts a new row here.
@@ -2993,6 +3030,116 @@ mod tests {
             })
             .unwrap();
         assert_eq!(fact_count, 0);
+    }
+
+    fn a_fact_draft(text: &str) -> FactDraft {
+        FactDraft {
+            category: FactCategory::Milestone,
+            subject: None,
+            text: text.to_string(),
+            quote_speaker: None,
+            sources: vec![1],
+            replaces: vec![],
+            relation_to: None,
+            relation: None,
+            canon: true,
+            rejected_reason: None,
+        }
+    }
+
+    #[test]
+    fn clear_history_on_deletes_contradictions_facts_and_checkpoints_and_resets_compacted_through()
+    {
+        let (_dir, con) = fresh_db();
+        let id = a_committed_checkpoint(&con, 1, 3);
+        let fact_ids = insert_facts_on(&con, id, &[a_fact_draft("fact")]).unwrap();
+        set_compacted_through_on(&con, 1, Some(3)).unwrap();
+        con.execute(
+            "INSERT INTO compaction_contradictions (compaction_id, fact_id, thought_id, thought_text, quote)
+             VALUES (?, ?, ?, ?, ?)",
+            params![id, fact_ids[0], 1, "a thought", "a quote"],
+        )
+        .unwrap();
+
+        clear_history_on(&con, 1).unwrap();
+
+        assert!(list_checkpoints_on(&con, 1).unwrap().is_empty());
+        assert_eq!(compacted_through_on(&con, 1).unwrap(), None);
+        let fact_count: i64 = con
+            .query_row("SELECT COUNT(*) FROM compaction_facts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fact_count, 0);
+        let contradiction_count: i64 = con
+            .query_row(
+                "SELECT COUNT(*) FROM compaction_contradictions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(contradiction_count, 0);
+    }
+
+    /// #238's key risk: `compaction_facts.superseded_by` is a
+    /// self-referencing foreign key with no `ON DELETE` action, so deleting
+    /// a chain of superseded facts in the wrong order can fail. Builds a
+    /// two-link chain (`oldest` superseded by `middle` superseded by
+    /// `newest`) and asserts `clear_history_on` removes all three without a
+    /// foreign-key error.
+    #[test]
+    fn clear_history_on_removes_a_superseded_by_chain_without_a_foreign_key_error() {
+        let (_dir, con) = fresh_db();
+        let id = a_committed_checkpoint(&con, 1, 3);
+        let oldest = insert_facts_on(&con, id, &[a_fact_draft("oldest")]).unwrap()[0];
+        let middle = insert_facts_on(&con, id, &[a_fact_draft("middle")]).unwrap()[0];
+        let newest = insert_facts_on(&con, id, &[a_fact_draft("newest")]).unwrap()[0];
+        supersede_on(&con, oldest, middle).unwrap();
+        supersede_on(&con, middle, newest).unwrap();
+
+        clear_history_on(&con, 1).unwrap();
+
+        let fact_count: i64 = con
+            .query_row("SELECT COUNT(*) FROM compaction_facts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fact_count, 0);
+    }
+
+    #[test]
+    fn clear_history_on_leaves_messages_pins_and_other_companions_untouched() {
+        let (_dir, con) = fresh_db();
+        con.execute(
+            "INSERT INTO companion (id, name, persona, example_dialogue, first_message, long_term_mem, short_term_mem, roleplay, dialogue_tuning, avatar_path) VALUES (2, 'Other', '', '', '', 0, 0, 0, 0, '')",
+            [],
+        )
+        .unwrap();
+        let id = a_committed_checkpoint(&con, 1, 3);
+        insert_facts_on(&con, id, &[a_fact_draft("fact")]).unwrap();
+        pin_on(&con, 1).unwrap();
+        let other_id = insert_draft_on(
+            &con,
+            &NewDraft {
+                companion_id: 2,
+                from_message_id: 1,
+                through_message_id: 2,
+                trigger: CompactionTrigger::Threshold,
+                raw_model_output: None,
+            },
+        )
+        .unwrap();
+        update_status_on(&con, other_id, CompactionStatus::Committed).unwrap();
+
+        clear_history_on(&con, 1).unwrap();
+
+        assert!(list_checkpoints_on(&con, 1).unwrap().is_empty());
+        assert_eq!(list_checkpoints_on(&con, 2).unwrap().len(), 1);
+        assert_eq!(pins_on(&con).unwrap().len(), 1);
+        let message_count: i64 = con
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(message_count, 3);
     }
 
     #[test]

@@ -723,6 +723,10 @@ mod tests {
         ) -> rusqlite::Result<Vec<RunningThought>> {
             self.inner.delete_from(companion_id, message_id)
         }
+
+        fn clear(&self, companion_id: i32) -> rusqlite::Result<usize> {
+            self.inner.clear(companion_id)
+        }
     }
 
     #[test]

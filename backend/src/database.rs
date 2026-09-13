@@ -2474,6 +2474,31 @@ impl Database {
         Ok(())
     }
 
+    /// Deletes every compaction row for `companion_id` -- checkpoints,
+    /// extracted facts, and contradiction flags -- and resets its
+    /// `compacted_through` cutoff, all inside one transaction. #238's
+    /// "Clear compaction history" button. Unlike `erase_messages` (which
+    /// also runs `compaction::store::clear_all_on`), this never touches
+    /// `messages`: clearing chat and clearing compaction history are
+    /// independently triggerable. The caller is responsible for rebuilding
+    /// the long-term memory index afterward -- this only clears the SQLite
+    /// side, and cleared facts stay searchable in the tantivy index until
+    /// that rebuild runs.
+    pub fn clear_compaction_history(companion_id: i32) -> Result<()> {
+        let mut con = Self::open()?;
+        Self::clear_compaction_history_on(&mut con, companion_id)
+    }
+
+    /// The connection-taking half of [`Database::clear_compaction_history`],
+    /// split out so tests can run it against `Database::open_at(tempdir)`,
+    /// matching `erase_messages`/`erase_messages_on`.
+    fn clear_compaction_history_on(con: &mut Connection, companion_id: i32) -> Result<()> {
+        let tx = con.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        crate::compaction::store::clear_history_on(&tx, companion_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Unadjusted starting point for a new `companion_attitudes` row, before
     /// persona adjustment. Pure (no connection), so callers that only need a
     /// decay baseline can use it without touching SQLite.
@@ -2858,6 +2883,47 @@ impl Database {
             "DELETE FROM third_party_individuals WHERE id = ?",
             params![id],
         )?;
+        Ok(())
+    }
+
+    /// Deletes every known-person row: relationships, interactions, and
+    /// memories, then the `third_party_individuals` rows themselves, all
+    /// inside one transaction. #238's "Clear known people" button.
+    ///
+    /// `third_party_individuals` has no `companion_id` column (#177) --
+    /// there is only ever one companion row, so clearing every person here
+    /// matches every other `clear_*`/`erase_*` associated function's
+    /// effective scope. `third_party_relationships` has no `companion_id`
+    /// column either, so it is cleared unconditionally too; `_memories` and
+    /// `_interactions` do have the column and are scoped by it.
+    ///
+    /// Deliberately leaves `companion_attitudes` alone even though some of
+    /// its rows now point at a deleted person: attitudes are "Clear
+    /// attitude"'s own data, and #238 requires every clear stay independent
+    /// of the others (unlike `delete_third_party_in`, which cleans up a
+    /// single person's attitude row because that person is gone for good,
+    /// not because the whole feature was reset).
+    pub fn clear_third_party_data(companion_id: i32) -> Result<()> {
+        let mut con = Self::open()?;
+        Self::clear_third_party_data_in(&mut con, companion_id)
+    }
+
+    /// The connection-taking half of [`Database::clear_third_party_data`],
+    /// split out so tests can run it against `Database::open_at(tempdir)`,
+    /// matching `erase_messages`/`erase_messages_on`.
+    fn clear_third_party_data_in(con: &mut Connection, companion_id: i32) -> Result<()> {
+        let tx = con.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM third_party_relationships", [])?;
+        tx.execute(
+            "DELETE FROM third_party_interactions WHERE companion_id = ?",
+            params![companion_id],
+        )?;
+        tx.execute(
+            "DELETE FROM third_party_memories WHERE companion_id = ?",
+            params![companion_id],
+        )?;
+        tx.execute("DELETE FROM third_party_individuals", [])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -6097,6 +6163,182 @@ mod tests {
             .is_some());
     }
 
+    /// #238: unlike `erase_messages`, "Clear running thoughts" empties
+    /// `running_thoughts` on its own without touching anything compaction
+    /// owns -- the two clears are independently triggerable.
+    #[test]
+    fn clear_running_thoughts_leaves_compaction_history_untouched() {
+        use crate::compaction::types::CompactionStatus;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        create_companion_table(&con);
+        create_compaction_tables(&con);
+        crate::running_thoughts::store::create_tables(&con).unwrap();
+        insert_message_row(&con, USER_SPEAKER_ID, "hi");
+        let checkpoint = insert_checkpoint_row(&con, 1, 1, CompactionStatus::Committed);
+        let thought_id = crate::running_thoughts::store::insert_on(
+            &con,
+            &crate::running_thoughts::types::NewRunningThought {
+                companion_id: 1,
+                speaker_id: USER_SPEAKER_ID.to_string(),
+                from_message_id: 1,
+                through_message_id: 1,
+                text: "a note".to_string(),
+                edited: false,
+            },
+        )
+        .unwrap();
+
+        let removed = crate::running_thoughts::store::clear_on(&con, 1).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(crate::running_thoughts::store::get_on(&con, thought_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            checkpoint_status(&con, checkpoint),
+            CompactionStatus::Committed
+        );
+    }
+
+    /// #238's "Clear compaction history" button: empties every compaction
+    /// table for the companion and resets `compacted_through`, but leaves
+    /// `messages` and `companion_attitudes` alone -- clearing compaction
+    /// history, clearing chat, and clearing attitudes are independently
+    /// triggerable.
+    #[test]
+    fn clear_compaction_history_leaves_messages_and_attitudes_untouched() {
+        use crate::compaction::types::CompactionStatus;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_messages_table(&con);
+        create_companion_table(&con);
+        create_compaction_tables(&con);
+        create_third_party_tables(&con); // for companion_attitudes
+        for i in 1..=3 {
+            insert_message_row(&con, USER_SPEAKER_ID, &format!("msg {i}"));
+        }
+        let checkpoint = insert_checkpoint_row(&con, 1, 3, CompactionStatus::Committed);
+        crate::compaction::store::insert_facts_on(
+            &con,
+            checkpoint,
+            &[crate::compaction::types::FactDraft {
+                category: crate::compaction::types::FactCategory::Milestone,
+                subject: None,
+                text: "a fact".to_string(),
+                quote_speaker: None,
+                sources: vec![1],
+                replaces: vec![],
+                relation_to: None,
+                relation: None,
+                canon: true,
+                rejected_reason: None,
+            }],
+        )
+        .unwrap();
+        con.execute(
+            "UPDATE companion SET compacted_through = 3 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO companion_attitudes (companion_id, target_id, target_type, last_updated, created_at) VALUES (1, 1, 'user', ?, ?)",
+            params![get_current_date(), get_current_date()],
+        )
+        .unwrap();
+
+        Database::clear_compaction_history_on(&mut con, 1).unwrap();
+
+        let checkpoint_count: i64 = con
+            .query_row("SELECT COUNT(*) FROM compactions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(checkpoint_count, 0);
+        let fact_count: i64 = con
+            .query_row("SELECT COUNT(*) FROM compaction_facts", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(fact_count, 0);
+        let compacted_through: Option<i32> = con
+            .query_row(
+                "SELECT compacted_through FROM companion WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(compacted_through, None);
+
+        let message_count: i64 = con
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(message_count, 3);
+        let attitude_count: i64 = con
+            .query_row("SELECT COUNT(*) FROM companion_attitudes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(attitude_count, 1);
+    }
+
+    /// #238's "Clear known people" button: empties every `third_party_*`
+    /// table but leaves `companion_attitudes` alone, even though it now has
+    /// a row pointing at a deleted person -- attitudes are "Clear
+    /// attitude"'s own data, and clearing people must stay independent of
+    /// it.
+    #[test]
+    fn clear_third_party_data_removes_every_third_party_table_but_leaves_attitudes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
+        create_third_party_tables(&con);
+        let person_id = insert_heuristic_third_party(&con, "Alice");
+        con.execute(
+            "INSERT INTO third_party_memories (third_party_id, companion_id, memory_type, content, created_at) VALUES (?, 1, 'fact', 'met at the park', ?)",
+            params![person_id, get_current_date()],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO third_party_interactions (third_party_id, companion_id, interaction_type, description, created_at, updated_at) VALUES (?, 1, 'planned', 'coffee', ?, ?)",
+            params![person_id, get_current_date(), get_current_date()],
+        )
+        .unwrap();
+        let other_person_id = insert_heuristic_third_party(&con, "Bob");
+        con.execute(
+            "INSERT INTO third_party_relationships (from_party_id, to_party_id, relationship_type, created_at, updated_at) VALUES (?, ?, 'friend', ?, ?)",
+            params![person_id, other_person_id, get_current_date(), get_current_date()],
+        )
+        .unwrap();
+        con.execute(
+            "INSERT INTO companion_attitudes (companion_id, target_id, target_type, last_updated, created_at) VALUES (1, ?, 'third_party', ?, ?)",
+            params![person_id, get_current_date(), get_current_date()],
+        )
+        .unwrap();
+
+        Database::clear_third_party_data_in(&mut con, 1).unwrap();
+
+        for table in [
+            "third_party_individuals",
+            "third_party_memories",
+            "third_party_interactions",
+            "third_party_relationships",
+        ] {
+            let count: i64 = con
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} should be empty");
+        }
+        let attitude_count: i64 = con
+            .query_row("SELECT COUNT(*) FROM companion_attitudes", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(attitude_count, 1);
+    }
+
     /// #181 review finding: `mark_stale_containing_on` only ever matches
     /// `Committed` rows, so a pending `Draft` checkpoint whose range an edit
     /// falls inside was left completely untouched — committing it later
@@ -7655,6 +7897,37 @@ mod tests {
                 target_type TEXT NOT NULL,
                 last_updated TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS third_party_interactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                third_party_id INTEGER NOT NULL,
+                companion_id INTEGER NOT NULL,
+                interaction_type TEXT,
+                description TEXT NOT NULL,
+                planned_date TEXT,
+                actual_date TEXT,
+                outcome TEXT,
+                impact_on_relationship REAL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS third_party_relationships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_party_id INTEGER NOT NULL,
+                to_party_id INTEGER NOT NULL,
+                relationship_type TEXT NOT NULL,
+                strength REAL DEFAULT 0.5,
+                description TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             )",
             [],
         )
