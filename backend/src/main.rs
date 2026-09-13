@@ -4087,6 +4087,58 @@ mod thoughts_route_tests {
             "the slot should be free again once the guard drops"
         );
     }
+
+    // #243: `DELETE /api/thoughts/clear` and `DELETE /api/thoughts/{id}` share
+    // a method and a path prefix, so actix's registration order decides which
+    // one a literal "clear" segment reaches. This builds the test app with
+    // both services registered in the exact order production uses --
+    // `clear_running_thoughts` before `thought_delete`, per the comment at
+    // the real `.service(...)` call site -- and tells the two apart by their
+    // distinct 409 bodies (claiming `ACTIVE_TURN` first, the same trick the
+    // test above uses, so neither handler needs a real store or `Database`).
+    // Reversing the registration order here reproduces the bug: "clear" gets
+    // captured by `{id}`, fails to parse as `i64`, and the request never
+    // reaches either handler's body, so this test fails.
+    #[actix_web::test]
+    async fn thoughts_clear_route_is_reachable_registered_in_production_order() {
+        let _serial = crate::turn_slot::ACTIVE_TURN_TEST_LOCK.lock().await;
+        let guard = ACTIVE_TURN.try_claim().expect("slot should start free");
+
+        let app = actix_web::test::init_service(
+            App::new()
+                .service(clear_running_thoughts)
+                .service(thought_delete),
+        )
+        .await;
+
+        let clear_req = actix_web::test::TestRequest::delete()
+            .uri("/api/thoughts/clear")
+            .to_request();
+        let clear_response = actix_web::test::call_service(&app, clear_req).await;
+        assert_eq!(clear_response.status(), StatusCode::CONFLICT);
+        let clear_body = to_bytes(clear_response.into_body()).await.unwrap();
+        assert_eq!(
+            clear_body,
+            "A reply is still being generated; wait for it to finish before clearing running thoughts"
+        );
+
+        let delete_req = actix_web::test::TestRequest::delete()
+            .uri("/api/thoughts/5")
+            .to_request();
+        let delete_response = actix_web::test::call_service(&app, delete_req).await;
+        assert_eq!(delete_response.status(), StatusCode::CONFLICT);
+        let delete_body = to_bytes(delete_response.into_body()).await.unwrap();
+        assert_eq!(
+            delete_body,
+            "A reply is still being generated; wait for it to finish before deleting a thought"
+        );
+
+        drop(guard);
+        assert!(
+            ACTIVE_TURN.try_claim().is_some(),
+            "the slot should be free again once the guard drops"
+        );
+    }
 }
 
 //              Config
@@ -5884,9 +5936,15 @@ async fn main() -> std::io::Result<()> {
             .service(message_unpin)
             .service(thoughts_list)
             .service(thought_edit)
+            // `clear_running_thoughts` (`DELETE /api/thoughts/clear`) must be
+            // registered before `thought_delete` (`DELETE /api/thoughts/{id}`):
+            // actix matches routes in registration order, and both share the
+            // DELETE method on the same path prefix, so putting the
+            // parameterised route first captures "clear" as `{id}` and the
+            // clear route is never reached (#243).
+            .service(clear_running_thoughts)
             .service(thought_delete)
             .service(thoughts_regenerate)
-            .service(clear_running_thoughts)
     });
     if let Some(workers) = configured_workers() {
         server = server.workers(workers);
