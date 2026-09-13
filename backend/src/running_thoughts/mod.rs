@@ -38,6 +38,19 @@
 //! (`generate_thought`/`generate_thought_into`, which run the character
 //! model and persist the result). Remote bots' own thoughts are #220.
 //!
+//! The 2026-09-12 tuning pass (measured with `eval.rs`, an env-gated replay
+//! harness over a copy of a real database) changed how a note is produced,
+//! not where it lives: the prompt asks for what the user did, then what the
+//! companion makes of it, in one first-person paragraph, with the card's
+//! example dialogue quoted for register; length is enforced by stopping
+//! generation at the third sentence (`prompt::count_sentences` through
+//! `CharacterModel::complete_in_character`'s `keep_going`) because the model
+//! ignores a stated limit; the sampler is the thought's own
+//! (`llm::thought_sampler`), cooler and with a 1.05 repetition penalty; the
+//! chain is two notes; `*stage directions*` are stripped; and a note that
+//! names its own author in the third person is regenerated once
+//! (`generate::generate_thought`).
+//!
 //! #217 (the read/write HTTP surface) adds `regenerate.rs`: the
 //! delete-then-rewrite loop `main.rs`'s `POST /api/thoughts/regenerate`
 //! drives, built on `store.rs`'s `delete_from` and #216's
@@ -50,3 +63,6 @@ pub mod prompt;
 pub mod regenerate;
 pub mod store;
 pub mod types;
+
+#[cfg(test)]
+mod eval;
