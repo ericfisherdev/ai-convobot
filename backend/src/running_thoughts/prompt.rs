@@ -215,6 +215,14 @@ fn sentence_ends(text: &str) -> Vec<usize> {
         if before_is_digit && after_is_digit {
             continue;
         }
+        // `1. ` at the very start is the list number `strip_list_number`
+        // removes, not a sentence.
+        let is_leading_list_number = run.len() == 1
+            && run[0].1 == '.'
+            && chars[..start].iter().all(|(_, c)| c.is_ascii_digit());
+        if before_is_digit && is_leading_list_number {
+            continue;
+        }
         let run_is_ellipsis =
             run.iter().all(|(_, c)| matches!(c, '.' | '…')) && (run.len() > 1 || run[0].1 == '…');
         while i < chars.len() && is_closing_mark(chars[i].1) {
@@ -359,9 +367,10 @@ fn trim_to_last_sentence_boundary(text: &str) -> &str {
     &text[..end]
 }
 
-/// Cleans one raw thought-generation completion: strips `*stage
-/// directions*`, trims surrounding whitespace, cuts at the first blank line,
-/// strips a leading list number (`3. `) copied from the numbered chain (the model sometimes continues
+/// Cleans one raw thought-generation completion: trims surrounding
+/// whitespace, cuts at the first blank line, strips `*stage directions*`
+/// from the kept paragraph, strips a leading list number (`3. `) copied
+/// from the numbered chain (the model sometimes continues
 /// past its one note into a second paragraph or a reply), strips a leading
 /// `"{self_name}:"` self-attribution, strips a surrounding quote wrapper the
 /// model sometimes adds, then — last, so it can never re-expose a wrapper
@@ -376,12 +385,7 @@ fn trim_to_last_sentence_boundary(text: &str) -> &str {
 /// never empties a non-empty input, so that branch is reachable only by
 /// inputs that were already empty before the cap trim.
 pub fn clean_thought(raw: &str, self_name: &str, hit_token_cap: bool) -> Option<String> {
-    let without_asides = if raw.contains('*') {
-        strip_asides(raw)
-    } else {
-        raw.to_string()
-    };
-    let trimmed = without_asides.trim();
+    let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
@@ -390,7 +394,15 @@ pub fn clean_thought(raw: &str, self_name: &str, hit_token_cap: bool) -> Option<
     let cut = trimmed.split("\n\n").next().unwrap_or(trimmed).trim();
     let paragraph_finished_naturally = cut.len() != trimmed.len();
 
-    let without_number = strip_list_number(cut);
+    // Asides are stripped only inside the kept paragraph: `strip_asides`
+    // collapses all whitespace, so running it on `raw` would erase the
+    // blank line the cut above keys on.
+    let without_asides = if cut.contains('*') {
+        strip_asides(cut)
+    } else {
+        cut.to_string()
+    };
+    let without_number = strip_list_number(without_asides.trim());
     let prefix = format!("{self_name}:");
     let without_name = without_number
         .strip_prefix(prefix.as_str())
@@ -801,6 +813,25 @@ mod tests {
             clean_thought("3.5 miles is nothing.", "Bob", false),
             Some("3.5 miles is nothing.".to_string())
         );
+    }
+
+    #[test]
+    fn clean_thought_cuts_at_the_first_blank_line_even_when_an_aside_precedes_it() {
+        assert_eq!(
+            clean_thought(
+                "I'm glad. *smiles*\n\nBob: So how was your day?",
+                "Bob",
+                false
+            ),
+            Some("I'm glad.".to_string())
+        );
+    }
+
+    #[test]
+    fn count_sentences_does_not_count_a_leading_list_number() {
+        assert_eq!(count_sentences("1. He gave me a gun. Really. Truly."), 3);
+        assert_eq!(count_sentences("14 basilisks. Great."), 2);
+        assert_eq!(count_sentences("He gave me 3. Really."), 2);
     }
 
     #[test]
