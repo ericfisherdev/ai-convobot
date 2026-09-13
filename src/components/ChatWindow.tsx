@@ -41,6 +41,11 @@ import { scrollToMessage } from "../lib/messageAnchors";
 import { useRunningThoughts } from "./context/runningThoughtsContext";
 import { RunningThoughtsPanel } from "./thoughts/RunningThoughtsPanel";
 
+// Ceiling for the desktop composer's content-driven growth, mirroring
+// MobileChatInput's auto-resize. Kept in sync with the Textarea's
+// `max-h-[240px]` class below.
+const COMPOSER_MAX_HEIGHT_PX = 240;
+
 const ChatWindow = () => {
   const companionDataContext = useCompanionData();
   const companionData: CompanionData = companionDataContext?.companionData ?? {} as CompanionData;
@@ -85,6 +90,17 @@ const ChatWindow = () => {
       scrolledDraftIdRef.current = awaitedId;
     }
   }, [pendingDraft]);
+
+  // Grows the desktop composer with its content, the same way
+  // MobileChatInput does: reset to 'auto' so scrollHeight reflects the
+  // content (still floored by the `min-h-[120px]` class), then clamp to
+  // the max height so it scrolls internally past that point.
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, COMPOSER_MAX_HEIGHT_PX)}px`;
+  }, [userMessage, companionMessage, isImpersonating]);
 
   const handleMessageChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
     if (isImpersonating) {
@@ -357,7 +373,7 @@ const ChatWindow = () => {
                   placeholder={isImpersonating ? `🥸 Type your message as ${companionData?.name}` : "Type your message"}
                   onKeyDown={handleKeyDown}
                   disabled={isSending}
-                  className="min-h-[120px] max-h-[240px] resize-none"
+                  className="min-h-[120px] max-h-[240px] resize-none overflow-y-auto"
                 />
 
                 <TooltipProvider>
