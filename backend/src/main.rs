@@ -963,16 +963,7 @@ async fn rebuild_long_term() -> HttpResponse {
     };
     match off_worker("Error while rebuilding long term memory", move || {
         let _turn_guard = turn_guard;
-        let companion_id = Database::get_companion_id()?;
-        let facts = SqliteCompactionStore.active_facts(companion_id)?;
-        let entries: Vec<(i64, String)> = facts
-            .iter()
-            .map(|fact| (fact.id, compaction::ltm::fact_entry(fact)))
-            .collect();
-        let count = entries.len();
-        LongTermMem::shared()?
-            .replace_facts(entries.iter().map(|(id, text)| (*id, text.as_str())))?;
-        Ok::<usize, RebuildError>(count)
+        rebuild_long_term_memory_index()
     })
     .await
     {
@@ -981,6 +972,24 @@ async fn rebuild_long_term() -> HttpResponse {
         }
         Err(response) => response,
     }
+}
+
+/// Re-indexes every active fact from scratch into the tantivy long-term
+/// memory index. The body of `rebuild_long_term`'s route handler, split out
+/// so `clear_compaction` (#238) can also call it after clearing compaction
+/// history -- reusing this instead of writing a second replace-facts path.
+/// Both callers already hold [`ACTIVE_TURN`] themselves before calling this,
+/// so it does not claim the slot on its own.
+fn rebuild_long_term_memory_index() -> Result<usize, RebuildError> {
+    let companion_id = Database::get_companion_id()?;
+    let facts = SqliteCompactionStore.active_facts(companion_id)?;
+    let entries: Vec<(i64, String)> = facts
+        .iter()
+        .map(|fact| (fact.id, compaction::ltm::fact_entry(fact)))
+        .collect();
+    let count = entries.len();
+    LongTermMem::shared()?.replace_facts(entries.iter().map(|(id, text)| (*id, text.as_str())))?;
+    Ok(count)
 }
 
 /// Unifies `Database::get_companion_id`'s `rusqlite::Error`,
@@ -4543,6 +4552,88 @@ async fn clear_attitudes() -> HttpResponse {
     }
 }
 
+/// Deletes every running thought for the companion (#238's "Clear running
+/// thoughts" button). `erase_messages` deliberately leaves `running_thoughts`
+/// alone -- see the "Running thoughts" section comment above `thought_edit`
+/// -- so without this button a stale note from a wiped conversation keeps
+/// steering replies after the conversation it came from is gone. Claims
+/// [`ACTIVE_TURN`] like `thought_edit`/`thought_delete`, so a clear cannot
+/// race a live round's own thought write.
+#[delete("/api/thoughts/clear")]
+async fn clear_running_thoughts() -> HttpResponse {
+    let Some(turn_guard) = ACTIVE_TURN.try_claim() else {
+        return HttpResponse::Conflict().body(
+            "A reply is still being generated; wait for it to finish before clearing running thoughts",
+        );
+    };
+    match off_worker("Error while clearing running thoughts", move || {
+        let _turn_guard = turn_guard;
+        let companion_id = Database::get_companion_id()?;
+        SqliteRunningThoughtStore.clear(companion_id)
+    })
+    .await
+    {
+        Ok(count) => HttpResponse::Ok().body(format!("Cleared {count} running thoughts!")),
+        Err(response) => response,
+    }
+}
+
+/// Deletes every compaction row for the companion and rebuilds the
+/// long-term memory index afterward, so a cleared fact stops surfacing in
+/// prompts (#238's "Clear compaction history" button). Reuses
+/// [`rebuild_long_term_memory_index`] rather than a second replace-facts
+/// path. Claims [`ACTIVE_TURN`] for the same reason `rebuild_long_term`
+/// itself does: without it, a checkpoint committing concurrently could
+/// write a fact into the tantivy index in the gap between this handler's
+/// own clear and its rebuild, and the rebuild would then wipe it back out.
+#[delete("/api/compaction/clear")]
+async fn clear_compaction() -> HttpResponse {
+    let Some(turn_guard) = ACTIVE_TURN.try_claim() else {
+        return HttpResponse::Conflict().body(
+            "A reply is still being generated; wait for it to finish before clearing compaction history",
+        );
+    };
+    match off_worker("Error while clearing compaction history", move || {
+        let _turn_guard = turn_guard;
+        let companion_id = Database::get_companion_id()?;
+        Database::clear_compaction_history(companion_id)?;
+        rebuild_long_term_memory_index()
+    })
+    .await
+    {
+        Ok(count) => HttpResponse::Ok().body(format!(
+            "Compaction history cleared and long term memory rebuilt from {count} facts"
+        )),
+        Err(response) => response,
+    }
+}
+
+/// Deletes every known-person row: relationships, interactions, and
+/// memories, then the third-party individuals themselves (#238's "Clear
+/// known people" button). Registered at `/api/persons/clear`, alongside
+/// this feature's other routes (`/api/persons`, `/api/persons/cleanup-*`),
+/// not `/api/thirdParty/clear` as an earlier draft of this issue named it.
+/// Claims [`ACTIVE_TURN`] so a clear cannot race a live round's own
+/// person-detection write.
+#[delete("/api/persons/clear")]
+async fn clear_known_people() -> HttpResponse {
+    let Some(turn_guard) = ACTIVE_TURN.try_claim() else {
+        return HttpResponse::Conflict().body(
+            "A reply is still being generated; wait for it to finish before clearing known people",
+        );
+    };
+    match off_worker("Error while clearing known people", move || {
+        let _turn_guard = turn_guard;
+        let companion_id = Database::get_companion_id()?;
+        Database::clear_third_party_data(companion_id)
+    })
+    .await
+    {
+        Ok(_) => HttpResponse::Ok().body("Known people cleared!"),
+        Err(response) => response,
+    }
+}
+
 #[post("/api/persons/detect")]
 async fn detect_persons(
     received: web::Json<Prompt>,
@@ -5753,6 +5844,7 @@ async fn main() -> std::io::Result<()> {
             .service(get_person_by_name)
             .service(cleanup_duplicate_third_parties)
             .service(cleanup_invalid_third_parties)
+            .service(clear_known_people)
             .service(estimate_response_time_endpoint)
             .service(plan_interaction)
             .service(get_planned_interactions)
@@ -5777,12 +5869,14 @@ async fn main() -> std::io::Result<()> {
             .service(compaction_detail)
             .service(compaction_commit)
             .service(compaction_discard)
+            .service(clear_compaction)
             .service(message_pin)
             .service(message_unpin)
             .service(thoughts_list)
             .service(thought_edit)
             .service(thought_delete)
             .service(thoughts_regenerate)
+            .service(clear_running_thoughts)
     });
     if let Some(workers) = configured_workers() {
         server = server.workers(workers);

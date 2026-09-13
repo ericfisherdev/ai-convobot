@@ -42,6 +42,8 @@ import { UserData } from "../interfaces/UserData"
 import { toast } from "sonner"
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "../ui/dialog"
 import { useMessages } from "../context/messageContext"
+import { useCompaction } from "../context/compactionContext"
+import { useRunningThoughts } from "../context/runningThoughtsContext"
 import { AttitudeManager } from "../attitude/AttitudeManager"
 import { ThemeSettings } from "./ThemeSettings"
 import { DirectoryManager } from "../llm/DirectoryManager"
@@ -71,6 +73,8 @@ export function EditData() {
   const [modelRefreshTrigger, setModelRefreshTrigger] = useState(0);
 
   const { refreshMessages, resetStart } = useMessages();
+  const { refresh: refreshCompaction } = useCompaction();
+  const { refresh: refreshThoughts } = useRunningThoughts();
 
   const handleCompanionSave = async () => {
     if (companionFormData) {
@@ -340,6 +344,62 @@ export function EditData() {
     }
   };
 
+  const handleClearRunningThoughts = async () => {
+    try {
+      const response = await fetch("/api/thoughts/clear", {
+        method: "DELETE",
+      });
+
+      if (response.ok) {
+        toast.success(await response.text() || "Running thoughts cleared!");
+        refreshThoughts();
+      } else {
+        toast.error("Failed to clear running thoughts");
+        console.error("Failed to clear running thoughts");
+      }
+    } catch (error) {
+      toast.error(`Error while clearing running thoughts: ${error}`);
+      console.error("Error while clearing running thoughts:", error);
+    }
+  };
+
+  const handleClearCompactionHistory = async () => {
+    try {
+      const response = await fetch("/api/compaction/clear", {
+        method: "DELETE",
+      });
+
+      if (response.ok) {
+        toast.success(await response.text() || "Compaction history cleared!");
+        refreshCompaction();
+      } else {
+        toast.error("Failed to clear compaction history");
+        console.error("Failed to clear compaction history");
+      }
+    } catch (error) {
+      toast.error(`Error while clearing compaction history: ${error}`);
+      console.error("Error while clearing compaction history:", error);
+    }
+  };
+
+  const handleClearKnownPeople = async () => {
+    try {
+      const response = await fetch("/api/persons/clear", {
+        method: "DELETE",
+      });
+
+      if (response.ok) {
+        toast.success("Known people cleared!");
+      } else {
+        toast.error("Failed to clear known people");
+        console.error("Failed to clear known people");
+      }
+    } catch (error) {
+      toast.error(`Error while clearing known people: ${error}`);
+      console.error("Error while clearing known people:", error);
+    }
+  };
+
   const handleExportCharacterJson = async () => {
     try {
       const response = await fetch("/api/companion/characterJson");
@@ -606,6 +666,54 @@ export function EditData() {
                 <DialogFooter>
                   <DialogClose>
                     <Button onClick={handleClearAttitudes}>Clear attitude</Button>
+                  </DialogClose>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+            <Dialog>
+              <DialogTrigger><Button variant={"outline"} className="grow">Clear running thoughts</Button></DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Are you absolutely sure?</DialogTitle>
+                  <DialogDescription>
+                  Every running thought will be permanently erased (this action cannot be undone). Clearing the chat log does not clear running thoughts -- a stale thought from a wiped conversation would otherwise keep steering replies until it is cleared here too.
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogFooter>
+                  <DialogClose>
+                    <Button onClick={handleClearRunningThoughts}>Clear running thoughts</Button>
+                  </DialogClose>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+            <Dialog>
+              <DialogTrigger><Button variant={"outline"} className="grow">Clear compaction history</Button></DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Are you absolutely sure?</DialogTitle>
+                  <DialogDescription>
+                  Every compaction checkpoint and extracted fact will be permanently erased and the long-term memory index will be rebuilt to match (this action cannot be undone). The chat log itself is not affected.
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogFooter>
+                  <DialogClose>
+                    <Button onClick={handleClearCompactionHistory}>Clear compaction history</Button>
+                  </DialogClose>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+            <Dialog>
+              <DialogTrigger><Button variant={"outline"} className="grow">Clear known people</Button></DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Are you absolutely sure?</DialogTitle>
+                  <DialogDescription>
+                  Every known person and all of their memories, planned interactions, and relationships to other people will be permanently erased (this action cannot be undone).
+                  </DialogDescription>
+                </DialogHeader>
+                <DialogFooter>
+                  <DialogClose>
+                    <Button onClick={handleClearKnownPeople}>Clear known people</Button>
                   </DialogClose>
                 </DialogFooter>
               </DialogContent>
