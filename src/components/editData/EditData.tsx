@@ -708,7 +708,7 @@ export function EditData() {
                 <DialogHeader>
                   <DialogTitle>Are you absolutely sure?</DialogTitle>
                   <DialogDescription>
-                  Every known person and all of their memories, planned interactions, and relationships to other people will be permanently erased (this action cannot be undone).
+                  Every known person and all of their memories, planned interactions, relationships to other people, and companion attitude toward them will be permanently erased (this action cannot be undone).
                   </DialogDescription>
                 </DialogHeader>
                 <DialogFooter>

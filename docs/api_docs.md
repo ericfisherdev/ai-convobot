@@ -875,6 +875,7 @@ See section 1.7/1.8 for the pin/unpin routes, which live under `/message/{id}/pi
 - **Response:**
   - Status: 200 OK
   - Body: `Compaction history cleared and long term memory rebuilt from {n} facts`
+  - Status: 409 Conflict — this instance is a joiner; compaction lives on the host.
   - Status: 409 Conflict — a turn is already in flight; wait for it to finish before clearing.
 - **Example Request:**
   ```http

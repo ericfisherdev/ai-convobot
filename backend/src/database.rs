@@ -2886,9 +2886,10 @@ impl Database {
         Ok(())
     }
 
-    /// Deletes every known-person row: relationships, interactions, and
-    /// memories, then the `third_party_individuals` rows themselves, all
-    /// inside one transaction. #238's "Clear known people" button.
+    /// Deletes every known-person row: the `third_party`-typed attitude
+    /// rows, relationships, interactions, and memories, then the
+    /// `third_party_individuals` rows themselves, all inside one
+    /// transaction. #238's "Clear known people" button.
     ///
     /// `third_party_individuals` has no `companion_id` column (#177) --
     /// there is only ever one companion row, so clearing every person here
@@ -2897,12 +2898,14 @@ impl Database {
     /// column either, so it is cleared unconditionally too; `_memories` and
     /// `_interactions` do have the column and are scoped by it.
     ///
-    /// Deliberately leaves `companion_attitudes` alone even though some of
-    /// its rows now point at a deleted person: attitudes are "Clear
-    /// attitude"'s own data, and #238 requires every clear stay independent
-    /// of the others (unlike `delete_third_party_in`, which cleans up a
-    /// single person's attitude row because that person is gone for good,
-    /// not because the whole feature was reset).
+    /// Deletes the `target_type = 'third_party'` attitude rows the same way
+    /// `delete_third_party_in` does for a single person: a `third_party`
+    /// attitude row exists only because its person does, and
+    /// `third_party_individuals.id` is `AUTOINCREMENT`, so once the person
+    /// behind it is gone here that row can never resolve to a person again
+    /// (review finding on #240). The `target_type = 'user'` row is left
+    /// alone, so "Clear attitude" -- which resets it -- stays independent of
+    /// this clear.
     pub fn clear_third_party_data(companion_id: i32) -> Result<()> {
         let mut con = Self::open()?;
         Self::clear_third_party_data_in(&mut con, companion_id)
@@ -2913,6 +2916,10 @@ impl Database {
     /// matching `erase_messages`/`erase_messages_on`.
     fn clear_third_party_data_in(con: &mut Connection, companion_id: i32) -> Result<()> {
         let tx = con.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM companion_attitudes WHERE companion_id = ? AND target_type = 'third_party'",
+            params![companion_id],
+        )?;
         tx.execute("DELETE FROM third_party_relationships", [])?;
         tx.execute(
             "DELETE FROM third_party_interactions WHERE companion_id = ?",
@@ -6284,12 +6291,16 @@ mod tests {
     }
 
     /// #238's "Clear known people" button: empties every `third_party_*`
-    /// table but leaves `companion_attitudes` alone, even though it now has
-    /// a row pointing at a deleted person -- attitudes are "Clear
-    /// attitude"'s own data, and clearing people must stay independent of
-    /// it.
+    /// table and the now-unresolvable `target_type = 'third_party'`
+    /// attitude row, but leaves the `target_type = 'user'` attitude row
+    /// alone -- that row is "Clear attitude"'s own data, and clearing
+    /// people must stay independent of it (review finding on #240: a
+    /// `third_party` attitude row left behind here could never resolve to
+    /// a person again, since `third_party_individuals.id` never reuses a
+    /// deleted id).
     #[test]
-    fn clear_third_party_data_removes_every_third_party_table_but_leaves_attitudes() {
+    fn clear_third_party_data_removes_third_party_rows_and_their_attitude_but_leaves_the_user_attitude(
+    ) {
         let dir = tempfile::TempDir::new().unwrap();
         let mut con = Database::open_at(dir.path().join("t.db")).unwrap();
         create_third_party_tables(&con);
@@ -6315,6 +6326,11 @@ mod tests {
             params![person_id, get_current_date(), get_current_date()],
         )
         .unwrap();
+        con.execute(
+            "INSERT INTO companion_attitudes (companion_id, target_id, target_type, last_updated, created_at) VALUES (1, 1, 'user', ?, ?)",
+            params![get_current_date(), get_current_date()],
+        )
+        .unwrap();
 
         Database::clear_third_party_data_in(&mut con, 1).unwrap();
 
@@ -6331,12 +6347,14 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 0, "{table} should be empty");
         }
-        let attitude_count: i64 = con
-            .query_row("SELECT COUNT(*) FROM companion_attitudes", [], |row| {
-                row.get(0)
-            })
+        let remaining_target_types: Vec<String> = con
+            .prepare("SELECT target_type FROM companion_attitudes")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(attitude_count, 1);
+        assert_eq!(remaining_target_types, vec!["user".to_string()]);
     }
 
     /// #181 review finding: `mark_stale_containing_on` only ever matches
