@@ -6,7 +6,8 @@
 use crate::database::CompanionView;
 use crate::llm::{CharacterModel, PromptSpeakers};
 use crate::running_thoughts::prompt::{
-    build_thought_prompt, clean_thought, ThoughtInputs, THOUGHT_MAX_TOKENS,
+    build_thought_prompt, clean_thought, count_sentences, truncate_to_sentences, ThoughtInputs,
+    THOUGHT_MAX_TOKENS, THOUGHT_SENTENCE_LIMIT,
 };
 use crate::running_thoughts::store::RunningThoughtStore;
 use crate::running_thoughts::types::{NewRunningThought, RunningThought};
@@ -44,6 +45,14 @@ impl std::error::Error for ThoughtError {}
 /// it via `insert`. The one code path for both a live round
 /// (`chat_turn::PendingTurn::think`) and #217's regenerate route. Nothing is
 /// written on `Generate`/`Empty`.
+///
+/// Generation stops at the `THOUGHT_SENTENCE_LIMIT`-th sentence boundary,
+/// with `THOUGHT_MAX_TOKENS` as the backstop. A note that names the
+/// companion in the third person (`"Jinx looks around the room…"`) is
+/// regenerated once — a first-person note has no reason to contain its
+/// author's name, and every such slip seen in the eval carried it; the
+/// second attempt is kept whatever it says, so a name mentioned legitimately
+/// costs one extra call and nothing more.
 pub fn generate_thought(
     inputs: &ThoughtInputs,
     companion: &CompanionView,
@@ -51,16 +60,17 @@ pub fn generate_thought(
     model: &dyn CharacterModel,
     insert: &dyn Fn(NewRunningThought) -> rusqlite::Result<RunningThought>,
 ) -> Result<RunningThought, ThoughtError> {
-    let prompt = build_thought_prompt(inputs, &companion.persona, speakers);
-    let completion = model
-        .complete_in_character(&prompt.system, &prompt.user, THOUGHT_MAX_TOKENS)
-        .map_err(ThoughtError::Generate)?;
-    let text = clean_thought(
-        &completion.text,
-        speakers.self_name(),
-        completion.hit_token_cap,
-    )
-    .ok_or(ThoughtError::Empty)?;
+    let prompt = build_thought_prompt(
+        inputs,
+        &companion.persona,
+        &companion.example_dialogue,
+        speakers,
+    );
+    let self_name = speakers.self_name();
+    let mut text = complete_one_note(model, &prompt.system, &prompt.user, self_name)?;
+    if names_self(&text, self_name) {
+        text = complete_one_note(model, &prompt.system, &prompt.user, self_name)?;
+    }
 
     insert(NewRunningThought {
         companion_id: inputs.companion_id,
@@ -71,6 +81,29 @@ pub fn generate_thought(
         edited: false,
     })
     .map_err(ThoughtError::Store)
+}
+
+/// One model call plus cleaning: stops at the sentence limit, trims the
+/// token that crossed it, strips asides and a capped tail.
+fn complete_one_note(
+    model: &dyn CharacterModel,
+    system: &str,
+    user: &str,
+    self_name: &str,
+) -> Result<String, ThoughtError> {
+    let completion = model
+        .complete_in_character(system, user, THOUGHT_MAX_TOKENS, &mut |so_far| {
+            count_sentences(so_far) < THOUGHT_SENTENCE_LIMIT
+        })
+        .map_err(ThoughtError::Generate)?;
+    let within_limit = truncate_to_sentences(&completion.text, THOUGHT_SENTENCE_LIMIT);
+    clean_thought(within_limit, self_name, completion.hit_token_cap).ok_or(ThoughtError::Empty)
+}
+
+/// True when a note mentions its own author by name — the marker of a
+/// third-person slip in what should be first-person prose.
+fn names_self(text: &str, self_name: &str) -> bool {
+    !self_name.is_empty() && text.contains(self_name)
 }
 
 /// [`generate_thought`] over a [`RunningThoughtStore`]: `insert` then `get`
@@ -154,6 +187,7 @@ mod tests {
         let (system, user) = &prompts[0];
         assert!(system.contains("a warm, curious persona"));
         assert!(user.contains("none yet"));
+        assert!(user.contains("What just happened (Bob has not responded yet):"));
         assert!(user.contains("I got the job!"));
     }
 
@@ -172,6 +206,63 @@ mod tests {
         assert_eq!(stored.through_message_id, 5);
         assert!(!stored.edited);
         assert_eq!(store.thoughts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn generate_thought_into_regenerates_once_when_the_note_names_its_author() {
+        let store = RecordingStore::new();
+        let model = FakeCharacterModel::returning([
+            Ok("Bob looks around the room, unsure.".to_string()),
+            Ok("I'm not sure about this room.".to_string()),
+        ]);
+
+        let stored = generate_thought_into(&store, &inputs(), &companion(), &speakers(), &model)
+            .expect("generation should succeed");
+
+        assert_eq!(stored.text, "I'm not sure about this room.");
+        assert_eq!(model.prompts.lock().unwrap().len(), 2);
+        assert_eq!(store.thoughts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn generate_thought_into_keeps_the_second_attempt_even_if_it_still_names_the_author() {
+        let store = RecordingStore::new();
+        let model = FakeCharacterModel::returning([
+            Ok("Bob is wary.".to_string()),
+            Ok("Bob is still wary.".to_string()),
+        ]);
+
+        let stored = generate_thought_into(&store, &inputs(), &companion(), &speakers(), &model)
+            .expect("generation should succeed");
+
+        assert_eq!(stored.text, "Bob is still wary.");
+        assert_eq!(model.prompts.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn generate_thought_into_truncates_past_the_sentence_limit() {
+        let store = RecordingStore::new();
+        let model = FakeCharacterModel::returning([Ok(
+            "One. Two. Three. Four that the fake did not stop at.".to_string(),
+        )]);
+
+        let stored = generate_thought_into(&store, &inputs(), &companion(), &speakers(), &model)
+            .expect("generation should succeed");
+
+        assert_eq!(stored.text, "One. Two. Three.");
+    }
+
+    #[test]
+    fn generate_thought_into_strips_stage_directions() {
+        let store = RecordingStore::new();
+        let model = FakeCharacterModel::returning([Ok(
+            "I'm proud of them. *I scribble in my notebook.* Really.".to_string(),
+        )]);
+
+        let stored = generate_thought_into(&store, &inputs(), &companion(), &speakers(), &model)
+            .expect("generation should succeed");
+
+        assert_eq!(stored.text, "I'm proud of them. Really.");
     }
 
     #[test]

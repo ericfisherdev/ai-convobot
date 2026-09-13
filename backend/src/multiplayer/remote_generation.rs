@@ -713,7 +713,7 @@ mod tests {
         let store = RecordingThoughtStore::new();
         let bot1 = ParticipantId::parse("bot1").unwrap();
         let transcript = vec![sample_message(1, USER_SPEAKER_ID, "hi")];
-        let model = FakeCharacterModel::returning([Ok("bot1's own first note".to_string())]);
+        let model = FakeCharacterModel::returning([Ok("my own first note".to_string())]);
 
         let result = think_into(
             &store,
@@ -728,7 +728,7 @@ mod tests {
         .expect("no prior row, so a thought should be written");
 
         assert_eq!(result.speaker_id, bot1.to_string());
-        assert_eq!(result.text, "bot1's own first note");
+        assert_eq!(result.text, "my own first note");
         assert_eq!((result.from_message_id, result.through_message_id), (1, 1));
     }
 

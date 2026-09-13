@@ -1472,12 +1472,11 @@ fn run_decode(
     Ok((generated, tokens_generated))
 }
 
-/// The sampler chain both a reply (`generate`) and a running thought
-/// (`ResidentCharacterModel::complete_in_character`, #216) sample with, so
-/// the two can never drift apart. The old `llm` crate hid this behind
+/// The sampler chain a reply (`generate`) samples with. A running thought
+/// uses [`thought_sampler`] instead; see there for why they differ. The old `llm` crate hid this behind
 /// `InferenceParameters::default()`; llama.cpp requires an explicit chain,
 /// so these values reproduce a conventional chat preset.
-fn reply_sampler(model: &LlamaModel, seed: u32) -> LlamaSampler {
+pub(crate) fn reply_sampler(model: &LlamaModel, seed: u32) -> LlamaSampler {
     LlamaSampler::chain_simple([
         LlamaSampler::penalties(model.n_vocab(), 64, 1.1, 0.0, 0.0),
         LlamaSampler::top_k(40),
@@ -2164,8 +2163,15 @@ pub struct CharacterCompletion {
 /// One short in-character completion on the *chat* model, for the running
 /// thought (#216). Distinct from [`Extractor`] on purpose: that seam prefers
 /// the configured extraction model and samples greedily; a thought is
-/// subjective and in-voice, so it runs on `RESIDENT_MODEL` with the same
-/// sampler chain [`generate`] uses for replies.
+/// subjective and in-voice, so it runs on `RESIDENT_MODEL` — with its own
+/// sampler ([`thought_sampler`]), not the reply's, since the reply's 1.1
+/// repetition penalty pushed notes away from the round's own wording.
+///
+/// `keep_going` sees the text generated so far after every token and
+/// returns `false` to stop: how `generate_thought` enforces
+/// `THOUGHT_SENTENCE_LIMIT` structurally, since the model ignores a
+/// sentence limit stated in the prompt. A stop this way is not a token-cap
+/// hit.
 pub trait CharacterModel {
     /// # Errors
     /// Propagates model load, tokenization and decode failures as
@@ -2175,6 +2181,7 @@ pub trait CharacterModel {
         system: &str,
         user: &str,
         max_tokens: usize,
+        keep_going: &mut dyn FnMut(&str) -> bool,
     ) -> std::io::Result<CharacterCompletion>;
 }
 
@@ -2190,7 +2197,41 @@ impl CharacterModel for ResidentCharacterModel {
         system: &str,
         user: &str,
         max_tokens: usize,
+        keep_going: &mut dyn FnMut(&str) -> bool,
     ) -> std::io::Result<CharacterCompletion> {
+        complete_on_resident_model(system, user, max_tokens, &thought_sampler, keep_going)
+    }
+}
+
+/// The sampler chain a running thought samples with. Cooler than
+/// [`reply_sampler`] (0.5 against 0.8) and with a much lighter repetition
+/// penalty (1.05 against 1.1): the reply's penalty made notes paraphrase
+/// away from what was actually said, while no penalty at all let a note
+/// copy its own chain verbatim. Tuned on the 2026-09-12 eval.
+pub(crate) fn thought_sampler(model: &LlamaModel, seed: u32) -> LlamaSampler {
+    LlamaSampler::chain_simple([
+        LlamaSampler::penalties(model.n_vocab(), 64, 1.05, 0.0, 0.0),
+        LlamaSampler::top_k(40),
+        LlamaSampler::top_p(0.9, 1),
+        LlamaSampler::min_p(0.05, 1),
+        LlamaSampler::temp(0.5),
+        LlamaSampler::dist(seed),
+    ])
+}
+
+/// One system+user completion on `RESIDENT_MODEL` with the given sampler
+/// chain and early-stop predicate: `keep_going` sees the text generated so
+/// far after every token and returns `false` to stop. A stop that way is
+/// reported as `hit_token_cap: false`. Split from the trait impl so the
+/// running-thoughts eval can drive the same load/template/decode path.
+pub(crate) fn complete_on_resident_model(
+    system: &str,
+    user: &str,
+    max_tokens: usize,
+    build_sampler: &dyn Fn(&LlamaModel, u32) -> LlamaSampler,
+    keep_going: &mut dyn FnMut(&str) -> bool,
+) -> std::io::Result<CharacterCompletion> {
+    {
         let _generation_guard = GENERATION_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2239,21 +2280,30 @@ impl CharacterModel for ResidentCharacterModel {
             .map_err(|e| std::io::Error::other(format!("failed to create llama context: {}", e)))?;
 
         let seed = sampler_seed();
-        let mut sampler = reply_sampler(&model, seed);
+        let mut sampler = build_sampler(&model, seed);
 
         // Counting-only callback: a thought is not the turn's reply, so
         // neither `INFERENCE_TRACKER` nor `INFERENCE_OPTIMIZER` (which
         // measure replies) are touched here.
+        let mut so_far = String::new();
+        let mut stopped_early = false;
         let (text, tokens_generated) = run_decode(
             &model,
             &mut llama_context,
             &mut sampler,
             &prompt_tokens,
             max_tokens,
-            &mut |_piece| true,
+            &mut |piece| {
+                so_far.push_str(piece);
+                let keep = keep_going(&so_far);
+                if !keep {
+                    stopped_early = true;
+                }
+                keep
+            },
         )?;
 
-        let hit_token_cap = tokens_generated >= max_tokens;
+        let hit_token_cap = !stopped_early && tokens_generated >= max_tokens;
         println!(
             "💭 Thought: {} prompt tokens, {} generated{}",
             prompt_token_count,
@@ -2323,6 +2373,7 @@ impl CharacterModel for FakeCharacterModel {
         system: &str,
         user: &str,
         _max_tokens: usize,
+        _keep_going: &mut dyn FnMut(&str) -> bool,
     ) -> std::io::Result<CharacterCompletion> {
         self.prompts
             .lock()

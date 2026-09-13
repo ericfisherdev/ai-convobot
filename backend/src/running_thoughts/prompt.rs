@@ -12,11 +12,19 @@ use crate::llm::PromptSpeakers;
 use crate::participants::{expand_placeholders, render_mentions, ParticipantId};
 use crate::running_thoughts::types::RunningThought;
 
-/// Previous notes shown to the thought generator.
-pub const THOUGHT_CHAIN_LENGTH: usize = 6;
-/// Output cap for one note: a short paragraph, so the added latency is a
-/// fraction of the reply's.
-pub const THOUGHT_MAX_TOKENS: usize = 96;
+/// Previous notes shown to the thought generator. Two, not more: with a
+/// longer chain the model paraphrased or copied its older notes instead of
+/// reading the round (the 2026-09-12 eval saw the same sentence restated in
+/// four consecutive notes at six).
+pub const THOUGHT_CHAIN_LENGTH: usize = 2;
+/// Sentences a note may run to. Length is enforced by stopping generation
+/// at the sentence boundary (`count_sentences` in the decode callback);
+/// asking the model for "at most three sentences" had no effect.
+pub const THOUGHT_SENTENCE_LIMIT: usize = 3;
+/// Backstop token cap for one note, behind the sentence stop: a note that
+/// never closes a sentence still ends here, so the added latency stays a
+/// fraction of the reply's. Three sentences normally finish well under it.
+pub const THOUGHT_MAX_TOKENS: usize = 120;
 /// Ceiling on the messages a single round can carry into the thought
 /// prompt: the first note after enabling the flag on a long chat must not
 /// render the whole history.
@@ -55,29 +63,56 @@ pub struct ThoughtPrompt {
 }
 
 /// Builds the prompt for one thought-generation call: the companion's
-/// persona and instructions as the system part, the previous notes plus the
-/// round that just closed as the user part.
+/// persona, instructions and the card's example dialogue (its register) as
+/// the system part; the previous notes plus the round that just closed as
+/// the user part.
+///
+/// The instruction asks for two things in one paragraph — what the user
+/// just said or did, then what the companion makes of it — and pins the
+/// tense ("has not responded yet"), because a note written *before* the
+/// reply otherwise narrates the pending exchange as already finished. The
+/// worked example is about nobody in particular so it carries only the
+/// shape; voice comes from the card's example dialogue — its spoken lines
+/// only, since quoting its `*actions*` primed the model to narrate the
+/// companion from the outside instead of thinking as her.
 pub fn build_thought_prompt(
     inputs: &ThoughtInputs,
     persona: &str,
+    example_dialogue: &str,
     speakers: &PromptSpeakers,
 ) -> ThoughtPrompt {
     let self_name = speakers.self_name();
     let user_name = speakers.user_name();
-    let system = format!(
+    let mut system = format!(
         "You are {self_name}. {persona}\n\
-         Write one short, first-person note in {self_name}'s own voice, recording what \
-         {self_name} took from the exchange below — including anything {self_name} now \
-         believes or suspects, even if it was never said outright. Write it as a private \
-         thought, in plain first-person prose.",
+         Before you answer {user_name}, you think to yourself, in your own words: one \
+         paragraph, at most three sentences, written as \"I\". You never call yourself \
+         {self_name} in it and never describe yourself from the outside. First what \
+         {user_name} just said or did, keeping strictly to what is in the exchange below \
+         and nothing that has not happened yet; then what you make of it — what you \
+         suspect {user_name} is after, and how you feel about {user_name} right now. \
+         Guesses about {user_name}'s intentions are welcome; invented events are not. \
+         Plain prose only: no asterisks, no stage directions.\n\
+         An example of the shape, about somebody else entirely: \"She asked where I'd been \
+         and let it go when I dodged. I think she already knows and is waiting for me to \
+         say it, and I don't like being waited on.\"",
         self_name = self_name,
+        user_name = user_name,
         persona = expand_placeholders(persona, &speakers.registry),
     );
+    let dialogue = spoken_lines(&expand_placeholders(example_dialogue, &speakers.registry));
+    if !dialogue.is_empty() {
+        system.push_str("\nThis is how you talk:\n");
+        system.push_str(&dialogue);
+    }
 
-    let mut user = String::from("Your previous notes:\n");
+    let mut user = String::new();
     if inputs.previous.is_empty() {
-        user.push_str("none yet\n");
+        user.push_str("Your earlier thoughts: none yet.\n");
     } else {
+        user.push_str(
+            "Your earlier thoughts, already noted (do not repeat them; only add what is new):\n",
+        );
         for (index, note) in inputs.previous.iter().enumerate() {
             let n = index + 1;
             if note.edited {
@@ -93,7 +128,9 @@ pub fn build_thought_prompt(
         }
     }
 
-    user.push_str("\nWhat just happened:\n");
+    user.push_str(&format!(
+        "\nWhat just happened ({self_name} has not responded yet):\n"
+    ));
     for message in &inputs.round {
         let display_name = ParticipantId::parse(&message.speaker_id)
             .ok()
@@ -102,7 +139,7 @@ pub fn build_thought_prompt(
         let text = render_mentions(&message.content, &speakers.registry);
         user.push_str(&format!("{display_name}: {text}\n"));
     }
-    user.push_str("\nYour note:");
+    user.push_str("\nYour thought:");
 
     ThoughtPrompt { system, user }
 }
@@ -146,6 +183,119 @@ fn render_thought_block(header: &str, notes: &[RunningThought]) -> String {
         block.push_str(&format!("- {}\n", note.text));
     }
     block
+}
+
+fn is_terminator(c: char) -> bool {
+    matches!(c, '.' | '!' | '?' | '…')
+}
+
+/// Byte offsets just past each sentence end in `text`: a run of terminators
+/// (so `...` is one end, not three) plus any closing quotes/brackets that
+/// immediately follow, where the run is not sandwiched between digits
+/// (`3.5`) and is followed by whitespace or the end of the text. A run made
+/// only of ellipsis at the very end is a pause, not an end, until the
+/// whitespace after it proves the sentence closed — otherwise a streamed
+/// `But...` stops generation mid-thought.
+fn sentence_ends(text: &str) -> Vec<usize> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut ends = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if !is_terminator(chars[i].1) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < chars.len() && is_terminator(chars[i].1) {
+            i += 1;
+        }
+        let run = &chars[start..i];
+        let before_is_digit = start > 0 && chars[start - 1].1.is_ascii_digit();
+        let after_is_digit = i < chars.len() && chars[i].1.is_ascii_digit();
+        if before_is_digit && after_is_digit {
+            continue;
+        }
+        let run_is_ellipsis =
+            run.iter().all(|(_, c)| matches!(c, '.' | '…')) && (run.len() > 1 || run[0].1 == '…');
+        while i < chars.len() && is_closing_mark(chars[i].1) {
+            i += 1;
+        }
+        let at_end = i >= chars.len();
+        let at_boundary = if at_end {
+            !run_is_ellipsis
+        } else {
+            chars[i].1.is_whitespace()
+        };
+        if at_boundary {
+            ends.push(chars.get(i).map_or(text.len(), |(b, _)| *b));
+        }
+    }
+    ends
+}
+
+/// Sentences closed so far in `text`. Fed the streamed completion after
+/// every token by `generate_thought`, which stops at
+/// [`THOUGHT_SENTENCE_LIMIT`].
+pub fn count_sentences(text: &str) -> usize {
+    sentence_ends(text).len()
+}
+
+/// `text` cut just after its `limit`-th sentence, or whole when it has
+/// fewer. The decode loop stops one token late at best (the token that
+/// closed the sentence may carry the start of the next), so this trims the
+/// remainder.
+pub fn truncate_to_sentences(text: &str, limit: usize) -> &str {
+    let ends = sentence_ends(text);
+    match limit.checked_sub(1).and_then(|i| ends.get(i)) {
+        Some(&end) => &text[..end],
+        None => text,
+    }
+}
+
+/// The example dialogue with every `*action*` removed, line by line, and
+/// any line that was only an action (or only a speaker label) dropped.
+/// What the thought prompt quotes for register: how the companion speaks,
+/// not how a roleplay narrates her.
+fn spoken_lines(example_dialogue: &str) -> String {
+    example_dialogue
+        .lines()
+        .map(strip_asides)
+        .filter(|line| !line.is_empty() && !line.ends_with(':'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Strips a leading `N. ` — the model sometimes continues the numbered
+/// "earlier thoughts" list into its own note.
+fn strip_list_number(text: &str) -> &str {
+    let digits = text.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 {
+        return text;
+    }
+    match text[digits..].strip_prefix('.') {
+        Some(rest) if rest.starts_with(char::is_whitespace) => rest.trim_start(),
+        _ => text,
+    }
+}
+
+/// Drops every `*…*` span — the asterisk-delimited stage direction a
+/// roleplay model slips into prose (`*I scribble in my notebook.*`) — and
+/// collapses the whitespace it leaves behind. An unmatched `*` drops the
+/// rest of the text, which is the lesser evil: a dangling action beat is
+/// never part of the thought.
+fn strip_asides(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_aside = false;
+    for c in text.chars() {
+        if c == '*' {
+            in_aside = !in_aside;
+            continue;
+        }
+        if !in_aside {
+            out.push(c);
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// A closing quote or bracket, in any script the thought generator might
@@ -209,8 +359,9 @@ fn trim_to_last_sentence_boundary(text: &str) -> &str {
     &text[..end]
 }
 
-/// Cleans one raw thought-generation completion: trims surrounding
-/// whitespace, cuts at the first blank line (the model sometimes continues
+/// Cleans one raw thought-generation completion: strips `*stage
+/// directions*`, trims surrounding whitespace, cuts at the first blank line,
+/// strips a leading list number (`3. `) copied from the numbered chain (the model sometimes continues
 /// past its one note into a second paragraph or a reply), strips a leading
 /// `"{self_name}:"` self-attribution, strips a surrounding quote wrapper the
 /// model sometimes adds, then — last, so it can never re-expose a wrapper
@@ -225,7 +376,12 @@ fn trim_to_last_sentence_boundary(text: &str) -> &str {
 /// never empties a non-empty input, so that branch is reachable only by
 /// inputs that were already empty before the cap trim.
 pub fn clean_thought(raw: &str, self_name: &str, hit_token_cap: bool) -> Option<String> {
-    let trimmed = raw.trim();
+    let without_asides = if raw.contains('*') {
+        strip_asides(raw)
+    } else {
+        raw.to_string()
+    };
+    let trimmed = without_asides.trim();
     if trimmed.is_empty() {
         return None;
     }
@@ -234,11 +390,12 @@ pub fn clean_thought(raw: &str, self_name: &str, hit_token_cap: bool) -> Option<
     let cut = trimmed.split("\n\n").next().unwrap_or(trimmed).trim();
     let paragraph_finished_naturally = cut.len() != trimmed.len();
 
+    let without_number = strip_list_number(cut);
     let prefix = format!("{self_name}:");
-    let without_name = cut
+    let without_name = without_number
         .strip_prefix(prefix.as_str())
         .map(str::trim_start)
-        .unwrap_or(cut);
+        .unwrap_or(without_number);
 
     let unquoted = without_name.trim_matches(|c: char| matches!(c, '"' | '\'' | '“' | '”'));
 
@@ -302,11 +459,83 @@ mod tests {
             through_message_id: 1,
         };
 
-        let prompt = build_thought_prompt(&inputs, "a friendly persona", &speakers());
+        let prompt = build_thought_prompt(&inputs, "a friendly persona", "", &speakers());
 
-        assert!(prompt.user.contains("Your previous notes:\nnone yet\n"));
+        assert!(prompt.user.contains("Your earlier thoughts: none yet.\n"));
         assert!(prompt.system.contains("Bob"));
         assert!(prompt.system.contains("a friendly persona"));
+        assert!(
+            !prompt.system.contains("This is how you talk"),
+            "an empty example dialogue adds no register block"
+        );
+    }
+
+    #[test]
+    fn build_thought_prompt_quotes_the_example_dialogue_as_the_companions_register() {
+        let inputs = ThoughtInputs {
+            companion_id: 1,
+            speaker_id: ParticipantId::CHAR,
+            previous: vec![],
+            round: vec![a_message("user", "hi")],
+            from_message_id: 1,
+            through_message_id: 1,
+        };
+
+        let prompt = build_thought_prompt(
+            &inputs,
+            "persona",
+            "{{user}}: hey\n{{char}}: what.",
+            &speakers(),
+        );
+
+        assert!(prompt
+            .system
+            .contains("This is how you talk:\nAlice: hey\nBob: what."));
+    }
+
+    #[test]
+    fn build_thought_prompt_quotes_only_the_spoken_part_of_the_example_dialogue() {
+        let inputs = ThoughtInputs {
+            companion_id: 1,
+            speaker_id: ParticipantId::CHAR,
+            previous: vec![],
+            round: vec![a_message("user", "hi")],
+            from_message_id: 1,
+            through_message_id: 1,
+        };
+
+        let prompt = build_thought_prompt(
+            &inputs,
+            "persona",
+            "{{user}}: You're bleeding.\n{{char}}: *doesn't look down* Wow. Real observant. *shifts* It's fine.\n{{char}}: *very still*\n{{user}}: Who?",
+            &speakers(),
+        );
+
+        assert!(prompt.system.contains(
+            "This is how you talk:\nAlice: You're bleeding.\nBob: Wow. Real observant. It's fine.\nAlice: Who?"
+        ));
+        assert!(!prompt.system.contains('*'));
+    }
+
+    #[test]
+    fn build_thought_prompt_anchors_the_tense_and_asks_for_plain_prose() {
+        let inputs = ThoughtInputs {
+            companion_id: 1,
+            speaker_id: ParticipantId::CHAR,
+            previous: vec![],
+            round: vec![a_message("user", "hi")],
+            from_message_id: 1,
+            through_message_id: 1,
+        };
+
+        let prompt = build_thought_prompt(&inputs, "persona", "", &speakers());
+
+        assert!(prompt
+            .user
+            .contains("What just happened (Bob has not responded yet):"));
+        assert!(prompt.system.contains("nothing that has not happened yet"));
+        assert!(prompt.system.contains("no asterisks, no stage directions"));
+        assert!(prompt.user.ends_with("Your thought:"));
     }
 
     #[test]
@@ -323,7 +552,7 @@ mod tests {
             through_message_id: 1,
         };
 
-        let prompt = build_thought_prompt(&inputs, "persona", &speakers());
+        let prompt = build_thought_prompt(&inputs, "persona", "", &speakers());
 
         assert!(prompt.user.contains("1. original note\n"));
         assert!(prompt
@@ -345,7 +574,7 @@ mod tests {
             through_message_id: 2,
         };
 
-        let prompt = build_thought_prompt(&inputs, "persona", &speakers());
+        let prompt = build_thought_prompt(&inputs, "persona", "", &speakers());
 
         assert!(prompt.user.contains("Alice: hey @Bob, how are you?\n"));
         assert!(prompt.user.contains("Bob: I'm well, @Alice\n"));
@@ -556,5 +785,65 @@ mod tests {
             clean_thought("Done thinking\n\nMore words that got cut ab", "Bob", true),
             Some("Done thinking".to_string())
         );
+    }
+
+    #[test]
+    fn clean_thought_strips_a_leading_list_number_but_not_a_number_in_prose() {
+        assert_eq!(
+            clean_thought("1. He gave me a gun.", "Bob", false),
+            Some("He gave me a gun.".to_string())
+        );
+        assert_eq!(
+            clean_thought("14 basilisks. Great.", "Bob", false),
+            Some("14 basilisks. Great.".to_string())
+        );
+        assert_eq!(
+            clean_thought("3.5 miles is nothing.", "Bob", false),
+            Some("3.5 miles is nothing.".to_string())
+        );
+    }
+
+    #[test]
+    fn clean_thought_strips_stage_directions() {
+        assert_eq!(
+            clean_thought(
+                "He's got nerve. *I scribble in my notebook.* But still.",
+                "Bob",
+                false
+            ),
+            Some("He's got nerve. But still.".to_string())
+        );
+        assert_eq!(clean_thought("*shrugs*", "Bob", false), None);
+    }
+
+    #[test]
+    fn count_sentences_counts_plain_sentences_and_a_terminator_at_the_end() {
+        assert_eq!(count_sentences("He said fine. I think so! Really?"), 3);
+        assert_eq!(count_sentences("First. Second. Third."), 3);
+        assert_eq!(count_sentences("First. Second. Thi"), 2);
+    }
+
+    #[test]
+    fn count_sentences_does_not_split_decimals_or_ellipsis_runs() {
+        assert_eq!(count_sentences("It's 3.5 miles. Wait... what? No."), 4);
+        assert_eq!(count_sentences("Wait... what"), 1);
+    }
+
+    #[test]
+    fn count_sentences_treats_a_trailing_ellipsis_as_a_pause_until_whitespace_follows() {
+        assert_eq!(count_sentences("He's got some nerve. But..."), 1);
+        assert_eq!(count_sentences("He's got some nerve. But… "), 2);
+        assert_eq!(count_sentences("Nope."), 1);
+    }
+
+    #[test]
+    fn truncate_to_sentences_cuts_after_the_limit_and_keeps_a_closing_quote() {
+        assert_eq!(truncate_to_sentences("A. B. C. D.", 3), "A. B. C.");
+        assert_eq!(truncate_to_sentences("A. B.", 3), "A. B.");
+        assert_eq!(
+            truncate_to_sentences("He said \"fine.\" Then left. And more. Extra.", 3),
+            "He said \"fine.\" Then left. And more."
+        );
+        assert_eq!(truncate_to_sentences("A. B.", 0), "A. B.");
     }
 }
