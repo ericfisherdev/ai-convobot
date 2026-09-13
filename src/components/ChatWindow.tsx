@@ -354,11 +354,10 @@ const ChatWindow = () => {
                   ref={inputRef}
                   value={isImpersonating ? companionMessage : userMessage}
                   onChange={handleMessageChange}
-                  cols={1}
                   placeholder={isImpersonating ? `🥸 Type your message as ${companionData?.name}` : "Type your message"}
                   onKeyDown={handleKeyDown}
                   disabled={isSending}
-                  className="min-h-[44px] max-h-[120px] resize-none"
+                  className="min-h-[120px] max-h-[240px] resize-none"
                 />
 
                 <TooltipProvider>

@@ -170,6 +170,18 @@ describe('ChatWindow Component', () => {
     expect(textarea).toBeInTheDocument()
   })
 
+  it('sizes the composer to at least 5 rows with room to grow beyond that minimum', () => {
+    render(
+      <MockProviders>
+        <ChatWindow />
+      </MockProviders>
+    )
+
+    const textarea = screen.getByRole('textbox')
+    expect(textarea).toHaveClass('min-h-[120px]')
+    expect(textarea).toHaveClass('max-h-[240px]')
+  })
+
   it('shows send button', () => {
     render(
       <MockProviders>
