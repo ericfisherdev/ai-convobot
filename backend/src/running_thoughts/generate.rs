@@ -100,10 +100,19 @@ fn complete_one_note(
     clean_thought(within_limit, self_name, completion.hit_token_cap).ok_or(ThoughtError::Empty)
 }
 
-/// True when a note mentions its own author by name — the marker of a
-/// third-person slip in what should be first-person prose.
+/// True when a note mentions its own author by name, as a whole word — the
+/// marker of a third-person slip in what should be first-person prose. A
+/// possessive (`Bob's`) still counts; `Eve` inside `Even` does not, since a
+/// false hit costs a whole second model call.
 fn names_self(text: &str, self_name: &str) -> bool {
-    !self_name.is_empty() && text.contains(self_name)
+    if self_name.is_empty() {
+        return false;
+    }
+    text.match_indices(self_name).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + self_name.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
 }
 
 /// [`generate_thought`] over a [`RunningThoughtStore`]: `insert` then `get`
@@ -263,6 +272,27 @@ mod tests {
             .expect("generation should succeed");
 
         assert_eq!(stored.text, "I'm proud of them. Really.");
+    }
+
+    #[test]
+    fn names_self_matches_only_whole_words() {
+        assert!(!names_self("Even so, I'm fine.", "Eve"));
+        assert!(names_self("Eve is wary.", "Eve"));
+        assert!(names_self("Bob's hands shake.", "Bob"));
+        assert!(!names_self("I told Bobby.", "Bob"));
+        assert!(!names_self("anything", ""));
+    }
+
+    #[test]
+    fn generate_thought_into_does_not_regenerate_on_a_word_that_merely_contains_the_name() {
+        let store = RecordingStore::new();
+        let model = FakeCharacterModel::returning([Ok("Bobbing along, I'm fine.".to_string())]);
+
+        let stored = generate_thought_into(&store, &inputs(), &companion(), &speakers(), &model)
+            .expect("generation should succeed");
+
+        assert_eq!(stored.text, "Bobbing along, I'm fine.");
+        assert_eq!(model.prompts.lock().unwrap().len(), 1);
     }
 
     #[test]

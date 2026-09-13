@@ -2231,91 +2231,88 @@ pub(crate) fn complete_on_resident_model(
     build_sampler: &dyn Fn(&LlamaModel, u32) -> LlamaSampler,
     keep_going: &mut dyn FnMut(&str) -> bool,
 ) -> std::io::Result<CharacterCompletion> {
-    {
-        let _generation_guard = GENERATION_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _generation_guard = GENERATION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        let config = Database::get_config().map_err(|e| {
-            std::io::Error::other(format!("config unavailable while writing a thought: {e}"))
-        })?;
-        let backend = llama_backend()?;
-        let (model, _) = RESIDENT_MODEL.get_or_load(ModelKey::from_config(&config), |_| {
-            load_chat_model(backend, &config)
-        })?;
+    let config = Database::get_config().map_err(|e| {
+        std::io::Error::other(format!("config unavailable while writing a thought: {e}"))
+    })?;
+    let backend = llama_backend()?;
+    let (model, _) = RESIDENT_MODEL.get_or_load(ModelKey::from_config(&config), |_| {
+        load_chat_model(backend, &config)
+    })?;
 
-        // Rendered through the model's own template, same fallback shape as
-        // `run_extraction`: not fatal, since a plain system+user join still
-        // produces a usable prompt.
-        let rendered = match apply_gguf_chat_template(&model, system, &[(false, user.to_string())])
-        {
-            Ok(rendered) => rendered,
-            Err(e) => {
-                eprintln!("⚠️ Thought template unavailable ({e}), using the raw prompt");
-                format!("{system}\n\n{user}\n")
+    // Rendered through the model's own template, same fallback shape as
+    // `run_extraction`: not fatal, since a plain system+user join still
+    // produces a usable prompt.
+    let rendered = match apply_gguf_chat_template(&model, system, &[(false, user.to_string())]) {
+        Ok(rendered) => rendered,
+        Err(e) => {
+            eprintln!("⚠️ Thought template unavailable ({e}), using the raw prompt");
+            format!("{system}\n\n{user}\n")
+        }
+    };
+
+    let prompt_tokens = model
+        .str_to_token(&rendered, AddBos::Always)
+        .map_err(|e| std::io::Error::other(format!("failed to tokenize prompt: {}", e)))?;
+    let prompt_token_count = prompt_tokens.len();
+    // Sized the same way `run_extraction` sizes its own context: rounded
+    // up to 256, capped at the chat model's own token budget.
+    let window = ContextManager::new(config.clone()).token_budget.total;
+    let n_ctx = (prompt_token_count + max_tokens)
+        .next_multiple_of(256)
+        .min(window.max(256));
+
+    let cpu_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let context_params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(n_ctx as u32))
+        .with_n_batch(N_BATCH)
+        .with_n_threads(cpu_cores as i32)
+        .with_n_threads_batch(cpu_cores as i32);
+    let mut llama_context = model
+        .new_context(backend, context_params)
+        .map_err(|e| std::io::Error::other(format!("failed to create llama context: {}", e)))?;
+
+    let seed = sampler_seed();
+    let mut sampler = build_sampler(&model, seed);
+
+    // Counting-only callback: a thought is not the turn's reply, so
+    // neither `INFERENCE_TRACKER` nor `INFERENCE_OPTIMIZER` (which
+    // measure replies) are touched here.
+    let mut so_far = String::new();
+    let mut stopped_early = false;
+    let (text, tokens_generated) = run_decode(
+        &model,
+        &mut llama_context,
+        &mut sampler,
+        &prompt_tokens,
+        max_tokens,
+        &mut |piece| {
+            so_far.push_str(piece);
+            let keep = keep_going(&so_far);
+            if !keep {
+                stopped_early = true;
             }
-        };
+            keep
+        },
+    )?;
 
-        let prompt_tokens = model
-            .str_to_token(&rendered, AddBos::Always)
-            .map_err(|e| std::io::Error::other(format!("failed to tokenize prompt: {}", e)))?;
-        let prompt_token_count = prompt_tokens.len();
-        // Sized the same way `run_extraction` sizes its own context: rounded
-        // up to 256, capped at the chat model's own token budget.
-        let window = ContextManager::new(config.clone()).token_budget.total;
-        let n_ctx = (prompt_token_count + max_tokens)
-            .next_multiple_of(256)
-            .min(window.max(256));
+    let hit_token_cap = !stopped_early && tokens_generated >= max_tokens;
+    println!(
+        "💭 Thought: {} prompt tokens, {} generated{}",
+        prompt_token_count,
+        tokens_generated,
+        if hit_token_cap { " (capped)" } else { "" }
+    );
 
-        let cpu_cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        let context_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(n_ctx as u32))
-            .with_n_batch(N_BATCH)
-            .with_n_threads(cpu_cores as i32)
-            .with_n_threads_batch(cpu_cores as i32);
-        let mut llama_context = model
-            .new_context(backend, context_params)
-            .map_err(|e| std::io::Error::other(format!("failed to create llama context: {}", e)))?;
-
-        let seed = sampler_seed();
-        let mut sampler = build_sampler(&model, seed);
-
-        // Counting-only callback: a thought is not the turn's reply, so
-        // neither `INFERENCE_TRACKER` nor `INFERENCE_OPTIMIZER` (which
-        // measure replies) are touched here.
-        let mut so_far = String::new();
-        let mut stopped_early = false;
-        let (text, tokens_generated) = run_decode(
-            &model,
-            &mut llama_context,
-            &mut sampler,
-            &prompt_tokens,
-            max_tokens,
-            &mut |piece| {
-                so_far.push_str(piece);
-                let keep = keep_going(&so_far);
-                if !keep {
-                    stopped_early = true;
-                }
-                keep
-            },
-        )?;
-
-        let hit_token_cap = !stopped_early && tokens_generated >= max_tokens;
-        println!(
-            "💭 Thought: {} prompt tokens, {} generated{}",
-            prompt_token_count,
-            tokens_generated,
-            if hit_token_cap { " (capped)" } else { "" }
-        );
-
-        Ok(CharacterCompletion {
-            text,
-            hit_token_cap,
-        })
-    }
+    Ok(CharacterCompletion {
+        text,
+        hit_token_cap,
+    })
 }
 
 /// A canned [`CharacterModel`] for other modules' tests (#216's
